@@ -69,6 +69,8 @@ export interface RunSummary {
 	background?: boolean;
 	role: string;
 	model: string;
+	/** The model id Claude Code reported at init. Until then the list shows `model`, the role's alias. */
+	modelId?: string;
 	title?: string;
 	/** The Pi tool that started the run, the id of that tool call, and the Pi session it was made in. */
 	tool?: string;
@@ -336,6 +338,7 @@ function summaryOf(run: StoredRun): RunSummary {
 	if (run.handle !== undefined) summary.handle = run.handle;
 	if (run.background) summary.background = true;
 	if (run.question !== undefined) summary.question = run.question;
+	if (run.modelId !== undefined) summary.modelId = run.modelId;
 	if (run.title !== undefined) summary.title = run.title;
 	if (run.tool !== undefined) summary.tool = run.tool;
 	if (run.toolCallId !== undefined) summary.toolCallId = run.toolCallId;

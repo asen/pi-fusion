@@ -338,6 +338,7 @@ test("progress copies cost, cache, context, model usage and thinking, and caps t
 	assert.ok(Buffer.byteLength(detail.thinking.at(-1)!, "utf8") <= THINKING_CAP_BYTES);
 	const summary = store.summaries()[0]!;
 	assert.equal(summary.costUsd, 0.25);
+	assert.equal(summary.modelId, "claude-fable-5-1[1m]");
 	assert.equal(summary.contextTokens, 1_206);
 	assert.ok(!("thinking" in summary) && !("models" in summary), "the run list stays small");
 });
