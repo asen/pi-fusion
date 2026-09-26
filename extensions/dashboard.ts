@@ -3,9 +3,10 @@ import * as fs from "node:fs";
 import { createServer } from "node:http";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
+import type { ChildEvent } from "./backends/types.ts";
 import type { UsageTotals } from "./budget.ts";
 import type { ChangedFile } from "./changes.ts";
-import type { ChildEvent, RunOrigin } from "./fusion.ts";
+import type { RunOrigin } from "./fusion.ts";
 
 export const MAX_RUNS = 30;
 export const MAX_LOG_PER_RUN = 100;

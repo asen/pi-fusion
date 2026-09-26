@@ -20,6 +20,8 @@ A single Pi extension. `extensions/fusion.ts` default-exports `fusion(pi: Extens
 
 Each `claude` call starts a **child**: a headless Claude Code session in the host's working directory, run through `@anthropic-ai/claude-agent-sdk`. The role (`plan`, `implement`, `ultracode`, `ask`) fixes the child's model, effort, tool list, permission mode and contract; `ROLES` in `fusion.ts` holds that table, and each role's behavior is prose in `contracts/*.md`, appended to the child's system prompt. Change how a role behaves by editing its contract, not the code. The extension throws at load if a contract file is missing.
 
+The SDK lives behind a backend boundary. `fusion.ts` owns the run lifecycle and imports no SDK: it asks `claudeBackend` in `extensions/backends/claude.ts` to run a child and reads the run back through the records in `extensions/backends/types.ts`. Those types name no SDK, and the role and session shapes a backend takes stay its own, through their generic parameters. Keep it that way: SDK options, the questions bridge and stream handling belong in the backend, and process launching and descendant killing in `extensions/process-tree.ts`, which takes its own launch shape so no SDK type reaches it.
+
 Run state lives in two places, and the difference matters:
 
 - **In memory**, for this Pi process: `LiveRun` records in `fusion.ts` and the dashboard's `RunStore`. They die with the process unless `PI_FUSION_HISTORY=1` mirrors them to disk through `history.ts`.
@@ -29,7 +31,10 @@ Module map:
 
 | File | Holds |
 | --- | --- |
-| `extensions/fusion.ts` | roles, child spawning and process-tree kill, the SDK stream loop, the two tools, `/fusion`, run lifecycle |
+| `extensions/fusion.ts` | roles, handles, records, questions, scheduling, the two tools, `/fusion`, run lifecycle |
+| `extensions/backends/types.ts` | the backend boundary: the run record, its events, the question callback, the steer queue and the run request |
+| `extensions/backends/claude.ts` | the Claude Code backend: its role and session shapes, SDK options, the questions bridge, the stream loop |
+| `extensions/process-tree.ts` | spawning a child process and killing it with its descendants, process groups included |
 | `extensions/budget.ts` | the session cost ledger; each call reports a running total that replaces the one before it, never a delta |
 | `extensions/cards.ts` | TUI cards and the run widget, built on `@earendil-works/pi-tui` |
 | `extensions/changes.ts` | git snapshots before and after a run, to list the files it changed |
