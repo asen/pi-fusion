@@ -6,8 +6,9 @@ This is that report, and the second half of a pair. [docs/pi-config-write-spike.
 chose the child's execution shape, the public SDK bootstrap, by measuring what each way of starting a Pi child
 writes outside its own directory. This spike takes that same bootstrap and measures what a child built from it can
 promise: a durable checkpoint, an older checkpoint, a fork at an exact position, what survives each shape of
-failure, a question that holds its child until one answer arrives, a cancellation, the recovery work a run has to
-finish before it is done, and strict model selection. It changes no runtime code and proposes no product
+failure, what a navigation or a fork an extension cancelled leaves behind, a question that holds its child until
+one answer arrives, a cancellation, the recovery work a run has to finish before it is done, and strict model
+selection. It changes no runtime code and proposes no product
 behaviour. No Pi backend exists in `extensions/fusion.ts`, and nothing here claims one does.
 
 Findings are marked **measured** (this spike ran it against Pi 0.85.1), **source** (read in the installed Pi, not
@@ -21,10 +22,11 @@ page says so, and in one place they do.
 ## Reproducing
 
 ```bash
-node test/spikes/pi-session-lifecycle.mjs                        # all nine cases
+node test/spikes/pi-session-lifecycle.mjs                        # all ten cases
 node test/spikes/pi-session-lifecycle.mjs --list                 # the catalogue; exit 2, because it runs no case
 node test/spikes/pi-session-lifecycle.mjs --case row3-fork-at    # one case
 node test/spikes/pi-session-lifecycle.mjs --case=stage-b --keep  # one group, keep the temp root
+node test/spikes/pi-session-lifecycle.mjs --case row4-cancelled-operations   # the cancellation case
 ```
 
 The harness is a manual one: it spawns real Pi processes, so it stays out of `npm test`, whose glob is
@@ -32,7 +34,7 @@ The harness is a manual one: it spawns real Pi processes, so it stays out of `np
 unproven, and 2 whenever no case ran at all: an unmatched `--case`, a `--case` with no value, an unrecognised
 argument, or `--list`. `--case row3-fork-at` and `--case=row3-fork-at` are the same argument, and an argument the
 harness does not recognise is refused rather than ignored, because a silently ignored `--case=nope` would run all
-nine cases and exit 0 for a command line that named nothing. A full run takes about 48 seconds.
+ten cases and exit 0 for a command line that named nothing. A full run takes about 51 seconds.
 
 The Pi under test is pinned to the repository's dependency, 0.85.1, resolved through the package's public entry
 point (`import.meta.resolve`), and the harness prints the version it resolved on every run. It never runs
@@ -61,6 +63,14 @@ evidence for every claim about what goes out. The bridge can also log an in-chil
 through `before_provider_request` when `PI_SPIKE_LOG_PROVIDER_REQUESTS=1`, which is supplemental only and is off
 in every run reported here.
 
+The cancellation case needs an extension that refuses a session operation, so the same generated bridge registers
+`session_before_tree` and `session_before_fork` handlers that answer `{ cancel: true }`, but only for the hooks
+named in `PI_SPIKE_CANCEL_HOOKS`. A child that names neither, which is every other case and the cancellation
+case's own positive control, registers no handler for them at all, which is what Pi's `hasHandlers()` fast path
+checks, so the control runs against an absent hook rather than a passive one. That variable is the harness's own
+switch, set per child and never a path, and each firing is notified before the hook answers, so "the hook ran" is
+evidence in the stream rather than something inferred from the operation's result.
+
 What the harness does not do is sandbox anything. It guarantees, and measures rather than asserts, that the fake
 user profile and the fake project are byte-identical after every case, and that the `AGENTS.md` sentinel in every
 agent directory a child was actually pointed at still has its original bytes. Those guards run in the runner's
@@ -81,9 +91,10 @@ before it writes the file that names it.
 
 ## The case matrix
 
-Pi 0.85.1 on node v24.18.0, Linux, 2026-09-26. Nine cases cover the eight acceptance rows; row 2 has two,
-because a compacted run's checkpoint behaves differently from an ordinary one. Every result below is taken from
-the full run this page's Verification section records, not from any earlier report.
+Pi 0.85.1 on node v24.18.0, Linux, 2026-09-26. Ten cases cover the eight acceptance rows; row 2 has two, because
+a compacted run's checkpoint behaves differently from an ordinary one, and row 4 has two, because an operation an
+extension cancelled is refused in a different way from one that failed. Every result below is taken from the full
+run this page's Verification section records, not from any earlier report.
 
 | Row | Harness case | Result | Primary evidence |
 | --- | --- | --- | --- |
@@ -92,12 +103,13 @@ the full run this page's Verification section records, not from any earlier repo
 | 2 checkpoint at a compaction | `row2-compaction-checkpoint` | measured pass | event order, HTTP payloads restored both ways, JSONL tree |
 | 3 exact-position fork | `row3-fork-at` | measured pass | JSONL entry ids and header, file hashes before and after, HTTP payloads |
 | 4 failed continuation and the other failure shapes | `row4-failures` | measured pass | JSONL tree, HTTP payload roles, `extension_error` events, RPC state read-back |
+| 4 a cancelled navigation and a cancelled fork | `row4-cancelled-operations` | measured pass | hook-firing notifications, `cancelled` in the command results, request counts in a quiet window, session-directory snapshots, a positive control with no hook |
 | 5 questions that hold their child | `row5-questions` | measured pass | request counts inside measured windows, `tool_call_id` correlation, message positions |
 | 6 cancellation | `row6-cancellation` | measured pass | `clear_queue` payload, request counts, recorded pids and their liveness |
 | 7 retry and automatic compaction before settled completion | `row7-retry-compaction` | measured pass | event order, after a quiet window in the retry, overflow and queued-work phases, request counts, summary request shape, stats deltas |
 | 8 strict model and thinking checks | `row8-model-thinking` | measured pass | RPC responses and read-backs for four rejected selections, `model_change` and `thinking_level_change` entries, system content sentinels |
 
-Nine of nine are measured passes, and the harness prints `9/9 selected rows are measured passes`. Several claims
+Ten of ten are measured passes, and the harness prints `10/10 selected rows are measured passes`. Several claims
 *inside* those rows are not measurements, and a passing row must not be read as covering them:
 
 | Row | Claim | Status | Reason |
@@ -107,6 +119,7 @@ Nine of nine are measured passes, and the harness prints `9/9 selected rows are 
 | 3 | a forked host gets its own child session on first use | simulated Fusion policy | the fork's measured half is its content; the first-use rule needs a host |
 | 3 | the fork id the record should carry | measured incompatible | Pi allocates the id itself, see row 3 below |
 | 4 | what a record with no checkpoint should mean for Fusion | measured, undecided | Pi's behaviour is measured; the Fusion rule is an open decision, below |
+| 4 | the guard that refuses to submit a task after a cancelled operation | simulated Fusion policy | the guard is a harness function; what is measured is that Pi reported the cancellation and that no request and no durable write followed |
 | 6 | Pi's own `SIGTERM` and `SIGHUP` cleanup path | source | `killTrackedDetachedChildren` is registered by `runRpcMode` for those signals and is itself a group kill; not exercised here |
 | 7 | manual compaction | not used | manual compact is no evidence about automatic ordering, so the case drives the automatic threshold and overflow paths instead |
 | all | anything a real provider does | unproven | a loopback fixture cannot show it, see the gaps section |
@@ -225,6 +238,61 @@ count were all unchanged and no provider request went out. Simulated Fusion poli
 prompt after a refused restore or fork, which is why the request count stayed where it was. This is the plan's
 "verify by postcondition" rule, measured: a failed navigation and a successful prompt sit side by side in the
 stream.
+
+### Row 4, cancellation variant: an operation an extension refused
+
+The case is `row4-cancelled-operations`. Two turns settle first, so S1 (`cf7aae49`) is a real earlier checkpoint and
+S2 (`5ad00358`) is the leaf, and the durable state before anything is refused is one file of seven lines, sha
+`f64e3c60c92ba0f7`. The armed child then has both cancel hooks registered; the positive control at the end has
+neither.
+
+**A cancelled navigation and a cancelled fork are ordinary results, not errors.** Measured, evidence: the hook's own
+notification, the command's result and the event stream. `session_before_tree` fired exactly once, reporting
+`targetId cf7aae49` and `oldLeafId 5ad00358`, and `navigateTree` returned `{ cancelled: true }`; `session_before_fork`
+fired exactly once, reporting the same entry id and `position "at"`, and `fork` returned `{ cancelled: true }`. In
+both cases the prompt that carried the bridge command still answered `success: true` and no `extension_error` was
+emitted at all. That is the difference from row 4's invalid targets, which arrive as `extension_error` events: a host
+that only watches for errors, or only reads the prompt acknowledgement, sees nothing wrong here.
+
+**A cancelled fork leaves no fork.** Measured, evidence: the state read-back and a session-directory snapshot. The
+child stayed on the source session id `01a0defc-86fb-74f1-aaf4-416f97ffd3e5` and the source session file, the
+session directory held the same one path before and after, and its bytes were unchanged. Source, and the reason:
+`agent-session-runtime.js` `fork()` answers the cancel before it even looks the entry up and before any session
+replacement, so nothing is created and nothing is torn down.
+
+**A postcondition that holds is not evidence that an operation ran.** Measured: navigating to the entry that is
+already the leaf answered `{ cancelled: false }` with zero hook firings, because `agent-session.js` `navigateTree`
+returns early for a target equal to the current leaf, before the event is emitted. So "the leaf is the target" can be
+true of an operation that was cancelled, of one that never happened, and of one that succeeded. The guard in this
+case therefore treats `cancelled: true` as a refusal on its own, before it compares anything, and a cancel hook
+cannot be relied on to observe every navigation either. Both phases assert which refusal they got, not merely that
+one happened, because in this case the postconditions disagree too: with the guard's `cancelled` check deleted or
+moved after the postcondition comparison, the refusal is still a refusal and only that assertion fails.
+
+**Nothing followed either refusal: no request, no durable write, no record change.** Measured, evidence: the
+fixture's request log across a stated window, the state read-back, the session-directory snapshot and a marker
+search. The provider request count was 2 before the cancelled navigation, 2 after it, 2 after the cancelled fork and
+still 2 after a 1500 ms quiet window. The child's session id, session file, leaf and entry count (6) were identical
+to the read-back taken before the two operations, and the session directory was unchanged both while the child was
+still running and after it exited. The ledger's record was identical, field for field, to the one taken before. The `ROW4C-BLOCKED-TASK` marker, which is the task the guard was
+supposed to refuse to submit, appears in no recorded payload and in no file under the session directory. The two
+bridge commands that carried the refused operations persist nothing of their own, which is what the unchanged line
+count and the unchanged file bytes show, so the claim here is the strong one and not a marker-only one.
+
+**The guard is exercised, not described, and a positive control shows it is not simply refusing everything.**
+Measured for the control half: with no hook registered, the same guard on the same targets accepted the navigation to
+`cf7aae49` and let its task reach the fixture with roles `["system","user","assistant","user"]` carrying
+`ROW4C-NAV-CONTROL`, then accepted a fork at `cf7aae49`, which created `01a0defc-9136-711b-8097-e3f19f7b02c4` on its
+own file, and let that fork's task reach the fixture too. Simulated Fusion policy, and labelled as such in the
+output: the guard itself, the refusal-to-submit rule, and the ledger lines. The ledger kept its prior record through
+both refusals, a resume that recorded nothing and a cancellation with no session id to record, so the record after
+the case still names the source session at checkpoint `5ad00358`.
+
+**What this case does not do.** It does not implement or test a Fusion adapter, and it is no evidence that Fusion
+handles a cancelled navigation or fork correctly; there is no Fusion code in it. The measured half is Pi's: the hooks
+ran, the operations reported themselves cancelled, the session and its transcript were untouched, no fork was
+created and no provider request went out. Everything about what a host should then record or refuse to send is the
+in-harness guard and ledger.
 
 ### Row 5: a question that holds its child
 
@@ -361,6 +429,8 @@ evidence stands behind it.
 | Record the checkpoint as the leaf at settle, compaction entries included | a compacted call's leaf is the compaction entry, and its parent, the last assistant message, silently undoes the compaction when restored | measured both ways in one file |
 | Take the fork's session id from the child, and treat a fork as having no identity until the call returns | `fork()` ignores a supplied id; `createBranchedSession` generates one | measured by asking, source for the reason |
 | Read the event stream as first class: a prompt's `success` is an acceptance, and a failed navigation arrives as `extension_error` | an invalid target answered `success: true` on the prompt and reported the failure as its own event | measured |
+| Accept a navigation or a fork only on a non-cancelled result *and* verified postconditions, and submit no task otherwise | a cancelled hook makes both return `{ cancelled: true }` with a successful prompt and no `extension_error`, and a navigation to the current leaf answers `{ cancelled: false }` without reaching the hook, so neither the result alone nor the postcondition alone is enough | measured, both directions, with a positive control |
+| Treat a cancellation before a fork exists as recording nothing | the child keeps the source session id and file and no branched transcript is created, so the prior durable reference is still the only one there is | measured for the Pi half, simulated Fusion policy for the record |
 | Finish a call only on `agent_settled`, after retry, compaction and queued work | `agent_end` is emitted before a retry, before a compaction and between queued turns | measured; a 1500 ms quiet window for the retry, overflow and queued-work phases |
 | Send `clear_queue` before `abort` | abort with a steer and a follow-up queued produced one further provider request carrying both | measured, with the counterexample in the same case |
 | Treat a host abort as the cancelled question's answer and release the question | nothing is written back for the pending dialog id; the tool's result names the cancellation | measured, source for the `onAbort` reason |
@@ -386,7 +456,9 @@ evidence stands behind it.
   unproven where `/usr/bin/setsid` is absent, and the two checks that decide whether a pid may be signalled read
   as "not ours" off Linux, where the pid-file sweep therefore finds nothing.
 - **Every ledger line is simulated Fusion policy.** A row passes on what Pi did, never on what the simulation
-  decided.
+  decided. The restore-or-fork-then-task guard in the cancellation case is the same kind of stand-in: it is a
+  harness function, so the case is evidence about Pi's cancellation and about what did not follow it, and no
+  evidence at all that a Fusion adapter would refuse the same way.
 - **The `/tree` refusal is not exercisable.** Fusion refuses `/tree` while any run is unfinished. There is no host
   here, so the spike can simulate the record selection a `/tree` move makes and measure its effect on the child,
   and nothing about the refusal.
@@ -436,9 +508,10 @@ These are decisions, not missing measurements, unless the entry says otherwise.
 ## Go or no-go for implementation step 2
 
 **Go.** Implementation step 1 of the plan is complete: the configuration-write spike chose the execution shape and
-this spike measured the session semantics that step's gate named. Nine of nine cases are measured passes, no case
-failed and the harness marked none unproven; what stays outside measurement is named in the matrix above and in
-the two sections that follow it, and none of it is a Pi session semantic the adapter would have to guess at. The
+this spike measured the session semantics that step's gate named. Every case is a measured pass, no case failed
+and the harness marked none unproven: nine of nine when this go was written, and ten of ten since the cancellation
+case was added to the same matrix. What stays outside measurement is named in the matrix above and in the two
+sections that follow it, and none of it is a Pi session semantic the adapter would have to guess at. The
 conditions attached to that go are these.
 
 1. Step 2 extracts the backend boundary and the process-tree helper and touches no Pi code. It must keep every
@@ -455,11 +528,21 @@ conditions attached to that go are these.
    child reports reaches `nextSession` and the tagged record, given that a fork has no identity until the call
    returns, and what a record with no checkpoint means for a Pi child. Both are named in the decisions above.
 5. The gate is against Pi 0.85.1. Re-run this harness against whatever Pi version Fusion ships with and require
-   9/9 again; a different version is outside what was measured, and the plan's startup capability check is what
-   turns that into an actionable error rather than a surprise.
+   every case to pass, which is 10/10 in the current matrix and was 9/9 when this go was given; a different
+   version is outside what was measured, and the plan's startup capability check is what turns that into an
+   actionable error rather than a surprise.
 
-No-go conditions: a harness run that reports fewer than 9/9 on the Pi version being targeted, or a decision to
+No-go conditions: a harness run in which any case fails on the Pi version being targeted, or a decision to
 build the adapter on a checkpoint rule other than "the leaf at settle", which the compaction measurement rules out.
+
+What is still gated after step 2, and where it is gated, because nothing on this page closes any of it. The plan
+carries an explicit acceptance gate on step 3 and another on step 4, and these measurements feed both. Step 3's
+gate settles the recovery for a failed first call that has an identity and no checkpoint, the path a
+child-reported session identity travels into the record, and, from the cancellation case, that a cancelled
+operation records nothing and leaves the prior durable reference authoritative. Step 4's gate settles the
+descendant ownership strategy, identity-safe late signals, cleanup after a normal exit as well as an abort, the
+`clear_queue`-before-`abort` shutdown ordering, and the guard this harness only simulates: a Pi adapter has to
+refuse a cancelled navigation or fork itself, before any task prompt, and no Fusion code does that today.
 
 ## Verification
 
@@ -467,12 +550,23 @@ Run on 2026-09-26 against Pi 0.85.1 on node v24.18.0, Linux. Every command ran i
 another, never concurrently with `npm test`, and no command was backgrounded. The numbers below are the final
 sequential verification of this page; where a bullet reports an earlier run it says so.
 
-- `node test/spikes/pi-session-lifecycle.mjs` (all nine cases): exit 0, `9/9 selected rows are measured passes`,
-  394 lines of output, 48 s wall clock, no `FAIL` line, no case marked unproven, no leaked process and no temp
-  root left behind. An independent full rerun also exited 0 with all nine cases measured passes.
-- `node test/spikes/pi-session-lifecycle.mjs --case row7-retry-compaction`, the one case whose harness text this
-  revision touched, and only an explanatory message in its phase (e): exit 0,
-  `1/1 selected rows are measured passes`. No assertion changed.
+- `node test/spikes/pi-session-lifecycle.mjs --case row4-cancelled-operations`, the case this revision adds, run
+  before the full harness: exit 0, `1/1 selected rows are measured passes`.
+- The same case against two deliberate mutations of its own guard, to show the cancellation assertions bite rather
+  than riding on a postcondition that also disagreed: with the guard's `cancelled` check deleted, exit 1 with
+  exactly two failures, both "the guard refused ... for another reason than its cancellation"; with that check
+  moved after the postcondition comparison instead, exit 1 with the same two failures and no others. The check was
+  restored and the case re-run to exit 0 with `1/1 selected rows are measured passes`; neither mutation is in the
+  harness.
+- `node test/spikes/pi-session-lifecycle.mjs` (all ten cases): exit 0, `10/10 selected rows are measured passes`,
+  440 lines of output, 51 s wall clock, no `FAIL` line, no case marked unproven, no leaked process and no temp
+  root left behind. The row values quoted on this page are from that run, and an independent full rerun of the ten
+  cases also exited 0 with `10/10 selected rows are measured passes` in 440 lines and 51 s.
+- The earlier revision's numbers, kept as the record of the nine-case matrix: `node
+  test/spikes/pi-session-lifecycle.mjs` exited 0 with `9/9 selected rows are measured passes`, 394 lines of output
+  and 48 s wall clock, and an independent full rerun also exited 0 with all nine cases measured passes;
+  `--case row7-retry-compaction`, the one case that revision's text touched, exited 0 with
+  `1/1 selected rows are measured passes` and no assertion changed.
 - An earlier run measured the value this page stopped quoting:
   `--case row3-fork-at` twice, each exit 0 with `1/1 selected rows are measured passes`, printing
   `fork file sha before/after the original's turn: 9db79a8056762950 / 9db79a8056762950` and then
@@ -481,15 +575,20 @@ sequential verification of this page; where a bullet reports an earlier run it s
 - Both self-tests printed before the first case, which is what makes two safety claims measurements rather than
   assertions: the containment guard refused a path in `os.tmpdir()` and accepted one inside the root, and the
   sentinel guard reported a deliberately modified file (`4a7ed79667172211 -> 4eef38fc68b7f333`).
-- `node test/spikes/pi-session-lifecycle.mjs --case nope`: exit 2, `no case or group is named nope`. The rest of
-  the exit-code contract, measured in the same way: `--case=nope` exit 2 with the same line; `--case` and
-  `--case --keep` exit 2 with `--case needs a case or group name`; `--bogus` exit 2 with
-  `unrecognised argument(s): --bogus`; `--list` exit 2 after printing nine cases and two groups.
+- `--list`: exit 2 after printing ten cases and two groups, with `row4-cancelled-operations` in `stage-a`. The
+  rest of the exit-code contract is unchanged by this revision and was measured in the same way earlier:
+  `--case nope` exit 2 with `no case or group is named nope`; `--case=nope` exit 2 with the same line; `--case`
+  and `--case --keep` exit 2 with `--case needs a case or group name`; `--bogus` exit 2 with
+  `unrecognised argument(s): --bogus`.
 - Row 6's conditional unproven branch did not fire: `/usr/bin/setsid` is present on this machine, so the
   detached-descendant half is measured rather than skipped, and Pi's abort still fails to reach the grandchild.
 - `npm run typecheck`: exit 0, clean. The harness is an `.mjs` file outside the `include` globs, so it is not
   typechecked, by design.
-- `npm test`, three runs. Run 1: exit 1, 325 tests, 324 pass, 1 fail, 0 skipped; the failure was
+- `npm test`, two runs, both exit 0: 333 tests, 333 pass, 0 fail, 0 skipped, so the browser cases ran, and neither
+  run hit the click flake below. Nothing under `extensions/` and nothing in the `test/*.test.ts` glob changed in
+  this revision; the harness and this page are outside both.
+- The earlier revision's `npm test`, kept as the record of the flakes it hit, when the suite held 325 tests. Three
+  runs. Run 1: exit 1, 325 tests, 324 pass, 1 fail, 0 skipped; the failure was
   `test/browser.test.ts` "a run's tasks are drawn on a timeline of the run", reporting
   `the page threw: TypeError: Cannot read properties of undefined (reading 'click')`. Run 2: exit 1, 324 of 325,
   0 skipped, with a different browser case, "the log stays in place when its entry count gains a digit", failing

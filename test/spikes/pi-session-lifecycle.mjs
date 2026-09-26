@@ -653,6 +653,29 @@ export default function (pi) {
 		},
 	});
 
+	/**
+	 * The two cancellable session hooks, armed by naming them in PI_SPIKE_CANCEL_HOOKS. A child that
+	 * does not name one registers no handler for it at all, which is what Pi's own hasHandlers() fast
+	 * path checks, so the positive control runs against a genuinely absent hook rather than a passive
+	 * one. Each firing is notified before the answer, so "the hook ran" is evidence of its own and does
+	 * not have to be inferred from the command's result.
+	 */
+	for (const hook of (process.env.PI_SPIKE_CANCEL_HOOKS || "").split(",").filter((name) => name.length > 0)) {
+		pi.on(hook, async (event, ctx) => {
+			const manager = ctx.sessionManager;
+			notifyJson(ctx, "SPIKE_HOOK", {
+				hook: hook,
+				cancel: true,
+				// session_before_tree carries a preparation; session_before_fork carries entryId/position.
+				targetId: event.preparation ? event.preparation.targetId : event.entryId || null,
+				oldLeafId: event.preparation ? event.preparation.oldLeafId : manager.getLeafId() || null,
+				position: event.position || null,
+				sessionId: manager.getSessionId(),
+			});
+			return { cancel: true };
+		});
+	}
+
 	/** Supplemental only: an in-child view of the outgoing payload, never the primary evidence. */
 	if (process.env.PI_SPIKE_LOG_PROVIDER_REQUESTS === "1") {
 		pi.on("before_provider_request", async (event, ctx) => {
@@ -1186,7 +1209,7 @@ function trackSentinel(dirs, label, file) {
 }
 
 /** Write a child configuration and start it. `session` chooses new versus reopened. */
-function startChild(dirs, label, { session, tools = ["read"], settings, modelsPath, agentDir = dirs.agentDir }) {
+function startChild(dirs, label, { session, tools = ["read"], settings, modelsPath, agentDir = dirs.agentDir, extraEnv }) {
 	const configFile = path.join(dirs.caseRoot, `bootstrap-${label}.json`);
 	writeChildConfig(dirs.root, configFile, {
 		packageEntry,
@@ -1205,7 +1228,13 @@ function startChild(dirs, label, { session, tools = ["read"], settings, modelsPa
 	});
 	// PI_CODING_AGENT_DIR has to name the same directory as the configuration, so a child on another agent
 	// directory is given its own environment; every other variable, and the containment check, is unchanged.
-	const env = agentDir === dirs.agentDir ? dirs.env : childEnv(dirs.root, { agentDir, sessionDir: dirs.sessionDir });
+	const base = agentDir === dirs.agentDir ? dirs.env : childEnv(dirs.root, { agentDir, sessionDir: dirs.sessionDir });
+	// extraEnv is for switches, never for locations: childEnv is where the containment check lives, so a
+	// value that looks like a path would bypass it. Refuse one rather than launch an unchecked child.
+	for (const [name, value] of Object.entries(extraEnv ?? {})) {
+		if (String(value).includes(path.sep)) throw new Error(`refusing to launch: extraEnv ${name}=${value} names a path, which childEnv is what checks`);
+	}
+	const env = extraEnv ? { ...base, ...extraEnv } : base;
 	return new RpcChild(`${dirs.name}/${label}`, process.execPath, [dirs.bootstrap, configFile], { cwd: dirs.project, env });
 }
 
@@ -1226,6 +1255,52 @@ async function runPrompt(child, message, deadlineMs = SETTLE_DEADLINE_MS) {
 	if (!response.success) return { mark, response, settled: undefined };
 	const settled = await child.waitSettled(mark, deadlineMs);
 	return { mark, response, settled };
+}
+
+/** The hook firings the bridge reported at or after `from`, which is the proof that a hook ran at all. */
+const hookFirings = (child, from = 0) =>
+	child
+		.notifications(from)
+		.filter((message) => message.startsWith("SPIKE_HOOK "))
+		.map((message) => JSON.parse(message.slice("SPIKE_HOOK ".length)));
+
+/**
+ * The refusal a cancellation and nothing else produces. A case asserts on this exact string, so removing or
+ * reordering the guard's `cancelled` check fails the case instead of passing on whichever postcondition
+ * happened to disagree next.
+ */
+const cancelledRefusal = (kind) => `the ${kind} was cancelled, so this run has no verified session to prompt`;
+
+/**
+ * The restore-or-fork-then-task path an adapter owes, exercised rather than described: a cancelled
+ * operation is a refusal on its own, before any postcondition is looked at, because a cancelled
+ * navigation can leave the leaf wherever the guard hoped to find it and a satisfied postcondition is
+ * not permission to ignore `cancelled: true`. Only a verified operation may submit the task prompt, so
+ * a refusal is observable as a provider request that never happened.
+ */
+async function guardedOperation(child, { kind, targetId, expect, task, deadlineMs = SETTLE_DEADLINE_MS }) {
+	const prefix = kind === "fork" ? "SPIKE_FORK" : "SPIKE_NAVIGATE";
+	const mark = child.mark();
+	const response = await child.send({ type: "prompt", message: `${kind === "fork" ? "/spike-fork" : "/spike-navigate"} ${targetId}` });
+	const ack = await child.waitNotification(prefix, mark, COMMAND_DEADLINE_MS);
+	const refuse = (reason) => ({ mark, response, ack, submitted: false, reason, run: undefined });
+	if (response.success !== true) return refuse(`the prompt carrying the ${kind} was rejected`);
+	if (ack.ok !== true) return refuse(`the ${kind} command failed: ${ack.error ?? "?"}`);
+	if (ack.cancelled === true) return refuse(cancelledRefusal(kind));
+	const problems = [];
+	if (ack.leafId !== targetId) problems.push(`leaf ${ack.leafId} is not the target ${targetId}`);
+	if (kind === "fork") {
+		if (!ack.sessionFile) problems.push("the fork reported no session file");
+		else if (!fs.existsSync(ack.sessionFile)) problems.push(`the fork's session file ${ack.sessionFile} is not on disk`);
+		if (ack.sessionId === expect.sessionId) problems.push(`the fork reported the source session id ${ack.sessionId}`);
+		if (ack.sessionFile === expect.sessionFile) problems.push(`the fork reported the source session file ${ack.sessionFile}`);
+	} else {
+		if (ack.sessionId !== expect.sessionId) problems.push(`session id ${ack.sessionId} is not the recorded ${expect.sessionId}`);
+		if (ack.sessionFile !== expect.sessionFile) problems.push(`session file ${ack.sessionFile} is not the recorded ${expect.sessionFile}`);
+	}
+	if (problems.length > 0) return refuse(`${kind} postconditions failed: ${problems.join("; ")}`);
+	const run = await runPrompt(child, task, deadlineMs);
+	return { mark, response, ack, submitted: true, reason: undefined, run };
 }
 
 /** Pi's own view of what the run cost, beside the numbers the fixture actually sent. */
@@ -1998,6 +2073,243 @@ async function caseFailures(root, server, result) {
 	} finally {
 		await childD.close();
 	}
+
+	result.check(server.unscripted.length === 0, `the fixture saw ${server.unscripted.length} unscripted request(s): ${JSON.stringify(server.unscripted.map((r) => r.note))}`);
+}
+
+/**
+ * Row 4, cancellation variant: a `session_before_tree` or `session_before_fork` handler that answers
+ * `{ cancel: true }`. Pi returns that as an ordinary `{ cancelled: true }` result, not as the
+ * `extension_error` the invalid-target phase above measures and not as a failed prompt acknowledgement,
+ * so a guard that only watches for errors would walk straight past it.
+ */
+async function caseCancelledOperations(root, server, result) {
+	const dirs = setupCase(root, server, result.name);
+	const ledger = new Ledger((line) => result.say(line));
+	const HOST = "host-session-1";
+	const OTHER_HOST = "host-session-2";
+	/** The one marker that must never appear anywhere: the task the guard has to refuse to submit. */
+	const BLOCKED = "ROW4C-BLOCKED-TASK";
+	const ARMED = { PI_SPIKE_CANCEL_HOOKS: "session_before_tree,session_before_fork" };
+	server.install([
+		textStep("s1", "ROW4C-S1-ANSWER"),
+		textStep("s2", "ROW4C-S2-ANSWER"),
+		textStep("nav-control", "ROW4C-NAV-CONTROL-ANSWER"),
+		textStep("fork-control", "ROW4C-FORK-CONTROL-ANSWER"),
+	]);
+
+	/* (a) two settled turns, so the older checkpoint is a real move rather than a no-op */
+	result.phase("(a) two settled turns: S1 becomes the older checkpoint, S2 the leaf");
+	const planA = ledger.plan("row4cancel", HOST);
+	const childA = startChild(dirs, "setup", { session: { mode: "create" }, settings: { retry: { enabled: false } } });
+	let sessionFile;
+	let sessionId;
+	let checkpointS1;
+	let checkpointS2;
+	try {
+		await runPrompt(childA, "ROW4C-S1 first turn.");
+		const afterS1 = await state(childA);
+		checkpointS1 = afterS1.leafId;
+		sessionFile = afterS1.sessionFile;
+		sessionId = afterS1.sessionId;
+		await runPrompt(childA, "ROW4C-S2 second turn.");
+		const afterS2 = await state(childA);
+		checkpointS2 = afterS2.leafId;
+		result.say(`session ${sessionId} at ${sessionFile}; S1 ${checkpointS1}, S2 ${checkpointS2} (${afterS2.leafType})`);
+		ledger.record("row4cancel", { hostSessionId: HOST, plan: planA, sessionId, checkpoint: checkpointS2, ok: true });
+	} finally {
+		await childA.close();
+	}
+	const priorRecord = { ...ledger.get("row4cancel") };
+	const sessionsBefore = snapshot(dirs.sessionDir);
+	const fileHashBefore = hashFile(sessionFile);
+	const entryCountBefore = readSessionEntries(sessionFile).length;
+	result.say(`durable state before any cancelled operation: sha ${fileHashBefore}, ${entryCountBefore} line(s), ${sessionsBefore.size} path(s) under the session directory`);
+
+	/* (b) and (c): one armed child, a cancelled navigation and a cancelled fork */
+	const childB = startChild(dirs, "cancelled", {
+		session: { mode: "open", file: sessionFile, requireCheckpoint: checkpointS1 },
+		settings: { retry: { enabled: false } },
+		extraEnv: ARMED,
+	});
+	try {
+		const opened = await state(childB);
+		result.check(opened.leafId === checkpointS2, `the reopened leaf is ${opened.leafId}, not the file's last line ${checkpointS2}`);
+
+		result.phase("(b) measured Pi behaviour: a navigation to the current leaf never reaches the hook");
+		const noopMark = childB.mark();
+		const noop = (await bridgeCommand(childB, `/spike-navigate ${checkpointS2}`, "SPIKE_NAVIGATE")).data;
+		result.check(noop.ok === true && noop.cancelled === false, `navigating to the current leaf answered ${JSON.stringify({ ok: noop.ok, cancelled: noop.cancelled })}`);
+		result.check(hookFirings(childB, noopMark).length === 0, "session_before_tree fired for a navigation to the current leaf");
+		result.say(`navigating to the current leaf ${checkpointS2}: ack ${JSON.stringify({ ok: noop.ok, cancelled: noop.cancelled, leafId: noop.leafId })}, hook firings ${hookFirings(childB, noopMark).length}`);
+		result.say(
+			"source (core/agent-session.js navigateTree): a target equal to the current leaf returns { cancelled: false } before the event is emitted, so a cancel hook cannot be relied on to see every navigation, and the harness submits no task here",
+		);
+
+		result.phase("(c) a cancelled navigation: the guard refuses it and submits nothing");
+		const planB = ledger.plan("row4cancel", HOST);
+		result.check(planB.action === "resume" && planB.checkpoint === checkpointS2, `the same host planned ${planB.action} at ${planB.checkpoint}`);
+		result.say(
+			`the ledger's record still names ${checkpointS2}; this case targets the earlier ${checkpointS1} instead, which is the harness's own choice and outside what this ledger models — a host /tree move would supply it from an earlier record the ledger does not keep`,
+		);
+		const requestsBeforeNavigate = server.requests.length;
+		const navigateMark = childB.mark();
+		const navigate = await guardedOperation(childB, {
+			kind: "navigate",
+			targetId: checkpointS1,
+			expect: { sessionId, sessionFile },
+			task: `${BLOCKED} this prompt must never be sent after a cancelled navigation.`,
+		});
+		const navigateHooks = hookFirings(childB, navigateMark);
+		result.say(`session_before_tree firings: ${JSON.stringify(navigateHooks)}`);
+		result.check(navigateHooks.length === 1 && navigateHooks[0].hook === "session_before_tree", `the navigation fired ${navigateHooks.length} session_before_tree handler(s)`);
+		result.check(navigateHooks[0]?.targetId === checkpointS1, `the hook saw target ${navigateHooks[0]?.targetId} instead of ${checkpointS1}`);
+		result.check(navigateHooks[0]?.oldLeafId === checkpointS2, `the hook saw old leaf ${navigateHooks[0]?.oldLeafId} instead of ${checkpointS2}`);
+		result.say(`navigate ack: ${JSON.stringify({ ok: navigate.ack.ok, cancelled: navigate.ack.cancelled, leafId: navigate.ack.leafId, sessionId: navigate.ack.sessionId })}`);
+		result.check(navigate.response.success === true, "the prompt carrying the cancelled navigation did not answer success:true");
+		result.check(navigate.ack.ok === true, `the cancelled navigation was reported as a command failure: ${navigate.ack.error ?? "?"}`);
+		result.check(navigate.ack.cancelled === true, "navigateTree did not report cancelled:true for a hook that answered { cancel: true }");
+		result.check(childB.extensionErrors(navigateMark).length === 0, `the cancelled navigation also produced ${childB.extensionErrors(navigateMark).length} extension_error event(s)`);
+		result.say("measured Pi behaviour: a cancelled navigation is an ordinary result — success:true on the prompt, no extension_error, cancelled:true in the return value");
+		result.check(navigate.submitted === false, "the guard submitted the task after a cancelled navigation");
+		result.say(`the guard refused: ${navigate.reason}`);
+		result.check(
+			navigate.reason === cancelledRefusal("navigate"),
+			`the guard refused the navigation for another reason than its cancellation: ${JSON.stringify(navigate.reason)}`,
+		);
+		result.check(navigate.ack.leafId === checkpointS2, `the cancelled navigation moved the leaf to ${navigate.ack.leafId}`);
+		result.check(server.requests.length === requestsBeforeNavigate, `the cancelled navigation produced ${server.requests.length - requestsBeforeNavigate} provider request(s)`);
+		result.say(`provider requests across the cancelled navigation: ${requestsBeforeNavigate} -> ${server.requests.length}`);
+		ledger.record("row4cancel", { hostSessionId: HOST, plan: planB, sessionId: navigate.ack.sessionId, checkpoint: navigate.ack.leafId, ok: false });
+		result.check(
+			JSON.stringify(ledger.get("row4cancel")) === JSON.stringify(priorRecord),
+			`the cancelled navigation changed the record from ${JSON.stringify(priorRecord)} to ${JSON.stringify(ledger.get("row4cancel"))}`,
+		);
+
+		result.phase("(d) a cancelled fork: no fork identity, no fork transcript, nothing recorded");
+		const planC = ledger.plan("row4cancel", OTHER_HOST);
+		result.check(planC.action === "fork" && planC.checkpoint === checkpointS2, `the other host planned ${planC.action} at ${planC.checkpoint}`);
+		const requestsBeforeFork = server.requests.length;
+		const forkMark = childB.mark();
+		const fork = await guardedOperation(childB, {
+			kind: "fork",
+			targetId: checkpointS1,
+			expect: { sessionId, sessionFile },
+			task: `${BLOCKED} this prompt must never be sent after a cancelled fork.`,
+		});
+		const forkHooks = hookFirings(childB, forkMark);
+		result.say(`session_before_fork firings: ${JSON.stringify(forkHooks)}`);
+		result.check(forkHooks.length === 1 && forkHooks[0].hook === "session_before_fork", `the fork fired ${forkHooks.length} session_before_fork handler(s)`);
+		result.check(forkHooks[0]?.targetId === checkpointS1, `the hook saw entry ${forkHooks[0]?.targetId} instead of ${checkpointS1}`);
+		result.check(forkHooks[0]?.position === "at", `the hook saw position ${JSON.stringify(forkHooks[0]?.position)} instead of "at"`);
+		result.say(`fork ack: ${JSON.stringify({ ok: fork.ack.ok, cancelled: fork.ack.cancelled, sessionId: fork.ack.sessionId, sessionFile: fork.ack.sessionFile })}`);
+		result.check(fork.response.success === true, "the prompt carrying the cancelled fork did not answer success:true");
+		result.check(fork.ack.ok === true, `the cancelled fork was reported as a command failure: ${fork.ack.error ?? "?"}`);
+		result.check(fork.ack.cancelled === true, "fork did not report cancelled:true for a hook that answered { cancel: true }");
+		result.check(childB.extensionErrors(forkMark).length === 0, `the cancelled fork also produced ${childB.extensionErrors(forkMark).length} extension_error event(s)`);
+		result.check(fork.submitted === false, "the guard submitted the task after a cancelled fork");
+		result.say(`the guard refused: ${fork.reason}`);
+		result.check(fork.reason === cancelledRefusal("fork"), `the guard refused the fork for another reason than its cancellation: ${JSON.stringify(fork.reason)}`);
+		result.check(fork.ack.sessionId === sessionId && fork.ack.sessionFile === sessionFile, `the cancelled fork left the child on ${fork.ack.sessionId} at ${fork.ack.sessionFile}`);
+		result.say(
+			"source (core/agent-session-runtime.js fork): the cancel is answered before the entry is even looked up and before any session replacement, so the child keeps the source session and no branched file is created",
+		);
+		result.check(server.requests.length === requestsBeforeFork, `the cancelled fork produced ${server.requests.length - requestsBeforeFork} provider request(s)`);
+		result.say(`provider requests across the cancelled fork: ${requestsBeforeFork} -> ${server.requests.length}`);
+		ledger.record("row4cancel", { hostSessionId: OTHER_HOST, plan: planC, sessionId: undefined, checkpoint: undefined, ok: false });
+		result.check(
+			JSON.stringify(ledger.get("row4cancel")) === JSON.stringify(priorRecord),
+			`the cancelled fork changed the record from ${JSON.stringify(priorRecord)} to ${JSON.stringify(ledger.get("row4cancel"))}`,
+		);
+		result.say("simulated Fusion policy: a cancellation before a fork exists records nothing, so the prior durable reference stays authoritative; the settled rule for a failure after a fork exists is the one row4-failures measures and is untouched here");
+
+		result.phase("(e) a bounded quiet window: no task prompt arrives late");
+		const quietFrom = server.requests.length;
+		await sleep(SETTLE_QUIET_MS);
+		result.check(server.requests.length === quietFrom, `${server.requests.length - quietFrom} provider request(s) arrived in the ${SETTLE_QUIET_MS}ms after the two cancelled operations`);
+		result.say(`provider requests after both cancellations: ${server.requests.length}, unchanged across ${SETTLE_QUIET_MS}ms`);
+		const settledState = await state(childB);
+		result.say(`child state after both cancellations: ${JSON.stringify({ sessionId: settledState.sessionId, leafId: settledState.leafId, entryCount: settledState.entryCount })}`);
+		result.check(settledState.sessionId === opened.sessionId, `the session id changed from ${opened.sessionId} to ${settledState.sessionId}`);
+		result.check(settledState.sessionFile === opened.sessionFile, "the session file changed across the cancelled operations");
+		result.check(settledState.leafId === opened.leafId, `the leaf moved from ${opened.leafId} to ${settledState.leafId}`);
+		result.check(settledState.entryCount === opened.entryCount, `the entry count changed from ${opened.entryCount} to ${settledState.entryCount}`);
+		const liveDiff = diffSnapshots(sessionsBefore, snapshot(dirs.sessionDir));
+		result.say(`session directory while the child is still open: ${formatDiff(liveDiff)}`);
+		result.check(isEmptyDiff(liveDiff), `the cancelled operations changed the session directory while the child was still open: ${formatDiff(liveDiff)}`);
+	} finally {
+		await childB.close();
+	}
+
+	result.phase("(f) the durable side: same bytes, no fork file, and the blocked task nowhere");
+	const sessionsAfter = snapshot(dirs.sessionDir);
+	const diff = diffSnapshots(sessionsBefore, sessionsAfter);
+	result.say(`session directory after the cancelled operations: ${formatDiff(diff)}`);
+	result.check(isEmptyDiff(diff), `the cancelled operations changed the session directory: ${formatDiff(diff)}`);
+	result.check(hashFile(sessionFile) === fileHashBefore, `the source transcript's bytes changed: ${fileHashBefore} -> ${hashFile(sessionFile)}`);
+	result.check(readSessionEntries(sessionFile).length === entryCountBefore, `the source transcript gained or lost lines: ${entryCountBefore} -> ${readSessionEntries(sessionFile).length}`);
+	result.check(sessionsAfter.size === sessionsBefore.size, "a cancelled fork created a session file");
+	// snapshot() keys are relative to the directory it walked, and only its file entries are readable.
+	const blockedOnDisk = [...sessionsAfter]
+		.filter(([, value]) => value.startsWith("file:"))
+		.map(([rel]) => path.join(dirs.sessionDir, rel))
+		.filter((file) => fs.readFileSync(file, "utf8").includes(BLOCKED));
+	result.check(blockedOnDisk.length === 0, `the blocked task marker reached ${JSON.stringify(blockedOnDisk)}`);
+	result.check(
+		!server.requests.some((request) => JSON.stringify(request.messages ?? []).includes(BLOCKED)),
+		"the blocked task marker reached the fixture's recorded payloads",
+	);
+	result.say(`measured: the ${BLOCKED} marker is in no provider payload and in no file under the session directory; the two bridge commands that carried the cancelled operations are prompts and persist nothing, which is what the unchanged line count shows`);
+
+	/* (g) the positive control: the same guard, the same targets, no hook registered at all */
+	result.phase("(g) positive control: with the hooks unregistered the guard permits both operations");
+	const childC = startChild(dirs, "control", {
+		session: { mode: "open", file: sessionFile, requireCheckpoint: checkpointS1 },
+		settings: { retry: { enabled: false } },
+	});
+	let controlForkFile;
+	try {
+		const requestsBeforeControl = server.requests.length;
+		const controlMark = childC.mark();
+		const navigate = await guardedOperation(childC, {
+			kind: "navigate",
+			targetId: checkpointS1,
+			expect: { sessionId, sessionFile },
+			task: "ROW4C-NAV-CONTROL a task the guard is allowed to submit.",
+		});
+		result.check(hookFirings(childC, controlMark).length === 0, "a hook fired in the control child, which registers none");
+		result.check(navigate.ack.cancelled === false, `the control navigation reported cancelled ${navigate.ack.cancelled}`);
+		result.check(navigate.submitted === true, `the guard refused the control navigation: ${navigate.reason}`);
+		result.check(navigate.ack.leafId === checkpointS1, `the control navigation left the leaf at ${navigate.ack.leafId}`);
+		result.check(navigate.run?.response.success === true && navigate.run?.settled !== undefined, "the control navigation's task did not settle");
+		result.check(server.requests.length === requestsBeforeControl + 1, `the control navigation's task produced ${server.requests.length - requestsBeforeControl} provider request(s)`);
+		const navRequest = server.requests.at(-1);
+		result.say(`control navigation request: ${describeRequest(navRequest)}`);
+		result.check(conversationTexts(navRequest).some((text) => text.includes("ROW4C-NAV-CONTROL")), "the control navigation's task is missing from the payload");
+
+		const forkMark = childC.mark();
+		const fork = await guardedOperation(childC, {
+			kind: "fork",
+			targetId: checkpointS1,
+			expect: { sessionId, sessionFile },
+			task: "ROW4C-FORK-CONTROL a task on a fork the guard verified.",
+		});
+		result.check(hookFirings(childC, forkMark).length === 0, "a hook fired in the control child's fork");
+		result.check(fork.ack.cancelled === false, `the control fork reported cancelled ${fork.ack.cancelled}`);
+		result.check(fork.submitted === true, `the guard refused the control fork: ${fork.reason}`);
+		controlForkFile = fork.ack.sessionFile;
+		result.say(`control fork ${fork.ack.sessionId} at ${controlForkFile}, leaf ${fork.ack.leafId}`);
+		result.check(fork.ack.sessionId !== sessionId && controlForkFile !== sessionFile, "the control fork reported the source identity");
+		result.check(fork.run?.response.success === true && fork.run?.settled !== undefined, "the control fork's task did not settle");
+		const forkRequest = server.requests.at(-1);
+		result.say(`control fork request: ${describeRequest(forkRequest)}`);
+		result.check(conversationTexts(forkRequest).some((text) => text.includes("ROW4C-FORK-CONTROL")), "the control fork's task is missing from the payload");
+	} finally {
+		await childC.close();
+	}
+	result.check(Boolean(controlForkFile) && fs.existsSync(controlForkFile), `the permitted fork left no transcript at ${JSON.stringify(controlForkFile)}`);
+	result.say("the control proves the guard is not refusing everything: the same guard, on the same targets, permitted a navigation and a fork and let each one reach the local fixture");
+	result.say("what stays simulation: the record decisions above are the in-harness ledger, and no Fusion adapter is involved in either the refusal or the submission");
 
 	result.check(server.unscripted.length === 0, `the fixture saw ${server.unscripted.length} unscripted request(s): ${JSON.stringify(server.unscripted.map((r) => r.note))}`);
 }
@@ -2803,6 +3115,12 @@ const CASES = [
 	{ name: "row2-older-checkpoint", row: 2, title: "restoring an older checkpoint after a later turn (host /tree simulation)", run: caseOlderCheckpoint },
 	{ name: "row3-fork-at", row: 3, title: "fork at an exact checkpoint, two transcripts that stay apart", run: caseForkAt },
 	{ name: "row4-failures", row: 4, title: "failed continuation, failed new run, failed fork after creation, invalid targets", run: caseFailures },
+	{
+		name: "row4-cancelled-operations",
+		row: 4,
+		title: "a cancelled navigation and a cancelled fork, and the guard that refuses to prompt after them",
+		run: caseCancelledOperations,
+	},
 	{ name: "row2-compaction-checkpoint", row: 2, title: "a compaction at the checkpoint, and the hazard of recording the assistant message instead", run: caseCompactionCheckpoint },
 	{ name: "row5-questions", row: 5, title: "a blocking question, duplicate answers, two in a row, and a steer that waits", run: caseQuestions },
 	{ name: "row6-cancellation", row: 6, title: "clear_queue before abort, and a descendant that leaves the killed process group", run: caseCancellation },
@@ -2810,7 +3128,7 @@ const CASES = [
 ];
 
 const GROUPS = {
-	"stage-a": ["row8-model-thinking", "row1-durable-checkpoint", "row2-older-checkpoint", "row3-fork-at", "row4-failures"],
+	"stage-a": ["row8-model-thinking", "row1-durable-checkpoint", "row2-older-checkpoint", "row3-fork-at", "row4-failures", "row4-cancelled-operations"],
 	"stage-b": ["row2-compaction-checkpoint", "row5-questions", "row6-cancellation", "row7-retry-compaction"],
 };
 
