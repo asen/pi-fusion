@@ -118,7 +118,7 @@ Ten of ten are measured passes, and the harness prints `10/10 selected rows are 
 | 2 | `/tree` stays refused while a run is unfinished | unproven | there is no host in the harness; only the record *selection* a `/tree` move makes can be simulated, and its effect on the child measured |
 | 3 | a forked host gets its own child session on first use | simulated Fusion policy | the fork's measured half is its content; the first-use rule needs a host |
 | 3 | the fork id the record should carry | measured incompatible | Pi allocates the id itself, see row 3 below |
-| 4 | what a record with no checkpoint should mean for Fusion | measured, undecided | Pi's behaviour is measured; the Fusion rule is an open decision, below |
+| 4 | what a record with no checkpoint should mean for Fusion | measured; the Fusion rule is user-approved policy | Pi's behaviour is measured here; the rule that a Pi record with no trusted checkpoint fails closed is approved product policy, recorded in the plan, and not implemented |
 | 4 | the guard that refuses to submit a task after a cancelled operation | simulated Fusion policy | the guard is a harness function; what is measured is that Pi reported the cancellation and that no request and no durable write followed |
 | 6 | Pi's own `SIGTERM` and `SIGHUP` cleanup path | source | `killTrackedDetachedChildren` is registered by `runRpcMode` for those signals and is itself a group kill; not exercised here |
 | 7 | manual compaction | not used | manual compact is no evidence about automatic ordering, so the case drives the automatic threshold and overflow paths instead |
@@ -475,16 +475,24 @@ evidence stands behind it.
 
 These are decisions, not missing measurements, unless the entry says otherwise.
 
+The first three have since been decided by the user, as product policy rather than as anything this spike measured.
+They are recorded under "Recovery and identity transport" in [docs/pi-backend-plan.md](pi-backend-plan.md), no Pi
+backend implements them, and no measurement on this page changed. The entries after them are still open.
+
 - **What a record with no checkpoint means for a Pi child.** The measurement is in: reopening a failed new call's
-  session whole replays the failed prompt and produces two consecutive user messages. Fail the call, or define a
-  narrower recovery, but do not carry the Claude backend's whole-session resume over unexamined. Pending.
+  session whole replays the failed prompt and produces two consecutive user messages. **Settled, user-approved
+  policy:** a Pi record naming a session with no trusted checkpoint fails closed; the session reference and its
+  transcript are kept for diagnostics, and the next call for that handle is refused with guidance to start a new
+  run under a new handle. The Claude backend's whole-session resume is not carried over.
 - **How the child-reported fork id reaches the record.** Who allocates it is measured and settled: Pi does, and
-  the record carries what the child reports rather than the child being made to accept an id. What is pending is
-  the path that id travels. A fork has no identity until the fork call returns, so the record cannot be
-  pre-allocated the way `nextSession` allocates one today, and both its contract and the point at which a tagged
-  record is written have to follow the child's answer. Pending.
+  the record carries what the child reports rather than the child being made to accept an id. A fork has no
+  identity until the fork call returns, so the record cannot be pre-allocated the way `nextSession` allocates one
+  today. **Settled, user-approved policy:** the identity travels in the structured outcome a run returns, failure
+  and cancellation outcomes included, and the host writes the record from it during finalization.
 - **Whether a branch that ends in an error entry may be resumed at all**, given that the payload hazard is
-  adapter-specific. Pending.
+  adapter-specific. **Settled, user-approved policy:** only a trusted checkpoint is restored, so an error entry
+  later in the file does not make the session unusable, while the failed tip and a record with no trusted
+  checkpoint are never resumed.
 - **The OAuth write policy.** Carried over from the configuration-write spike and untouched here: a shared
   `auth.json` has its token rotated in place by the credential store (source, no fixture exists). Whether Fusion
   shares a credential that can rotate, requires the child to hold its own, or refuses the case is pending, and no
@@ -526,7 +534,9 @@ conditions attached to that go are these.
    have to be reopened in step 4.
 4. Two record-rule questions must be settled before step 3 writes tagged records, not after: how a fork id the
    child reports reaches `nextSession` and the tagged record, given that a fork has no identity until the call
-   returns, and what a record with no checkpoint means for a Pi child. Both are named in the decisions above.
+   returns, and what a record with no checkpoint means for a Pi child. Both are named in the decisions above, and
+   both have since been answered by user-approved policy in the plan; this condition is met on the policy side,
+   and step 3 still has to implement and verify it.
 5. The gate is against Pi 0.85.1. Re-run this harness against whatever Pi version Fusion ships with and require
    every case to pass, which is 10/10 in the current matrix and was 9/9 when this go was given; a different
    version is outside what was measured, and the plan's startup capability check is what turns that into an
@@ -537,10 +547,11 @@ build the adapter on a checkpoint rule other than "the leaf at settle", which th
 
 What is still gated after step 2, and where it is gated, because nothing on this page closes any of it. The plan
 carries an explicit acceptance gate on step 3 and another on step 4, and these measurements feed both. Step 3's
-gate settles the recovery for a failed first call that has an identity and no checkpoint, the path a
+gate covered the recovery for a failed first call that has an identity and no checkpoint, the path a
 child-reported session identity travels into the record, and, from the cancellation case, that a cancelled
-operation records nothing and leaves the prior durable reference authoritative. Step 4's gate settles the
-descendant ownership strategy, identity-safe late signals, cleanup after a normal exit as well as an abort, the
+operation records nothing and leaves the prior durable reference authoritative; its policy is now settled in the
+plan, and its implementation and verification are not. Step 4's gate settles the descendant ownership strategy,
+identity-safe late signals, cleanup after a normal exit as well as an abort, the
 `clear_queue`-before-`abort` shutdown ordering, and the guard this harness only simulates: a Pi adapter has to
 refuse a cancelled navigation or fork itself, before any task prompt, and no Fusion code does that today.
 
