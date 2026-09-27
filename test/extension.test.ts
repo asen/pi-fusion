@@ -137,13 +137,12 @@ function assertCommon(run: Invocation, contract: string) {
 	assert.match(run.text, /\n\n\[.+ · \d+ tool calls · in \d+ out \d+ · context [\d.]+k\/[\d.]+M \(<1%\) · workflow agents 250 tokens · claude --resume [^\]]+\]$/);
 }
 
-test("registers the sequential claude and claude_control tools, the fusion command, one session_shutdown handler and one session_before_tree handler", () => {
+test("registers the sequential fusion and claude tool pairs, the fusion command, one session_shutdown handler and one session_before_tree handler", () => {
 	assert.deepEqual(
 		tools.map((tool) => tool.name),
-		["claude", "claude_control"],
+		["fusion", "claude", "fusion_control", "claude_control"],
 	);
-	assert.equal(byName("claude").executionMode, "sequential");
-	assert.equal(byName("claude_control").executionMode, "sequential");
+	for (const name of ["fusion", "claude", "fusion_control", "claude_control"]) assert.equal(byName(name).executionMode, "sequential", name);
 	assert.deepEqual([...handlers.keys()], ["session_shutdown", "session_before_tree"]);
 	const command = commands.get("fusion");
 	assert.ok(command, "the fusion command is not registered");
@@ -284,39 +283,90 @@ test("the extension registers a renderer for its run notices, and it fits any wi
 	}
 });
 
-test("the role and effort parameters are plain string enums", () => {
+test("the claude tool keeps the exact schema it had: four roles, five efforts and no backend", () => {
 	const properties = byName("claude").parameters.properties;
+	assert.deepEqual(Object.keys(properties), ["role", "task", "continue", "context", "background", "fresh", "mode", "model", "effort"]);
 	assert.deepEqual(properties.role.enum, ["plan", "implement", "ultracode", "ask"]);
 	assert.deepEqual(properties.mode.enum, ["answer", "review"]);
 	assert.equal(properties.mode.type, "string");
 	assert.equal(properties.role.type, "string");
 	assert.deepEqual(properties.effort.enum, ["low", "medium", "high", "xhigh", "max"]);
 	assert.equal(properties.continue.type, "string");
+	assert.equal(properties.backend, undefined, "the compatibility tool advertises no backend at all");
 	assert.deepEqual(byName("claude").parameters.required, ["task"]);
 });
 
-test("every prompt guideline names the claude tool, and together they name every role", () => {
-	const guidelines = byName("claude").promptGuidelines ?? [];
-	assert.ok(guidelines.length, "claude contributes no guidelines");
-	for (const guideline of guidelines) assert.ok(guideline.includes("claude"), `a guideline never names claude: ${guideline}`);
-	for (const role of ["plan", "implement", "ultracode", "ask"]) {
-		assert.ok(guidelines.some((guideline) => guideline.includes(`role ${role}`)), `no guideline names role ${role}`);
+test("the fusion tool advertises the same roles, a backend and every backend's effort levels, all as plain string enums", () => {
+	const properties = byName("fusion").parameters.properties;
+	assert.deepEqual(Object.keys(properties), ["role", "task", "continue", "context", "background", "fresh", "mode", "backend", "model", "effort"]);
+	assert.deepEqual(properties.role.enum, ["plan", "implement", "ultracode", "ask"], "security is metadata until a backend runs it");
+	assert.deepEqual(properties.backend.enum, ["claude", "pi"]);
+	assert.equal(properties.backend.type, "string");
+	assert.deepEqual(properties.effort.enum, ["off", "minimal", "low", "medium", "high", "xhigh", "max"]);
+	for (const level of ["low", "medium", "high", "xhigh", "max"]) assert.ok(properties.effort.enum.includes(level), `the claude tiers must stay in the union: ${level}`);
+	assert.deepEqual(properties.mode.enum, ["answer", "review"]);
+	assert.equal(properties.model.type, "string");
+	assert.deepEqual(byName("fusion").parameters.required, ["task"]);
+	for (const name of ["fusion_control", "claude_control"]) {
+		const control = byName(name).parameters;
+		assert.deepEqual(Object.keys(control.properties), ["action", "run", "message"], name);
+		assert.deepEqual(control.properties.action.enum, ["status", "wait", "message", "cancel"], name);
+		assert.deepEqual(control.required, ["action"], name);
 	}
-	for (const pattern of [/do not edit files yourself/, /choice wins/, /^Report to the user/, /Escalation/, /continue set to its handle/, /background true/]) {
-		assert.equal(guidelines.filter((guideline) => pattern.test(guideline)).length, 1, `${pattern} must match one guideline`);
+});
+
+test("every prompt guideline names the tool that carries it, and together they name every role", () => {
+	for (const [tool, control] of [
+		["fusion", "fusion_control"],
+		["claude", "claude_control"],
+	]) {
+		const guidelines = byName(tool).promptGuidelines ?? [];
+		assert.ok(guidelines.length, `${tool} contributes no guidelines`);
+		for (const guideline of guidelines) assert.ok(guideline.includes(tool), `a ${tool} guideline never names ${tool}: ${guideline}`);
+		assert.ok(guidelines.some((guideline) => guideline.includes(control)), `no ${tool} guideline names ${control}`);
+		if (tool === "fusion") {
+			for (const guideline of guidelines) assert.ok(!/\bclaude\b/.test(guideline), `a fusion guideline still routes through the claude tool: ${guideline}`);
+		}
+		for (const role of ["plan", "implement", "ultracode", "ask"]) {
+			assert.ok(guidelines.some((guideline) => guideline.includes(`role ${role}`)), `no ${tool} guideline names role ${role}`);
+		}
+		for (const pattern of [/do not edit files yourself/, /choice wins/, /^Report to the user/, /Escalation/, /continue set to its handle/, /background true/]) {
+			assert.equal(guidelines.filter((guideline) => pattern.test(guideline)).length, 1, `${pattern} must match one ${tool} guideline`);
+		}
+		assert.ok(!guidelines.some((guideline) => /tool list/.test(guideline)), "all roles are always available");
 	}
-	assert.ok(!guidelines.some((guideline) => /tool list/.test(guideline)), "all roles are always available");
 });
 
 test("no tool metadata routes by file count or names the old tools", () => {
 	const routing = /multi-file|one small task|non-trivial/i;
-	const tool = byName("claude");
-	const properties = Object.values(tool.parameters.properties ?? {}) as Array<{ description?: string }>;
-	const metadata = [tool.description, tool.promptSnippet ?? "", ...(tool.promptGuidelines ?? []), ...properties.map((property) => property.description ?? "")];
-	for (const text of metadata) {
-		assert.ok(!routing.test(text), `claude still routes by file count: ${text}`);
-		assert.ok(!/fable_consolidate|opus_implement|fable_implement/.test(text), `claude metadata names an old tool: ${text}`);
+	for (const name of ["fusion", "claude"]) {
+		const tool = byName(name);
+		const properties = Object.values(tool.parameters.properties ?? {}) as Array<{ description?: string }>;
+		const metadata = [tool.description, tool.promptSnippet ?? "", ...(tool.promptGuidelines ?? []), ...properties.map((property) => property.description ?? "")];
+		for (const text of metadata) {
+			assert.ok(!routing.test(text), `${name} still routes by file count: ${text}`);
+			assert.ok(!/fable_consolidate|opus_implement|fable_implement/.test(text), `${name} metadata names an old tool: ${text}`);
+		}
 	}
+});
+
+test("a fusion call with no backend runs the role's claude defaults and records the run as a claude one", async () => {
+	const before = appendedEntries;
+	const run = await invoke("fusion", { role: "implement", task: "rename x" });
+	assertCommon(run, "implement.md");
+	assert.equal(valueOf(run.argv, "--model"), "opus");
+	assert.equal(valueOf(run.argv, "--effort"), "high");
+	assert.equal(run.prompt, "rename x");
+	assert.equal(appendedEntries, before + 1);
+	// ultracode runs on claude and nowhere else, whether or not the call says so.
+	const ultracode = await invoke("fusion", { role: "ultracode", task: "do a thing", backend: "claude" });
+	assert.equal(valueOf(ultracode.argv, "--effort"), "ultracode");
+	await assert.rejects(byName("fusion").execute("call-1", { role: "ultracode", task: "x", backend: "pi" }, undefined, undefined, ctx), {
+		message: "role ultracode does not run on the pi backend; use one of claude",
+	});
+	await assert.rejects(byName("fusion").execute("call-1", { role: "security", task: "x" }, undefined, undefined, ctx), {
+		message: "role security is known to records and reviews, and no backend runs it in this build; use one of plan, implement, ultracode, ask",
+	});
 });
 
 test("role implement takes a direct task and records its run in the host session", async () => {

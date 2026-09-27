@@ -141,7 +141,7 @@ export function headerLine(theme: CardTheme, parts: { label: string; details: Ca
 
 /** Both ways to answer a run that waits, so the card says it wherever the question shows. */
 function answerHint(handle: string | undefined): string {
-	return `answer: /fusion answer ${handle ?? "run-N"} <text> or claude_control message`;
+	return `answer: /fusion answer ${handle ?? "run-N"} <text> or fusion_control message`;
 }
 
 /** A Markdown heading as a card shows it: the headings the host must act on stand out from the rest. */

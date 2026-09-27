@@ -547,3 +547,83 @@ test("loading from a directory that is not there yet reads nothing, warns about 
 		assert.equal(fs.existsSync(dir), false);
 	});
 });
+
+test("a version 1 file written before backends were tagged reads back unchanged", () => {
+	withDir((root) => {
+		const dir = path.join(root, "history");
+		fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+		const legacy = {
+			...record({ id: "legacy-1", state: "done" }),
+			sessionId: "sess-1",
+			checkpoint: "asst-2",
+			session: { kind: "resume", id: "sess-1", at: "asst-1" },
+		};
+		fs.writeFileSync(path.join(dir, "host-1.json"), JSON.stringify({ version: 1, hostSessionId: "host-1", cwd: "/work", records: [legacy] }));
+		const history = new History(dir);
+		const loaded = history.load("host-1");
+		assert.deepEqual(loaded.records, [legacy], "an older record keeps every field it had, and gains none");
+		assert.equal(loaded.records[0]!.backend, undefined, "a record without a backend stays without one: the reader treats it as claude");
+		assert.equal(history.save("host-1", "/work", loaded.records[0]!), undefined);
+		assert.deepEqual(written(dir, "host-1"), { version: HISTORY_VERSION, hostSessionId: "host-1", cwd: "/work", records: [legacy] });
+	});
+});
+
+test("a pi run's backend, session reference, session file and resolved selection survive a write and a read", () => {
+	withDir((root) => {
+		const dir = path.join(root, "history");
+		const history = new History(dir);
+		const held = record({
+			id: "pi-run",
+			backend: "pi",
+			ref: { backend: "pi", sessionId: "pi-1", sessionFile: "/sessions/pi-1.jsonl", checkpoint: "entry-9" },
+			selection: { model: "deepseek/deepseek-chat", effort: "medium" },
+			session: { kind: "resume", backend: "pi", id: "pi-1", file: "/sessions/pi-1.jsonl", at: "entry-9" },
+		});
+		assert.equal(history.save("host-1", "/work", held), undefined);
+		const loaded = history.load("host-1");
+		assert.deepEqual(loaded.records, [held]);
+		assert.equal(loaded.records[0]!.sessionId, undefined, "a pi run fills no claude session id, so no older reader offers a resume for it");
+	});
+});
+
+test("a long session file survives a write and a read whole, and one past the ceiling takes its reference with it", () => {
+	withDir((root) => {
+		const dir = path.join(root, "history");
+		const history = new History(dir);
+		const file = `/home/asen/.pi/agent/sessions/${"a-deeply-nested-project-directory/".repeat(12)}0199c9e2-1b3a-7f00-8000-0123456789ab.jsonl`;
+		assert.ok(file.length > 400 && file.length < 4_096, `the path under test is ${file.length} characters`);
+		const ref = { backend: "pi" as const, sessionId: "0199c9e2-1b3a-7f00-8000-0123456789ab", sessionFile: file, checkpoint: "entry-9" };
+		const selection = { model: `openrouter/${"deep-".repeat(60)}chat`, effort: "medium" };
+		assert.equal(history.save("host-1", "/work", record({ id: "long", backend: "pi", ref, selection })), undefined);
+		const kept = history.load("host-1").records[0]!;
+		assert.deepEqual(kept.ref, ref, "a transcript path a reader has to open is kept as the child reported it");
+		assert.deepEqual(kept.selection, selection, "and so is a model a continuation would have to name again");
+
+		// Past the ceiling the whole value goes: a shortened path names another file and a shortened model another model.
+		const over = "x".repeat(33_000);
+		assert.equal(history.save("host-2", "/work", record({ id: "over", hostSessionId: "host-2", backend: "pi", ref: { ...ref, sessionFile: `/sessions/${over}.jsonl` }, selection })), undefined);
+		const cut = history.load("host-2").records[0]!;
+		assert.equal(cut.ref, undefined);
+		assert.deepEqual(cut.selection, selection, "the selection is its own value and is kept");
+		assert.equal(history.save("host-3", "/work", record({ id: "over-model", hostSessionId: "host-3", backend: "pi", ref, selection: { model: `openrouter/${over}`, effort: "medium" } })), undefined);
+		const model = history.load("host-3").records[0]!;
+		assert.deepEqual(model.ref, ref);
+		assert.equal(model.selection, undefined);
+	});
+});
+
+test("a pi session a run only started has no id yet, and a reference this host cannot use is dropped", () => {
+	withDir((root) => {
+		const dir = path.join(root, "history");
+		fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+		const records = [
+			{ ...record({ id: "new-pi", backend: "pi" }), session: { kind: "new", backend: "pi" } },
+			{ ...record({ id: "no-file", backend: "pi" }), ref: { backend: "pi", sessionId: "pi-1" }, selection: { model: "deepseek-chat", effort: "medium" } },
+		];
+		fs.writeFileSync(path.join(dir, "host-1.json"), JSON.stringify({ version: HISTORY_VERSION, hostSessionId: "host-1", cwd: "/work", records }));
+		const loaded = new History(dir).load("host-1");
+		assert.deepEqual(loaded.records[0]!.session, { kind: "new", backend: "pi" }, "a new pi session is kept without an id");
+		assert.equal(loaded.records[1]!.ref, undefined, "a pi reference without its session file is no identity at all");
+		assert.equal(loaded.records[1]!.selection, undefined, "a model that is not a provider and a model id is no selection to repeat");
+	});
+});

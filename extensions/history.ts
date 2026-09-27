@@ -1,6 +1,7 @@
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { type BackendName, isBackendName, keptRef, keptSelection, type ResolvedSelection, type SessionRef } from "./backends/types.ts";
 import { cap, capBytes } from "./dashboard.ts";
 
 /** The layout of a history file. A file that names a higher version was written by a pi-fusion this one cannot read. */
@@ -62,9 +63,16 @@ export interface HistoryRecord {
 	files?: Array<{ path: string; status: string; added?: number; removed?: number }>;
 	/** How many files the run changed, which is more than `files` holds once the per-run cap cuts the list. */
 	filesTotal?: number;
+	/** The Claude session id and checkpoint. A Pi run leaves them unset: its identity is `ref`, never a bare id. */
 	sessionId?: string;
 	checkpoint?: string;
-	session?: { kind: "new" | "resume" | "fork"; id: string; from?: string; at?: string };
+	/** The backend the run went through. A record without one was written before backends were tagged, which means Claude. */
+	backend?: string;
+	session?: { kind: "new" | "resume" | "fork"; id?: string; from?: string; at?: string; file?: string; backend?: BackendName };
+	/** The session the backend verified the run ran in, which for Pi is the only identity a later reader may use. */
+	ref?: SessionRef;
+	/** What the child actually ran with, kept so a restored record still says which model and effort produced it. */
+	selection?: ResolvedSelection;
 	contract?: string;
 	title?: string;
 	usage?: { costUsd?: number; tokensIn: number; tokensOut: number; workflowTokens?: number; toolCalls: number };
@@ -120,7 +128,7 @@ const joined = (...warnings: Array<string | undefined>): string | undefined => {
 	return held.length ? held.join("; ") : undefined;
 };
 
-const STRING_FIELDS = ["mode", "tool", "toolCallId", "reviews", "reviewedBy", "sessionId", "checkpoint", "contract", "title"] as const;
+const STRING_FIELDS = ["mode", "tool", "toolCallId", "reviews", "reviewedBy", "sessionId", "checkpoint", "backend", "contract", "title"] as const;
 
 /** A copy of the record with every text, list and number a bounded one, so one run can never fill a session file. */
 export function boundRecord(record: HistoryRecord): HistoryRecord {
@@ -170,10 +178,24 @@ export function boundRecord(record: HistoryRecord): HistoryRecord {
 		if (filesTotal !== undefined) bound.filesTotal = filesTotal;
 	}
 	if (record.session !== undefined) {
-		const session: NonNullable<HistoryRecord["session"]> = { kind: record.session.kind, id: cap(String(record.session.id)) };
+		const session: NonNullable<HistoryRecord["session"]> = { kind: record.session.kind };
+		if (record.session.id !== undefined) session.id = cap(String(record.session.id));
 		if (record.session.from !== undefined) session.from = cap(String(record.session.from));
 		if (record.session.at !== undefined) session.at = cap(String(record.session.at));
+		if (record.session.file !== undefined) session.file = cap(String(record.session.file));
+		if (isBackendName(record.session.backend)) session.backend = record.session.backend;
 		bound.session = session;
+	}
+	// A reference and a selection are opaque and are kept exactly: a session file cut to fit names another file, and
+	// a model id cut to fit names another model. One field over the ceiling drops the whole value instead, and the
+	// host branch, which is what a continuation actually reads, is written elsewhere and is never bounded by this.
+	if (record.ref !== undefined) {
+		const ref = keptRef(record.ref, record.ref.backend);
+		if (ref) bound.ref = ref;
+	}
+	if (record.selection !== undefined) {
+		const selection = keptSelection(record.selection, isBackendName(record.backend) ? record.backend : "claude");
+		if (selection) bound.selection = selection;
 	}
 	if (record.usage !== undefined) {
 		const usage: NonNullable<HistoryRecord["usage"]> = {
@@ -229,10 +251,14 @@ function filesOf(value: unknown): HistoryRecord["files"] {
 
 function sessionOf(value: unknown): HistoryRecord["session"] {
 	const data = value as Record<string, unknown> | null;
-	if (!data || typeof data !== "object" || typeof data.kind !== "string" || !SESSION_KINDS.has(data.kind) || typeof data.id !== "string") return undefined;
-	const session: NonNullable<HistoryRecord["session"]> = { kind: data.kind as "new" | "resume" | "fork", id: data.id };
+	if (!data || typeof data !== "object" || typeof data.kind !== "string" || !SESSION_KINDS.has(data.kind)) return undefined;
+	// A Pi session a run started has no id until the child reports one, so only its kind is required here.
+	const session: NonNullable<HistoryRecord["session"]> = { kind: data.kind as "new" | "resume" | "fork" };
+	if (typeof data.id === "string") session.id = data.id;
 	if (typeof data.from === "string") session.from = data.from;
 	if (typeof data.at === "string") session.at = data.at;
+	if (typeof data.file === "string") session.file = data.file;
+	if (isBackendName(data.backend)) session.backend = data.backend;
 	return session;
 }
 
@@ -289,6 +315,11 @@ function recordOf(value: unknown): HistoryRecord | undefined {
 	if (filesTotal !== undefined) record.filesTotal = filesTotal;
 	const session = sessionOf(data.session);
 	if (session !== undefined) record.session = session;
+	const backend: BackendName = isBackendName(data.backend) ? data.backend : "claude";
+	const ref = keptRef(data.ref, backend);
+	if (ref !== undefined) record.ref = ref;
+	const selection = keptSelection(data.selection, backend);
+	if (selection !== undefined) record.selection = selection;
 	const usage = usageOf(data.usage);
 	if (usage !== undefined) record.usage = usage;
 	return boundRecord(record);

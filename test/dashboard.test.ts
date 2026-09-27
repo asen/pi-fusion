@@ -62,6 +62,7 @@ test("a started run is running with its role, model and title and zero counters"
 	assert.deepEqual(store.summaries(), [
 		{
 			id: "run-1",
+			backend: "claude",
 			role: "fable-implement",
 			model: "fable",
 			title: "add the thing",
@@ -706,6 +707,7 @@ test("returned views are copies with only the contracted keys", () => {
 	assert.deepEqual(Object.keys(detail).sort(), [
 		"activity",
 		"agentToolCalls",
+		"backend",
 		"cacheRead",
 		"cacheWrite",
 		"deniedTools",
@@ -756,6 +758,7 @@ test("returned views are copies with only the contracted keys", () => {
 	assert.deepEqual(Object.keys(store.summaries()[0]!).sort(), [
 		"activity",
 		"agentToolCalls",
+		"backend",
 		"deniedTools",
 		"endedAt",
 		"id",
@@ -1312,4 +1315,135 @@ test("the stylesheet fetches nothing", () => {
 	for (const forbidden of ["url(", "@import", "expression("]) {
 		assert.ok(!css.includes(forbidden), `app.css must not use ${forbidden}: the page must load nothing beyond its own three files`);
 	}
+});
+
+test("a run says which backend it went through, and a record from before backends were tagged is a claude run", () => {
+	const { store } = makeStore();
+	store.start({ id: "run-1", role: "implement", model: "opus" });
+	store.start({ id: "run-2", backend: "pi", role: "implement", model: "deepseek/deepseek-chat" });
+	store.restore({ id: "run-3", role: "implement", model: "opus", state: "done", startedAt: START });
+	store.restore({ id: "run-4", backend: "pi", role: "security", model: "deepseek/deepseek-chat", state: "done", startedAt: START });
+	store.restore({ id: "run-5", backend: "elsewhere", role: "implement", model: "opus", state: "done", startedAt: START });
+	const backends = Object.fromEntries(store.summaries().map((run) => [run.id, run.backend]));
+	assert.deepEqual(backends, { "run-1": "claude", "run-2": "pi", "run-3": "claude", "run-4": "pi", "run-5": "claude" });
+	assert.equal(detailOf(store, "run-2").backend, "pi");
+});
+
+test("a pi session is shown by its file, with no id for a new one and none guessed for a fork", () => {
+	const { store } = makeStore();
+	store.start({ id: "run-1", backend: "pi", role: "implement", model: "deepseek/deepseek-chat", session: { kind: "new", backend: "pi" } });
+	store.start({
+		id: "run-2",
+		backend: "pi",
+		role: "implement",
+		model: "deepseek/deepseek-chat",
+		session: { kind: "resume", backend: "pi", id: "pi-1", file: "/sessions/pi-1.jsonl", at: "entry-9" },
+	});
+	store.start({
+		id: "run-3",
+		backend: "pi",
+		role: "implement",
+		model: "deepseek/deepseek-chat",
+		session: { kind: "fork", backend: "pi", from: "pi-1", file: "/sessions/pi-1.jsonl", at: "entry-9" },
+	});
+	assert.deepEqual(detailOf(store, "run-1").session, { kind: "new", backend: "pi" });
+	assert.deepEqual(detailOf(store, "run-2").session, { kind: "resume", backend: "pi", id: "pi-1", file: "/sessions/pi-1.jsonl", at: "entry-9" });
+	assert.deepEqual(detailOf(store, "run-3").session, { kind: "fork", backend: "pi", from: "pi-1", file: "/sessions/pi-1.jsonl", at: "entry-9" });
+	assert.equal(detailOf(store, "run-3").sessionId, undefined, "a pi fork's new id is the child's to report, never the host's to guess");
+});
+
+test("a pi run's transcript path is the session its outcome verified, never the one its launch asked for", () => {
+	const { store } = makeStore();
+	const forked = { backend: "pi" as const, sessionId: "pi-2", sessionFile: "/sessions/pi-2.jsonl", checkpoint: "entry-9" };
+	// A new run has no session until its outcome lands, so nothing names one for it while it runs.
+	store.start({ id: "fresh", backend: "pi", role: "implement", model: "deepseek/deepseek-chat", session: { kind: "new", backend: "pi" } });
+	assert.equal(detailOf(store, "fresh").ref, undefined, "a run that has reported nothing has no verified session");
+	store.finish("fresh", { status: "done", ref: { backend: "pi", sessionId: "pi-1", sessionFile: "/sessions/pi-1.jsonl", checkpoint: "entry-1" } });
+	assert.deepEqual(detailOf(store, "fresh").ref, { backend: "pi", sessionId: "pi-1", sessionFile: "/sessions/pi-1.jsonl", checkpoint: "entry-1" });
+
+	// A fork keeps its launch request, which names the parent, and its result, which names the child it made.
+	store.start({ id: "forked", backend: "pi", role: "implement", model: "deepseek/deepseek-chat", session: { kind: "fork", backend: "pi", from: "pi-1", file: "/sessions/pi-1.jsonl", at: "entry-9" } });
+	store.finish("forked", { status: "failed", failure: "the provider dropped the connection", ref: forked });
+	assert.deepEqual(detailOf(store, "forked").session, { kind: "fork", backend: "pi", from: "pi-1", file: "/sessions/pi-1.jsonl", at: "entry-9" }, "the launch request is unchanged");
+	assert.deepEqual(detailOf(store, "forked").ref, forked, "and the verified child is a field of its own, even on a failure with no selection");
+
+	// An outcome the host refused passes no reference, so nothing is offered for it.
+	store.start({ id: "invalid", backend: "pi", role: "implement", model: "deepseek/deepseek-chat", session: { kind: "new", backend: "pi" } });
+	store.finish("invalid", { status: "failed", failure: "invalid session postcondition" });
+	assert.equal(detailOf(store, "invalid").ref, undefined);
+
+	// A reference of another backend, or one missing half a pi identity, is no reference this store keeps.
+	store.start({ id: "mixed", backend: "pi", role: "implement", model: "deepseek/deepseek-chat" });
+	store.finish("mixed", { status: "done", ref: { backend: "claude", sessionId: "s-1" } });
+	assert.equal(detailOf(store, "mixed").ref, undefined, "a claude reference is not a pi run's session");
+	store.start({ id: "half", backend: "pi", role: "implement", model: "deepseek/deepseek-chat" });
+	store.finish("half", { status: "done", ref: { backend: "pi", sessionId: "pi-3" } as never });
+	assert.equal(detailOf(store, "half").ref, undefined, "a pi reference without its file is no identity");
+
+	// A restored run reads its reference from the history record, not from the session its launch asked for.
+	store.restore({
+		id: "held",
+		backend: "pi",
+		role: "implement",
+		model: "deepseek/deepseek-chat",
+		state: "failed",
+		startedAt: START,
+		session: { kind: "fork", backend: "pi", from: "pi-1", file: "/sessions/pi-1.jsonl", at: "entry-9" },
+		ref: forked,
+	});
+	assert.deepEqual(detailOf(store, "held").ref, forked);
+	store.restore({ id: "held-none", backend: "pi", role: "implement", model: "deepseek/deepseek-chat", state: "failed", startedAt: START, session: { kind: "fork", backend: "pi", from: "pi-1", file: "/sessions/pi-1.jsonl", at: "entry-9" } });
+	assert.equal(detailOf(store, "held-none").ref, undefined, "a history record with no verified reference gains none from its launch");
+});
+
+/** A realistic Pi transcript path that is well past the display cap and well under any platform's path limit. */
+const LONG_FILE = `/home/asen/.pi/agent/sessions/${"a-deeply-nested-project-directory/".repeat(12)}0199c9e2-1b3a-7f00-8000-0123456789ab.jsonl`;
+const OVER_LIMIT = `/sessions/${"x".repeat(33_000)}.jsonl`;
+
+test("a session reference is kept exactly or not at all, so a long transcript path is never shortened into another", () => {
+	const { store } = makeStore();
+	assert.ok(LONG_FILE.length > 400 && LONG_FILE.length < 4_096, `the path under test is ${LONG_FILE.length} characters`);
+	const long = { backend: "pi" as const, sessionId: "0199c9e2-1b3a-7f00-8000-0123456789ab", sessionFile: LONG_FILE, checkpoint: "entry-9" };
+	store.start({ id: "long", backend: "pi", role: "implement", model: "deepseek/deepseek-chat" });
+	store.finish("long", { status: "done", ref: long });
+	assert.deepEqual(detailOf(store, "long").ref, long, "the file a run is opened with is the file the child reported, whole");
+
+	// The same through a restore, because a reference cut on the way back is as wrong as one cut on the way in.
+	store.restore({ id: "long-held", backend: "pi", role: "implement", model: "deepseek/deepseek-chat", state: "done", startedAt: START, ref: long });
+	assert.deepEqual(detailOf(store, "long-held").ref, long);
+
+	// Past the ceiling the whole reference goes, rather than a field of it becoming a path to somewhere else.
+	store.start({ id: "over", backend: "pi", role: "implement", model: "deepseek/deepseek-chat" });
+	store.finish("over", { status: "done", ref: { backend: "pi", sessionId: "pi-1", sessionFile: OVER_LIMIT, checkpoint: "entry-9" } });
+	assert.equal(detailOf(store, "over").ref, undefined);
+	store.restore({ id: "over-held", backend: "pi", role: "implement", model: "deepseek/deepseek-chat", state: "done", startedAt: START, ref: { backend: "pi", sessionId: "x".repeat(33_000), sessionFile: "/sessions/pi-1.jsonl" } });
+	assert.equal(detailOf(store, "over-held").ref, undefined);
+
+	// What is kept is a reference this store built, not the caller's object: nothing else on it comes along, and a
+	// later change to what the caller held does not reach the page.
+	const mutable = { backend: "pi" as const, sessionId: "pi-2", sessionFile: "/sessions/pi-2.jsonl", secret: "not a field of a reference" };
+	store.start({ id: "extra", backend: "pi", role: "implement", model: "deepseek/deepseek-chat" });
+	store.finish("extra", { status: "done", ref: mutable as never });
+	mutable.sessionFile = "/sessions/moved.jsonl";
+	assert.deepEqual(detailOf(store, "extra").ref, { backend: "pi", sessionId: "pi-2", sessionFile: "/sessions/pi-2.jsonl" });
+	assert.equal((detailOf(store, "extra").ref as unknown as { secret?: string }).secret, undefined);
+});
+
+test("the page names a pi transcript from the verified result alone, and its request as a request", () => {
+	const source = asset("app.js");
+	const resume = source.slice(source.indexOf("const appendResume"), source.indexOf("const appendChain"));
+	assert.ok(resume.includes("resultRef(detail)"), "the pi path reads the verified result reference");
+	assert.ok(!/session\.file/.test(resume), "and never falls back to the launch request's file, which for a fork is the parent's");
+	assert.ok(source.includes('"Pi session request"'), "the launch request is labelled as one");
+});
+
+test("the page offers a claude resume only for a claude run", () => {
+	const source = asset("app.js");
+	const resume = source.slice(source.indexOf("const appendResume"), source.indexOf("const appendChain"));
+	assert.ok(resume.includes("claude --resume"), "the resume command is built here and nowhere else");
+	assert.equal(source.split("claude --resume").length - 1, 2, "no other part of the page writes a resume command");
+	assert.ok(
+		resume.indexOf('backendOf(detail) === "pi"') < resume.indexOf("claude --resume"),
+		"a pi run must leave before a claude resume command is built: its session is a file, not a claude session id",
+	);
 });

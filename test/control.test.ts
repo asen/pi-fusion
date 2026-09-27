@@ -188,9 +188,9 @@ test("a second run that can change files fails while one is active, an ask run d
 	const host = makeHost();
 	await withScenario("hang", () => host.claude({ role: "implement", task: "long work", background: true }));
 	await assert.rejects(host.claude({ role: "ultracode", task: "other work" }), {
-		message: "run-1 (implement) is still active; wait for it, message it or cancel it with claude_control before you start or continue another run that can change files",
+		message: "run-1 (implement) is still active; wait for it, message it or cancel it with fusion_control before you start or continue another run that can change files",
 	});
-	await assert.rejects(host.claude({ continue: "run-1", task: "more" }), /^Error: run-1 is still active; send it a message with claude_control message/);
+	await assert.rejects(host.claude({ continue: "run-1", task: "more" }), /^Error: run-1 is still active; send it a message with fusion_control message/);
 	const answer = await host.text(host.claude({ role: "ask", task: "where is x?" }));
 	assert.match(answer, /^done\n\n\[run-2 · ask · opus · /);
 	assert.equal(await host.text(host.control({ action: "cancel", run: "run-1" })), "run-1 cancelled");
@@ -257,7 +257,7 @@ test("a message to a run that has ended sends nothing and returns its state and 
 
 test("status lists nothing before the first run, and a run recorded before this Pi process is not active", async () => {
 	const host = makeHost();
-	assert.equal(await host.text(host.control({ action: "status" })), "no claude runs in this Pi session yet");
+	assert.equal(await host.text(host.control({ action: "status" })), "no runs in this Pi session yet");
 	host.branch.push({ type: "custom", customType: "pi-fusion", data: { run: "run-4", role: "plan", sessionId: "s-4", hostSessionId: "host-1" } });
 	assert.equal(
 		await host.text(host.control({ action: "message", run: "run-4", message: "x" })),
@@ -296,7 +296,7 @@ test("session_shutdown stops active runs without a notice", async () => {
 });
 
 const asks = (handle: string, role: string, question: string) =>
-	`${handle} (${role}) asks:\n\n${question}\n\nThe run waits in the background until you answer with claude_control message and run ${handle}. Ask the user first if the decision is theirs.`;
+	`${handle} (${role}) asks:\n\n${question}\n\nThe run waits in the background until you answer with fusion_control message and run ${handle}. Ask the user first if the decision is theirs.`;
 
 test("a question in a foreground run returns it at once, the run waits in the background, and the answer reaches the child as the tool result", async () => {
 	const host = makeHost();
@@ -413,7 +413,7 @@ test("cancel stops a waiting run without a notice", async () => {
 });
 
 const treeBlocked = (names: string) =>
-	`/tree is blocked while claude runs are active: ${names}. A report or run record that arrives after /tree would land on the destination branch. Wait for each run or cancel it with claude_control, then retry /tree.`;
+	`/tree is blocked while fusion runs are active: ${names}. A report or run record that arrives after /tree would land on the destination branch. Wait for each run or cancel it with fusion_control, then retry /tree.`;
 
 test("/tree is refused while a background run is active and allowed again after cancel, without a new warning", async () => {
 	const host = makeHost();
@@ -590,7 +590,7 @@ test("parseFusion reads every /fusion form and answers anything else with the us
 test("/fusion status lists this Pi session's runs and details the one it is given", async () => {
 	const host = makeHost();
 	await host.command("status");
-	assert.deepEqual(host.notices, [["no claude runs in this Pi session yet\nsession usage: est. $0.0000 · in 0 out 0 tokens · workflow agents 0 tokens · 0 calls", "info"]]);
+	assert.deepEqual(host.notices, [["no runs in this Pi session yet\nsession usage: est. $0.0000 · in 0 out 0 tokens · workflow agents 0 tokens · 0 calls", "info"]]);
 	await withScenario("hang", () => host.claude({ role: "implement", task: "long work", background: true }));
 	host.notices.length = 0;
 	await host.command("status");
@@ -725,7 +725,7 @@ test("/fusion answer reaches the child, tells the host once, and turns the host'
 	const late = await host.control({ action: "message", run: "run-1", message: "call it bar" });
 	assert.equal(
 		late.content[0]!.text,
-		"The user already answered run-1's question with: call it foo. Your message was not sent; the child goes on with the user's answer. If it still applies, send it again with claude_control message and it goes to the child as a steer, or as the answer if it has asked another question by then.",
+		"The user already answered run-1's question with: call it foo. Your message was not sent; the child goes on with the user's answer. If it still applies, send it again with fusion_control message and it goes to the child as a steer, or as the answer if it has asked another question by then.",
 	);
 	assert.deepEqual(fixed(late.details), { handle: "run-1", role: "implement", model: "opus", state: "running", background: true, sent: "none", answeredBy: "user" });
 	const report = await host.text(host.control({ action: "wait", run: "run-1" }));
@@ -1078,7 +1078,7 @@ test("a budget variable that names no amount is reported once, and the control i
 		await host.command("status");
 		assert.deepEqual(host.notices, [
 			["fusion: PI_FUSION_BUDGET_LIMIT_USD=1,000 is not a dollar amount; no limit is set", "warning"],
-			["no claude runs in this Pi session yet\nsession usage: est. $0.0000 · in 0 out 0 tokens · workflow agents 0 tokens · 0 calls · warn at $5.00", "info"],
+			["no runs in this Pi session yet\nsession usage: est. $0.0000 · in 0 out 0 tokens · workflow agents 0 tokens · 0 calls · warn at $5.00", "info"],
 		]);
 		host.notices.length = 0;
 		await host.command("status");
@@ -1087,10 +1087,10 @@ test("a budget variable that names no amount is reported once, and the control i
 	}));
 
 const BLOCKED =
-	"the claude runs of this Pi session have cost an estimated $0.2500, at or over the PI_FUSION_BUDGET_LIMIT_USD limit of $0.1000; no new run starts and no run is continued. Active runs are not cancelled; wait for them, message them or cancel them with claude_control. The estimate uses list prices and updates when a child turn ends, so it can lag; raise or unset the variable and restart Pi to start runs again";
+	"the runs of this Pi session have cost an estimated $0.2500, at or over the PI_FUSION_BUDGET_LIMIT_USD limit of $0.1000; no new run starts and no run is continued. Active runs are not cancelled; wait for them, message them or cancel them with fusion_control. The estimate uses list prices and updates when a child turn ends, so it can lag; raise or unset the variable and restart Pi to start runs again";
 
 const warning = (total: string, threshold: string) =>
-	`fusion: the claude runs of this Pi session have cost an estimated ${total} so far, past the ${threshold} warning threshold (list prices; the estimate updates when a child turn ends, so it lags)`;
+	`fusion: the runs of this Pi session have cost an estimated ${total} so far, past the ${threshold} warning threshold (list prices; the estimate updates when a child turn ends, so it lags)`;
 
 test("PI_FUSION_BUDGET_LIMIT_USD stops the next new, ask and continued call and leaves the run that spent it alone", () =>
 	withBudget({ PI_FUSION_BUDGET_LIMIT_USD: "0.1" }, async () => {
@@ -1146,7 +1146,7 @@ test("a warning notice that throws leaves its threshold pending, so a later run 
 test("the session usage shows in /fusion status and claude_control details with no budget variable set", async () => {
 	const host = makeHost();
 	await host.command("status");
-	assert.deepEqual(host.notices, [["no claude runs in this Pi session yet\nsession usage: est. $0.0000 · in 0 out 0 tokens · workflow agents 0 tokens · 0 calls", "info"]]);
+	assert.deepEqual(host.notices, [["no runs in this Pi session yet\nsession usage: est. $0.0000 · in 0 out 0 tokens · workflow agents 0 tokens · 0 calls", "info"]]);
 	await withScenario("ok", () => host.claude({ role: "implement", task: "do a thing" }));
 	host.notices.length = 0;
 	await host.command("status");
@@ -1166,7 +1166,7 @@ test("/fusion status names the thresholds the budget variables set", () =>
 		const host = makeHost();
 		await host.command("status");
 		assert.deepEqual(host.notices, [
-			["no claude runs in this Pi session yet\nsession usage: est. $0.0000 · in 0 out 0 tokens · workflow agents 0 tokens · 0 calls · warn at $0.1000, $0.2000 · limit $5.00", "info"],
+			["no runs in this Pi session yet\nsession usage: est. $0.0000 · in 0 out 0 tokens · workflow agents 0 tokens · 0 calls · warn at $0.1000, $0.2000 · limit $5.00", "info"],
 		]);
 	}));
 
@@ -1601,7 +1601,7 @@ test("a later Pi process on the same host session shows the earlier runs, their 
 		await second.command("status");
 		assert.match(
 			second.notices[0]![0],
-			/^no claude runs in this Pi session yet\nrun-1 · ultracode · fable · done · earlier Pi process\nsession usage: est\. \$0\.2500 · in \d+ out \d+ tokens · workflow agents 250 tokens · 1 calls$/,
+			/^no runs in this Pi session yet\nrun-1 · ultracode · fable · done · earlier Pi process\nsession usage: est\. \$0\.2500 · in \d+ out \d+ tokens · workflow agents 250 tokens · 1 calls$/,
 		);
 		assert.deepEqual(second.completions("status "), [{ value: "status run-1", label: "status run-1" }], "the earlier run is offered for status, which acts on it");
 		second.notices.length = 0;
@@ -1654,7 +1654,7 @@ test("one host session never reads another one's runs", () =>
 		const other = durable("host-9");
 		other.branch.push(...first.branch);
 		await other.command("status");
-		assert.deepEqual(other.notices, [["no claude runs in this Pi session yet\nsession usage: est. $0.0000 · in 0 out 0 tokens · workflow agents 0 tokens · 0 calls", "info"]]);
+		assert.deepEqual(other.notices, [["no runs in this Pi session yet\nsession usage: est. $0.0000 · in 0 out 0 tokens · workflow agents 0 tokens · 0 calls", "info"]]);
 		assert.equal(fs.existsSync(path.join(dir, "host-9.json")), false, "a session with nothing to keep writes nothing");
 	}));
 
@@ -1699,12 +1699,12 @@ test("a run whose Pi process ended while it was going comes back as aborted, in 
 			const sent = await second.control({ action: "message", run: "run-1", message: "go on" });
 			assert.equal(
 				sent.content[0]!.text,
-				"run-1 (implement) ran in an earlier Pi process and is not active. The message was not sent. Read it with claude_control status and run run-1, or take no action.",
+				"run-1 (implement) ran in an earlier Pi process and is not active. The message was not sent. Read it with fusion_control status and run run-1, or take no action.",
 			);
 			assert.deepEqual(sent.details, { handle: "run-1", state: "aborted", historical: true });
 			second.notices.length = 0;
 			await second.command("status");
-			assert.match(second.notices[0]![0], /^no claude runs in this Pi session yet\nrun-1 · implement · opus · aborted · earlier Pi process\n/);
+			assert.match(second.notices[0]![0], /^no runs in this Pi session yet\nrun-1 · implement · opus · aborted · earlier Pi process\n/);
 			assert.match(await withScenario("ok", () => second.text(second.claude({ role: "implement", task: "another thing" }))), /\[run-2 · implement · /, "the interrupted run keeps its name");
 			assert.deepEqual(
 				heldFile(dir, "host-1").records.map((record) => [record.handle, record.state]),
@@ -1782,6 +1782,41 @@ test("a run of an earlier Pi process can still be reviewed, and the review is ke
 				assert.equal(held.get("run-1").reviewedBy, "run-2");
 				assert.equal(held.get("run-2").state, "done");
 				assert.equal(held.get("run-2").reviews, "run-1");
+			},
+			{ id: "host-1", file: path.join(os.tmpdir(), "host-1.jsonl") },
+		),
+	));
+
+test("a restored security run is reviewed by no claude reviewer, and nothing starts, links or records for it", () =>
+	withHistory((dir) =>
+		withRepo(
+			async (first, cwd) => {
+				await withScenario("edit", () => first.claude({ role: "implement", task: "add the retry" }));
+				const file = path.join(dir, "host-1.json");
+				const kept = JSON.parse(fs.readFileSync(file, "utf8")) as { records: any[] };
+				const { sessionId, checkpoint, ...held } = kept.records[0];
+				assert.ok(held.files?.length, "the run under test has to have changed files, so its role is the only reason left to refuse it");
+				// What another build's pi security run leaves behind: a full file-changing role this host runs nowhere.
+				const ref = { backend: "pi", sessionId: "pi-1", sessionFile: "/sessions/pi-1.jsonl", checkpoint: "entry-9" };
+				const selection = { model: "deepseek/deepseek-chat", effort: "medium" };
+				fs.writeFileSync(file, JSON.stringify({ ...kept, records: [{ ...held, role: "security", backend: "pi", ref, selection }] }));
+				const second = durable("host-1", cwd);
+				second.branch.push({ type: "custom", customType: "pi-fusion", data: { run: "run-1", role: "security", backend: "pi", hostSessionId: "host-1", session: ref, selection } });
+				await second.command("status run-1");
+				assert.match(second.notices[0]![0], /^run-1 \(security\) ran in an earlier Pi process/);
+				assert.ok(!second.notices[0]![0].includes("review it with"), "a role no backend runs here is offered for review nowhere");
+				assert.equal(second.completions("review "), null, "and it is completed for review nowhere either");
+				second.notices.length = 0;
+				await second.command("review run-1");
+				assert.deepEqual(second.notices, [
+					["run-1 is a security run, which no backend runs in this build; its review waits for the backend that runs it, and no claude reviewer stands in for it", "warning"],
+				]);
+				assert.deepEqual(second.sent, [], "no review run starts and the host hears nothing of one");
+				assert.equal(await second.text(second.control({ action: "status" })), "no runs in this Pi session yet", "no run of this Pi process was started");
+				assert.equal(second.branch.length, 1, "and no entry was appended for one");
+				const after = heldFile(dir, "host-1");
+				assert.deepEqual(after.records.map((record) => record.handle), ["run-1"], "the history keeps no review run either");
+				assert.equal(after.records[0].reviewedBy, undefined, "and the source is linked to no review");
 			},
 			{ id: "host-1", file: path.join(os.tmpdir(), "host-1.jsonl") },
 		),

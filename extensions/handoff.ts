@@ -59,12 +59,12 @@ export function handoffPrompt(prompt: string, from: string, report: string): str
 
 /** What the host is told when a plan call handed off, so it knows which run holds the agreement now. */
 export function handoffNote(from: string, to: string, share: number): string {
-	return `${to} is a fresh plan run: ${from}'s context had reached ${sharePercent(share)} of its window, so it was not continued. ${to} carries ${from}'s last report as the plan so far, not the reading and the reasoning behind it. Follow-up plan calls continue ${to} from here; to go back to ${from} anyway, call claude with continue ${from}.`;
+	return `${to} is a fresh plan run: ${from}'s context had reached ${sharePercent(share)} of its window, so it was not continued. ${to} carries ${from}'s last report as the plan so far, not the reading and the reasoning behind it. Follow-up plan calls continue ${to} from here; to go back to ${from} anyway, call fusion with continue ${from}.`;
 }
 
 /** What a role's own fresh run costs the host, which is what makes the warning about a long run actionable. */
 const AFRESH: Record<string, string> = {
-	plan: "call claude with role plan and fresh true, restating the plan agreed so far in the task",
+	plan: "call fusion with role plan and fresh true, restating the plan agreed so far in the task",
 	implement: "start a new run with a self-contained brief: the work so far is in the work tree, and this run's report names what it changed and how it was verified",
 	ultracode: "start a new run with a self-contained brief: the work so far is in the work tree, and this run's report names what it changed and how it was verified",
 	ask: "start a new ask run, which reads what it needs itself",
@@ -78,5 +78,5 @@ export function continueNote(handle: string, role: string, share: number, pct: n
 
 /** Why a plan call that must hand off cannot, with what the host can do instead. */
 export function handoffBlocked(from: string, share: number): string {
-	return `${from}'s context has reached ${sharePercent(share)} of its window, so a plan call does not continue it, and its report is not in this Pi process any more, so a fresh run cannot carry the plan so far. Call claude with role plan and fresh true, restating the agreed plan in the task, or continue ${from} anyway with continue ${from}.`;
+	return `${from}'s context has reached ${sharePercent(share)} of its window, so a plan call does not continue it, and its report is not in this Pi process any more, so a fresh run cannot carry the plan so far. Call fusion with role plan and fresh true, restating the agreed plan in the task, or continue ${from} anyway with continue ${from}.`;
 }

@@ -8,7 +8,7 @@ const theme = { fg: (color: string, text: string) => `<${color}>${text}</${color
 
 const STATS = "[run-1 · implement · opus · 3s · 2 tool calls · in 10 out 5]";
 const REVIEW = "run-2 reviews this run in the background; its report arrives as a message.";
-const HINT = (handle: string) => `<muted>answer: /fusion answer ${handle} <text> or claude_control message</muted>`;
+const HINT = (handle: string) => `<muted>answer: /fusion answer ${handle} <text> or fusion_control message</muted>`;
 
 test("a header names the run, what became of it, its time, its files and its cost", () => {
 	assert.equal(

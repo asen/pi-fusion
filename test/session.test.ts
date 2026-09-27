@@ -108,6 +108,7 @@ function entry(data: Record<string, unknown>) {
 const recorded = (run: string, role: string, sessionId: string | undefined, hostSessionId: string, checkpoint?: string) => ({
 	run,
 	role,
+	backend: "claude",
 	hostSessionId,
 	...(sessionId ? { sessionId } : {}),
 	...(checkpoint ? { checkpoint } : {}),
@@ -368,7 +369,7 @@ test("continue rejects an unknown handle, another role, fresh, and a parameter t
 });
 
 test("runRecords keeps the last entry per handle, the last plan run and the highest handle", () => {
-	assert.deepEqual(runRecords([]), { runs: new Map(), highest: 0 });
+	assert.deepEqual(runRecords([]), { runs: new Map(), lastPlan: new Map(), highest: 0 });
 	const records = runRecords([
 		{ type: "message" },
 		entry(legacy(0, "s-0", "h-1", "c-0")),
@@ -380,11 +381,11 @@ test("runRecords keeps the last entry per handle, the last plan run and the high
 		{ type: "custom", customType: "other", data: recorded("run-9", "plan", "s-9", "h-1") },
 	]);
 	assert.equal(records.highest, 4);
-	assert.equal(records.lastPlan, "run-2");
+	assert.deepEqual([...records.lastPlan], [["claude", "run-2"]]);
 	assert.deepEqual([...records.runs.values()], [
-		{ handle: "run-1", role: "plan", sessionId: "s-0", hostSessionId: "h-1", checkpoint: "c-0" },
-		{ handle: "run-4", role: "implement", sessionId: "s-4", hostSessionId: "h-1", checkpoint: "c-5" },
-		{ handle: "run-2", role: "plan", sessionId: "s-2", hostSessionId: "h-1" },
+		{ handle: "run-1", role: "plan", backend: "claude", sessionId: "s-0", hostSessionId: "h-1", checkpoint: "c-0", session: { backend: "claude", sessionId: "s-0", checkpoint: "c-0" } },
+		{ handle: "run-4", role: "implement", backend: "claude", sessionId: "s-4", hostSessionId: "h-1", checkpoint: "c-5", session: { backend: "claude", sessionId: "s-4", checkpoint: "c-5" } },
+		{ handle: "run-2", role: "plan", backend: "claude", sessionId: "s-2", hostSessionId: "h-1", session: { backend: "claude", sessionId: "s-2" } },
 	]);
 });
 

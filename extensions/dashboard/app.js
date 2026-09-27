@@ -314,7 +314,7 @@ const factsList = (detail) => {
 	if (str(detail.reviews)) addFact(facts, "Reviews", str(detail.reviews));
 	if (str(detail.reviewedBy)) addFact(facts, "Reviewed by", str(detail.reviewedBy));
 	if (str(detail.contract)) addFact(facts, "Contract", str(detail.contract));
-	if (detail.session && typeof detail.session === "object") addFact(facts, "Claude session", sessionText(detail.session));
+	if (detail.session && typeof detail.session === "object") addFact(facts, sessionLabel(detail), sessionText(detail.session));
 	const denied = list(detail.deniedTools).map(str).filter(Boolean);
 	if (denied.length > 0) addFact(facts, "Denied tools", denied.join(", "));
 	return facts;
@@ -361,12 +361,26 @@ const section = (title, copyText) => {
 	return node;
 };
 
+const backendOf = (run) => str(run.backend) || "claude";
+
+/** The launch request, labelled as one: for a fork it names the session forked *from*, not the child that was made. */
+const sessionLabel = (detail) => (backendOf(detail) === "pi" ? "Pi session request" : "Claude session");
+
+/** The session the backend verified the run ran in, which is the only one this page names as the child's own. */
+const resultRef = (detail) => {
+	const ref = detail.ref;
+	return ref && typeof ref === "object" && !Array.isArray(ref) ? ref : undefined;
+};
+
+/** A Pi session is named by its file as well, and a new one has no id until its child reports one. */
 const sessionText = (session) => {
 	const kind = str(session.kind);
 	const at = str(session.at) ? " at " + str(session.at) : "";
-	if (kind === "resume") return "resume " + str(session.id) + at;
-	if (kind === "fork") return "fork of " + str(session.from) + at + " into " + str(session.id);
-	return "new " + str(session.id);
+	const file = str(session.file) ? " in " + str(session.file) : "";
+	const id = str(session.id);
+	if (kind === "resume") return "resume " + (id || "(no id)") + at + file;
+	if (kind === "fork") return "fork of " + str(session.from) + at + (id ? " into " + id : "") + file;
+	return "new" + (id ? " " + id : "") + file;
 };
 
 const taskPrompt = (task) => {
@@ -961,7 +975,25 @@ const appendBlock = (parent, title, body, truncated, className, copy) => {
 	parent.appendChild(node);
 };
 
-const appendResume = (parent, sessionId) => {
+/**
+ * Only a Claude session is reopened with the Claude CLI: a Pi run's session is shown as the file it lives in, and
+ * that file comes from the verified result alone. The launch request is not a fallback: a fork's request names the
+ * parent's file, and offering that as this run's transcript would point at another child's work. A run whose result
+ * the host has not verified shows no path at all, which is what a new run shows until its outcome lands.
+ */
+const appendResume = (parent, detail) => {
+	if (backendOf(detail) === "pi") {
+		const ref = resultRef(detail);
+		const file = str(ref ? ref.sessionFile : "");
+		if (file) {
+			const held = el("p", "resume");
+			held.appendChild(el("code", "resume-command", file));
+			held.appendChild(copyButton(file));
+			parent.appendChild(held);
+		}
+		return;
+	}
+	const sessionId = str(detail.sessionId);
 	if (!sessionId) return;
 	const line = el("p", "resume");
 	line.appendChild(el("code", "resume-command", "claude --resume " + sessionId));
@@ -1117,7 +1149,7 @@ const appendDetail = (parent, detail) => {
 	appendBlock(panels.overview, "Prompt", str(detail.prompt), detail.promptTruncated, "prompt", true);
 	appendModels(panels.overview, list(detail.models));
 	appendFiles(panels.overview, detail);
-	appendResume(panels.overview, str(detail.sessionId));
+	appendResume(panels.overview, detail);
 	appendLog(panels.log, str(detail.id), list(detail.log));
 	appendTimeline(panels.tasks, detail, list(detail.tasks));
 	appendTasks(panels.tasks, list(detail.tasks));

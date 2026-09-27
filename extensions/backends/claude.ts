@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -15,7 +16,7 @@ import {
 import { z } from "zod";
 import { resultText } from "../cards.ts";
 import { ChildTree, KILL_GRACE_MS } from "../process-tree.ts";
-import type { Ask, Backend, ChildControl, ChildEvent, ChildRun, ModelCost, RunRequest } from "./types.ts";
+import { type Ask, type Backend, type ChildControl, type ChildEvent, type ChildRun, failed, type ModelCost, type RunRequest, type SessionIntent, type SessionRef } from "./types.ts";
 
 /**
  * The Claude Code backend: the SDK options a role runs with, the questions bridge the child asks through, and the
@@ -67,6 +68,20 @@ export type ChildSession =
 	| { kind: "new"; id: string }
 	| { kind: "resume"; id: string; at?: string }
 	| { kind: "fork"; id: string; from: string; at?: string };
+
+/**
+ * The Claude session request an intent becomes: this backend allocates the uuid a new session and a fork run under,
+ * and carries a reference's checkpoint as the position to continue from. A reference another backend wrote names a
+ * session this one cannot open, so it is refused here rather than resumed as if the id were a Claude one.
+ */
+export function claudeSession(intent: SessionIntent): ChildSession {
+	if (intent.kind === "new") return { kind: "new", id: randomUUID() };
+	const ref = intent.kind === "resume" ? intent.ref : intent.from;
+	if (ref.backend !== "claude") throw new Error(`${ref.backend} session ${ref.sessionId} cannot be continued by the claude backend`);
+	const at = ref.checkpoint ? { at: ref.checkpoint } : {};
+	if (intent.kind === "resume") return { kind: "resume", id: ref.sessionId, ...at };
+	return { kind: "fork", id: randomUUID(), from: ref.sessionId, ...at };
+}
 
 /** A Claude child's run: the shared record over this backend's own role shape. Its checkpoint is a message uuid. */
 export type ClaudeRun = ChildRun<Role>;
@@ -374,6 +389,19 @@ function questionOptions(ask: Ask, signal: AbortSignal): Pick<Options, "mcpServe
 	};
 }
 
+/**
+ * The session this run is known to have used, with a checkpoint only where one is trusted: the message the child
+ * ended on when the run succeeded, and for a fork that failed after the session existed, the message it forked at,
+ * never the failed tip. The run's own scalar `sessionId` and `checkpoint` stay as they were, for the callers that
+ * read them.
+ */
+function verifiedSession(run: ClaudeRun, session: ChildSession | undefined): SessionRef | undefined {
+	if (!run.sessionId) return undefined;
+	const ok = !failed(run);
+	const checkpoint = (ok && run.checkpoint) || (session?.kind === "fork" ? session.at : undefined);
+	return { backend: "claude", sessionId: run.sessionId, ...(checkpoint ? { checkpoint } : {}) };
+}
+
 export async function runChild(opts: RunRequest<Role, ChildSession, ChildInput>): Promise<ClaudeRun> {
 	const { role } = opts;
 	const run = newRun(role);
@@ -623,6 +651,7 @@ export async function runChild(opts: RunRequest<Role, ChildSession, ChildInput>)
 	else if (sdkError && !run.aborted && !run.exitCode) run.errorMessage ??= sdkError.message;
 	if (run.aborted) run.stopReason = "aborted";
 	else if (pendingTasks.size) run.abandonedTasks = [...pendingTasks.values()];
+	run.session = verifiedSession(run, opts.session);
 	return run;
 }
 
@@ -630,5 +659,6 @@ export async function runChild(opts: RunRequest<Role, ChildSession, ChildInput>)
 export const claudeBackend: Backend<Role, ChildSession, ChildInput> = {
 	name: "claude",
 	control: () => new ChildInput(),
+	session: claudeSession,
 	run: runChild,
 };

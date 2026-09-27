@@ -1,6 +1,6 @@
 # pi-fusion
 
-A Pi extension in which the host model hands work to headless Claude Code sessions and manages them while they work.
+A Pi extension in which the host model hands work to headless coding sessions and manages them while they work.
 
 ## Language
 
@@ -9,11 +9,15 @@ The Pi model that talks with the user and decides which work to hand off.
 _Avoid_: orchestrator, main model, parent
 
 **Child**:
-A headless Claude Code session that does work the host handed off.
+A headless coding session that does work the host handed off. In this build every child is a Claude Code session.
 _Avoid_: subagent, worker, delegate
 
+**Backend**:
+The harness a child runs in, named in every record and route: `claude`, and `pi`, which records and routing know and which no child runs in this build. A backend owns its own session shape, model binding and stream; the host owns handles, records and scheduling.
+_Avoid_: adapter, provider, harness, runtime
+
 **Role**:
-The job a child does: `plan`, `implement`, `ultracode` or `ask`. A role fixes the child's contract, tools and default model and effort.
+The job a child does: `plan`, `implement`, `ultracode` or `ask`, with `security` reserved for a later step. A role fixes the child's contract, tools and default model and effort, says which backends may run it, whether it takes the file-changing slot and whether a review reads it.
 _Avoid_: agent type, tool, persona
 
 **Run**:
@@ -37,11 +41,11 @@ The state of a run whose child has an open question and does no work until it ge
 _Avoid_: blocked, paused, suspended
 
 **Answer**:
-The reply a question gets, from the host through `claude_control message` or from the user through `/fusion answer`. A question takes one answer; whoever is second is told who answered first.
+The reply a question gets, from the host through `fusion_control message` or from the user through `/fusion answer`. A question takes one answer; whoever is second is told who answered first.
 _Avoid_: reply, response, decision
 
 **Handoff**:
-A `plan` call that starts a fresh run, carrying the replaced run's last report, rather than continue a plan run whose context has passed its cap. A `continue` call names its run and is warned instead, never handed off.
+A `plan` call that starts a fresh run on the same backend, carrying the replaced run's last report, rather than continue a plan run whose context has passed its cap. The fresh run is a new run in every other way: its own handle, its own session and its own binding. A `continue` call names its run and is warned instead, never handed off.
 _Avoid_: rollover, compaction, reset
 
 **Escalation**:

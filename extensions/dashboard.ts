@@ -3,7 +3,7 @@ import * as fs from "node:fs";
 import { createServer } from "node:http";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
-import type { ChildEvent } from "./backends/types.ts";
+import { type BackendName, type ChildEvent, isBackendName, keptRef, type SessionRef } from "./backends/types.ts";
 import type { UsageTotals } from "./budget.ts";
 import type { ChangedFile } from "./changes.ts";
 import type { RunOrigin } from "./fusion.ts";
@@ -66,6 +66,8 @@ export interface RunProgress {
 export interface RunSummary {
 	id: string;
 	handle?: string;
+	/** The backend the run went through, which decides how its session is named and whether a resume command fits it. */
+	backend: BackendName;
 	/** True for a run that went on after the host's tool call returned. */
 	background?: boolean;
 	role: string;
@@ -155,17 +157,28 @@ export interface CallView {
 	isError: boolean;
 }
 
-/** The Claude Code session a run started in: a new one, a resume of `id`, or a fork of `from`, optionally at a message. */
+/**
+ * The child session a run asked for: a new one, a resume of `id`, or a fork of `from`, optionally at a message. This
+ * is the launch request and its source, made before the child ran and never corrected by what the child did: a fork's
+ * `id` and `file` here are the session it forked *from*. Where the run actually ended up is `ref`, and only that.
+ * A Claude run allocates its id before the child starts, so it always has one; a new Pi session has no id until the
+ * child reports one, and a Pi session is named by its file as well, so both are optional here.
+ */
 export interface RunSession {
 	kind: "new" | "resume" | "fork";
-	id: string;
+	backend?: BackendName;
+	id?: string;
 	from?: string;
 	at?: string;
+	/** The transcript file a Pi session lives in, which is half of its identity. */
+	file?: string;
 }
 
 export interface RunStart {
 	id: string;
 	handle?: string;
+	/** The backend the child runs in; a run that names none is a Claude run, which is what every older record is. */
+	backend?: BackendName;
 	/** True for a run that went on after the host's tool call returned. */
 	background?: boolean;
 	role: string;
@@ -186,6 +199,7 @@ export interface RunStart {
 export interface RestoredRun {
 	id: string;
 	handle?: string;
+	backend?: string;
 	background?: boolean;
 	role: string;
 	model: string;
@@ -204,6 +218,8 @@ export interface RestoredRun {
 	contract?: string;
 	session?: RunSession;
 	sessionId?: string;
+	/** The session the run's backend verified, as the history kept it: a reference, never the launch request. */
+	ref?: SessionRef;
 	report?: string;
 	failure?: string;
 	files?: ReadonlyArray<ChangedFile>;
@@ -212,6 +228,8 @@ export interface RestoredRun {
 }
 
 export interface RunDetail extends RunSummary {
+	/** The session the backend verified the run ran in, which is the only one anything may name as the child's. */
+	ref?: SessionRef;
 	files?: ChangedFile[];
 	filesTruncated: boolean;
 	cacheRead: number;
@@ -236,6 +254,7 @@ export interface RunDetail extends RunSummary {
 interface StoredRun {
 	id: string;
 	handle?: string;
+	backend: BackendName;
 	/** True for a run that went on after the host's tool call returned. */
 	background?: boolean;
 	role: string;
@@ -276,6 +295,8 @@ interface StoredRun {
 	sessionId?: string;
 	deniedTools?: string[];
 	restored?: true;
+	/** The verified result reference, kept apart from the launch request in `session` and never inferred from it. */
+	ref?: SessionRef;
 	calls: Map<string, CallView>;
 	agentPrompts: Map<string, string>;
 	prompt: string;
@@ -323,6 +344,7 @@ function agentsOf(agents: ReadonlyArray<{ label: string; state: string }>): Arra
 function summaryOf(run: StoredRun): RunSummary {
 	const summary: RunSummary = {
 		id: run.id,
+		backend: run.backend,
 		role: run.role,
 		model: run.model,
 		status: run.status,
@@ -430,9 +452,12 @@ function promptOf(input: unknown): string | undefined {
 }
 
 function sessionOf(session: RunSession): RunSession {
-	const copy: RunSession = { kind: session.kind, id: cap(String(session.id)) };
+	const copy: RunSession = { kind: session.kind };
+	if (isBackendName(session.backend)) copy.backend = session.backend;
+	if (session.id !== undefined) copy.id = cap(String(session.id));
 	if (session.from !== undefined) copy.from = cap(String(session.from));
 	if (session.at !== undefined) copy.at = cap(String(session.at));
+	if (session.file !== undefined) copy.file = cap(String(session.file));
 	return copy;
 }
 
@@ -454,6 +479,8 @@ export class RunStore {
 		const at = this.clock();
 		const run: StoredRun = {
 			id,
+			// Nothing older than backend tags ever ran anywhere but Claude, so a record without one is a Claude run.
+			backend: isBackendName(input.backend) ? input.backend : "claude",
 			role: cap(String(input.role)),
 			model: cap(String(input.model)),
 			status: "running",
@@ -514,6 +541,8 @@ export class RunStore {
 		const text = capBytes(String(input.report ?? ""), TEXT_CAP_BYTES);
 		const run: StoredRun = {
 			id,
+			// Nothing older than backend tags ever ran anywhere but Claude, so a record without one is a Claude run.
+			backend: isBackendName(input.backend) ? input.backend : "claude",
 			role: cap(String(input.role)),
 			model: cap(String(input.model)),
 			status: status as RunStatus,
@@ -558,6 +587,10 @@ export class RunStore {
 		if (input.contract !== undefined) run.contract = cap(String(input.contract));
 		if (input.session !== undefined) run.session = sessionOf(input.session);
 		if (input.sessionId !== undefined) run.sessionId = cap(String(input.sessionId));
+		// A restored reference is read with the same grammar a live one is, and under this run's own backend: a record
+		// that names another backend's session, an incomplete one or one too long to keep whole leaves the run none.
+		const restoredRef = keptRef(input.ref, run.backend);
+		if (restoredRef) run.ref = { ...restoredRef };
 		if (input.failure !== undefined) {
 			const failure = capBytes(String(input.failure), FAILURE_CAP_BYTES);
 			run.failure = failure.text;
@@ -702,11 +735,16 @@ export class RunStore {
 
 	finish(
 		id: string,
-		outcome: { status: Exclude<RunStatus, "running" | "waiting">; text?: string; failure?: string; snapshot?: RunProgress; files?: readonly ChangedFile[] },
+		outcome: { status: Exclude<RunStatus, "running" | "waiting">; text?: string; failure?: string; snapshot?: RunProgress; files?: readonly ChangedFile[]; ref?: SessionRef },
 	): void {
 		const run = this.runs.get(cap(String(id)));
 		if (!run) return;
 		const at = this.clock();
+		// Only the caller's validated result reference becomes this run's session; a progress snapshot never does,
+		// because what a child said while it worked is not what the host checked when the run ended. It is kept whole
+		// or not at all: a session file cut to fit would be a path to somewhere else, which is worse than no path.
+		const ref = keptRef(outcome.ref, run.backend);
+		if (ref) run.ref = { ...ref };
 		run.status = outcome.status;
 		run.endedAt = at;
 		delete run.question;
@@ -762,6 +800,7 @@ export class RunStore {
 		if (run.failure !== undefined) detail.failure = run.failure;
 		if (run.contract !== undefined) detail.contract = run.contract;
 		if (run.session !== undefined) detail.session = sessionOf(run.session);
+		if (run.ref !== undefined) detail.ref = { ...run.ref };
 		if (run.numTurns !== undefined) detail.numTurns = run.numTurns;
 		if (run.apiMs !== undefined) detail.apiMs = run.apiMs;
 		if (run.modelId !== undefined) detail.modelId = run.modelId;

@@ -1,7 +1,7 @@
 # The ultracode role
 
 
-Role `ultracode` starts its child with the SDK equivalent of:
+Role `ultracode` runs on the `claude` backend and nowhere else: a call that routes it elsewhere is refused before a child starts. It starts its child with the SDK equivalent of:
 
 ```bash
 claude --model fable --effort ultracode --output-format stream-json --input-format stream-json --verbose \

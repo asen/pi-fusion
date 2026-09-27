@@ -1263,3 +1263,69 @@ test("a run restored from an earlier Pi process is labelled in the list and in i
 	assert.equal(await page.evaluate<string>(FACT_VALUE("Restored")), "from an earlier Pi process");
 	assert.equal(await page.evaluate<string>(FACT_VALUE("Tool calls")), "7");
 });
+
+const RESUME_TEXT = "(document.querySelector('.resume .resume-command') || {}).textContent || ''";
+/** A realistic Pi transcript path past every display cap this page has, and well under the platform's own limit. */
+const LONG_PI_FILE = `/home/asen/.pi/agent/sessions/${"a-deeply-nested-project-directory/".repeat(12)}0199c9e2-1b3a-7f00-8000-0123456789ab.jsonl`;
+const FACT = (label: string) =>
+	`(() => { const keys = Array.from(document.querySelectorAll('.fact-key')); const key = keys.find((node) => node.textContent === ${JSON.stringify(label)}); return key && key.nextElementSibling ? key.nextElementSibling.textContent : ''; })()`;
+/** Takes the clipboard over, so a click on Copy says what the page would have put there rather than asking Chrome for it. */
+const TAKE_CLIPBOARD = "(() => { window.__copied = []; Object.defineProperty(navigator, 'clipboard', { configurable: true, value: { writeText: (text) => { window.__copied.push(text); return Promise.resolve(); } } }); return 'ok'; })()";
+const COPY_RESUME = "(() => { const button = document.querySelector('.resume .copy'); if (!button) return 'missing'; button.click(); return 'clicked'; })()";
+const COPIED = "(window.__copied || []).join('|')";
+const SELECT_ROLE = (role: string) => `(() => { const item = Array.from(document.querySelectorAll('.run')).find((node) => node.querySelector('.run-role').textContent === ${JSON.stringify(role)}); if (!item) return 'missing'; item.click(); return 'ok'; })()`;
+
+test("a pi run's transcript is the file its outcome verified, and a fork's launch request is not offered as one", { skip }, async () => {
+	const { page, store, url } = await fixture();
+	const forked = { backend: "pi" as const, sessionId: "pi-2", sessionFile: "/sessions/pi-2.jsonl", checkpoint: "entry-9" };
+	const request = { kind: "fork" as const, backend: "pi" as const, from: "pi-1", file: "/sessions/pi-1.jsonl", at: "entry-9" };
+	store.start({ id: "pi-fresh", backend: "pi", role: "pi-fresh-role", model: "deepseek/deepseek-chat", session: { kind: "new", backend: "pi" } });
+	store.start({ id: "pi-fork", backend: "pi", role: "pi-fork-role", model: "deepseek/deepseek-chat", session: request });
+	// A fork that failed before it read a selection back still verified the child it made, and that is its transcript.
+	store.finish("pi-fork", { status: "failed", failure: "the provider dropped the connection", ref: forked });
+	store.start({ id: "pi-invalid", backend: "pi", role: "pi-invalid-role", model: "deepseek/deepseek-chat", session: { kind: "new", backend: "pi" } });
+	store.finish("pi-invalid", { status: "failed", failure: "invalid session postcondition: run-9 succeeded without reporting the session it ran in" });
+	store.restore({ id: "pi-held", backend: "pi", role: "pi-held-role", model: "deepseek/deepseek-chat", state: "failed", startedAt: Date.now() - 10_000, session: request, ref: forked });
+	store.start({ id: "pi-long", backend: "pi", role: "pi-long-role", model: "deepseek/deepseek-chat", session: { kind: "new", backend: "pi" } });
+	store.finish("pi-long", { status: "done", text: "done", ref: { backend: "pi", sessionId: "0199c9e2-1b3a-7f00-8000-0123456789ab", sessionFile: LONG_PI_FILE, checkpoint: "entry-1" } });
+	await page.open(url);
+	await page.until<number>("the pi runs are listed", RUN_BUTTONS, (count) => count >= 7);
+	await page.evaluate<string>(TAKE_CLIPBOARD);
+
+	// A run that has reported nothing yet has no transcript to offer, and none is invented from its request.
+	assert.equal(await page.evaluate<string>(SELECT_ROLE("pi-fresh-role")), "ok");
+	await page.until<string>("the new pi run is shown", DETAIL_TITLE, (title) => title === "pi-fresh-role");
+	assert.equal(await page.evaluate<string>(RESUME_TEXT), "");
+	assert.equal(await page.evaluate<string>(FACT("Pi session request")), "new");
+
+	// Its outcome lands, and the page names the file that outcome verified.
+	store.finish("pi-fresh", { status: "done", text: "done", ref: { backend: "pi", sessionId: "pi-1", sessionFile: "/sessions/pi-1.jsonl", checkpoint: "entry-1" } });
+	await page.until<string>("the verified transcript appears", RESUME_TEXT, (text) => text === "/sessions/pi-1.jsonl");
+
+	// A fork shows its parent as the request it was launched with, and its own child as the transcript.
+	assert.equal(await page.evaluate<string>(SELECT_ROLE("pi-fork-role")), "ok");
+	await page.until<string>("the fork is shown", DETAIL_TITLE, (title) => title === "pi-fork-role");
+	assert.equal(await page.evaluate<string>(FACT("Pi session request")), "fork of pi-1 at entry-9 in /sessions/pi-1.jsonl");
+	assert.equal(await page.evaluate<string>(RESUME_TEXT), "/sessions/pi-2.jsonl");
+	assert.equal(await page.evaluate<string>(COPY_RESUME), "clicked");
+	assert.equal(await page.evaluate<string>(COPIED), "/sessions/pi-2.jsonl", "Copy takes the verified child, never the parent the fork was launched from");
+
+	// The same run as an earlier Pi process left it, restored from the history.
+	assert.equal(await page.evaluate<string>(SELECT_ROLE("pi-held-role")), "ok");
+	await page.until<string>("the restored run is shown", DETAIL_TITLE, (title) => title === "pi-held-role");
+	assert.equal(await page.evaluate<string>(RESUME_TEXT), "/sessions/pi-2.jsonl");
+
+	// A long transcript path is copied whole: a page that shortened it would hand over a path to somewhere else.
+	assert.equal(await page.evaluate<string>(SELECT_ROLE("pi-long-role")), "ok");
+	await page.until<string>("the long path is shown", DETAIL_TITLE, (title) => title === "pi-long-role");
+	assert.equal(await page.evaluate<string>(RESUME_TEXT), LONG_PI_FILE);
+	assert.equal(await page.evaluate<string>(COPY_RESUME), "clicked");
+	assert.equal(await page.evaluate<string>("(window.__copied || []).slice(-1)[0] || ''"), LONG_PI_FILE, "Copy takes the whole path the child reported");
+
+	// An outcome the host refused passes no reference, so there is nothing to show and nothing to copy.
+	assert.equal(await page.evaluate<string>(SELECT_ROLE("pi-invalid-role")), "ok");
+	await page.until<string>("the refused run is shown", DETAIL_TITLE, (title) => title === "pi-invalid-role");
+	assert.equal(await page.evaluate<string>(RESUME_TEXT), "");
+	assert.equal(await page.evaluate<string>(COPY_RESUME), "missing", "a run with no verified session has no copyable transcript");
+	assert.equal(await page.evaluate<string>(COPIED), `/sessions/pi-2.jsonl|${LONG_PI_FILE}`, "and nothing was copied for the run that has no verified session");
+});
