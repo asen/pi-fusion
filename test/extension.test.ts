@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import * as fs from "node:fs";
+import * as http from "node:http";
 import * as os from "node:os";
 import * as path from "node:path";
 import test from "node:test";
@@ -590,20 +591,17 @@ async function getJson(target: string): Promise<any> {
 
 /**
  * The dashboard is gone when the port refuses the connection, not when it answers 404. A pooled keep-alive socket
- * that closing destroyed reports a reset instead, so a reset is retried on a fresh connection.
+ * that closing destroyed proves nothing about the port, so the probe opens its own connection every time and reads
+ * the code the kernel gives it.
  */
 async function refused(target: string): Promise<string> {
-	let code = "";
-	for (let attempt = 0; attempt < 5; attempt++) {
-		try {
-			await fetch(target);
-			return "answered";
-		} catch (error) {
-			code = (error as { cause?: { code?: string } }).cause?.code ?? (error as Error).message;
-			if (code !== "ECONNRESET") return code;
-		}
-	}
-	return code;
+	return new Promise<string>((resolve) => {
+		const request = http.get(target, { agent: false }, (response) => {
+			response.resume();
+			resolve("answered");
+		});
+		request.on("error", (error: NodeJS.ErrnoException) => resolve(error.code ?? error.message));
+	});
 }
 
 let dashboardUrl = "";
@@ -729,6 +727,7 @@ test("a later /fusion dashboard gets a fresh url and session_shutdown closes it,
 	const url = urlIn(await runCommand("dashboard"));
 	assert.notEqual(url, dashboardUrl, "a restart must not reuse the closed server's token or port");
 	assert.equal(((await getJson(`${url}api/runs`)) as { cwd: string }).cwd, ctx.cwd);
+	assert.equal(await refused(`${url}api/runs`), "answered", "the refusal probe must answer a live listener, or ECONNREFUSED proves nothing");
 	const shutdown = handlers.get("session_shutdown");
 	assert.ok(shutdown, "no session_shutdown handler is registered");
 	await shutdown({ reason: "quit" }, ctx);

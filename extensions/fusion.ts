@@ -642,21 +642,22 @@ export function budgetBlockMessage(block: { limitUsd: number; costUsd: number })
  * named by the caller and never inferred from the fields: a Pi run that ended before it verified a reference can
  * still carry a scalar session id as a diagnostic, and `claude --resume` on such an id names a session the Claude
  * CLI cannot open. Only a Claude run's flat id is a resume command, and only a verified Pi reference names a file.
+ * That reference is passed in, never read off the snapshot: what a child claimed in progress and what an outcome
+ * the host refused carried are both on the snapshot, and neither is a path anyone may be handed.
  */
-function sessionHint(run: { session?: SessionRef; sessionId?: string }, backend: BackendName): string[] {
-	const ref = run.session;
+function sessionHint(run: { sessionId?: string } | undefined, ref: SessionRef | undefined, backend: BackendName): string[] {
 	if (ref?.backend === "pi") return [`pi session ${ref.sessionFile}`];
-	return backend === "claude" && run.sessionId ? [`claude --resume ${run.sessionId}`] : [];
+	return backend === "claude" && run?.sessionId ? [`claude --resume ${run.sessionId}`] : [];
 }
 
-function stats(handle: string, run: HostRun, backend: BackendName): string {
+function stats(handle: string, run: HostRun, backend: BackendName, ref: SessionRef | undefined): string {
 	const secs = Math.round(run.ms / 1000);
 	const parts = [`${handle} · ${run.role.name} · ${run.role.model} · ${secs}s · ${run.toolCalls} tool calls · in ${formatTokens(run.tokensIn)} out ${formatTokens(run.tokensOut)}`];
 	const { contextTokens, contextWindow } = run;
 	if (contextTokens && contextWindow) parts.push(`context ${formatTokens(contextTokens)}/${formatTokens(contextWindow)} (${sharePercent(contextTokens / contextWindow)})`);
 	if (run.workflowTokens) parts.push(`workflow agents ${formatTokens(run.workflowTokens)} tokens`);
 	if (run.deniedTools?.length) parts.push(`denied: ${[...new Set(run.deniedTools)].join(", ")}`);
-	parts.push(...sessionHint(run, backend));
+	parts.push(...sessionHint(run, ref, backend));
 	return parts.join(" · ");
 }
 
@@ -769,6 +770,13 @@ interface LiveRun {
 	controller: AbortController;
 	cancelled: boolean;
 	cancelledBy?: "user" | "host";
+	/**
+	 * The latest snapshot of the child: its last progress report while it works, and the outcome it returned once it
+	 * has, because that outcome is what the run actually spent and did. What a backend reports as it returns is not
+	 * required to come through the progress stream, so a host that kept the last progress would show and keep less
+	 * than the run cost. No structured session reference is read from here; only `verified` says what the host checked.
+	 * A Claude run's flat session id is the one exception, read off this snapshot as it always was.
+	 */
 	latest?: HostRun;
 	cwd: string;
 	before?: Snapshot;
@@ -1232,9 +1240,11 @@ export default function fusion(pi: ExtensionAPI, options: FusionOptions = {}) {
 		...(run.backend !== "claude" || child?.sessionId === undefined ? {} : { sessionId: child.sessionId }),
 		...(run.backend !== "claude" || child?.checkpoint === undefined ? {} : { checkpoint: child.checkpoint }),
 		backend: run.backend,
-		// The identity and the selection come from the outcome the host validated, never from `child`, which is the
-		// latest progress: a run still going has reported no result to keep, and a record written mid-run that named
-		// one would come back from a killed Pi process as a session nothing had checked.
+		// The structured reference and the selection come from the outcome the host validated, never from `child`,
+		// which is only the latest snapshot of the run, progress while it works and its returned outcome after that: a
+		// run still going has reported no result to keep, a record written mid-run that named one would come back from
+		// a killed Pi process as a session nothing had checked, and a returned outcome may be one the decision refused.
+		// The flat Claude fields above are the exception, and they still come from the snapshot as they always did.
 		...(run.verified?.ref === undefined ? {} : { ref: run.verified.ref }),
 		...(run.verified?.selection === undefined ? {} : { selection: run.verified.selection }),
 		session: { ...run.session, backend: run.backend },
@@ -1676,6 +1686,8 @@ export default function fusion(pi: ExtensionAPI, options: FusionOptions = {}) {
 						onEvent: (event) => record(() => store.event(id, event)),
 					});
 				} catch (error) {
+					// A backend that threw returned no outcome, so the last progress stays this run's latest snapshot:
+					// what the child had already spent is what is known about it, and nothing replaces it.
 					run.failure = error instanceof Error ? error.message : String(error);
 					run.state = "failed";
 					const changed = await files();
@@ -1683,6 +1695,10 @@ export default function fusion(pi: ExtensionAPI, options: FusionOptions = {}) {
 					record(() => store.finish(id, { status: "failed", failure: run.failure!, ...changed }));
 					return;
 				}
+				// The outcome is the run's latest snapshot as well as what it is metered on: it is what the run ended up
+				// spending and doing, whether or not this backend also announced it as progress. A backend that shares
+				// one record between its progress and its outcome, as the Claude one does, was already here.
+				run.latest = child;
 				meter(run, child, ctx);
 				// What the outcome records is decided here, because an outcome naming a session the run cannot have had is itself a failure.
 				let recorded: RecordedRun = { commit: () => {} };
@@ -1706,7 +1722,7 @@ export default function fusion(pi: ExtensionAPI, options: FusionOptions = {}) {
 						: recorded.invalid;
 				run.state = run.cancelled ? "cancelled" : child.aborted ? "aborted" : failure !== undefined ? "failed" : "done";
 				run.report = child.text;
-				run.stats = stats(handle, child, run.backend);
+				run.stats = stats(handle, child, run.backend, run.verified?.ref);
 				if (failure !== undefined) run.failure = failure;
 				const changed = await files();
 				if (changed.files) run.files = changed.files;
@@ -2042,7 +2058,9 @@ export default function fusion(pi: ExtensionAPI, options: FusionOptions = {}) {
 				const run = live(command.handle);
 				if (!run) return;
 				const lines = await runStatus(run);
-				if (run.latest) lines.push(...sessionHint(run.latest, run.backend));
+				// The Pi path a status line offers is the one the run's outcome was accepted with, so a run still going
+				// and one whose result the host refused offer none; a Claude id stays the live scalar it always was.
+				lines.push(...sessionHint(run.latest, run.verified?.ref, run.backend));
 				notice(lines.join("\n"), "info");
 				return;
 			}

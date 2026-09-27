@@ -1180,3 +1180,175 @@ test("a backend that broke, or an outcome the host refused, publishes nothing th
 		});
 	}
 });
+
+/** The session usage line `/fusion status` ends with, which is the live ledger as the user reads it. */
+const usageLine = async (host: ReturnType<typeof makeHost>): Promise<string> => {
+	host.notices.length = 0;
+	await host.command("status");
+	const line = (host.notices.at(-1) ?? "").split("\n").find((text) => text.startsWith("session usage:"));
+	assert.ok(line, `no session usage line in: ${host.notices.at(-1)}`);
+	return line;
+};
+
+test("the outcome a run returned is its authoritative usage, in the live ledger, the history and a later process's total", async () => {
+	for (const [what, script] of [
+		["reported progress the outcome then replaced", { running: { costUsd: 1 }, finalProgress: false, costUsd: 5 }],
+		["reported no progress at all", { runningProgress: false, finalProgress: false, costUsd: 5 }],
+	] as const) {
+		const dir = tempDir("pi-returned-usage");
+		const sessionFile = path.join(dir, "host-1.jsonl");
+		await withEnv({ ...piEnv(), PI_FUSION_HISTORY: "1", PI_FUSION_HISTORY_DIR: dir }, async () => {
+			const branch: unknown[] = [];
+			const host = makeHost({ backends: both(fakeBackend({ scripts: [script as FakeScript] })), branch, sessionFile });
+			const ran = await host.fusion({ role: "implement", task: "do the thing", backend: "pi" });
+			assert.equal(ran.error, undefined, what);
+			assert.equal(ran.details.sessionUsage.costUsd, 5, `${what}: the ledger takes what the run returned`);
+			assert.equal(ran.details.toolCalls, 2, `${what}: and the counters are the outcome's own`);
+			assert.match(ran.text ?? "", /· 2 tool calls ·/, `${what}: the stats line counts what the outcome reported`);
+			assert.match(await usageLine(host), /^session usage: est\. \$5\.00 ·/, what);
+			assert.deepEqual(new History(dir).load("host-1").records.at(-1)!.usage, { costUsd: 5, tokensIn: 10, tokensOut: 5, toolCalls: 2 }, `${what}: the history keeps the same total`);
+
+			// And a later process restores that record, so its cold total is the $5 the run really cost.
+			const cold = makeHost({ backends: both(fakeBackend()), branch: [], sessionFile, sessionId: "host-1" });
+			assert.match(await usageLine(cold), /^session usage: est\. \$5\.00 ·/, `${what}: a restored total`);
+		});
+	}
+});
+
+test("a run that ended badly keeps the cost its outcome returned, and one whose backend threw keeps the cost it had reported", async () => {
+	for (const [what, script, cost] of [
+		["a child that failed", { fail: "the provider refused the request", running: { costUsd: 1 }, finalProgress: false, costUsd: 5 }, 5],
+		["an outcome the host refused", { checkpoint: null, running: { costUsd: 1 }, finalProgress: false, costUsd: 5 }, 5],
+		["a backend that threw after its child reported progress", { throwsLate: "the backend broke mid-run", running: { costUsd: 1 } }, 1],
+	] as const) {
+		const dir = tempDir("pi-failed-usage");
+		const sessionFile = path.join(dir, "host-1.jsonl");
+		await withEnv({ ...piEnv(), PI_FUSION_HISTORY: "1", PI_FUSION_HISTORY_DIR: dir }, async () => {
+			const host = makeHost({ backends: both(fakeBackend({ scripts: [script as FakeScript] })), branch: [], sessionFile });
+			const ran = await host.fusion({ role: "implement", task: "do the thing", backend: "pi" });
+			assert.ok(ran.error, `${what} should fail the run`);
+			assert.match(await usageLine(host), new RegExp(`^session usage: est\\. \\$${cost}\\.00 ·`), `${what}: the ledger`);
+			assert.equal(new History(dir).load("host-1").records.at(-1)!.usage?.costUsd, cost, `${what}: the history`);
+		});
+	}
+
+	// A cancelled run ends on the outcome its backend still returned, and that is what its cost is.
+	await withEnv(piEnv(), async () => {
+		const pi = fakeBackend({ scripts: [{ pending: true, running: { costUsd: 1 }, finalProgress: false, costUsd: 5 }] });
+		const host = makeHost({ backends: both(pi) });
+		await host.fusion({ role: "implement", task: "long work", backend: "pi", background: true });
+		await pi.started();
+		assert.equal((await host.control({ action: "cancel", run: "run-1" })).text, "run-1 cancelled");
+		assert.match(await usageLine(host), /^session usage: est\. \$5\.00 ·/, "a cancelled run's spending is what its outcome reported");
+	});
+});
+
+test("the budget limit a returned outcome passed blocks the next call, before and after a restart", async () => {
+	const dir = tempDir("pi-limit");
+	const sessionFile = path.join(dir, "host-1.jsonl");
+	await withEnv({ ...piEnv(), PI_FUSION_HISTORY: "1", PI_FUSION_HISTORY_DIR: dir, PI_FUSION_BUDGET_LIMIT_USD: "3" }, async () => {
+		const branch: unknown[] = [];
+		const pi = fakeBackend({ scripts: [{ running: { costUsd: 1 }, finalProgress: false, costUsd: 5 }] });
+		const host = makeHost({ backends: both(pi), branch, sessionFile });
+		assert.equal((await host.fusion({ role: "implement", task: "do the thing", backend: "pi" })).error, undefined);
+		const blocked = /have cost an estimated \$5\.00, at or over the PI_FUSION_BUDGET_LIMIT_USD limit of \$3\.00/;
+		assert.match((await host.fusion({ role: "implement", task: "and more", backend: "pi" })).error ?? "", blocked, "the run the limit counts is the one that returned $5, not the $1 it reported");
+		assert.equal(pi.starts.length, 1, "no second child started");
+
+		const later = fakeBackend();
+		const cold = makeHost({ backends: both(later), branch, sessionFile, sessionId: "host-1" });
+		assert.match((await cold.fusion({ role: "implement", task: "after the restart", backend: "pi" })).error ?? "", blocked);
+		assert.deepEqual(later.starts, [], "and the restored total blocks the call before a child starts");
+	});
+});
+
+/** The line `/fusion status run-N` ends with for a run whose session the host can offer, if it offers one at all. */
+const statusOf = async (host: ReturnType<typeof makeHost>, handle: string): Promise<string> => {
+	host.notices.length = 0;
+	await host.command(`status ${handle}`);
+	return host.notices.at(-1) ?? "";
+};
+
+const noPiHint = (where: string, ...texts: Array<string | undefined>): void => {
+	for (const text of texts) assert.ok(!/pi session /.test(text ?? ""), `${where} offers a pi session hint: ${text}`);
+};
+
+test("a generated pi session hint names only an identity the host accepted, wherever the host generates one", async () => {
+	const claimed = { backend: "pi" as const, sessionId: "pi-claimed", sessionFile: "/sessions/pi-claimed.jsonl", checkpoint: "entry-claimed" };
+	for (const [what, script] of [
+		["an outcome the host refused after the child claimed a session", { running: { session: claimed }, checkpoint: null }],
+		["a backend that threw after the child claimed one", { throwsLate: "the backend broke mid-run", running: { session: claimed } }],
+	] as const) {
+		await withEnv(piEnv(), async () => {
+			// In the foreground the hint rides on the error the tool throws.
+			const host = makeHost({ backends: both(fakeBackend({ scripts: [script as FakeScript] })) });
+			const ran = await host.fusion({ role: "implement", task: "do the thing", backend: "pi" });
+			assert.ok(ran.error, `${what} should fail the run`);
+			noPiHint(`${what}, in the foreground error`, ran.error);
+			noPiHint(`${what}, in the status after it ended`, await statusOf(host, "run-1"));
+
+			// In the background it rides on the completion notice, and on the report a control wait hands back.
+			const background = makeHost({ backends: both(fakeBackend({ scripts: [script as FakeScript] })) });
+			await background.fusion({ role: "implement", task: "do the thing", backend: "pi", background: true });
+			await until(`the notice for ${what}`, () => background.sent.length > 0);
+			noPiHint(`${what}, in the background notice`, background.sent[0]![0].content);
+			noPiHint(`${what}, in a control wait`, (await background.control({ action: "wait", run: "run-1" })).text);
+			noPiHint(`${what}, in a control message after the end`, (await background.control({ action: "message", run: "run-1", message: "too late" })).text);
+		});
+	}
+
+	// A run still going has had nothing validated, whatever session it claims in progress.
+	await withEnv(piEnv(), async () => {
+		const pi = fakeBackend({ scripts: [{ pending: true, running: { session: claimed } }] });
+		const host = makeHost({ backends: both(pi) });
+		await host.fusion({ role: "implement", task: "long work", backend: "pi", background: true });
+		await pi.started();
+		const running = await statusOf(host, "run-1");
+		assert.match(running, /^run-1 · implement · deepseek\/deepseek-chat · running · background ·/);
+		noPiHint("the status of a running pi run", running);
+		assert.equal((await host.control({ action: "cancel", run: "run-1" })).text, "run-1 cancelled");
+	});
+});
+
+test("a pi identity the host accepted is offered wherever a hint is generated, diagnostic references included", async () => {
+	await withEnv(piEnv(), async () => {
+		const branch: unknown[] = [];
+		// A settled run, a first call that failed with an identity and no checkpoint, and a fork verified before the
+		// call failed without a selection: the last two are refused for continuation and still name a file to read.
+		const pi = fakeBackend({
+			scripts: [{}, { fail: "the provider refused the request", newId: "pi-failed", newFile: "/sessions/pi-failed.jsonl" }],
+		});
+		const host = makeHost({ backends: both(pi), branch });
+		const settled = await host.fusion({ role: "implement", task: "do the thing", backend: "pi" });
+		assert.equal(settled.error, undefined);
+		assert.match(settled.text ?? "", /pi session \/sessions\/pi-1\.jsonl\]$/);
+		assert.match(await statusOf(host, "run-1"), /\npi session \/sessions\/pi-1\.jsonl$/);
+
+		const failed = await host.fusion({ role: "implement", task: "something new", backend: "pi" });
+		assert.match(failed.error ?? "", /pi session \/sessions\/pi-failed\.jsonl\]$/, "a first call that failed with an identity still says where to read it");
+		assert.match(await statusOf(host, "run-2"), /\npi session \/sessions\/pi-failed\.jsonl$/);
+
+		// A forked host session forks the recorded run, and that fork failed before it read a selection back.
+		const forked = { backend: "pi" as const, sessionId: "pi-forked", sessionFile: "/sessions/pi-forked.jsonl", checkpoint: "entry-1" };
+		const forking = fakeBackend({ scripts: [{ fail: "the provider dropped the connection", session: forked, selection: null }] });
+		const other = makeHost({ backends: both(forking), branch, sessionId: "host-2" });
+		const fork = await other.fusion({ continue: "run-1", task: "carry on in the fork" });
+		assert.equal(forking.starts[0]!.intent?.kind, "fork", "the run under test is the fork a forked host makes");
+		assert.match(fork.error ?? "", /pi session \/sessions\/pi-forked\.jsonl\]$/, "a fork kept for reading names the child it made");
+		assert.match(await statusOf(other, "run-1"), /\npi session \/sessions\/pi-forked\.jsonl$/);
+	});
+});
+
+test("a claude run still offers the live scalar resume command it always did, running and ended", async () => {
+	await withEnv(piEnv(), async () => {
+		const claude = fakeBackend({ name: "claude", scripts: [{ pending: true }] });
+		const host = makeHost({ backends: both(fakeBackend(), claude) });
+		await host.fusion({ role: "implement", task: "long work", backend: "claude", background: true });
+		const start = await claude.started();
+		assert.match(await statusOf(host, "run-1"), /\nclaude --resume c-1$/, "a running claude run offers the id its child reported");
+		start.release();
+		assert.match(await ended(host, "run-1"), /claude --resume c-1\]/);
+		assert.match(await statusOf(host, "run-1"), /\nclaude --resume c-1$/);
+		noPiHint("a claude run", host.sent.map(([message]) => message.content).join("\n"));
+	});
+});

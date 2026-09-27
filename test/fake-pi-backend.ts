@@ -46,7 +46,9 @@ export interface FakeScript {
 	 * What the run reports while it is still going, over what its outcome reports. A child can claim a session in
 	 * progress and return another, or none, and nothing the host has not checked may be kept from either.
 	 */
-	running?: Omit<FakeScript, "running" | "onAbort" | "questions" | "pending" | "throws" | "throwsLate" | "finalProgress">;
+	running?: Omit<FakeScript, "running" | "onAbort" | "questions" | "pending" | "throws" | "throwsLate" | "runningProgress" | "finalProgress">;
+	/** False reports no progress at all, so the returned outcome is the only thing the host ever hears from the run. */
+	runningProgress?: boolean;
 	/** False leaves the settled outcome out of the progress stream, so the returned value is the only place it is. */
 	finalProgress?: boolean;
 	/** What the outcome becomes when the run is aborted, over a cancelled run's own defaults. */
@@ -216,8 +218,8 @@ export function fakeBackend(options: FakeBackendOptions = {}): FakeBackend {
 						if (request.signal?.aborted) return resolve();
 						request.signal?.addEventListener("abort", () => resolve(), { once: true });
 					});
-					const progress = child(request.role, { ...script, ...script.running }, { name, defaultEffort }, undefined, mine, false, 1);
-					request.onProgress(progress);
+					// A backend need not report progress at all: a child that settles in one turn can say nothing until it ends.
+					if (script.runningProgress !== false) request.onProgress(child(request.role, { ...script, ...script.running }, { name, defaultEffort }, undefined, mine, false, 1));
 					if (script.throwsLate) throw new Error(script.throwsLate);
 					try {
 						for (const text of script.questions ?? []) {
