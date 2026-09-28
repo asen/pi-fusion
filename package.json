@@ -2,6 +2,7 @@
   "name": "pi-fusion",
   "version": "0.1.0",
   "private": true,
+  "license": "MIT",
   "type": "module",
   "description": "Pi extension: Astra orchestrates through one claude tool; Fable plans, Opus implements and answers, and Fable runs ultracode.",
   "keywords": [
