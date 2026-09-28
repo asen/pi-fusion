@@ -8,7 +8,7 @@ The `role` parameter of `claude` picks the job.
 
 | Role | Model and effort | Tools given to the child | Purpose |
 | --- | --- | --- | --- |
-| `plan` | `fable`, xhigh | Read, Bash, Edit, Write, Grep, Glob | Challenge a plan and return an agreed, numbered task list. |
+| `plan` | `fable` (the host picks `opus` for bounded design), xhigh | Read, Bash, Edit, Write, Grep, Glob | Challenge a plan and return an agreed, numbered task list. |
 | `implement` | `opus`, high | Read, Bash, Edit, Write, Grep, Glob | Implement one clear, bounded task. |
 | `ultracode` | `fable`, ultracode | Claude Code's own, plus Workflow, Agent and the user's MCP servers | Complex, uncertain or high-risk work, or a whole agreed plan. The host uses it only when you ask for it. |
 | `ask` | `opus`, high | Read, Bash, Grep, Glob, WebSearch, WebFetch | Answer a question about the code, or review a change with `mode: "review"`. Changes no files. |
@@ -26,7 +26,7 @@ The `role` parameter of `claude` picks the job.
 | `background` | all | `true` returns the handle at once and lets the run go on. |
 | `fresh` | `plan` | Start a new plan run. Not allowed with `continue`. |
 | `mode` | `ask` | `answer` (default) sends `contracts/ask-answer.md`, `review` sends `contracts/ask-review.md`. |
-| `model` | `implement`, `ask` | Replaces the role's model for one call. |
+| `model` | `plan`, `implement`, `ask` | Replaces the role's model. The run keeps it for later calls that name no model. |
 | `effort` | `plan`, `implement`, `ask` | `low`, `medium`, `high`, `xhigh` or `max`. |
 
 `ultracode` takes neither `model` nor `effort`, because any other effort turns its workflows off. A parameter the role does not take fails the call before a child starts, with an error such as `effort is not allowed for role ultracode`. Both tools are registered `executionMode: "sequential"`, so their calls run one at a time: Pi runs every tool call in a turn sequentially as soon as one of them is sequential.
