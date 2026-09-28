@@ -10,7 +10,7 @@ The `role` parameter of `claude` picks the job.
 | --- | --- | --- | --- |
 | `plan` | `fable`, xhigh | Read, Bash, Edit, Write, Grep, Glob | Challenge a plan and return an agreed, numbered task list. |
 | `implement` | `opus`, high | Read, Bash, Edit, Write, Grep, Glob | Implement one clear, bounded task. |
-| `ultracode` | `fable`, ultracode | Claude Code's own, plus Workflow, Agent and the user's MCP servers | Complex, uncertain or high-risk work, or a whole agreed plan. |
+| `ultracode` | `fable`, ultracode | Claude Code's own, plus Workflow, Agent and the user's MCP servers | Complex, uncertain or high-risk work, or a whole agreed plan. The host uses it only when you ask for it. |
 | `ask` | `opus`, high | Read, Bash, Grep, Glob, WebSearch, WebFetch | Answer a question about the code, or review a change with `mode: "review"`. Changes no files. |
 
 ## Parameters
@@ -41,7 +41,7 @@ While a child runs, the status line shows `<handle> <role> · <seconds> · <n> t
 
 ## Routing
 
-The host model is the orchestrator. Its guidelines ask two questions: is the design unresolved, and which implementer role fits the complexity and risk. That leaves three routes: straight to `implement`; `plan` first, then `implement` task by task; or `ultracode`, with or without `plan`.
+The host model is the orchestrator. Its guidelines ask one question: is the design unresolved. The host sends all implementation to `implement` and uses `ultracode` only when you ask for it. That leaves three routes: straight to `implement`; `plan` first, then `implement` task by task; or `ultracode`, with or without `plan`, on your request.
 
 Your explicit choice wins. Ask for Opus and the host uses `implement`, ask for Fable or ultracode and it uses `ultracode`, and ask for or skip planning as you like. For an independent review, the host calls `ask` with `mode: "review"`. See [Routing](docs/routing.md).
 

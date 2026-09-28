@@ -13,7 +13,7 @@ Agree, agree with changes, or disagree, with only the reasons that matter.
 Numbered tasks in dependency order. Each task must stand on its own for an implementer that has not seen this conversation: files to touch, the change, acceptance criteria, and how to verify it (exact commands where possible). Keep each task small enough to review in one sitting.
 
 ## Route
-Recommend `implement` task by task, or `ultracode` for the plan, by complexity and risk, not file count. One line of reason.
+Recommend `implement` task by task. Recommend `ultracode` for the plan only when the goal says the user asked for ultracode or for Fable to implement. One line of reason.
 
 ## Open questions
 Only questions whose answer changes the plan. Omit the section when there are none.
