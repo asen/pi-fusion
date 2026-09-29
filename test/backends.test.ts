@@ -68,6 +68,12 @@ test("the pi binding is a binding, not an adapter: it depends on the boundary al
 	assert.deepEqual(names, ["./types.ts"], `a role binding must name no host, no process and no SDK; it names ${names.join(", ")}`);
 });
 
+test("the pi storage layout depends on node itself, so a path is composed before any package is loaded", () => {
+	const names = dependenciesOf("backends/pi-storage.ts");
+	assert.ok(names.length > 0, "the storage layout does its own file work, so it names node's own modules");
+	for (const name of names) assert.match(name, /^node:/, `the storage layout must name no host, no backend and no SDK; it names ${names.join(", ")}`);
+});
+
 test("a pi model is a provider and a model id split at the first slash, so a provider's own slashes survive", () => {
 	assert.deepEqual(piModelParts("deepseek/deepseek-chat"), { provider: "deepseek", model: "deepseek-chat" });
 	assert.deepEqual(piModelParts("openrouter/deepseek/deepseek-chat"), { provider: "openrouter", model: "deepseek/deepseek-chat" });

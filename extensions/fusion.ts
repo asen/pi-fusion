@@ -1093,6 +1093,12 @@ export interface FusionOptions {
 }
 
 export default function fusion(pi: ExtensionAPI, options: FusionOptions = {}) {
+	// A Pi child of this extension is an ordinary Pi session, so it loads this extension too. Registering the delegation
+	// tools inside a child would let a child delegate again, and its `/tree`, shutdown and dashboard machinery would run
+	// beside the host's. `piLaunch` is the one thing that sets this marker and it sets it for a Pi child alone, so a host
+	// never carries it; nothing is registered here, and the child is left with the tools its role names. Any other value
+	// registers the ordinary surface, because a marker this build does not know is not a child of this build.
+	if (process.env.PI_FUSION_CHILD === "pi") return;
 	for (const name of new Set([...Object.values(ROLES).map((role) => role.contract), ...Object.values(ASK_CONTRACTS)])) {
 		const contract = path.join(CONTRACTS_DIR, name);
 		if (!fs.existsSync(contract)) throw new Error(`pi-fusion: missing contract ${contract}`);

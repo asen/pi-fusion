@@ -1061,7 +1061,7 @@ test("the monitor names a pi run by the session the host verified, and names non
 });
 
 /** The run detail the monitor serves, which is what the page reads and what a Copy button would take from it. */
-const monitorDetail = async (host: ReturnType<typeof makeHost>, handle: string): Promise<{ ref?: any; session?: any }> => {
+const monitorDetail = async (host: ReturnType<typeof makeHost>, handle: string): Promise<{ ref?: any; session?: any; text?: any }> => {
 	host.notices.length = 0;
 	await host.command("dashboard");
 	const url = host.notices.map((text) => /^fusion dashboard: (\S+)$/.exec(text)?.[1]).find(Boolean);
@@ -1070,7 +1070,7 @@ const monitorDetail = async (host: ReturnType<typeof makeHost>, handle: string):
 		const runs = (await payload(`${url}api/runs`)).runs as Array<{ id: string; handle?: string }>;
 		const run = runs.find((entry) => entry.handle === handle);
 		assert.ok(run, `no run ${handle} in the monitor`);
-		return (await payload(`${url}api/runs/${run.id}`)) as { ref?: any; session?: any };
+		return (await payload(`${url}api/runs/${run.id}`)) as { ref?: any; session?: any; text?: any };
 	} finally {
 		await host.command("dashboard stop");
 	}
@@ -1097,6 +1097,76 @@ test("a long pi transcript path reaches the branch, the history and the monitor 
 		assert.equal((await later.fusion({ continue: "run-1", task: "carry on" })).error, undefined);
 		assert.deepEqual(next.starts[0]!.intent, { kind: "resume", ref });
 		assert.deepEqual((await monitorDetail(later, "run-1")).ref, { ...ref, sessionFile: file, checkpoint: "entry-1" });
+	});
+});
+
+/*
+ * Metadata no backend in this build reports, shaped like what a credential-aware one could: paths to an auth and a
+ * models file, a key, a token pair and a structured blob holding more of the same. The host composes its branch entry,
+ * its history record and its monitor entry from the fields it names, so none of this may appear in any of the three.
+ * What that pins is the allowlisting of the structured metadata Fusion composes, and nothing else: a prompt, a report,
+ * a model id and a tool name are the run's own text and are kept as the run gave them.
+ */
+const PLANTED: Record<string, unknown> = {
+	authPath: "/dummy/auth-DUMMYAUTHPATH.json",
+	modelsPath: "/dummy/models-DUMMYMODELSPATH.json",
+	apiKey: "sk-DUMMYAPIKEY-0123456789",
+	access: "DUMMYACCESSTOKEN-0123456789",
+	refresh: "DUMMYREFRESHTOKEN-0123456789",
+	credential: { provider: "dummy", store: "/dummy/store-DUMMYSTOREPATH.json", apiKey: "sk-DUMMYNESTEDKEY-0123456789", expiresAt: 4_102_444_800_000 },
+};
+
+/** Every planted value, each unmistakable, so a match is a leak rather than a word two things happen to share. */
+const PLANTED_VALUES = ["DUMMYAUTHPATH", "DUMMYMODELSPATH", "DUMMYAPIKEY", "DUMMYACCESSTOKEN", "DUMMYREFRESHTOKEN", "DUMMYSTOREPATH", "DUMMYNESTEDKEY", "sk-DUMMY"];
+
+/**
+ * A field the record does carry, planted in the same map as the fields it does not: the run's report. It is what keeps
+ * the absences below from being vacuous for good rather than by inspection — if the fake ever stopped applying that map
+ * to the terminal outcome, this value would not be in the persisted report and the test would fail there, instead of
+ * passing on a run that planted nothing. It is also the ordinary case the promise does not touch: a report is the run's
+ * own text and is recorded as the run gave it, never filtered.
+ */
+const PLANTED_REPORT = "planted-report-reaches-the-host";
+
+test("an outcome carrying metadata no backend reports reaches the branch, the history and the monitor as the fields they name and nothing more", async () => {
+	const dir = tempDir("pi-planted");
+	const sessionFile = path.join(dir, "host-1.jsonl");
+	await withEnv({ ...piEnv(), PI_FUSION_HISTORY: "1", PI_FUSION_HISTORY_DIR: dir }, async () => {
+		const pi = fakeBackend({ defaultEffort: "off", scripts: [{ extra: { ...PLANTED, text: PLANTED_REPORT }, costUsd: 0.5 }] });
+		const host = makeHost({ backends: both(pi), sessionFile });
+		const ran = await host.fusion({ role: "implement", task: "do the thing", backend: "pi" });
+		assert.equal(ran.error, undefined);
+		const ref = { backend: "pi", sessionId: "pi-1", sessionFile: "/sessions/pi-1.jsonl", checkpoint: "entry-1" };
+		const selection = { model: PI_MODEL, effort: "off" };
+
+		// The controls first, so the absences below are absences and not an empty record: the identity, the selection, the
+		// spend and the report the run really did produce are all where they belong, in all three places.
+		assert.deepEqual(host.entries(), [{ run: "run-1", role: "implement", backend: "pi", hostSessionId: "host-1", session: ref, selection }]);
+		const held = new History(dir).load("host-1").records.at(-1)!;
+		assert.deepEqual(held.ref, ref, "the history keeps the session the host validated");
+		assert.deepEqual(held.selection, selection);
+		assert.deepEqual(held.usage, { costUsd: 0.5, tokensIn: 10, tokensOut: 5, toolCalls: 2 });
+		assert.equal(held.state, "done");
+		// The report is the control that keeps every absence below honest: it is a supported field planted in the very map
+		// the unknown ones were planted in, so it is in the history only because that map reached the terminal outcome.
+		assert.equal(held.report, PLANTED_REPORT, "the planted report reached the history, so the map the rest was planted in was applied at all");
+		const detail = await monitorDetail(host, "run-1");
+		assert.deepEqual(detail.ref, ref, "and the monitor names the same session");
+		assert.equal(detail.text, PLANTED_REPORT, "and the monitor shows the same report, which is the run's own text and is not filtered");
+		assert.match(ran.text ?? "", new RegExp(PLANTED_REPORT), "as does what the host was told when the call returned");
+
+		// And now the planted fields, over everything each of the three actually holds rather than the keys it was asked for.
+		const historyFile = path.join(dir, "host-1.json");
+		const places: Array<[string, unknown]> = [
+			["the host branch entry", host.entries()],
+			["the history file", JSON.parse(fs.readFileSync(historyFile, "utf8"))],
+			["the monitor detail", detail],
+		];
+		for (const [what, value] of places) {
+			const text = JSON.stringify(value);
+			for (const key of Object.keys(PLANTED)) assert.ok(!text.includes(`"${key}"`), `${what} carries the planted field ${key}`);
+			for (const dummy of PLANTED_VALUES) assert.ok(!text.includes(dummy), `${what} carries the planted value ${dummy}`);
+		}
 	});
 });
 

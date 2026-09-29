@@ -8,6 +8,7 @@ import { fileURLToPath } from "node:url";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { visibleWidth } from "@earendil-works/pi-tui";
 import { CARD_REPORT_LINES } from "../extensions/cards.ts";
+import { PI_CHILD_MARKER, PI_CHILD_VARIABLE } from "../extensions/backends/pi-launch.ts";
 import fusion from "../extensions/fusion.ts";
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -378,6 +379,40 @@ test("role implement takes a direct task and records its run in the host session
 	assert.equal(appendedEntries, before + 1, "every run records its handle so the host can continue it");
 });
 
+test("a marked pi child registers nothing at all, and any other value registers the ordinary surface", () => {
+	/** What one call of the extension registered, whatever it registered it with. */
+	const registered = (marker: string | undefined) => {
+		const seen = { tools: [] as string[], commands: [] as string[], events: [] as string[], renderers: [] as string[], entries: 0 };
+		const recorder = {
+			registerTool: (tool: { name: string }) => seen.tools.push(tool.name),
+			registerCommand: (name: string) => seen.commands.push(name),
+			on: (event: string) => seen.events.push(event),
+			appendEntry: () => {
+				seen.entries++;
+			},
+			registerMessageRenderer: (customType: string) => seen.renderers.push(customType),
+		} as unknown as ExtensionAPI;
+		const before = process.env[PI_CHILD_VARIABLE];
+		if (marker === undefined) delete process.env[PI_CHILD_VARIABLE];
+		else process.env[PI_CHILD_VARIABLE] = marker;
+		try {
+			fusion(recorder);
+		} finally {
+			if (before === undefined) delete process.env[PI_CHILD_VARIABLE];
+			else process.env[PI_CHILD_VARIABLE] = before;
+		}
+		return seen;
+	};
+	const host = registered(undefined);
+	assert.ok(host.tools.length && host.commands.length && host.events.length && host.renderers.length, "an unmarked host registers the tools, the command, the handlers and the renderer");
+	// The marker `piLaunch` sets, read from the module that sets it: nothing is registered and nothing is thrown, which
+	// is what a child needs — a throw here would fail the child's own startup instead of leaving it its role's tools.
+	assert.deepEqual(registered(PI_CHILD_MARKER), { tools: [], commands: [], events: [], renderers: [], entries: 0 });
+	for (const marker of ["", "1", "claude", "PI", "pi ", "0"]) {
+		assert.deepEqual(registered(marker), host, `marker ${JSON.stringify(marker)} changed what the extension registers, and only the pi marker means anything`);
+	}
+});
+
 test("the contracts carry the escalation and route sections the tool promises", () => {
 	const contract = (name: string) => fs.readFileSync(path.join(repoRoot, "contracts", name), "utf8");
 	const implement = contract("implement.md");
@@ -397,6 +432,38 @@ test("the contracts carry the escalation and route sections the tool promises", 
 		assert.ok(!/multi-file|one small task/i.test(contract(name)), `${name} still routes by file count`);
 		assert.ok(!/fable_consolidate|opus_implement|fable_implement|workhorse|consolidator/.test(contract(name)), `${name} still uses an old name`);
 	}
+});
+
+test("the four common contracts read as prose any backend's child can run, and say the same things they said", () => {
+	const contract = (name: string) => fs.readFileSync(path.join(repoRoot, "contracts", name), "utf8");
+	const common = ["plan.md", "implement.md", "ask-answer.md", "ask-review.md"];
+	for (const name of common) {
+		const text = contract(name);
+		// A vendor, a model or a harness's own tool name: a Pi child runs this prose too, and none of these mean
+		// anything to it. `contracts/ultracode.md` is Claude's alone and is not in this list.
+		for (const named of [/Claude/i, /\bOpus\b/i, /\bFable\b/i, /\bAstra\b/i, /\bGPT/i, /\bGlob\b/, /WebSearch/, /WebFetch/, /AskUserQuestion/]) {
+			assert.ok(!named.test(text), `${name} still names ${named.source}`);
+		}
+		assert.match(text, /ask_orchestrator/, `${name} no longer says how a child asks its question`);
+	}
+	// What replaced a named tool still names a capability, so no rule lost the thing it was about. `implement.md` is
+	// not in this list: it never named a tool, and it still verifies with the commands the task names.
+	for (const name of ["plan.md", "ask-answer.md", "ask-review.md"]) {
+		assert.match(contract(name), /your (shell|search|file-editing) tools?/, `${name} names no tool a child of any backend has`);
+	}
+	// The rules each contract is relied on for, kept word for word where a caller or a test reads them.
+	assert.match(contract("plan.md"), /Do not implement the plan and do not change the project's source, tests or configuration/);
+	assert.match(contract("plan.md"), /scratch files/, "the plan contract still bounds what it may write");
+	assert.match(contract("implement.md"), /Stay inside the task's scope/);
+	assert.match(contract("implement.md"), /Do not commit\./);
+	assert.match(contract("implement.md"), /project's conventions and its agent instruction files/, "the implement contract still points at the project's own rules");
+	assert.match(contract("implement.md"), /start another coding session/, "the implement contract still refuses to start another session of its own");
+	for (const name of ["ask-answer.md", "ask-review.md"]) {
+		assert.match(contract(name), /Do not change files\. Do not use your shell tool to write, move or delete files, to change git state, to install packages or to start anything that keeps running\./, `${name} weakened its read-only rule`);
+	}
+	assert.match(contract("ask-answer.md"), /name the source/, "the answer contract still requires a source for a fact from outside the project");
+	assert.match(contract("ask-review.md"), /`git diff`, `git log`, the tests, a build or a type check/);
+	assert.match(contract("ultracode.md"), /AskUserQuestion/, "role ultracode is Claude's own and keeps the tool names it runs with");
 });
 
 test("role plan runs at xhigh in its own Claude Code session", async () => {

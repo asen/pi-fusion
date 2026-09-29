@@ -1,10 +1,12 @@
 import { isPiModel, PI_EFFORTS, type ResolvedSelection } from "./types.ts";
 
 /**
- * What a role runs as on the Pi backend: the model and thinking level a call resolves to, and the contract that role
- * has always run under. This is a binding, not an execution adapter: nothing here starts a child, reads a provider
- * configuration or knows Pi's protocol. Which models exist and which thinking levels one of them offers is the
- * adapter's check against the child; this module only settles what the call asks for and refuses what it cannot.
+ * What a role runs as on the Pi backend: the model and thinking level a call resolves to, the contract that role has
+ * always run under, and the tools and resources the role is made of. This is a binding, not an execution adapter:
+ * nothing here starts a child, reads a provider configuration or knows Pi's protocol, and the lists it hands back are
+ * plain names and plain paths — nothing is resolved against a directory, looked up on disk or fetched from anywhere.
+ * Which models exist and which thinking levels one of them offers is the adapter's check against the child; this
+ * module only settles what the call asks for and refuses what it cannot.
  */
 
 /** A Pi child's role. `effort` is absent when nothing named one, which leaves the child its own default. */
@@ -15,6 +17,14 @@ export interface PiRole {
 	effort?: string;
 	contract: string;
 	mode?: PiMode;
+	/** The tools this role's child runs with, as Pi names its own. Explicit: a role with no list gets none guessed for it. */
+	tools: string[];
+	/**
+	 * The local resources this role adds, as the call names them and no more: this build's roles name none, and a path
+	 * here is neither resolved nor read. What a composed path may be, and which forms are refused, is `pi-launch.ts`'s.
+	 */
+	extensions: string[];
+	skills: string[];
 }
 
 /** The roles this build binds on Pi. `security` is metadata until it has a contract and a binding of its own. */
@@ -23,6 +33,27 @@ export type PiRoleName = (typeof PI_ROLE_NAMES)[number];
 
 export const PI_MODES = ["answer", "review"] as const;
 export type PiMode = (typeof PI_MODES)[number];
+
+/**
+ * The tools each role's child runs with, as Pi names its own. `ask` reads, searches and runs commands and has no edit
+ * or write tool at all, which is what a review and an answer need; `plan` and `implement` get the standard coding set,
+ * the same shape their Claude bindings have always had.
+ */
+const PI_ROLE_TOOLS: Record<PiRoleName, readonly string[]> = {
+	plan: ["read", "bash", "edit", "write", "grep", "find", "ls"],
+	implement: ["read", "bash", "edit", "write", "grep", "find", "ls"],
+	ask: ["read", "bash", "grep", "find", "ls"],
+};
+
+/**
+ * The local resources each role adds. Empty for every role in this build, and named here rather than left out so that
+ * enabling one is an edit to a role's own metadata: a child loads the resources its role names and discovers none.
+ */
+const PI_ROLE_RESOURCES: Record<PiRoleName, { extensions: readonly string[]; skills: readonly string[] }> = {
+	plan: { extensions: [], skills: [] },
+	implement: { extensions: [], skills: [] },
+	ask: { extensions: [], skills: [] },
+};
 
 /** The contracts a Pi role runs under: the same prose the Claude roles run under, named here as metadata and no more. */
 const PI_CONTRACTS: Record<PiRoleName, string> = { plan: "plan.md", implement: "implement.md", ask: "ask-answer.md" };
@@ -106,11 +137,15 @@ export function piRole(call: PiCall, recorded?: ResolvedSelection, env: NodeJS.P
 	if (effort && !(PI_EFFORTS as readonly string[]).includes(effort.value)) {
 		throw new Error(`${effort.from} names effort ${JSON.stringify(effort.value)}, which is not a pi thinking level; use one of ${PI_EFFORTS.join(", ")}`);
 	}
+	// Each field is copied out of the tables, so nothing a caller does to the lists it gets back reaches the next call.
 	return {
 		name,
 		model: model.value,
 		...(effort ? { effort: effort.value } : {}),
 		contract: name === "ask" ? PI_ASK_CONTRACTS[mode] : PI_CONTRACTS[name],
 		...(name === "ask" ? { mode } : {}),
+		tools: [...PI_ROLE_TOOLS[name]],
+		extensions: [...PI_ROLE_RESOURCES[name].extensions],
+		skills: [...PI_ROLE_RESOURCES[name].skills],
 	};
 }

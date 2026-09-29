@@ -370,6 +370,106 @@ test("a claude entry that keeps its identity only in a session reference is refu
 	assert.deepEqual(intentFor(empty, "host-1"), { kind: "new" });
 });
 
+/*
+ * Metadata no outcome of any backend in this build reports, shaped like what a credential-aware one could: a path to
+ * an auth file, a path to a models file, a key, a token pair and a structured blob holding more of the same. A record
+ * is composed from the fields it names, so a decision must carry none of it, whichever backend and whichever verdict.
+ * What this pins is the allowlisting of the structured metadata Fusion composes; it is not redaction of a task, a
+ * report or a model name, which are the run's own text and are recorded as the run gave them.
+ */
+const EXTRA: Record<string, unknown> = {
+	authPath: "/dummy/auth-DUMMYAUTHPATH.json",
+	modelsPath: "/dummy/models-DUMMYMODELSPATH.json",
+	apiKey: "sk-DUMMYAPIKEY-0123456789",
+	access: "DUMMYACCESSTOKEN-0123456789",
+	refresh: "DUMMYREFRESHTOKEN-0123456789",
+	credential: { provider: "dummy", store: "/dummy/store-DUMMYSTOREPATH.json", apiKey: "sk-DUMMYNESTEDKEY-0123456789", expiresAt: 4_102_444_800_000 },
+};
+
+/** Every planted value that must appear in no entry, so a match is unmistakable rather than a plausible coincidence. */
+const DUMMIES = ["DUMMYAUTHPATH", "DUMMYMODELSPATH", "DUMMYAPIKEY", "DUMMYACCESSTOKEN", "DUMMYREFRESHTOKEN", "DUMMYSTOREPATH", "DUMMYNESTEDKEY", "sk-DUMMY"];
+
+/** The same outcome with that metadata on it, which no production backend composes and no reader of one expects. */
+const withExtra = (given: RunOutcome): RunOutcome => ({ ...given, ...EXTRA }) as RunOutcome;
+
+/** What a decision recorded, checked for the planted fields and values by key and by serialised text alike. */
+const carriesNoExtra = (what: string, entry: Record<string, unknown>): void => {
+	const text = JSON.stringify(entry);
+	for (const key of Object.keys(EXTRA)) assert.ok(!(key in entry), `${what} kept the planted field ${key}`);
+	for (const key of Object.keys(EXTRA)) assert.ok(!text.includes(`"${key}"`), `${what} kept the planted field ${key} somewhere inside it`);
+	for (const dummy of DUMMIES) assert.ok(!text.includes(dummy), `${what} kept the planted value ${dummy}`);
+};
+
+test("an outcome carrying metadata no backend reports records the supported fields and exactly those", () => {
+	const piEntryFields = { run: "run-1", role: "implement", backend: "pi", hostSessionId: "host-1" };
+	const claudeEntryFields = { run: "run-1", role: "implement", backend: "claude", hostSessionId: "host-1" };
+	const { checkpoint, ...identity } = PI_REF;
+	const claudeSource = { backend: "claude" as const, sessionId: "s-1", checkpoint: "c-1" };
+	const cases: Array<{ what: string; call: RecordCall; given: RunOutcome; entry: Record<string, unknown> }> = [
+		{
+			what: "a settled pi run",
+			call: piCall(),
+			given: withExtra(outcome({ session: PI_REF, selection: PI_SELECTION, contextTokens: 10, contextWindow: 100 })),
+			entry: { ...piEntryFields, session: PI_REF, selection: PI_SELECTION, contextTokens: 10, contextWindow: 100 },
+		},
+		{
+			what: "a first pi call that failed with an identity",
+			call: piCall(),
+			given: withExtra(outcome({ ok: false, session: identity, selection: PI_SELECTION })),
+			entry: { ...piEntryFields, session: identity, selection: PI_SELECTION },
+		},
+		{
+			what: "a pi fork that failed after its session existed",
+			call: piCall({ intent: FORK }),
+			given: withExtra(outcome({ ok: false, session: FORKED, selection: PI_SELECTION })),
+			entry: { ...piEntryFields, session: FORKED, selection: PI_SELECTION },
+		},
+		{
+			what: "a pi run that verified nothing",
+			call: piCall(),
+			given: withExtra(outcome({ ok: false })),
+			entry: piEntryFields,
+		},
+		{
+			what: "a settled claude run",
+			call: claudeCall(),
+			given: withExtra(outcome({ sessionId: "s-1", checkpoint: "c-1", contextTokens: 10, contextWindow: 100 })),
+			entry: { ...claudeEntryFields, sessionId: "s-1", checkpoint: "c-1", contextTokens: 10, contextWindow: 100 },
+		},
+		{
+			what: "a claude fork that failed",
+			call: claudeCall({ intent: { kind: "fork", from: claudeSource } }),
+			given: withExtra(outcome({ ok: false, sessionId: "s-2", checkpoint: "c-9" })),
+			entry: { ...claudeEntryFields, sessionId: "s-2", checkpoint: "c-1" },
+		},
+		{
+			what: "a claude review run",
+			call: claudeCall({ mode: "review", role: "ask" }),
+			given: withExtra(outcome({ sessionId: "s-1" })),
+			entry: { run: "run-1", role: "ask", backend: "claude", hostSessionId: "host-1", mode: "review", sessionId: "s-1" },
+		},
+	];
+	for (const one of cases) {
+		const decision = recordDecision(one.call, one.given);
+		assert.ok("entry" in decision, `${one.what}: expected an entry`);
+		// The positive control and the absence in one assertion: the entry is the supported fields, so nothing was planted
+		// in it and nothing legitimate was dropped to get there either.
+		assert.deepEqual(decision.entry, one.entry, one.what);
+		carriesNoExtra(one.what, decision.entry);
+	}
+	// A decision that records nothing, and one the host refuses, carry no planted field either: there is nothing to put it in.
+	assert.deepEqual(recordDecision(piCall({ intent: RESUME }), withExtra(outcome({ ok: false, session: PI_REF, selection: PI_SELECTION }))), { keep: true });
+	const refused = recordDecision(piCall(), withExtra(outcome({ session: PI_REF })));
+	assert.ok("invalid" in refused);
+	for (const dummy of DUMMIES) assert.ok(!refused.invalid.includes(dummy), `a refusal repeats the planted ${dummy}`);
+	// And the entry a settled pi run wrote reads back as the record it meant, with no planted field surviving the round trip.
+	const settled = recordDecision(piCall(), withExtra(outcome({ session: PI_REF, selection: PI_SELECTION })));
+	assert.ok("entry" in settled);
+	const record = only(settled.entry as Record<string, unknown>);
+	assert.deepEqual(record, { handle: "run-1", role: "implement", backend: "pi", hostSessionId: "host-1", session: PI_REF, selection: PI_SELECTION });
+	carriesNoExtra("the record a settled pi entry reads back as", record as unknown as Record<string, unknown>);
+});
+
 test("a claude outcome that knows its session only as a reference fails instead of recording a run with no session", () => {
 	const ref = { backend: "claude", sessionId: "s-1", checkpoint: "c-1" } as const;
 	for (const call of [claudeCall(), claudeCall({ prior: { handle: "run-1", role: "implement", backend: "claude", sessionId: "s-0" } })]) {

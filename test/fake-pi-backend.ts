@@ -43,10 +43,18 @@ export interface FakeScript {
 	/** The same, after the run has reported progress once: a backend that broke with a claim already in flight. */
 	throwsLate?: string;
 	/**
+	 * Fields set on the terminal outcome this run returns, over the ones a backend of this name would report. No
+	 * production backend has any of them: this is how a test plants what an outcome carrying unknown metadata would look
+	 * like — a credential-looking field, a path, a structured blob — so what the host composes from an outcome can be
+	 * shown to be the fields it names and nothing else. Test-only, and absent it changes nothing: a run without it
+	 * reports exactly what it reported before.
+	 */
+	extra?: Record<string, unknown>;
+	/**
 	 * What the run reports while it is still going, over what its outcome reports. A child can claim a session in
 	 * progress and return another, or none, and nothing the host has not checked may be kept from either.
 	 */
-	running?: Omit<FakeScript, "running" | "onAbort" | "questions" | "pending" | "throws" | "throwsLate" | "runningProgress" | "finalProgress">;
+	running?: Omit<FakeScript, "running" | "onAbort" | "questions" | "pending" | "throws" | "throwsLate" | "runningProgress" | "finalProgress" | "extra">;
 	/** False reports no progress at all, so the returned outcome is the only thing the host ever hears from the run. */
 	runningProgress?: boolean;
 	/** False leaves the settled outcome out of the progress stream, so the returned value is the only place it is. */
@@ -233,7 +241,9 @@ export function fakeBackend(options: FakeBackendOptions = {}): FakeBackend {
 					aborted = request.signal?.aborted === true;
 					// A run nobody let finish verified nothing, unless the script says what the child had already reported.
 					const merged: FakeScript = aborted ? { ...script, session: null, selection: null, ...script.onAbort, ...over } : { ...script, ...over };
-					return child(request.role, merged, { name, defaultEffort }, request.session?.intent, mine, aborted, 2);
+					const settled = child(request.role, merged, { name, defaultEffort }, request.session?.intent, mine, aborted, 2);
+					// Planted last and on the terminal outcome alone, so they are exactly what this backend would never report.
+					return merged.extra === undefined ? settled : { ...settled, ...merged.extra };
 				};
 				const result = await outcome();
 				// A backend need not announce its own settled outcome as progress, and a host that only reads the

@@ -174,12 +174,19 @@ test("a fusion call binds the role its backend owns: claude keeps its defaults, 
 	}
 });
 
+/**
+ * The tools and the empty resource lists every pi role carries, so a selection assertion stays about the selection.
+ * Which role gets which list is `test/pi-bootstrap.test.ts`'s, against the binding itself.
+ */
+const PI_CODING_METADATA = { tools: ["read", "bash", "edit", "write", "grep", "find", "ls"], extensions: [], skills: [] };
+const PI_ASK_METADATA = { tools: ["read", "bash", "grep", "find", "ls"], extensions: [], skills: [] };
+
 test("a pi role takes its model from the call, then the recorded selection, then its own variable", () => {
 	const recorded: ResolvedSelection = { model: "deepseek/deepseek-chat", effort: "medium" };
 	const env = piEnv({ PI_FUSION_PI_IMPLEMENT_MODEL: "openrouter/deepseek/deepseek-chat", PI_FUSION_PI_IMPLEMENT_EFFORT: "high" });
-	assert.deepEqual(piRole({ role: "implement" }, undefined, env), { name: "implement", model: "openrouter/deepseek/deepseek-chat", effort: "high", contract: "implement.md" });
-	assert.deepEqual(piRole({ role: "implement" }, recorded, env), { name: "implement", model: "deepseek/deepseek-chat", effort: "medium", contract: "implement.md" }, "the recorded selection wins over a variable that has changed");
-	assert.deepEqual(piRole({ role: "implement", model: "openai/gpt-5", effort: "max" }, recorded, env), { name: "implement", model: "openai/gpt-5", effort: "max", contract: "implement.md" });
+	assert.deepEqual(piRole({ role: "implement" }, undefined, env), { name: "implement", model: "openrouter/deepseek/deepseek-chat", effort: "high", contract: "implement.md", ...PI_CODING_METADATA });
+	assert.deepEqual(piRole({ role: "implement" }, recorded, env), { name: "implement", model: "deepseek/deepseek-chat", effort: "medium", contract: "implement.md", ...PI_CODING_METADATA }, "the recorded selection wins over a variable that has changed");
+	assert.deepEqual(piRole({ role: "implement", model: "openai/gpt-5", effort: "max" }, recorded, env), { name: "implement", model: "openai/gpt-5", effort: "max", contract: "implement.md", ...PI_CODING_METADATA });
 	// A call that overrides the model alone keeps the effort the run actually ran with, not the variable's.
 	assert.deepEqual(piRole({ role: "implement", model: "openai/gpt-5" }, recorded, env).effort, "medium");
 	assert.deepEqual(piRole({ role: "implement", effort: "low" }, recorded, env).model, "deepseek/deepseek-chat");
@@ -193,7 +200,7 @@ test("a pi role has no default model and no default level, and says which settin
 	assert.equal(piModelVariable("ask"), "PI_FUSION_PI_ASK_MODEL");
 	// An initial call with no level at all leaves the level to the child, which reports back what it ran with.
 	const initial = piRole({ role: "ask" }, undefined, { PI_FUSION_PI_ASK_MODEL: "deepseek/deepseek-chat" } as NodeJS.ProcessEnv);
-	assert.deepEqual(initial, { name: "ask", model: "deepseek/deepseek-chat", contract: "ask-answer.md", mode: "answer" });
+	assert.deepEqual(initial, { name: "ask", model: "deepseek/deepseek-chat", contract: "ask-answer.md", mode: "answer", ...PI_ASK_METADATA });
 	assert.equal(piRole({ role: "ask", mode: "review" }, undefined, { PI_FUSION_PI_ASK_MODEL: "deepseek/deepseek-chat" } as NodeJS.ProcessEnv).contract, "ask-review.md");
 });
 
@@ -467,7 +474,7 @@ test("a blank pi model or effort the call names is refused, and no recorded or c
 		assert.throws(() => piRole({ role: "implement", effort: blank }, recorded, env), /^Error: the call names an empty effort for the pi backend/, JSON.stringify(blank));
 	}
 	// Leaving the parameter out is what takes the recorded value, so the fallback was there and the blank call did not use it.
-	assert.deepEqual(piRole({ role: "implement" }, recorded, env), { name: "implement", model: "deepseek/deepseek-chat", effort: "medium", contract: "implement.md" });
+	assert.deepEqual(piRole({ role: "implement" }, recorded, env), { name: "implement", model: "deepseek/deepseek-chat", effort: "medium", contract: "implement.md", ...PI_CODING_METADATA });
 	assert.deepEqual(piRole({ role: "implement" }, undefined, env).model, "openrouter/deepseek/deepseek-chat");
 	// The claude binding keeps the behavior it has always had: a blank model is no model, and the role's default stands.
 	assert.equal(fusionCall({ role: "implement", task: "x", model: "  " }, records()).bound.model, "opus");
