@@ -23,6 +23,7 @@ import {
 	withinDirectory,
 } from "../extensions/backends/pi-bootstrap.mjs";
 import { HELPER_RETRY_NOTICE, HELPER_UNAVAILABLE } from "../extensions/backends/pi-helper-retry.mjs";
+import { QUESTION_TOOL_DESCRIPTION, QUESTION_TOOL_NAME, QUESTION_UNANSWERED, questionTool } from "../extensions/backends/pi-question-tool.mjs";
 import {
 	bootstrapInput,
 	type BootstrapInput,
@@ -343,6 +344,11 @@ function fakeSdk(models: string[] = ["deepseek/deepseek-chat"], fault: Fault = {
 			// active and a name outside it never becomes active, whichever extension registered it. `registry` stands
 			// for what an extension's factory body registered, which is in the registry before the session exists.
 			const registered = new Set([...BUILTIN_TOOLS, ...(fault.tools?.registry ?? [])]);
+			// A definition passed in `customTools` is in the registry under its own name, which is what the installed
+			// refresh does with one: it replaces a builtin of that name and adds one the registry did not have.
+			for (const definition of Array.isArray(options.customTools) ? options.customTools : []) {
+				if (typeof definition?.name === "string") registered.add(definition.name);
+			}
 			const allowed: string[] = Array.isArray(options.tools) ? options.tools : [];
 			const session: Record<string, unknown> = {
 				kind: "agent-session",
@@ -2242,6 +2248,137 @@ test("a search-tool factory this bootstrap cannot read is a compatibility refusa
 		});
 		assert.deepEqual(calls.session, [], `${one.what}: the session was never constructed`);
 	}
+});
+
+/*
+ * The question tool a call may ask for: what the composer writes, what the bootstrap refuses, what the constructor is
+ * handed, and what the definition itself does with one dialog. Nothing here runs a child, opens a dialog or maps a
+ * question to a host queue: the runner that would do that does not exist yet, and these cases are about the
+ * composition and the definition alone.
+ */
+
+test("a call that asks for questions runs the question tool, named once after the role's own list, and one that does not runs without it", () => {
+	const compose = (questions?: boolean): BootstrapInput => bootstrapInput({ role, storage: STORAGE, session: { kind: "new" }, contract: "# implement", ...(questions === undefined ? {} : { questions }) });
+	const quiet = compose();
+	assert.equal(quiet.questionTool, false, "the field is always written, so a child reads it rather than inferring the tool from a name in its list");
+	assert.deepEqual(quiet.tools, role.tools);
+	assert.equal(compose(false).questionTool, false);
+	const asking = compose(true);
+	assert.equal(asking.questionTool, true);
+	assert.deepEqual(asking.tools, [...role.tools, QUESTION_TOOL_NAME], "the role's own names in their own order, with the question tool after them");
+	assert.equal(asking.tools.filter((tool) => tool === QUESTION_TOOL_NAME).length, 1, "named once");
+	// A role that named it itself is not given it twice, and neither call writes to the list the binding handed over.
+	const named: PiRole = { ...role, tools: [...role.tools, QUESTION_TOOL_NAME] };
+	assert.deepEqual(bootstrapInput({ role: named, storage: STORAGE, session: { kind: "new" }, contract: "x", questions: true }).tools, named.tools);
+	assert.deepEqual(role.tools, piRole({ role: "implement", model: "deepseek/deepseek-chat", effort: "high" }, undefined, {}).tools, "the role's own list is what its binding named");
+});
+
+test("the question flag is a boolean or absent, and a call that asks for the tool without naming it is refused before the SDK is loaded", () => {
+	const refuses = (over: Partial<BootstrapInput>, expect: RegExp): void => {
+		assert.throws(
+			() => checkInput({ ...input(), ...over }),
+			(error: Error & { stage?: string }) => {
+				assert.equal(error.stage, "input", JSON.stringify(over));
+				assert.match(error.message, expect, JSON.stringify(over));
+				return true;
+			},
+			JSON.stringify(over),
+		);
+	};
+	for (const flag of ["true", "", 1, 0, null, {}, []]) refuses({ questionTool: flag as unknown as boolean }, /questionTool is not a boolean/);
+	// Absent is no question tool: an input hand-built before this field existed is a call that runs without it.
+	const { questionTool: _flag, ...without } = input();
+	const checked = checkInput(without);
+	assert.equal("questionTool" in checked, false, "nothing is filled in for it");
+	refuses({ questionTool: true }, /asks for the question tool and its tools do not name ask_orchestrator/);
+	assert.equal(checkInput(bootstrapInput({ role, storage: STORAGE, session: { kind: "new" }, contract: "x", questions: true })).questionTool, true, "the composed pair is what checks out");
+});
+
+test("a call that asks for questions passes the question tool to the constructor beside the wrapped search tools", async () => {
+	const asking = checkInput(bootstrapInput({ role, storage: STORAGE, session: { kind: "new" }, contract: "# implement", questions: true }));
+	const { sdk, calls } = fakeSdk();
+	const started = (await createRuntime(asking, sdk)) as { created: { session: { getActiveToolNames(): string[] } } };
+	assert.deepEqual(
+		(calls.session[0].customTools as Array<Record<string, any>>).map((one) => one.name),
+		["grep", "find", QUESTION_TOOL_NAME],
+		"the two wrapped builtins, then the one definition this composition adds a name for",
+	);
+	assert.deepEqual(calls.session[0].tools, asking.tools, "the allow list is the composed one, the question tool's name included");
+	assert.deepEqual(started.created.session.getActiveToolNames(), asking.tools, "a custom definition is in the registry, so the name the role runs with is active");
+	const definition = custom(calls, QUESTION_TOOL_NAME);
+	assert.deepEqual([definition.label, definition.description], ["Ask orchestrator", QUESTION_TOOL_DESCRIPTION]);
+	assert.equal(calls.helperFactories.length, 2, "and the search tools are composed exactly as they are for any other call");
+	// A call that asks for nothing is exactly what it was: the two wrapped search tools and no third definition.
+	const quiet = fakeSdk();
+	await createRuntime(input(), quiet.sdk);
+	assert.deepEqual(
+		(quiet.calls.session[0].customTools as Array<Record<string, any>>).map((one) => one.name),
+		["grep", "find"],
+	);
+});
+
+test("a call that names an extension gets no question tool either, and that extension's own registration is the way to have one", async () => {
+	await withDirAsync(async (root) => {
+		const file = path.join(root, "ext.ts");
+		fs.writeFileSync(file, "export default () => {};\n");
+		const asking = checkInput({ ...bootstrapInput({ role, storage: STORAGE, session: { kind: "new" }, contract: "# implement", questions: true }), extensions: [file] });
+		const { sdk, calls } = fakeSdk();
+		await assert.rejects(createRuntime(asking, sdk), (error: Error & { stage?: string }) => {
+			assert.equal(error.stage, "runtime");
+			assert.match(error.message, /does not have the tool ask_orchestrator this role runs with/, "the tool check refuses it by name rather than the call running without the tool its contract names");
+			return true;
+		});
+		assert.deepEqual(calls.session[0].customTools, [], "no custom tool of Fusion's goes in beside an explicit user extension, the question tool included");
+		// An extension that registers that tool in its factory body is what such a call runs on, and this composition
+		// overrides nothing of it.
+		const registering = fakeSdk(["deepseek/deepseek-chat"], { tools: { registry: [QUESTION_TOOL_NAME] } });
+		const started = (await createRuntime(asking, registering.sdk)) as { created: { session: { getActiveToolNames(): string[] } } };
+		assert.deepEqual(started.created.session.getActiveToolNames(), asking.tools);
+		assert.deepEqual(registering.calls.session[0].customTools, []);
+	});
+});
+
+test("the question tool asks one blocking dialog and answers with exactly what came back", async () => {
+	const definition = questionTool();
+	assert.deepEqual([definition.name, definition.label, definition.description], [QUESTION_TOOL_NAME, "Ask orchestrator", QUESTION_TOOL_DESCRIPTION]);
+	const asked: Array<{ title: unknown; placeholder: unknown; options: unknown }> = [];
+	/** One dialog as the extension ui answers it, recording what it was asked with by identity. */
+	const ui = (answer: string | undefined) => ({
+		input: async (title: unknown, placeholder?: unknown, options?: unknown): Promise<string | undefined> => {
+			asked.push({ title, placeholder, options });
+			return answer;
+		},
+	});
+	const signal = new AbortController().signal;
+	const answered = await definition.execute("toolu-1", { question: "which name?" }, signal, undefined, { ui: ui("the second one") });
+	assert.deepEqual(answered, { content: [{ type: "text", text: "the second one" }], details: undefined });
+	assert.deepEqual(asked, [{ title: "which name?", placeholder: undefined, options: { signal } }], "the question is the dialog's title, there is no placeholder, and the options carry the signal alone");
+	assert.equal((asked[0].options as { signal: AbortSignal }).signal, signal, "the call's own signal, by identity, so an abort dismisses that dialog");
+	// An empty answer is an answer: the host sent it, and nothing here turns it into a failure or a default.
+	asked.length = 0;
+	assert.deepEqual(await definition.execute("toolu-2", { question: "which name?" }, undefined, undefined, { ui: ui("") }), { content: [{ type: "text", text: "" }], details: undefined });
+	assert.deepEqual(asked, [{ title: "which name?", placeholder: undefined, options: undefined }], "no signal, and then no dialog options at all rather than one holding undefined");
+	// A dialog that produced no answer is one fixed failure, and the dialog is not opened a second time.
+	asked.length = 0;
+	await assert.rejects(definition.execute("toolu-3", { question: "which name?" }, undefined, undefined, { ui: ui(undefined) }), (error: Error) => {
+		assert.equal(error.message, QUESTION_UNANSWERED);
+		return true;
+	});
+	assert.equal(asked.length, 1, "one dialog per call: no retry, no second question and no timeout of its own");
+});
+
+test("the question tool is the name and the sentence the Claude backend's own question tool carries, and no builtin of this Pi", () => {
+	assert.equal(QUESTION_TOOL_NAME, "ask_orchestrator");
+	assert.equal(BUILTIN_TOOLS.includes(QUESTION_TOOL_NAME), false, "a custom definition replaces a builtin of the same name, and this name is no builtin's");
+	// Read as source rather than imported: importing the Claude backend here would pull its SDK into a file that
+	// builds nothing, and what has to hold is that the two files say the same thing to a child.
+	const claude = fs.readFileSync(path.join(repoRoot, "extensions", "backends", "claude.ts"), "utf8");
+	assert.ok(claude.includes(`export const QUESTION_TOOL = ${JSON.stringify(QUESTION_TOOL_NAME)};`), "the Claude backend names the same tool");
+	assert.ok(claude.includes(JSON.stringify(QUESTION_TOOL_DESCRIPTION)), "and describes it with the same sentence, because one contract tells both children to ask through it");
+	const schema = questionTool().parameters as unknown as { required: string[]; properties: { question: { type: string; description: string } } };
+	assert.deepEqual(schema.required, ["question"], "the question is the one parameter and it is required, so a call with none is not a question the host could answer");
+	assert.equal(schema.properties.question.type, "string", "and it is a string rather than a shape a host would have to interpret");
+	assert.ok(claude.includes(JSON.stringify(schema.properties.question.description)), "and asks for the question with the same words");
 });
 
 test("the thinking levels the bootstrap accepts are Pi's own, and nothing else is a level", () => {

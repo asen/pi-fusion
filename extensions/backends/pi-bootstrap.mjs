@@ -2,12 +2,21 @@ import { accessSync, constants, readFileSync, realpathSync, statSync } from "nod
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import { HELPER_UNAVAILABLE, withHelperRetry } from "./pi-helper-retry.mjs";
+import { QUESTION_TOOL_NAME, questionTool } from "./pi-question-tool.mjs";
 
 /**
  * The program a Pi child runs. Plain ESM on purpose: a node from `PATH` runs this file with no loader, no bundler and
- * no TypeScript step between them, and the only package it imports is the public Pi SDK installed beside it. There is
- * no stock CLI here, no migration, no private import, no provider client of its own and nothing it installs: a
- * missing or incompatible API is an actionable startup failure naming the version it found.
+ * no TypeScript step between them. Two packages reach it, both resolved from its own location and neither installed by
+ * it: the public Pi SDK, and `typebox` through `./pi-question-tool.mjs`, which is the schema language a public tool
+ * definition is written in and the same package the host's own tools are written against. Whether one copy of it ends
+ * up serving both is a package manager's business and is claimed nowhere here. There is no stock CLI, no migration, no
+ * private import, no provider client of its own and nothing it installs.
+ *
+ * The two reach it differently, and only one of them is reported. The SDK is loaded inside `loadSdk` and read by
+ * `checkSdk`, so a missing install or an incompatible API is an actionable startup failure naming the version it
+ * found. `typebox` is an ordinary static import of this module: a failure to resolve or evaluate it happens before
+ * `main` runs at all, which is node's own module error on stderr and no diagnostic of this bootstrap's, because there
+ * is no stage to report it in and nothing here catches it.
  *
  * Everything it composes is passed in. The host writes one input file and this reads it, so a child from another
  * install refuses a shape it does not know rather than guessing at it, and the SDK is a parameter to every function
@@ -243,6 +252,18 @@ export function checkInput(value, probe = resourceProbe) {
 	// it, so the list is not checked against Pi's builtins here. Whether each of these tools is actually on the session
 	// is checked where it can be, on the session the moment it exists, by `checkTools` below.
 	if (!Array.isArray(value.tools) || value.tools.length === 0 || !value.tools.every(isText)) throw new StartupError("input", "the call input names no tools; a role's tool list is explicit and is never inferred here");
+	// Absent is no question tool: an input composed before this field existed, or hand-built by a caller that cannot
+	// answer a question, is a call that runs without it rather than one this bootstrap decides for. A value that is
+	// neither absent nor a boolean is refused by its field alone, the way every other input rule names one.
+	if (value.questionTool !== undefined && typeof value.questionTool !== "boolean") {
+		throw new StartupError("input", "the call input's questionTool is not a boolean; whether a child runs the question tool is said outright or not at all");
+	}
+	if (value.questionTool === true && !value.tools.includes(QUESTION_TOOL_NAME)) {
+		throw new StartupError(
+			"input",
+			`the call input asks for the question tool and its tools do not name ${QUESTION_TOOL_NAME}; the role's list is the allow list the session is built with, so a tool outside it never becomes active however it was registered`,
+		);
+	}
 	if (!isText(value.contract)) throw new StartupError("input", "the call input carries no contract text; the child's prompt is Pi's own plus the role contract");
 	for (const field of ["extensions", "skills"]) {
 		if (!Array.isArray(value[field])) throw new StartupError("input", `the call input's ${field} is not a list`);
@@ -983,9 +1004,17 @@ export async function createRuntime(input, sdk) {
 			// registered — in its factory body or later, in `session_start` — and an explicit override is the whole point
 			// of naming an extension. No extension named, no override to lose; every role in this build names none, so
 			// the default call is the wrapped one. Nothing here reads what an extension registers: the resource checks
-			// above already refuse an extension this call did not name, and a bridge of Fusion's own will account for its
-			// own tools when there is one.
-			const customTools = input.extensions.length ? [] : helperRetryTools(sdk, cwd, input.tools);
+			// above already refuse an extension this call did not name.
+			//
+			// The question tool is under that same gate, and deliberately so: a call that names an extension gets no
+			// custom tool of Fusion's at all, rather than the question tool alone. That is the narrow rule, no Fusion
+			// custom tool beside any explicit user extension, because the alternative is this composition silently
+			// overriding a tool of that name the extension itself registered. A call that asks for questions and names
+			// an extension therefore starts only if that extension registers `ask_orchestrator` in its factory body, and
+			// `checkTools` below refuses it by name when nothing does. Every role in this build names no extension, so a
+			// call that asks for questions gets the built-in bridge; that is not a promise about every combination of
+			// resources and questions.
+			const customTools = input.extensions.length ? [] : [...helperRetryTools(sdk, cwd, input.tools), ...(input.questionTool ? [questionTool()] : [])];
 			return sdk.createAgentSessionFromServices({
 				services,
 				sessionManager: manager,

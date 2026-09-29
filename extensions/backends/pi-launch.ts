@@ -2,6 +2,7 @@ import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import type { LaunchOptions } from "../process-tree.ts";
 import type { PiRole } from "./pi-binding.ts";
+import { QUESTION_TOOL_NAME } from "./pi-question-tool.mjs";
 import { type CallStorage, JITI_CACHE_DIR, NODE_CACHE_DIR } from "./pi-storage.ts";
 import { piModelParts, type PiSessionRef } from "./types.ts";
 
@@ -11,7 +12,8 @@ import { piModelParts, type PiSessionRef } from "./types.ts";
  * user's. The input is one serializable record with a version on it, because the bootstrap is a separate program
  * reading a file rather than a function taking objects, and a version is how a child from another install says so.
  * The role's tools and resources come from the role: this module composes a call's own additions onto them and
- * decides what a resource path may be, and keeps no list of its own. What a composed path has to be on the machine it
+ * decides what a resource path may be, and keeps no list of its own — the one name it adds, for a call that asks for
+ * questions, is the question tool's own. What a composed path has to be on the machine it
  * names — there, readable, one file or one directory — is the bootstrap's own check, and every role in this build names
  * no resource at all, so a child of it loads none.
  */
@@ -71,6 +73,12 @@ export interface BootstrapInput {
 	/** Pi's own thinking level. Absent leaves the child the level the model comes with. */
 	thinkingLevel?: string;
 	tools: string[];
+	/**
+	 * Whether this call's child runs Fusion's own question tool. Always written, never absent: a child reads one field
+	 * rather than inferring the tool from a name in `tools`, which is a list the role owns. When it is true the tool's
+	 * own name is in `tools` as well, because the session's allow list is what makes a tool active at all.
+	 */
+	questionTool: boolean;
 	/** The role contract's prose, read by the host: the bootstrap appends this text and opens no contract file. */
 	contract: string;
 	/**
@@ -96,6 +104,12 @@ export interface BootstrapRequest {
 	 */
 	storage: CallStorage;
 	session: BootstrapSession;
+	/**
+	 * Whether this call's child may ask the host a question. Internal, for a caller inside Fusion: there is no
+	 * parameter, variable or setting a user turns it on through, and a runner asks for it when it has somewhere to send
+	 * a question. Absent is no question tool at all, which is what a call that cannot answer one composes.
+	 */
+	questions?: boolean;
 	/** The contract's prose, already read by the host. */
 	contract: string;
 	/**
@@ -150,13 +164,20 @@ const resourcePath = (field: "extensions" | "skills", index: number, value: stri
 const resources = (field: "extensions" | "skills", role: readonly string[], added: readonly string[] | undefined, cwd: string): string[] =>
 	[...role, ...(added ?? [])].map((entry, index) => resourcePath(field, index, entry, cwd));
 
-/** The tools the role names, or an error: a role with no list gets none guessed for it here or anywhere else. */
-const roleTools = (role: PiRole): string[] => {
+/**
+ * The tools the role names, or an error: a role with no list gets none guessed for it here or anywhere else. A call
+ * that asks for questions has the question tool's own name appended after the role's, once, because that list is the
+ * allow list the session is built with and a tool outside it never becomes active however it was registered. The
+ * role's own list is copied rather than changed, so a role that names the tool already is not given it twice and no
+ * caller's array is written to.
+ */
+const roleTools = (role: PiRole, questions: boolean): string[] => {
 	const tools = [...role.tools];
 	if (!tools.length) throw new Error(`role ${role.name} has no pi tool list; a role runs with the tools its binding names and none are inferred`);
 	tools.forEach((tool, index) => {
 		if (!tool.trim()) throw new Error(`role ${role.name} names a blank tool at tools[${index}]; a tool is named by the name Pi knows it as`);
 	});
+	if (questions && !tools.includes(QUESTION_TOOL_NAME)) tools.push(QUESTION_TOOL_NAME);
 	return tools;
 };
 
@@ -176,6 +197,7 @@ export function bootstrapInput(request: BootstrapRequest): BootstrapInput {
 	const contract = request.contract.trim();
 	if (!contract) throw new Error(`role ${request.role.name} has no contract text; the child's prompt is Pi's own plus this role's contract, so an empty one is a call with no contract`);
 	const cwd = absolute("the child's working directory", request.storage.cwd);
+	const questions = request.questions === true;
 	const extensions = resources("extensions", request.role.extensions, request.extensions, cwd);
 	const skills = resources("skills", request.role.skills, request.skills, cwd);
 	const session: BootstrapSession = request.session.kind === "new" ? { kind: "new" } : { ...request.session, file: absolute("a recorded session file", request.session.file) };
@@ -190,7 +212,8 @@ export function bootstrapInput(request: BootstrapRequest): BootstrapInput {
 		modelsStorePath: absolute("the model catalog store", request.storage.modelsStorePath),
 		model,
 		...(request.role.effort === undefined ? {} : { thinkingLevel: request.role.effort }),
-		tools: roleTools(request.role),
+		tools: roleTools(request.role, questions),
+		questionTool: questions,
 		contract,
 		extensions,
 		skills,
