@@ -263,8 +263,12 @@ function readSelection(role: PiRole, state: Record<string, unknown>): ResolvedSe
  * The baseline, from an answer that names the session this preparation verified and carries every field of it. No
  * equation between the fields is checked: which of them a compaction, a branch summary or a tool's own reported
  * usage moves is Pi's business, and a host that required them to add up would refuse a healthy session.
+ *
+ * It is exported because a later reading has to be read by exactly this grammar to be subtracted from this one: a
+ * task's own share of the statistics is a delta against a baseline, and two readers would make it a delta between two
+ * different things.
  */
-function readUsage(response: PiResponse, session: PiSessionRef): PiUsageBaseline | undefined {
+export function usageReading(response: PiResponse, session: PiSessionRef): PiUsageBaseline | undefined {
 	const data = answered(response);
 	if (!data) return undefined;
 	if (data.sessionId !== session.sessionId || data.sessionFile !== session.sessionFile) return undefined;
@@ -434,7 +438,7 @@ async function claimed(request: PiPrepareRequest, action: BootstrapSession, chil
 		const stats = await child.request({ type: "get_session_stats" });
 		stop = gate();
 		if (stop) return await settle(child, stop, watched);
-		const usage = readUsage(stats, session);
+		const usage = usageReading(stats, session);
 		if (usage === undefined) return await settle(child, refuse("usage"), watched);
 
 		// The last gate reads nothing new — no await stands between it and the one above — and it is here so that the
