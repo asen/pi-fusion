@@ -7,20 +7,62 @@
  *
  *   node test/spikes/pi-session-lifecycle.mjs [--case <name> | --case=<name>] [--keep] [--list]
  *
- * Every child is the public SDK bootstrap (never `dist/bundle/cli.js`), generated into a disposable
- * temp root that also holds HOME, the child's agent directory (PI_CODING_AGENT_DIR), the fake user profile
- * that models.json is read from, the fake project, the session directory, TMPDIR, the XDG directories and
- * both compile caches. The harness refuses to launch when any of those resolves outside the root: every
- * environment variable that names a path, and every path field of the bootstrap configuration (cwd,
- * agentDir, sessionDir, authPath, modelsPath, modelsStorePath), goes through the same check, and a
- * self-test before the first case proves that the refusal still fires and that the sentinel guard still
- * reports a modified file. The only model endpoint is a scripted loopback fixture server;
- * its recorded HTTP payloads, the session JSONL read back as evidence, and Pi's own RPC output are
- * the only things assertions are derived from.
+ * Two kinds of case live here, and their children are not the same program. The ten cases of `stage-a` and
+ * `stage-b` run a bootstrap this file generates: a runtime built only from the package's public exports
+ * (never `dist/bundle/cli.js`), with a bridge extension of the harness's own for the commands and the
+ * notifications those rows measure. The two cases of `production` run the real thing instead —
+ * `createPiBackend` from `extensions/backends/pi-backend.ts` over the production storage layout, bootstrap
+ * input, launch, transport, preparation, session restore, task turn, outcome mapping and process cleanup,
+ * with `extensions/backends/pi-bootstrap.mjs` as the child's own program. A production case still sets up through the
+ * same `setupCase` every other case uses, so this file's generated bridge, bootstrap and open-probe sources do exist
+ * in its case root — and a production child neither loads nor is ever pointed at one of them: the call input names the
+ * production bootstrap and no extension resource at all, and nothing in the group starts a generated child.
  *
- * Every assertion about Fusion's record rules is a SIMULATION of `extensions/fusion.ts`
- * (`recordRun`, `nextSession`) run by the in-harness ledger, and is labelled as such. Only the Pi
- * side — what the fork contains, what the leaf is, what goes out on the wire — is measured.
+ * Five seams of this harness's own are injected into that composition, and exactly one of them is wrapped around the
+ * launch: the host agent directory each case owns, the contract prose a call is given in place of the contract file
+ * this install ships, the start seam, the environment `productionEnv` composes, and the `onCall` report that module
+ * already keeps for a test. Everything else — the bounds, the bootstrap path, the storage, the task — is the shipped
+ * default. The start seam is there for three things: the offline precondition and the containment checks below, which
+ * is where a production call's own composed environment and paths are held to their rules, and registering the child's
+ * pid in this harness's registry, which it can only do once `startPiChild` has handed that child back. It rewrites no
+ * command, no argument and no bootstrap, and it calls the production `startPiChild` itself — so the default start
+ * binding, which is what a call passing no seam would take, is measured by nothing here.
+ *
+ * What the network shape of a production case is, and what it is not. A production call passes no question callback,
+ * so no child of one runs the question tool; the host agent directory a production case composes holds one
+ * `models.json` naming the loopback fixture, one `AGENTS.md` sentinel and no `auth.json` at all; no provider variable,
+ * no credential of the user's and no paid model is anywhere in it; the environment the composition composed has to
+ * carry `PI_OFFLINE=1` exactly or this harness refuses to launch the child; and the call input composes no catalog
+ * base url. The loopback fixture server is network, and it is the only model endpoint this harness configures. That is
+ * a set of preconditions and composed defaults and nothing more: there is no sandbox here, no fetch guard, no egress
+ * boundary and no observation of what a child's process actually opens, so nothing in this group is evidence that a Pi
+ * child could not reach another endpoint through another client, or ignore the offline switch entirely.
+ *
+ * The one window that registration leaves open, named rather than designed around: between the transport spawning a
+ * production child and `startPiChild` resolving, that child's pid is in no registry of this harness's, so an interrupt
+ * inside it leaks the process instead of killing it. It is not the window the pid-file sweep closes and nothing here
+ * closes it the same way — a sweep works because the fixture commands of row 6 write their pids to files it can read,
+ * and a production child writes no such file. It is bounded by the transport's own startup bound and by nothing else,
+ * and closing it would need a seam inside the transport, which this harness does not add.
+ *
+ * Every child of either kind runs in a disposable temp root that also holds HOME, the child's agent directory, the
+ * fake project, the session directory, TMPDIR, the XDG directories and both compile caches. The fake user profile
+ * models.json is read from belongs to the generated-bootstrap cases; a production child reads the host agent
+ * directory's own models.json instead, and that fake profile is a directory nothing in the group points at. The
+ * harness refuses to launch when any of those resolves outside the root: every environment variable that names a path,
+ * every path field of the generated bootstrap's configuration, and, for a production call, every path-valued variable
+ * of the environment its launch composed together with every path field of its own call input (cwd, agentDir,
+ * sessionDir, authPath, modelsPath, modelsStorePath, and the recorded session file a continuation reopens) goes
+ * through the same check, and a self-test before the first case proves that the refusal still fires and that the
+ * sentinel guard still reports a modified file. The only model endpoint is a scripted loopback fixture server; its
+ * recorded HTTP payloads, the session JSONL read back as evidence, and Pi's own RPC output are the only things
+ * assertions are derived from.
+ *
+ * In the ten generated-bootstrap cases every assertion about Fusion's record rules is a SIMULATION of
+ * `extensions/fusion.ts` (`recordRun`, `nextSession`) run by the in-harness ledger, and is labelled as such.
+ * Only the Pi side — what the fork contains, what the leaf is, what goes out on the wire — is measured. The
+ * two `production` cases simulate nothing: what a run publishes there is `extensions/backends/pi-outcome.ts`'s
+ * own answer, and the ledger takes no part in them.
  *
  * Exit codes: 0 when every selected case is a measured pass, 1 when any case failed or is unproven, and 2
  * whenever no case ran at all — an unmatched or valueless `--case` in either spelling, an unrecognised
@@ -33,6 +75,15 @@ import * as http from "node:http";
 import * as os from "node:os";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
+// The production composition the `production` group drives, imported from the extension itself: nothing here
+// reimplements a part of it, and a call that stopped being composable this way fails the group rather than being
+// worked around in it. Node runs this .mjs and these .ts modules under the same type stripping `npm test` uses.
+import { createPiBackend } from "../../extensions/backends/pi-backend.ts";
+import { piRole } from "../../extensions/backends/pi-binding.ts";
+import { PI_BOOTSTRAP_PATH } from "../../extensions/backends/pi-launch.ts";
+import { piPaths } from "../../extensions/backends/pi-storage.ts";
+import { PI_BOUNDS, startPiChild } from "../../extensions/backends/pi-transport.ts";
+import { failed } from "../../extensions/backends/types.ts";
 
 // The package publishes only an "import" condition, so require.resolve cannot find it; resolve the
 // public entry point the way an ESM importer does.
@@ -45,7 +96,7 @@ const piVersion = JSON.parse(fs.readFileSync(path.join(packageRoot, "package.jso
  * spelling of `--case` reaches the same place. Absent is undefined; `--case` with a missing, flag-shaped or
  * empty value is the empty string, which names no case; both `--case x` and `--case=x` are the same
  * argument; and anything unrecognised is collected rather than ignored, because an ignored `--case=nope`
- * would run all nine cases and exit 0 for a command line that named nothing.
+ * would run every case in the catalogue and exit 0 for a command line that named nothing.
  */
 function parseArgv(args) {
 	const parsed = { onlyCase: undefined, keep: false, list: false, unknown: [] };
@@ -80,6 +131,48 @@ const PROJECT_CONTEXT_SENTINEL = "SPIKE-PROJECT-CONTEXT-SENTINEL";
 /** An id that generateId() cannot produce (it emits 8 hex characters), so it is always absent. */
 const ABSENT_ENTRY_ID = "zzzzzzzz";
 
+/**
+ * The sentinel of the host agent directory a production case composes. It is a directory Pi never reads a context
+ * file from — the child's own agent directory is the one `piPaths` puts under it — so its presence in a system prompt
+ * would mean the layout sent a child somewhere it was not meant to look. It is its own constant rather than the fake
+ * user profile's, so the two absences the production cases check are told apart.
+ */
+const PROD_HOST_AGENT_SENTINEL = "SPIKE-PROD-HOST-AGENT-CONTEXT-SENTINEL";
+/** The contract prose a production call is given, in place of the file this install ships, and the sentinel in it. */
+const PROD_CONTRACT_SENTINEL = "PROD-CONTRACT-SENTINEL";
+const PROD_CONTRACT = `# implement\nDo the task.\n${PROD_CONTRACT_SENTINEL}`;
+/** The one model and thinking level a production call asks for, named exactly and resolved by nothing. */
+const PROD_MODEL = `${FIXTURE_PROVIDER}/${FIXTURE_MODEL}`;
+const PROD_EFFORT = "medium";
+/**
+ * The stage diagnostics `extensions/backends/pi-bootstrap.mjs` writes on a child that got as far as serving: input,
+ * sdk, runtime and serving, the last of them named. A count that is not four is a startup that took another path.
+ */
+const PROD_STAGE_COUNT = 4;
+const PROD_LAST_STAGE = "serving";
+/**
+ * The one value `PI_OFFLINE` may have in the environment a production launch composed, checked before that launch
+ * happens and a refusal when it is anything else. It is exact rather than truthy because Pi's own runtime, read in
+ * 0.85.1's source, asks whether the variable is set at all, so `0` and an empty string are as offline as `1` there
+ * while meaning the opposite to a reader here; requiring the literal keeps the harness's own switch unambiguous.
+ *
+ * What this is: a precondition of this harness, refusing to start a child it was not able to configure this way. What
+ * it is not, and no case here may be read as: a network sandbox, an egress boundary or a fetch guard. Nothing in this
+ * group observes or restricts what a child's own process actually opens, so it is no evidence that a Pi child could
+ * not reach another endpoint through another client, or ignore this switch entirely.
+ */
+const PROD_REQUIRED_OFFLINE = "1";
+/**
+ * The fixed sentence `extensions/backends/pi-outcome.ts` maps a restore that refused on its postcondition to. It is
+ * written out here rather than imported, so that a change to that text fails the case that asserts on it instead of
+ * following it silently.
+ */
+const PROD_CHECKPOINT_REFUSAL = "the pi child did not read back as standing at the recorded checkpoint";
+/** How much of a run's own text a printed summary carries. A summary is a preview, never the answer. */
+const PROD_TEXT_PREVIEW_CHARS = 120;
+/** How far a computed cost and the one Pi reported may differ before the arithmetic below is called wrong. */
+const PROD_COST_EPSILON = 1e-9;
+
 /** models.json cost fields, so a printed cost has a stated provenance instead of reading as "free". */
 const MODEL_COST = { input: 1, output: 2, cacheRead: 0.1, cacheWrite: 1.25 };
 const MODEL_CONTEXT_WINDOW = 200_000;
@@ -89,6 +182,24 @@ const COMMAND_DEADLINE_MS = 30_000;
 const SETTLE_DEADLINE_MS = 90_000;
 const EXIT_DEADLINE_MS = 10_000;
 const GLOBAL_DEADLINE_MS = 10 * 60_000;
+/**
+ * How long one whole production call — a child started, prepared, restored where the intent asks for one, prompted and
+ * stopped — may take before the case fails. It is arithmetic over the transport's own default timers rather than a
+ * number anybody liked the look of, and it is derived from `PI_BOUNDS` itself so that a default which changes carries
+ * this with it: a production call is given no bounds of its own and runs on exactly those defaults.
+ *
+ * The terms are a startup, the acknowledgement of a prompt, one further request and one shutdown step, added rather
+ * than maximised, plus the harness's own exit deadline as the margin. So it sits above each of those individual
+ * production bounds and below `GLOBAL_DEADLINE_MS`, which stays the ultimate deadline that ends the whole run.
+ *
+ * What the arithmetic is not is an upper bound on a legitimate call. One call issues several requests and waits for a
+ * settle — a restore alone sends a state read, a command list, the control prompt and two readbacks, and the turn
+ * after it can compact or retry inside its own acknowledgement bound — so a perfectly healthy call can take longer
+ * than these four terms added together. This is therefore the harness's own patience and never a verdict about the
+ * transport or the child: when it fires, the call is cancelled through its own signal and then awaited, and what the
+ * case says is that the call did not come back inside that patience.
+ */
+const PROD_CALL_DEADLINE_MS = PI_BOUNDS.startupMs + PI_BOUNDS.ackMs + PI_BOUNDS.requestMs + PI_BOUNDS.shutdownStepMs + EXIT_DEADLINE_MS;
 /** "agent_settled was last" is only a claim about a window: nothing can be observed in zero time. */
 const SETTLE_QUIET_MS = 1500;
 
@@ -227,8 +338,14 @@ function writeChildConfig(root, file, config) {
 	return file;
 }
 
-/** Every writable location a child knows about is inside the temp root, and that is checked before launch. */
-function childEnv(root, { agentDir, sessionDir }) {
+/**
+ * The variables every child of this harness gets, whichever composition names the rest of them: the owned HOME, temp,
+ * XDG and cache directories, the offline and quiet switches, and the dummy key the fixture accepts. `extra` is for the
+ * variables one composition names and another does not, and it is spread where those variables have always sat, so it
+ * goes through the same containment check and the same owned-directory creation as everything around it — which is the
+ * whole point of there being one function for this.
+ */
+function baseChildEnv(root, extra = {}) {
 	const env = {
 		PATH: process.env.PATH ?? "/usr/bin:/bin",
 		HOME: path.join(root, "home"),
@@ -242,8 +359,7 @@ function childEnv(root, { agentDir, sessionDir }) {
 		XDG_STATE_HOME: path.join(root, "xdg", "state"),
 		NODE_COMPILE_CACHE: path.join(root, "node-compile-cache"),
 		JITI_FS_CACHE: path.join(root, "jiti-cache"),
-		PI_CODING_AGENT_DIR: agentDir,
-		PI_CODING_AGENT_SESSION_DIR: sessionDir,
+		...extra,
 		PI_OFFLINE: "1",
 		PI_SKIP_VERSION_CHECK: "1",
 		PI_TELEMETRY: "0",
@@ -258,6 +374,21 @@ function childEnv(root, { agentDir, sessionDir }) {
 	}
 	return env;
 }
+
+/** Every writable location a child knows about is inside the temp root, and that is checked before launch. */
+function childEnv(root, { agentDir, sessionDir }) {
+	return baseChildEnv(root, { PI_CODING_AGENT_DIR: agentDir, PI_CODING_AGENT_SESSION_DIR: sessionDir });
+}
+
+/**
+ * The environment a production call's child is composed from: the same base, and deliberately without
+ * `PI_CODING_AGENT_DIR` and `PI_CODING_AGENT_SESSION_DIR` in it. `childEnvironment` in
+ * `extensions/backends/pi-launch.ts` writes the first itself, from the call's own storage, and the session directory
+ * reaches a production child through the call input rather than through a variable — so naming either here would hide
+ * the composition this group exists to measure behind a value the harness had already chosen. Everything that is left
+ * is the owned one: the directories inside the root, an offline child, a quiet one, and the dummy fixture key.
+ */
+const productionEnv = (root) => baseChildEnv(root);
 
 /* ------------------------------------------------------------- fixture server */
 
@@ -1335,14 +1466,42 @@ function guardSentinel(result, sentinel) {
 	result.say(`${sentinel.label}: ${now === sentinel.hash ? "unchanged" : `changed (${now})`}`);
 }
 
+/** How many managed-subtree paths a summary names before it says how many more there were. */
+const MANAGED_SUMMARY_MAX = 6;
+
+/**
+ * A directory a case owns whose own root must stay as the case left it, with exactly one subtree the code under test
+ * manages. Everything created, modified or removed at or below that subtree is the thing being measured and is
+ * summarised; anything else in the root — an `auth.json`, a settings file, a `bin`, a stray sibling of any kind — is a
+ * failure and is named, because a root sibling is a file the code under test wrote where this case gave it nothing.
+ *
+ * It is a diff of the whole root rather than a check on a list of names, so a sibling nobody thought of is caught too.
+ */
+function guardManagedRoot(result, guard) {
+	const diff = diffSnapshots(guard.before, snapshot(guard.dir));
+	const prefix = `${guard.managed}${path.posix.sep}`;
+	const managed = (rel) => rel === guard.managed || rel.startsWith(prefix);
+	const signed = [...diff.created.map((rel) => ({ rel, text: `+${rel}` })), ...diff.modified.map((rel) => ({ rel, text: `~${rel}` })), ...diff.removed.map((rel) => ({ rel, text: `-${rel}` }))];
+	const outside = signed.filter((entry) => !managed(entry.rel)).map((entry) => entry.text);
+	const inside = signed.filter((entry) => managed(entry.rel)).map((entry) => entry.text);
+	result.check(outside.length === 0, `${guard.label} changed outside ${guard.managed}, which this case wrote nothing into: ${outside.join(" ")}`);
+	const shown = inside.slice(0, MANAGED_SUMMARY_MAX).join(" ");
+	const more = inside.length > MANAGED_SUMMARY_MAX ? ` and ${inside.length - MANAGED_SUMMARY_MAX} more` : "";
+	result.say(`${guard.label}: ${outside.length} change(s) outside ${guard.managed}, ${inside.length} at or below it${inside.length === 0 ? "" : ` (${shown}${more})`}`);
+}
+
 /**
  * The sentinel check the runner owes every case, on the failure path as much as on the success path:
  * a case that threw halfway is the one most likely to have written where it promised not to.
+ *
+ * `dirs.managed` is optional and only a production case sets one, so every case written before it is checked exactly
+ * as it always was.
  */
 function guardOpenCases(result) {
 	for (const dirs of openCases.splice(0)) {
 		guardUnchanged(result, "fake user profile", dirs.profileBefore, dirs.profile);
 		guardUnchanged(result, "fake project", dirs.projectBefore, dirs.project);
+		if (dirs.managed !== undefined) guardManagedRoot(result, dirs.managed);
 		for (const sentinel of dirs.sentinels) guardSentinel(result, sentinel);
 	}
 }
@@ -3109,6 +3268,679 @@ async function caseCompactionCheckpoint(root, server, result) {
 	result.check(server.unscripted.length === 0, `the fixture saw ${server.unscripted.length} unscripted request(s)`);
 }
 
+/* ------------------------------------------------------------ the production group */
+
+/**
+ * The two cases below drive the real backend rather than a stand-in for it: `createPiBackend` with five seams of this
+ * harness's own — the host agent directory this case owns, the contract prose in place of the file this install ships,
+ * the wrapped start described in the file header, the environment `productionEnv` composes, and the `onCall` report
+ * that module already keeps for a test — and production's own everything else. No bounds, no cleanup, no bootstrap
+ * path, no storage and no task are passed, so each of those is the shipped default. The storage layout, the bootstrap
+ * input, the launch, the transport, the preparation, the session
+ * restore, the task turn, the outcome mapping and the process cleanup are all the shipped ones, the child's program is
+ * `extensions/backends/pi-bootstrap.mjs`, and the SDK behind it is this repository's Pi.
+ *
+ * What that buys, and what it does not. It measures this composition against a real child: which requests one call
+ * sends, what a restore of a recorded checkpoint does to a real transcript, what a fork of one contains, what the
+ * outcome mapping then publishes, and whether the child and its storage are actually gone afterwards. It measures
+ * nothing about a real provider, a real credential or a paid model: the loopback fixture is the only model endpoint
+ * configured, the composed child environment must carry `PI_OFFLINE=1` exactly before a launch happens, and neither of
+ * those is a sandbox or evidence about what a child could reach by another route. It changes no policy either: the exact-leaf gate, the record rules and the retention rules are the shipped ones, and a
+ * refusal is reported as the composition reported it rather than worked around here.
+ */
+
+/** Session files of this case's own durable session directory, sorted, or nothing at all while there are none. */
+function sessionFiles(prod) {
+	try {
+		return fs
+			.readdirSync(prod.paths.sessionDir)
+			.filter((name) => name.endsWith(".jsonl"))
+			.sort();
+	} catch {
+		return [];
+	}
+}
+
+/** What is left in the layout's own calls directory, which after a call that ended cleanly is nothing. */
+function callDirs(prod) {
+	try {
+		return fs.readdirSync(prod.paths.callsDir).sort();
+	} catch {
+		return [];
+	}
+}
+
+/** The user message of a turn, found by the prompt it carries, which is how a case names an entry it never chose. */
+const userEntry = (entries, text) =>
+	entries.find((entry) => entry.type === "message" && entry.message?.role === "user" && messageText(entry.message).includes(text));
+
+/** An entry's own ancestry inside one transcript, oldest first, the entry itself included. */
+function ancestryOf(entries, id) {
+	const byId = new Map(entries.filter((entry) => entry.type !== "session").map((entry) => [entry.id, entry]));
+	const line = [];
+	for (let current = byId.get(id); current; current = current.parentId ? byId.get(current.parentId) : undefined) line.unshift(current);
+	return line;
+}
+
+/**
+ * What `MODEL_COST` prices one fixture usage chunk at, read as a price per million tokens, which is how a models.json
+ * cost is stated. The fixture sends no cache tokens, so only the two rates that matter are in it.
+ */
+const fixtureCost = (usage) => (usage.prompt_tokens * MODEL_COST.input + usage.completion_tokens * MODEL_COST.output) / 1_000_000;
+
+/**
+ * One production call under the harness's patience, and what running out of it does: the call is cancelled through its
+ * own signal — the same `AbortSignal` a real host hands a run, and the only way to end one from outside — and then
+ * awaited to the end, so the composition performs its own shutdown and cleanup before this reports anything. A case
+ * that fails this way therefore leaves nothing of its call running, and no later case starts beside an abandoned child
+ * writing into a temp root somebody else now owns.
+ *
+ * It never races the call and never abandons it: the same promise is awaited on both paths, which is also why there is
+ * no unhandled rejection to mop up. A call that ignores its own cancellation is left to `GLOBAL_DEADLINE_MS`, which
+ * stays the ultimate bound on the whole run.
+ *
+ * Nothing is cancelled unless the patience actually runs out: a call that answers in time was never signalled, and the
+ * error a timed-out call is reported with keeps whatever that call did after the cancellation.
+ */
+async function withinDeadline(what, controller, work, ms = PROD_CALL_DEADLINE_MS) {
+	let fired = false;
+	const timer = setTimeout(() => {
+		fired = true;
+		controller.abort();
+	}, ms);
+	let outcome;
+	try {
+		// Settled rather than raced: the value and the rejection are both taken, so the wait below is the whole call.
+		outcome = await work.then((value) => ({ ok: true, value }), (error) => ({ ok: false, error }));
+	} finally {
+		clearTimeout(timer);
+	}
+	if (!fired) {
+		if (outcome.ok) return outcome.value;
+		throw outcome.error;
+	}
+	const after = outcome.ok ? "it reported a run afterwards" : `it rejected afterwards with ${outcome.error instanceof Error ? outcome.error.message : String(outcome.error)}`;
+	throw new Error(`${what} had not come back inside the harness's patience of ${ms}ms, so it was cancelled through its own signal and awaited to the end: ${after}`);
+}
+
+/**
+ * One production case's own ground: the directories, sentinels and guards every case has, plus the host agent
+ * directory this one gives the backend. When the case starts that directory holds exactly two files — one
+ * `models.json` naming the loopback fixture, which is the one a production child reads, and one `AGENTS.md` whose
+ * sentinel must never reach a system prompt — and no `auth.json` at all, which is what sends the production storage to
+ * a private credential path inside the call's own directory. The layout underneath it is production's: `piPaths`
+ * computes it here so the case can look at what the call actually made.
+ *
+ * `setupCase` also writes this file's generated bridge, bootstrap and open-probe sources into the case root, because
+ * every case goes through it. A production case names none of them and starts no child from any of them; they sit
+ * there unread.
+ *
+ * The root itself is snapshotted after those two files are written, and `dirs.managed` is what the runner then diffs it
+ * against in its `finally`: the Fusion-owned subtree `piPaths` puts under this directory is allowed to appear and
+ * change, and anything else in the root — a credential file, a settings file, a helper `bin` — fails the case and is
+ * named. The subtree's own name is read back from `piPaths` rather than written out here, so it cannot drift from the
+ * layout it is meant to describe.
+ */
+function setupProductionCase(root, server, name) {
+	const dirs = setupCase(root, server, name);
+	const hostAgent = assertInsideRoot(root, "production host agent directory", path.join(dirs.caseRoot, "host-agent"));
+	fs.mkdirSync(hostAgent, { recursive: true });
+	const paths = piPaths(hostAgent, dirs.project);
+	writeJson(paths.userModelsPath, modelsJson(server.baseUrl));
+	write(path.join(hostAgent, "AGENTS.md"), `# Host agent directory context\n\n${PROD_HOST_AGENT_SENTINEL}\n`);
+	trackSentinel(dirs, "production host agent models.json", paths.userModelsPath);
+	trackSentinel(dirs, "production host agent AGENTS.md", path.join(hostAgent, "AGENTS.md"));
+	if (fs.existsSync(paths.userAuthPath)) throw new Error(`refusing to run: ${paths.userAuthPath} exists, so this case would point a child at a credential file it did not write`);
+	dirs.managed = { label: "production host agent root", dir: hostAgent, managed: path.relative(hostAgent, paths.root), before: snapshot(hostAgent) };
+	for (const field of ["root", "agentDir", "catalogDir", "modelsStorePath", "sessionDir", "callsDir", "userModelsPath", "userAuthPath", "hostBinDir"]) {
+		assertInsideRoot(root, `piPaths.${field}`, paths[field]);
+	}
+	return { dirs, server, root, hostAgent, paths, env: productionEnv(root) };
+}
+
+/**
+ * The start seam a production call is given, and the three things it is there for: the offline precondition, which is
+ * the one value `PI_OFFLINE` may have in the environment this composition composed; the containment checks, which is
+ * where the paths it composed for itself are held to the temp root; and registering the child's pid in this harness's
+ * registry. The first two are refusals before the launch rather than assertions after it, and neither is a sandbox —
+ * see `PROD_REQUIRED_OFFLINE` for what the offline one does and does not say. Everything else travels through untouched — the command, the arguments, the bootstrap, the
+ * environment, the bounds and the cleanup are the composition's own, and `startPiChild` is the production one — and a
+ * startup that failed is rethrown exactly as it came, because the composition above it reads that error.
+ *
+ * What the registration is, exactly. A pid is registered once `startPiChild` has handed a child back, because that is
+ * when this seam first has one, and it is forgotten again as soon as that child's `exited` settles — the same rule
+ * `RpcChild` keeps, so a pid the operating system has since reused is never one this harness signals. It follows that
+ * a child spawned by the transport and not yet handed over is in no registry here: an interrupt in that window leaks
+ * the process rather than killing it. Nothing here closes that window, and it is not the one the pid-file sweep
+ * closes: that sweep works by reading pid files the fixture commands of row 6 write, and a production child writes
+ * none. It is bounded by the transport's own startup bound and by nothing else, and closing it would need a seam
+ * inside the transport, which this harness does not add.
+ *
+ * A path outside the root is a refusal here rather than a diagnostic, the same rule every other child of this harness
+ * launches under, and what is checked is everything the composition composed rather than a list somebody kept up to
+ * date: the launch's own working directory, every value of the launch environment that looks like a path — HOME,
+ * USERPROFILE, the temp and XDG directories, the child agent directory and both compiler caches among them, with
+ * `PATH` the one exception, because the host's own search path is in it and the launch appends to that rather than
+ * replacing it — and every path field of the call input the bootstrap will read from the second argument, the recorded
+ * session file of a continuation included. A switch that is not a path, such as `NO_COLOR` or the marker, carries no
+ * separator and is passed over by the same rule. What is recorded beside them is what the case then asserts on: the
+ * command, the bootstrap, the child marker, the `PI_OFFLINE` value this seam refused or allowed, and the session,
+ * tools, question tool, configured file paths and catalog fields of that same input — one entry per start attempt, so
+ * the checks over them cannot pass by having nothing to look at.
+ */
+function productionStart(prod) {
+	const evidence = { attempts: 0, resolved: 0, commands: [], bootstraps: [], markers: [], offline: [], inputs: [], pids: [] };
+	const start = async (options) => {
+		evidence.attempts += 1;
+		const launch = options.launch;
+		evidence.commands.push(launch.command);
+		evidence.bootstraps.push(launch.args?.[0]);
+		evidence.markers.push(launch.env?.PI_FUSION_CHILD);
+		evidence.offline.push(launch.env?.PI_OFFLINE);
+		// Refused before the launch rather than asserted after it: a child this harness could not configure offline is
+		// one it does not start at all. See PROD_REQUIRED_OFFLINE for what this is and, more importantly, what it is not.
+		if (launch.env?.PI_OFFLINE !== PROD_REQUIRED_OFFLINE) {
+			throw new Error(
+				`refusing to launch: the environment this call composed has PI_OFFLINE=${JSON.stringify(launch.env?.PI_OFFLINE)} rather than exactly ${JSON.stringify(PROD_REQUIRED_OFFLINE)}`,
+			);
+		}
+		assertInsideRoot(prod.root, "production launch cwd", launch.cwd);
+		// Every path-valued variable of the composed environment, by the same rule `baseChildEnv` checks its own by:
+		// anything holding a separator is a path this child could read or write, and `PATH` is the one exception.
+		for (const [name, value] of Object.entries(launch.env ?? {})) {
+			if (name === "PATH" || typeof value !== "string" || !value.includes(path.sep)) continue;
+			assertInsideRoot(prod.root, `production launch env ${name}`, value);
+		}
+		const inputPath = assertInsideRoot(prod.root, "production call input file", launch.args?.[1]);
+		const input = JSON.parse(fs.readFileSync(inputPath, "utf8"));
+		for (const field of CONTAINED_CONFIG_FIELDS) assertInsideRoot(prod.root, `production call input ${field}`, input[field]);
+		// The transcript a continuation reopens is a path the host composed too, and the only one that is not a field
+		// of the input's own top level.
+		if (typeof input.session?.file === "string") assertInsideRoot(prod.root, "production call input session.file", input.session.file);
+		evidence.inputs.push({
+			session: input.session,
+			tools: input.tools,
+			questionTool: input.questionTool,
+			modelsPath: input.modelsPath,
+			authPath: input.authPath,
+			sessionDir: input.sessionDir,
+			agentDir: input.agentDir,
+			// The catalog half of the same question, kept as read rather than as a verdict: `allowModelNetwork` is
+			// production's own explicit permission, and `catalogBaseUrl` is the url it composes for a refresh — absent by
+			// production default, which is what the check below holds it to. Presence is recorded separately so that a
+			// `catalogBaseUrl: undefined` written into the input reads as present rather than as never composed.
+			allowModelNetwork: input.allowModelNetwork,
+			catalogBaseUrl: input.catalogBaseUrl,
+			hasCatalogBaseUrl: Object.hasOwn(input, "catalogBaseUrl"),
+		});
+		const child = await startPiChild(options);
+		evidence.resolved += 1;
+		evidence.pids.push(child.pid);
+		registerPid(child.pid);
+		// The registry holds pids the harness may signal, and a child that has ended is not one: the same rule RpcChild
+		// keeps for its own process, so an interrupt never reaches a pid somebody else has since been given.
+		const forget = () => spawnedPids.delete(child.pid);
+		child.exited.then(forget, forget);
+		return child;
+	};
+	return { evidence, start };
+}
+
+/**
+ * One call through the production backend, with everything it left behind collected in one place: the run it reported,
+ * the single call report, what a monitor saw, how often progress was reported, the fixture requests that arrived while
+ * it ran, and the composed-start evidence. The role is the explicit one on a first call and the recorded selection on
+ * a continuation, which is what `piRole` is given a recorded selection for.
+ *
+ * The call is given a signal of its own, which is how a real host runs one, and nothing ever aborts it except the
+ * harness running out of patience in `withinDeadline`: a call that answers in time ran to the end uncancelled. The
+ * controller is this call's alone, so one case's patience can never reach another's child.
+ */
+async function productionCall(prod, result, { label, prompt, intent, recorded }) {
+	const role = piRole({ role: "implement", ...(recorded === undefined ? { model: PROD_MODEL, effort: PROD_EFFORT } : {}) }, recorded, {});
+	const reports = [];
+	const events = [];
+	const contracts = [];
+	const counts = { progress: 0 };
+	const controller = new AbortController();
+	const { evidence, start } = productionStart(prod);
+	const backend = createPiBackend({
+		agentDir: async () => prod.hostAgent,
+		readContract: (name) => {
+			contracts.push(name);
+			return PROD_CONTRACT;
+		},
+		start,
+		env: prod.env,
+		onCall: (report) => reports.push(report),
+	});
+	const from = prod.server.requests.length;
+	const run = await withinDeadline(
+		`the production call ${label}`,
+		controller,
+		backend.run({
+			role,
+			prompt,
+			cwd: prod.dirs.project,
+			session: backend.session(intent ?? { kind: "new" }),
+			signal: controller.signal,
+			onProgress: () => {
+				counts.progress += 1;
+			},
+			onEvent: (event) => events.push(event),
+		}),
+	);
+	const call = { label, role, run, reports, report: reports[0], events, contracts, progress: counts.progress, requests: prod.server.requests.slice(from), start: evidence };
+	result.say(
+		`${label}: ok ${!failed(run)}, stopReason ${run.stopReason}, session ${run.session?.sessionId ?? "-"} at ${run.session?.checkpoint ?? "-"}, tokens ${run.tokensIn}/${run.tokensOut}, cost ${run.costUsd ?? 0}, turns ${run.numTurns ?? 0}, events ${JSON.stringify(events.map((event) => event.type))}, provider requests ${call.requests.length}, progress ${call.progress}`,
+	);
+	result.say(
+		`${label} text: ${JSON.stringify((run.text ?? "").slice(0, PROD_TEXT_PREVIEW_CHARS))}${run.errorMessage === undefined ? "" : `, message ${JSON.stringify(run.errorMessage)}`}`,
+	);
+	return call;
+}
+
+/** What the composition put in the launch, checked rather than assumed, and the call input it wrote beside it. */
+function checkComposedStart(result, prod, call) {
+	const evidence = call.start;
+	const input = evidence.inputs[0];
+	result.check(evidence.attempts === 1 && evidence.resolved === 1, `${call.label}: ${evidence.attempts} start attempt(s) and ${evidence.resolved} child(ren) for one call`);
+	result.check(evidence.commands.every((command) => command === "node"), `${call.label}: the composition launched ${JSON.stringify(evidence.commands)} rather than node`);
+	result.check(
+		evidence.bootstraps.every((bootstrap) => bootstrap === PI_BOOTSTRAP_PATH),
+		`${call.label}: the launch named ${JSON.stringify(evidence.bootstraps)} rather than the installed ${PI_BOOTSTRAP_PATH}`,
+	);
+	result.check(evidence.markers.every((marker) => marker === "pi"), `${call.label}: the child marker was ${JSON.stringify(evidence.markers)} rather than pi`);
+	// Non-vacuous by counting first: an empty evidence list would satisfy every() below, so the recorded values have to
+	// be one per start attempt before their contents are worth anything.
+	result.check(
+		evidence.offline.length === evidence.attempts && evidence.inputs.length === evidence.attempts && evidence.attempts > 0,
+		`${call.label}: ${evidence.attempts} start attempt(s) left ${evidence.offline.length} offline reading(s) and ${evidence.inputs.length} recorded input(s)`,
+	);
+	result.check(
+		evidence.offline.every((value) => value === PROD_REQUIRED_OFFLINE),
+		`${call.label}: the composed environment carried PI_OFFLINE ${JSON.stringify(evidence.offline)} rather than exactly ${JSON.stringify(PROD_REQUIRED_OFFLINE)}`,
+	);
+	// The catalog default, which the offline switch above is the other half of: production permits a refresh explicitly
+	// and composes no url for one, so the only base url a child could refresh from is Pi's own default. A composed url
+	// would be a second endpoint this group never configured, and it fails the case rather than being noted.
+	result.check(
+		evidence.inputs.every((recorded) => recorded.hasCatalogBaseUrl === false && recorded.catalogBaseUrl === undefined),
+		`${call.label}: the call input composed a catalogBaseUrl: ${JSON.stringify(evidence.inputs.map((recorded) => recorded.catalogBaseUrl))}`,
+	);
+	result.say(
+		`${call.label} network shape: PI_OFFLINE ${JSON.stringify(evidence.offline)}, allowModelNetwork ${JSON.stringify(evidence.inputs.map((recorded) => recorded.allowModelNetwork))}, catalogBaseUrl composed ${JSON.stringify(evidence.inputs.map((recorded) => recorded.hasCatalogBaseUrl))} (a harness precondition and a composed default, not a sandbox)`,
+	);
+	result.check(call.contracts.length === 1 && call.contracts[0] === call.role.contract, `${call.label}: the contract asked for was ${JSON.stringify(call.contracts)} rather than the role's own`);
+	result.check(input?.questionTool === false, `${call.label}: the call input's questionTool is ${JSON.stringify(input?.questionTool)}, and no production call here can answer a question`);
+	result.check(input?.tools?.includes("ask_orchestrator") === false, `${call.label}: the call input's tools name the question tool: ${JSON.stringify(input?.tools)}`);
+	result.check(input?.modelsPath === prod.paths.userModelsPath, `${call.label}: the child reads its models from ${input?.modelsPath} rather than the host agent directory's own`);
+	result.check(
+		typeof input?.authPath === "string" && path.dirname(path.dirname(input.authPath)) === prod.paths.callsDir,
+		`${call.label}: the auth path is ${input?.authPath}, and a host with no credential file of its own gets one inside the call's own directory`,
+	);
+	result.check(input?.agentDir === prod.paths.agentDir && input?.sessionDir === prod.paths.sessionDir, `${call.label}: the call input names agentDir ${input?.agentDir} and sessionDir ${input?.sessionDir}`);
+	result.say(`${call.label} launch: node ${PI_BOOTSTRAP_PATH} <call input>, marker ${evidence.markers[0]}, pid ${evidence.pids[0]}`);
+	result.say(`${call.label} input: session ${JSON.stringify(input?.session)}, tools ${JSON.stringify(input?.tools)}, questionTool ${input?.questionTool}`);
+	result.say(`${call.label} input paths: modelsPath ${input?.modelsPath}, authPath ${input?.authPath}`);
+}
+
+/**
+ * What a child's own ending has to look like for a production call to have left nothing behind. It is read off the
+ * exit report the stage that stopped the child reported, whichever stage that was, and every field of it is one the
+ * production retention decision is made from.
+ */
+function checkCleanExit(result, label, exit) {
+	if (exit === undefined) {
+		result.check(false, `${label}: the stage that stopped this child reported no exit at all`);
+		return;
+	}
+	const cleanup = exit.cleanup;
+	result.check(exit.failure === undefined, `${label}: the transport's verdict on how the child ended is ${JSON.stringify(exit.failure?.kind)}`);
+	result.check(exit.stoppedByUs === true, `${label}: the child ended itself rather than being stopped by this host`);
+	result.check(cleanup.root === "exited" || cleanup.root === "stopped", `${label}: its root is ${cleanup.root} rather than one that says the root is over`);
+	result.check(cleanup.stdio === "closed", `${label}: its pipes are ${cleanup.stdio}`);
+	result.check(cleanup.discovery === "ok", `${label}: descendant discovery was ${cleanup.discovery}`);
+	result.check(cleanup.leftovers.length === 0, `${label}: ${cleanup.leftovers.length} verified leftover process(es)`);
+	result.check(cleanup.skipped.length === 0, `${label}: ${cleanup.skipped.length} target(s) whose identity it could not prove`);
+	result.check(cleanup.deadlineHit === false, `${label}: the cleanup hit its own deadline`);
+	// Stricter than the retention decision on purpose, and knowingly so: every counter that is not zero fails these
+	// cases, deliberately, although only `streamsUnclosed` is itself a concern the disposition reads. The rest — a
+	// stray settle, a late response, a dropped frame, a cancelled dialog — is timing evidence about the wire rather
+	// than something left behind, so a nonzero one of those is a finding to look at and not proof of an unclean
+	// cleanup; it fails here because these are the quiet qualification cases — one prompt, one text answer, no steer,
+	// no question and no cancellation — where nothing should have produced one, and a case that started counting them
+	// is no longer the case this group is measuring. The value is printed so what it was is visible either way.
+	const counted = Object.entries(exit.counters).filter(([, value]) => value !== 0);
+	result.check(counted.length === 0, `${label}: counters that are not zero: ${JSON.stringify(counted)} (timing evidence about the wire; only streamsUnclosed is itself a cleanup concern)`);
+	const stderr = exit.stderr;
+	result.check(
+		stderr.serving === true && stderr.lastStage === PROD_LAST_STAGE && stderr.stageCount === PROD_STAGE_COUNT,
+		`${label}: the bootstrap's stage diagnostics read serving=${stderr.serving}, last ${stderr.lastStage}, count ${stderr.stageCount}`,
+	);
+	result.say(
+		`${label}: root ${cleanup.root}, stdio ${cleanup.stdio}, discovery ${cleanup.discovery}, stages ${stderr.stageCount} (last ${stderr.lastStage}, sdk ${stderr.sdk ?? "-"}), stderr tail ${JSON.stringify(stderr.tail.trim().split("\n").filter(Boolean).slice(-2).join(" | ").slice(0, 200))}`,
+	);
+}
+
+/**
+ * Everything an ordinary production call owes, whichever session it ran in: a turn that finished, one report at the
+ * task stage, one child started and stopped cleanly, a disposition with no concern and the call directory gone with
+ * it, the structured session reference a record would carry and no flat checkpoint beside it, the exact selection the
+ * call asked for, this turn's own canonical accounting, the two events a monitor should see, and one loopback request
+ * carrying this call's contract and the project's context and neither of the two sentinels nothing points a child at.
+ */
+function checkProductionCall(result, prod, call, { text }) {
+	const run = call.run;
+	const report = call.report;
+	const session = run.session;
+	result.check(failed(run) === false, `${call.label}: the run failed (${run.errorMessage ?? run.stopReason})`);
+	result.check(run.stopReason === "stop", `${call.label}: stopReason ${run.stopReason}`);
+	result.check(run.text === text, `${call.label}: the run's text is ${JSON.stringify(run.text)} rather than ${JSON.stringify(text)}`);
+	result.check(call.reports.length === 1, `${call.label}: ${call.reports.length} call report(s) for one call`);
+	result.check(report?.stage === "task", `${call.label}: the call stopped at ${report?.stage} rather than its task`);
+	result.check(report?.startCalled === true && report?.startResolved === true, `${call.label}: start called ${report?.startCalled}, resolved ${report?.startResolved}`);
+	const ended = report?.ended;
+	result.check(ended?.kind === "task", `${call.label}: the call ended ${ended?.kind} rather than at a task`);
+	const task = ended?.kind === "task" ? ended.result : undefined;
+	result.check(task?.ok === true, `${call.label}: the turn refused with ${task?.ok === false ? task.reason : "no result at all"}`);
+	checkCleanExit(result, `${call.label} exit`, task?.exit);
+	result.check(report?.disposition?.safe === true && report?.disposition?.concerns?.length === 0, `${call.label}: disposition ${JSON.stringify(report?.disposition)}`);
+	result.check(report?.storage?.attempted === true && report?.storage?.disposed === true, `${call.label}: storage attempted ${report?.storage?.attempted}, disposed ${report?.storage?.disposed}`);
+	result.check(path.dirname(report?.storage?.callDir ?? "") === prod.paths.callsDir, `${call.label}: the call directory ${report?.storage?.callDir} is not under the layout's own calls directory`);
+	result.check(report?.storage?.callDir !== undefined && !fs.existsSync(report.storage.callDir), `${call.label}: the call directory ${report?.storage?.callDir} is still on disk`);
+	for (const pid of call.start.pids) result.check(!pidAlive(pid), `${call.label}: the child pid ${pid} is still alive`);
+
+	result.check(session?.backend === "pi", `${call.label}: the published session is ${JSON.stringify(session)}`);
+	result.check(
+		typeof session?.sessionFile === "string" && path.dirname(session.sessionFile) === prod.paths.sessionDir,
+		`${call.label}: the session file ${session?.sessionFile} is not in this project's own durable session directory`,
+	);
+	const onDisk = typeof session?.sessionFile === "string" && fs.existsSync(session.sessionFile);
+	result.check(onDisk, `${call.label}: the published session file is not on disk`);
+	result.check(run.sessionId === session?.sessionId, `${call.label}: the scalar id ${run.sessionId} is not the reference's ${session?.sessionId}`);
+	result.check(run.checkpoint === undefined, `${call.label}: a flat checkpoint ${run.checkpoint} was published, and a pi continuation stands on the reference alone`);
+	const entries = onDisk ? readSessionEntries(session.sessionFile) : [];
+	const last = entries.at(-1);
+	result.check(last?.id === session?.checkpoint, `${call.label}: the checkpoint ${session?.checkpoint} is not the transcript's last entry ${last?.id}`);
+	result.check(
+		last?.type === "message" && last?.message?.role === "assistant",
+		`${call.label}: the entry the checkpoint names is ${last === undefined ? "absent" : entryLabel(last)} rather than an assistant message`,
+	);
+
+	result.check(run.selection?.model === PROD_MODEL && run.selection?.effort === PROD_EFFORT, `${call.label}: the selection read back as ${JSON.stringify(run.selection)}`);
+	result.check(run.modelId === PROD_MODEL, `${call.label}: the run names model ${run.modelId}`);
+	result.check(call.requests.length === 1, `${call.label}: ${call.requests.length} provider request(s) for one turn`);
+	const request = call.requests[0];
+	result.check(run.numTurns === 1, `${call.label}: the turn counted ${run.numTurns} assistant message(s)`);
+	const sent = request?.usageSent;
+	result.check(
+		run.tokensIn === sent?.prompt_tokens && run.tokensOut === sent?.completion_tokens && run.cacheRead === 0 && run.cacheWrite === 0,
+		`${call.label}: the canonical accounting is ${run.tokensIn}/${run.tokensOut} (cache ${run.cacheRead}/${run.cacheWrite}) against the usage the fixture sent, ${JSON.stringify(sent)}`,
+	);
+	const expected = sent === undefined ? undefined : fixtureCost(sent);
+	result.check(
+		expected !== undefined && typeof run.costUsd === "number" && Math.abs(run.costUsd - expected) < PROD_COST_EPSILON,
+		`${call.label}: the reported cost ${run.costUsd} is not ${expected}, which is what models.json prices ${JSON.stringify(sent)} at per million tokens (${JSON.stringify(MODEL_COST)})`,
+	);
+	result.check(
+		JSON.stringify(call.events) === JSON.stringify([{ type: "init", sessionId: session?.sessionId }, { type: "turn_result", ok: true }]),
+		`${call.label}: the events a monitor saw are ${JSON.stringify(call.events)}`,
+	);
+	result.check(call.progress >= 2, `${call.label}: progress was reported ${call.progress} time(s)`);
+
+	result.say(`${call.label} request: ${describeRequest(request ?? { messages: [] })}`);
+	result.check(request?.model === FIXTURE_MODEL, `${call.label}: the request asked for ${request?.model}`);
+	result.check(request?.authorizationMatchesFixtureKey === true, `${call.label}: the request did not carry the dummy fixture key`);
+	result.check(request?.systemText?.includes(PROD_CONTRACT_SENTINEL) === true, `${call.label}: the contract this call was given is not in the system content`);
+	result.check(request?.systemText?.includes(PROJECT_CONTEXT_SENTINEL) === true, `${call.label}: the project's own AGENTS.md sentinel is not in the system content`);
+	result.check(request?.systemText?.includes(PROD_HOST_AGENT_SENTINEL) === false, `${call.label}: the host agent directory's context sentinel reached the system content`);
+	result.check(request?.systemText?.includes(USER_CONTEXT_SENTINEL) === false, `${call.label}: the fake user profile's context sentinel reached the system content`);
+	checkComposedStart(result, prod, call);
+	return { entries, request };
+}
+
+/**
+ * What the production group deliberately does not measure, said out loud so that nobody reads a passing group as
+ * covering it. None of the four below is exercised by either case, and nothing here claims an answer for them.
+ */
+function sayProductionNotRun(result) {
+	result.phase("NOT RUN in this group");
+	result.say(
+		"NOT RUN: a recorded checkpoint that is a custom_message, and one that is a session label. Producing either needs an extension inside the child to write it, and every role's own metadata in this build names no extension resource — so reaching those two shapes would mean naming one purely to manufacture them, which changes the role input this group is measuring. The exact-leaf gate's behaviour for both is therefore unmeasured here, and nothing here relaxes, restates or decides anything about that gate",
+	);
+	result.say(
+		"NOT RUN: a branch that carries messages and no thinking-level entry, which is the reconstruction that appends one and advances the leaf. Reaching it needs a transcript fabricated by hand, and this group only ever reads transcripts a real child wrote",
+	);
+	result.say(
+		"NOT RUN: a fork whose session file is not on disk when the host looks. Production records an assistant checkpoint and the forked turn that succeeded wrote its own file, so this group never reaches the deferred-write case — its existence is not ruled out by anything here",
+	);
+	result.say(
+		"NOT RUN: the leaf a native navigation to a user target actually leaves behind. What U2 measures is the refusal — a session that did not read back as standing at the recorded entry — and that the leaf then stands at that entry's parent is inference from 0.85.1's own source rather than a reading of this child: the refusal stops the child before this harness can ask it where its leaf is",
+	);
+	result.say("none of the four is measured by this group: each is named so a pass below is not read as covering it");
+}
+
+/** Production: a new session, two restores of trusted checkpoints, and a fork at one, through the real backend. */
+async function caseProductionTrustedCheckpoints(root, server, result) {
+	const prod = setupProductionCase(root, server, result.name);
+	server.install([textStep("prod-t1", "PROD-T1-ANSWER"), textStep("prod-t2", "PROD-T2-ANSWER"), textStep("prod-t3", "PROD-T3-ANSWER"), textStep("prod-f1", "PROD-F1-ANSWER")]);
+	result.say(`production composition: createPiBackend over host agent directory ${prod.hostAgent}`);
+	result.say(`layout: root ${prod.paths.root}, child agent directory ${prod.paths.agentDir}, sessions ${prod.paths.sessionDir}, calls ${prod.paths.callsDir}`);
+
+	result.phase("A: a new session, through the production backend from end to end");
+	const a = await productionCall(prod, result, { label: "A", prompt: "PROD-T1 first turn." });
+	checkProductionCall(result, prod, a, { text: "PROD-T1-ANSWER" });
+	result.check(fs.existsSync(prod.paths.agentDir), "the stable child agent directory is not there after a call");
+	result.check(fs.existsSync(prod.paths.modelsStorePath), "the catalog store the layout publishes is not there after a call");
+	result.check(callDirs(prod).length === 0, `the calls directory still holds ${JSON.stringify(callDirs(prod))}`);
+	result.check(!fs.existsSync(prod.paths.userAuthPath), "the call wrote an auth file into the host agent directory, which it was given none of");
+	result.check(sessionFiles(prod).length === 1, `the session directory holds ${JSON.stringify(sessionFiles(prod))} rather than one transcript`);
+	const refA = a.run.session;
+	if (refA === undefined) throw new Error("A published no session, so there is nothing for B, C and D to continue from");
+	result.say(`refA: ${JSON.stringify(refA)}`);
+
+	result.phase("B: resume A's checkpoint while it is still the transcript's last entry");
+	const beforeB = readSessionEntries(refA.sessionFile);
+	result.check(beforeB.at(-1)?.id === refA.checkpoint, `A's checkpoint ${refA.checkpoint} is not the last entry ${beforeB.at(-1)?.id}, so B would not be the current-leaf case`);
+	result.say("what B measures: the recorded checkpoint is the transcript's own last entry when B starts, which is the current-leaf case of the restore's exact-leaf gate; what reopening itself appended in front of the navigation is asserted below and printed with it, rather than assumed");
+	const b = await productionCall(prod, result, { label: "B", prompt: "PROD-T2 second turn.", intent: { kind: "resume", ref: refA }, recorded: a.run.selection });
+	const evidenceB = checkProductionCall(result, prod, b, { text: "PROD-T2-ANSWER" });
+	const refB = b.run.session;
+	result.check(refB?.sessionId === refA.sessionId && refB?.sessionFile === refA.sessionFile, `the resume reported ${JSON.stringify(refB)} rather than A's own identity`);
+	result.check(refB?.checkpoint !== refA.checkpoint, "the resumed turn left the checkpoint where it was, so B shows no movement");
+	const addedByB = evidenceB.entries.slice(beforeB.length);
+	result.say(`B appended: ${JSON.stringify(addedByB.map(entryLabel))}`);
+	const inFrontOfB = addedByB.filter((entry) => entry.type !== "message");
+	// Asserted rather than printed, because this is the whole of what makes B the current-leaf case. The claim is that
+	// the navigation B's restore sent found the checkpoint already at the leaf and returned natively without moving it;
+	// from outside the child the only evidence for that is that reopening appended no entry of its own in front of B's
+	// own prompt. A reopening that wrote one — a thinking-level entry, say — would mean the leaf had been pushed off the
+	// checkpoint and the navigation was a real move, which is a different gate passing under the same green result. So
+	// it fails the case here, and the 12/12 result is what protects the no-op claim rather than a line of output.
+	result.check(
+		inFrontOfB.length === 0,
+		`B: reopening appended ${JSON.stringify(inFrontOfB.map((entry) => entry.type))} of its own in front of B's prompt, so B's restore was a real move back to the checkpoint rather than Pi's current-leaf no-op, and B is no longer the case this phase measures`,
+	);
+	result.say(
+		inFrontOfB.length === 0
+			? "measured: reopening appended no entry of its own, so the navigation B's restore sent found the checkpoint already at the leaf — Pi's own current-leaf no-op, which passes this gate having skipped the hooks a real move runs"
+			: `measured: reopening appended ${JSON.stringify(inFrontOfB.map((entry) => entry.type))} before the navigation, so B's restore moved the leaf back to the checkpoint rather than finding it there`,
+	);
+	const requestB = evidenceB.request;
+	result.check(JSON.stringify(requestB?.roles) === JSON.stringify(["system", "user", "assistant", "user"]), `B's role sequence is ${JSON.stringify(requestB?.roles)}`);
+	const textsB = conversationTexts(requestB ?? { messages: [] });
+	result.check(
+		textsB[0]?.includes("PROD-T1 first turn") && textsB[1]?.includes("PROD-T1-ANSWER") && textsB[2]?.includes("PROD-T2 second turn"),
+		"B's outgoing context is not T1's turn followed by B's own prompt",
+	);
+	const userB = userEntry(evidenceB.entries, "PROD-T2 second turn.");
+	result.check(userB?.parentId === refA.checkpoint, `B's user entry hangs off ${userB?.parentId} rather than A's checkpoint ${refA.checkpoint}`);
+	if (refB === undefined) throw new Error("B published no session, so there is nothing for D to fork from");
+	result.say(`refB: ${JSON.stringify(refB)}`);
+
+	result.phase("C: resume A's checkpoint again, now that B has advanced the file");
+	const c = await productionCall(prod, result, { label: "C", prompt: "PROD-T3 third turn.", intent: { kind: "resume", ref: refA }, recorded: a.run.selection });
+	const evidenceC = checkProductionCall(result, prod, c, { text: "PROD-T3-ANSWER" });
+	result.check(c.run.session?.sessionId === refA.sessionId && c.run.session?.sessionFile === refA.sessionFile, `C reported ${JSON.stringify(c.run.session)} rather than A's own identity`);
+	const requestC = evidenceC.request;
+	result.check(JSON.stringify(requestC?.roles) === JSON.stringify(["system", "user", "assistant", "user"]), `C's role sequence is ${JSON.stringify(requestC?.roles)}`);
+	const textsC = conversationTexts(requestC ?? { messages: [] });
+	result.check(
+		textsC[0]?.includes("PROD-T1 first turn") && textsC[1]?.includes("PROD-T1-ANSWER") && textsC[2]?.includes("PROD-T3 third turn"),
+		"C's outgoing context is not T1's branch alone followed by C's own prompt",
+	);
+	result.check(!textsC.some((text) => text.includes("PROD-T2")), "B's turn reached C's outgoing context, so the restore did not move off B's branch");
+	const childrenOfA = evidenceC.entries.filter((entry) => entry.parentId === refA.checkpoint);
+	result.say(`children of A's checkpoint: ${JSON.stringify(childrenOfA.map(entryLabel))}`);
+	const userChildren = childrenOfA.filter((entry) => entry.type === "message" && entry.message?.role === "user");
+	result.check(
+		userChildren.length === 2 &&
+			userChildren.some((entry) => messageText(entry.message).includes("PROD-T2 second turn")) &&
+			userChildren.some((entry) => messageText(entry.message).includes("PROD-T3 third turn")),
+		`B's and C's prompts are not the two user entries under A's checkpoint: ${JSON.stringify(userChildren.map(entryLabel))}`,
+	);
+
+	result.phase("D: fork at B's checkpoint, after C has branched the source");
+	const sourceBeforeD = readSessionEntries(refB.sessionFile);
+	const sourceHashBeforeD = hashFile(refB.sessionFile);
+	const ancestry = ancestryOf(sourceBeforeD, refB.checkpoint);
+	result.say(`ancestry of B's checkpoint: ${JSON.stringify(ancestry.map((entry) => entry.id))}`);
+	const d = await productionCall(prod, result, { label: "D", prompt: "PROD-F1 fork turn.", intent: { kind: "fork", from: refB }, recorded: a.run.selection });
+	const evidenceD = checkProductionCall(result, prod, d, { text: "PROD-F1-ANSWER" });
+	const refF = d.run.session;
+	// Presence first, so an absent reference cannot satisfy "not the source's" by being nothing at all: a fork that
+	// published no session is a failure of this assertion rather than a pass through its optional chaining.
+	result.check(
+		typeof refF?.sessionId === "string" && typeof refF?.sessionFile === "string" && refF.sessionId !== refB.sessionId && refF.sessionFile !== refB.sessionFile,
+		`the fork published ${JSON.stringify(refF)} rather than a session id and file of its own, both different from the source's`,
+	);
+	result.check(
+		typeof refF?.sessionFile === "string" && path.dirname(refF.sessionFile) === prod.paths.sessionDir && fs.existsSync(refF.sessionFile),
+		`the fork's session file ${refF?.sessionFile} is not a file in this project's own session directory`,
+	);
+	const prepared = d.report?.ended?.kind === "task" ? d.report.ended.prepared : undefined;
+	result.check(prepared?.session?.checkpoint === refB.checkpoint, `the prepared fork stood at ${prepared?.session?.checkpoint} rather than the recorded ${refB.checkpoint}`);
+	result.check(prepared?.session?.sessionId === refF?.sessionId, `the prepared fork's identity ${prepared?.session?.sessionId} is not the one the run published`);
+	const header = evidenceD.entries[0];
+	result.check(header?.type === "session" && header?.parentSession === refB.sessionFile, `the fork header's parentSession is ${header?.parentSession} rather than the source file`);
+	const forkBody = evidenceD.entries.filter((entry) => entry.type !== "session");
+	const preF1 = forkBody.slice(0, ancestry.length);
+	result.check(
+		JSON.stringify(preF1.map((entry) => entry.id)) === JSON.stringify(ancestry.map((entry) => entry.id)),
+		`the fork's own first entries ${JSON.stringify(preF1.map((entry) => entry.id))} are not the source ancestry id for id`,
+	);
+	result.check(JSON.stringify(preF1.map(entryLabel)) === JSON.stringify(ancestry.map(entryLabel)), "the fork's copied entries differ in shape from the ancestry they came from");
+	const ancestryIds = new Set(ancestry.map((entry) => entry.id));
+	const addedByF1 = forkBody.slice(ancestry.length);
+	result.check(!addedByF1.some((entry) => ancestryIds.has(entry.id)), "an entry of the ancestry appears after the copied prefix in the fork");
+	result.say(`the fork added after the ancestry: ${JSON.stringify(addedByF1.map(entryLabel))}`);
+	const textsD = conversationTexts(evidenceD.request ?? { messages: [] });
+	result.check(
+		textsD.some((text) => text.includes("PROD-T1 first turn")) && textsD.some((text) => text.includes("PROD-T2 second turn")) && textsD.some((text) => text.includes("PROD-F1 fork turn")),
+		"the fork's turn does not carry T1, T2 and its own prompt",
+	);
+	result.check(!textsD.some((text) => text.includes("PROD-T3")), "C's turn reached the fork's outgoing context");
+	result.check(
+		hashFile(refB.sessionFile) === sourceHashBeforeD,
+		`the source session file changed while the fork ran: ${JSON.stringify(readSessionEntries(refB.sessionFile).slice(sourceBeforeD.length).map(entryLabel))}`,
+	);
+	result.check(sessionFiles(prod).length === 2, `the session directory holds ${JSON.stringify(sessionFiles(prod))} rather than the source and its fork`);
+	result.check(callDirs(prod).length === 0, `the calls directory still holds ${JSON.stringify(callDirs(prod))}`);
+
+	result.phase("the two transcripts, read back");
+	result.say("source:");
+	for (const line of describeEntries(readSessionEntries(refB.sessionFile))) result.say(`  ${line}`);
+	result.say("fork:");
+	if (refF === undefined) result.say("  (the fork published no session of its own)");
+	else for (const line of describeEntries(readSessionEntries(refF.sessionFile))) result.say(`  ${line}`);
+	result.check(server.unscripted.length === 0, `the fixture saw ${server.unscripted.length} unscripted request(s)`);
+	sayProductionNotRun(result);
+}
+
+/** Production: a recorded checkpoint that is a user message, and the exact-leaf gate that refuses to continue it. */
+async function caseProductionUserTarget(root, server, result) {
+	const prod = setupProductionCase(root, server, result.name);
+	server.install([textStep("prod-u1", "PROD-U1-ANSWER")]);
+	result.say(`production composition: createPiBackend over host agent directory ${prod.hostAgent}`);
+
+	result.phase("U1: a new session, so there is a real transcript to name an entry of");
+	const a = await productionCall(prod, result, { label: "U1", prompt: "PROD-U1 first turn." });
+	const evidence = checkProductionCall(result, prod, a, { text: "PROD-U1-ANSWER" });
+	const refA = a.run.session;
+	if (refA === undefined) throw new Error("U1 published no session, so there is no recorded checkpoint to rewrite");
+	const user = userEntry(evidence.entries, "PROD-U1 first turn.");
+	result.check(user !== undefined, "the user message of the first turn is not in the transcript, so this case has no user target to name");
+	if (user === undefined) throw new Error("no user entry to aim a continuation at");
+	result.say(`the user entry of U1 is ${user.id}<-${user.parentId ?? "root"}, and U1's own trusted checkpoint is ${refA.checkpoint}`);
+
+	result.phase("U2: a continuation whose recorded checkpoint is that user message");
+	const hashBefore = hashFile(refA.sessionFile);
+	const before = readSessionEntries(refA.sessionFile);
+	const u2 = await productionCall(prod, result, {
+		label: "U2",
+		prompt: "PROD-U2 refused turn.",
+		intent: { kind: "resume", ref: { ...refA, checkpoint: user.id } },
+		recorded: a.run.selection,
+	});
+	const run = u2.run;
+	const report = u2.report;
+	result.check(failed(run) === true, "the refused continuation was reported as a run that finished");
+	result.check(run.aborted === false, "the refusal was reported as a cancellation, and nothing cancelled this run");
+	result.check(u2.reports.length === 1, `${u2.reports.length} call report(s) for one call`);
+	result.check(report?.stage === "prepare-refused", `the call stopped at ${report?.stage} rather than a preparation that refused`);
+	result.check(report?.startCalled === true && report?.startResolved === true, `start called ${report?.startCalled}, resolved ${report?.startResolved}`);
+	const ended = report?.ended;
+	result.check(ended?.kind === "prepare", `the call ended ${ended?.kind} rather than at its preparation`);
+	const refused = ended?.kind === "prepare" ? ended.refused : undefined;
+	result.check(refused?.reason === "restore", `the preparation refused with ${refused?.reason} rather than at its restore`);
+	const restore = refused?.restore;
+	result.check(restore?.reason === "postcondition", `the restore refused with ${restore?.reason} rather than on its postcondition`);
+	result.check(restore?.cancelled === undefined, `the restore reported the operation as cancelled (${restore?.cancelled})`);
+	// The published shape of this refusal, and not a turn record: a `postcondition` refusal retains no turn, because
+	// `turn` is attached to the two refusals a turn is the evidence for — one that was never acknowledged, and one the
+	// command itself failed. Asserting an acknowledged turn here would be asserting a field this reason never carries.
+	result.check(restore?.turn === undefined, `the postcondition refusal carries a turn record (${JSON.stringify(restore?.turn?.outcome)}), and this reason does not retain one`);
+	result.check(
+		restore?.failure === undefined && restore?.error === undefined,
+		`the postcondition refusal carries a transport failure or a thrown value (${JSON.stringify(restore?.failure?.kind)}, ${JSON.stringify(String(restore?.error))}), so the sequence threw rather than answering`,
+	);
+	result.say(
+		"what this is: the production composition classified the refusal as `postcondition`, which is a reason it can only reach after its own turn and operation gates have passed — so the control command was acknowledged and carried no extension error as a control-flow implication of that classification, and not as native evidence this harness read. The shape deliberately publishes no successful turn record, so the acknowledgement itself is not exposed and is not observed here",
+	);
+	result.say(
+		"what is measured: the session did not read back as standing at the recorded entry, which is the whole of what `postcondition` says. That reason covers both readbacks the restore makes — the session identity it expected to be in and the leaf it expected to stand at — so this result does not say which of the two disagreed, and nothing here asked the child. What it does say is that the refusal is the gate's rather than a failed operation's: it carries no cancellation, no transport failure and no thrown value, each checked above. That the leaf then stands at the recorded entry's parent is source inference from 0.85.1 and is named under NOT RUN below",
+	);
+	checkCleanExit(result, "U2 exit", restore?.exit);
+	result.check(restore?.unverified === undefined, "the one shutdown the restore attempted reported nothing about how the child ended");
+	result.check(report?.disposition?.safe === true && report?.disposition?.concerns?.length === 0, `disposition ${JSON.stringify(report?.disposition)}`);
+	result.check(report?.storage?.attempted === true && report?.storage?.disposed === true, `storage attempted ${report?.storage?.attempted}, disposed ${report?.storage?.disposed}`);
+	result.check(report?.storage?.callDir !== undefined && !fs.existsSync(report.storage.callDir), `the call directory ${report?.storage?.callDir} is still on disk`);
+	result.check(run.stopReason === "restore", `the run's stopReason is ${run.stopReason}`);
+	result.check(run.errorMessage === PROD_CHECKPOINT_REFUSAL, `the run's message is ${JSON.stringify(run.errorMessage)} rather than the fixed sentence for a restore postcondition`);
+	result.check(
+		run.session === undefined && run.sessionId === undefined && run.checkpoint === undefined,
+		`the refused run published a session: ${JSON.stringify([run.session, run.sessionId, run.checkpoint])}`,
+	);
+	result.check(u2.requests.length === 0, `${u2.requests.length} provider request(s) reached the fixture for a continuation that was refused`);
+	result.check(
+		JSON.stringify(u2.events) === JSON.stringify([{ type: "turn_result", ok: false, message: PROD_CHECKPOINT_REFUSAL }]),
+		`the events a monitor saw are ${JSON.stringify(u2.events)}, and a refused preparation names no session to initialise`,
+	);
+	result.check(
+		hashFile(refA.sessionFile) === hashBefore,
+		`the source session file changed during the refused continuation: ${JSON.stringify(readSessionEntries(refA.sessionFile).slice(before.length).map(entryLabel))}`,
+	);
+	result.check(sessionFiles(prod).length === 1, `the session directory holds ${JSON.stringify(sessionFiles(prod))} rather than the one transcript`);
+	for (const pid of u2.start.pids) result.check(!pidAlive(pid), `the refused call's child pid ${pid} is still alive`);
+	checkComposedStart(result, prod, u2);
+	result.check(server.unscripted.length === 0, `the fixture saw ${server.unscripted.length} unscripted request(s)`);
+	result.say(
+		"no workaround: nothing here navigates on the child's behalf, retries the restore, relaxes the gate or rewrites the recorded checkpoint — the refusal is reported exactly as the production composition reported it, and a host that records a user message as a checkpoint has a record it cannot continue",
+	);
+	sayProductionNotRun(result);
+}
+
 const CASES = [
 	{ name: "row8-model-thinking", row: 8, title: "strict model and thinking checks", run: caseModelThinking },
 	{ name: "row1-durable-checkpoint", row: 1, title: "a completed run's checkpoint survives the child process", run: caseDurableCheckpoint },
@@ -3125,11 +3957,14 @@ const CASES = [
 	{ name: "row5-questions", row: 5, title: "a blocking question, duplicate answers, two in a row, and a steer that waits", run: caseQuestions },
 	{ name: "row6-cancellation", row: 6, title: "clear_queue before abort, and a descendant that leaves the killed process group", run: caseCancellation },
 	{ name: "row7-retry-compaction", row: 7, title: "retry, threshold and overflow compaction, and queued work before agent_settled", run: caseRetryCompaction },
+	{ name: "prod-trusted-checkpoints", row: "prod", title: "the production backend: a new session, two restores and a fork at a trusted checkpoint", run: caseProductionTrustedCheckpoints },
+	{ name: "prod-user-target-refused", row: "prod", title: "the production backend: a recorded checkpoint that is a user message, refused by the exact-leaf gate", run: caseProductionUserTarget },
 ];
 
 const GROUPS = {
 	"stage-a": ["row8-model-thinking", "row1-durable-checkpoint", "row2-older-checkpoint", "row3-fork-at", "row4-failures", "row4-cancelled-operations"],
 	"stage-b": ["row2-compaction-checkpoint", "row5-questions", "row6-cancellation", "row7-retry-compaction"],
+	production: ["prod-trusted-checkpoints", "prod-user-target-refused"],
 };
 
 /* ------------------------------------------------------------------ the spike */
