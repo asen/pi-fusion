@@ -68,6 +68,19 @@ test("the pi binding is a binding, not an adapter: it depends on the boundary al
 	assert.deepEqual(names, ["./types.ts"], `a role binding must name no host, no process and no SDK; it names ${names.join(", ")}`);
 });
 
+test("the pi outcome mapping is pure: node's own path helper, this backend's own modules, and nothing else", () => {
+	const names = dependenciesOf("backends/pi-outcome.ts");
+	// `node:path` is there for one thing, deciding whether a recorded session file is absolute; everything else it
+	// names is a value-shape it maps from. A host, another backend, a card and a package are all outside that.
+	const allowed = ["node:path", "./types.ts", "./pi-binding.ts", "./pi-prepare.ts", "./pi-task.ts", "./pi-transport.ts", "./pi-session-restore.ts", "./pi-question-routing.ts", "../process-tree.ts"];
+	for (const name of names) {
+		assert.ok(allowed.includes(name), `the outcome mapping must name no host, no adapter and no package; it names ${name}`);
+	}
+	for (const forbidden of ["./claude.ts", "../fusion.ts", "../cards.ts"]) {
+		assert.ok(!names.includes(forbidden), `the outcome mapping must not depend on ${forbidden}`);
+	}
+});
+
 test("the pi storage layout depends on node itself, so a path is composed before any package is loaded", () => {
 	const names = dependenciesOf("backends/pi-storage.ts");
 	assert.ok(names.length > 0, "the storage layout does its own file work, so it names node's own modules");
