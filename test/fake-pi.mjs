@@ -22,6 +22,11 @@ import * as path from "node:path";
  * ends or a process that exits ends the whole of it whatever the pause was doing. Which of those any run took is not
  * something described here, and none of them is claimed to have happened.
  *
+ * One scenario keeps state across a prompt where the others keep none. `backend-task` is one whole turn, and the
+ * readbacks a task makes after that turn are worth nothing unless what they read moved: the leaf, the session's own
+ * statistics and the final assistant text each answer one way before the prompt and another after it, which is the
+ * only reason a flag lives in this file at all.
+ *
  * Every timer here is fixture machinery of the same kind: a liveness bound, so that a case that failed leaves nothing
  * waiting for good and fails rather than hanging. None of them is a sleep, a step anything is synchronized on, or a
  * measurement of how long anything took.
@@ -137,6 +142,36 @@ const state = () => {
 /** One record this child held back, to be released by the next command rather than by a clock. */
 let held;
 
+/** Whether the one turn of `backend-task` has run. The whole of that scenario's state, and read by nothing else. */
+let prompted = false;
+
+/** Where that turn leaves the session: a leaf that is null before the prompt and this entry after it. */
+const LEAF_AFTER = "fake-entry-0002";
+
+/** The answer that turn ends with, which is both the last assistant message's text and what the session reads back. */
+const FINAL_TEXT = "## Changed\nnothing, this was a fake";
+
+/**
+ * The records that turn streams, in order and as literals: a tool call and its result, the assistant message that
+ * finished, and the `agent_end` that repeats nothing this fixture counts. The usage on that message is deliberately
+ * nothing like the session's own statistics, so a run that published these live numbers instead of the turn's
+ * canonical share of the statistics is visible as that mistake rather than as a coincidence.
+ */
+const TASK_EVENTS = [
+	{ type: "tool_execution_start", toolName: "bash", toolCallId: "call-1", args: { command: "npm test" } },
+	{ type: "tool_execution_end", toolName: "bash", toolCallId: "call-1", result: "2 passing", isError: false },
+	{
+		type: "message_end",
+		message: {
+			role: "assistant",
+			content: [{ type: "text", text: FINAL_TEXT }],
+			stopReason: "stop",
+			usage: { input: 9999, output: 9999, cacheRead: 0, cacheWrite: 0 },
+		},
+	},
+	{ type: "agent_end" },
+];
+
 /** The one release marker a paused case writes, under the log directory that case already owns and nowhere else. */
 const RELEASE_MARKER = "release-the-fake";
 
@@ -189,6 +224,21 @@ function pauseUntilReleased(id, type) {
 
 /** The answer an ordinary command gets when the scenario has nothing to say about it. */
 function ordinary(id, type) {
+	if (SCENARIO === "backend-task") {
+		// The three answers that turn moves, and nothing else: every other command of this scenario is ordinary.
+		if (type === "get_session_stats") {
+			const session = { sessionFile, sessionId: SESSION_ID };
+			return success(
+				id,
+				type,
+				prompted
+					? { ...session, userMessages: 1, assistantMessages: 1, toolCalls: 1, toolResults: 1, totalMessages: 4, tokens: { input: 300, output: 60, cacheRead: 10, cacheWrite: 5, total: 375 }, cost: 0.5, contextUsage: { tokens: 1200, contextWindow: 65_536, percent: 2 } }
+					: { ...session, userMessages: 0, assistantMessages: 0, toolCalls: 0, toolResults: 0, totalMessages: 0, tokens: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 }, cost: 0, contextUsage: { tokens: null, contextWindow: 65_536, percent: null } },
+			);
+		}
+		if (type === "get_last_assistant_text") return success(id, type, { text: prompted ? FINAL_TEXT : null });
+		if (type === "get_tree") return success(id, type, { tree: [], leafId: prompted ? LEAF_AFTER : null });
+	}
 	if (type === "get_session_stats") return success(id, type, { sessionFile, sessionId: SESSION_ID, userMessages: 0, assistantMessages: 0, toolCalls: 0, toolResults: 0, totalMessages: 0, tokens: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 }, cost: 0 });
 	if (type === "get_last_assistant_text") return success(id, type, { text: null });
 	if (type === "clear_queue") return success(id, type, { steering: [], followUp: [] });
@@ -222,6 +272,17 @@ function prompt(id) {
 		out(success(id, "prompt"));
 		// Exit code zero on purpose: an exit nobody asked for is a failure whatever the code was.
 		process.exit(0);
+	}
+	if (SCENARIO === "backend-task") {
+		// One whole turn, written in the order a host has to read it in: the agent starts, the prompt is taken, the
+		// records of the turn arrive, and only then does the turn settle. The flag moves with the last record and
+		// before the settle, so every readback a host makes after this turn sees the session that turn left.
+		out({ type: "agent_start" });
+		out(success(id, "prompt"));
+		for (const event of TASK_EVENTS) out(event);
+		prompted = true;
+		out({ type: "agent_settled" });
+		return;
 	}
 	out({ type: "agent_start" });
 	// One write holding both records, which is what a transport that reads the acknowledgement only in a continuation
