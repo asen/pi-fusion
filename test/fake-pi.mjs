@@ -35,6 +35,13 @@ const SDK_VERSION = "0.85.1";
 /** The one bound the two uses of this timer share: it ends the lifetime of a scenario that reads no stdin, and it bounds how long one that paused its reader stays paused — which that scenario resumes from rather than exits on. Bounded, referenced, and owned. */
 const KEEPALIVE_MS = 30_000;
 
+/**
+ * The control extension's own cancellation sentence, as a literal: this fixture imports nothing of the host's, and the
+ * test that drives the scenario using it compares this against the exported constant, so a drift between them fails.
+ */
+const CONTROL_CANCELLED_TEXT =
+	"the session operation reported itself cancelled, so this command did not do what it was asked; nothing here retries it, and where the session stands now is read back rather than assumed";
+
 const SCENARIO = process.env.FAKE_PI_SCENARIO ?? "ok";
 const LOG = process.env.FAKE_PI_LOG;
 
@@ -202,6 +209,13 @@ function prompt(id) {
 	if (SCENARIO === "command-ack") {
 		// A prompt a caller knows runs no agent loop: it is acknowledged and nothing settles, ever.
 		out(success(id, "prompt"));
+		return;
+	}
+	if (SCENARIO === "command-ack-extension-error") {
+		// A control command that failed: the runner emits its error and the prompt is acknowledged after it, which is the
+		// ordering a host has to read as one turn rather than as an error belonging to nothing. One write holds both,
+		// and what a write becomes on the other side is not this fixture's to say.
+		raw(`${JSON.stringify({ type: "extension_error", extensionPath: "command:pi-fusion-navigate", event: "command", error: CONTROL_CANCELLED_TEXT })}\n${JSON.stringify(success(id, "prompt"))}\n`);
 		return;
 	}
 	if (SCENARIO === "exit-mid-turn") {

@@ -7,6 +7,7 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import type { RpcCommand, RpcResponse, RpcSessionState } from "@earendil-works/pi-coding-agent";
 import { isDeadState, type LaunchOptions, type ObservedProcess, type OwnedCleanup, type ProcessFacilities, readProcessTable } from "../extensions/process-tree.ts";
 import { piRole } from "../extensions/backends/pi-binding.ts";
+import { CONTROL_CANCELLED, NAVIGATE_COMMAND } from "../extensions/backends/pi-control-extension.mjs";
 import { DIAGNOSTIC_EVENT, STARTUP_EXIT_CODE } from "../extensions/backends/pi-bootstrap.mjs";
 import { bootstrapInput, piLaunch } from "../extensions/backends/pi-launch.ts";
 import { type PreparedCall, prepareCallStorage, writeCallInput } from "../extensions/backends/pi-storage.ts";
@@ -1576,6 +1577,32 @@ test("a caller that knows its prompt runs no agent loop finishes at the acknowle
 		assert.equal(turn.outcome, "acknowledged");
 		assert.equal(turn.ack?.success, true);
 		assert.deepEqual([turn.events, turn.earlySettles], [0, 0], "nothing settled, and nothing was waited for");
+		const exit = await child.shutdown();
+		assert.equal(exit.failure, undefined);
+	});
+});
+
+/*
+ * The one case here that a session restore depends on, and the whole of what it shows: that an `extension_error`
+ * written before a prompt's acknowledgement is reported on that turn rather than on nothing. It is about the ordering
+ * of two records and an acknowledged completion; it restores no session, sends no real control command and is not
+ * evidence that Pi's own commands fail this way. The fixture writes both records in one write, which arranges their
+ * order and claims nothing about how the pipe delivers them.
+ */
+test("an extension error written before the acknowledgement belongs to the acknowledged turn", async () => {
+	await withFake("command-ack-extension-error", async (fixture) => {
+		const child = await fixture.start();
+		const turn = await child.turn(`/${NAVIGATE_COMMAND} ${JSON.stringify("entry-1")}`, { completion: "acknowledged" });
+		assert.equal(turn.outcome, "acknowledged");
+		assert.equal(turn.ack?.success, true);
+		assert.equal(turn.extensionErrors, 1, "the error belongs to this turn, and a host reads it there");
+		// The fixture holds these as literals and imports nothing: comparing them against the control extension's own
+		// exports is what makes a drift between the two a failure rather than a case that quietly stops matching.
+		assert.equal(turn.lastExtensionError?.error, CONTROL_CANCELLED);
+		assert.equal(turn.lastExtensionError?.extensionPath, `command:${NAVIGATE_COMMAND}`);
+		assert.equal(turn.lastExtensionError?.event, "command");
+		assert.deepEqual(turn.lastExtensionError?.cut, { error: false, extensionPath: false, event: false }, "nothing of it was cut, so each field is the whole of what arrived");
+		assert.deepEqual([turn.events, turn.earlySettles], [1, 0], "the extension error is the one record this turn saw, and nothing settled");
 		const exit = await child.shutdown();
 		assert.equal(exit.failure, undefined);
 	});
