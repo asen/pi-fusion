@@ -1,6 +1,7 @@
 import { accessSync, constants, readFileSync, realpathSync, statSync } from "node:fs";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
+import { CONTROL_COMMANDS, CONTROL_EXTENSION_PATH, controlExtension } from "./pi-control-extension.mjs";
 import { HELPER_UNAVAILABLE, withHelperRetry } from "./pi-helper-retry.mjs";
 import { QUESTION_TOOL_NAME, questionTool } from "./pi-question-tool.mjs";
 
@@ -469,9 +470,11 @@ function projectContext(base, input, platform) {
  * resolved through the package manager, and a manifest can carry bundled skills, prompt templates and themes that are
  * then loaded beside the extension. That is why the checks after loading exist rather than being redundant — a loaded
  * prompt template or theme is refused outright, and a loaded skill only counts when it lies under a skills entry the
- * call named. `extensionFactories` is empty for the same reason the lists are explicit: this build ships no built-in
- * extension of its own, and the one Fusion's own bridge will need is a factory that task will pass rather than a
- * default hidden here.
+ * call named. `extensionFactories` carries exactly one entry, Fusion's own control extension, on every call and not
+ * as a switch: the two session commands a host moves a child with are the same for every role, so a call either has
+ * them or is not a call this host can drive. It is the one factory this composition passes, and `loadedExtensions`
+ * below admits exactly one loaded extension for it and no other — naming a factory is not a way for a call's own
+ * resources to arrive as one.
  *
  * The two prompt overrides are the reason this is explicit rather than trusting discovery to be off — a `SYSTEM.md` or
  * an `APPEND_SYSTEM.md` in the child agent directory is found by its own path rather than by discovery, so the
@@ -485,7 +488,7 @@ export function resourceOptions(input, platform = process.platform) {
 		additionalSkillPaths: [...input.skills],
 		additionalPromptTemplatePaths: [],
 		additionalThemePaths: [],
-		extensionFactories: [],
+		extensionFactories: [controlExtension()],
 		noExtensions: true,
 		noSkills: true,
 		noPromptTemplates: true,
@@ -699,28 +702,57 @@ const realOf = (file) => {
 };
 
 /**
- * The loaded extensions, as paths. Two things are settled here. An extension reports the path it was resolved to and
- * the path it was named by, and the resolved one is what a coverage answer is about; an extension that reports neither
- * as an absolute path is an inline one — `<inline>` is how 0.85.1 spells one — and this composition passes
- * `extensionFactories: []`, so there is none to expect and one is refused. It is refused for having no filesystem path
- * rather than for how that name is spelled: a spelling proves nothing about whose extension it is, and a name that is
- * not an absolute path cannot be judged against an explicit entry at all — an explicit entry of `/` would otherwise
- * make a naive comparison accept it. The bridge of task 7 will pass a factory of its own and account for it there.
+ * The loaded extensions the call's own lists have to account for: the paths, with this composition's own control
+ * extension taken out of them.
+ *
+ * An extension reports the path it was resolved to and the path it was named by, and for one read from a file the
+ * resolved one is what a coverage answer is about. A factory has neither: the loader spells a named one
+ * `<inline:name>` and reports that same string as both, which is the metadata `resourceOptions` above produces by
+ * passing exactly one named factory in this same process. So exactly one loaded extension may report that spelling in
+ * both fields, and it has to be there — a call that loaded none of it is a child with no control commands, and a
+ * second one is a registration this composition did not make. Everything else has to be an absolute filesystem path,
+ * and is returned for the coverage checks to answer for.
+ *
+ * What this is and is not. It is a narrow reading of the loader's own metadata about a factory this file just handed
+ * it, which is why one exact spelling in both fields is enough to tell it apart from a call's own resources. It is no
+ * authentication of what any extension does, no proof that the code behind that entry is this module's, and no
+ * general permission for a factory: any other inline spelling, a mismatch between the two fields and any second one
+ * are refused the same way a path nobody named is. A name that is not an absolute path also cannot be judged against
+ * an explicit entry at all — an explicit entry of `/` would otherwise make a naive comparison accept it.
  */
 function loadedExtensions(result, input) {
 	const list = result?.extensions;
 	if (!Array.isArray(list) || !list.every(isRecord)) throw incompatible("resourceLoader.getExtensions()", "a result whose extensions is a list of loaded extensions");
-	return list.map((entry) => {
+	const named = [];
+	let owned = 0;
+	for (const entry of list) {
 		const at = isText(entry.resolvedPath) ? entry.resolvedPath : isText(entry.path) ? entry.path : undefined;
 		if (at === undefined) throw incompatible("resourceLoader.getExtensions()", "a result whose extensions each report their own resolvedPath or path");
+		if (entry.path === CONTROL_EXTENSION_PATH || entry.resolvedPath === CONTROL_EXTENSION_PATH) {
+			if (entry.path !== CONTROL_EXTENSION_PATH || entry.resolvedPath !== CONTROL_EXTENSION_PATH) {
+				throw new StartupError(
+					"resources",
+					`the child loaded an extension that reports ${CONTROL_EXTENSION_PATH} as one of its two paths and something else as the other, and this host's own control extension is the one that reports it as both. An extension this composition cannot account for is refused rather than run with`,
+				);
+			}
+			owned += 1;
+			continue;
+		}
 		if (!path.isAbsolute(at)) {
 			throw new StartupError(
 				"resources",
-				`the child loaded an extension that reports no absolute filesystem path of its own, which is how an extension built from a factory rather than read from a file is reported, and this call passes no factory at all: ${list.length} extensions loaded against the ${input.extensions.length} this call named. An extension that is not one of the paths this call named is not this child's to run`,
+				`the child loaded an extension that reports no absolute filesystem path of its own, which is how an extension built from a factory rather than read from a file is reported, and the one factory this call passes is this host's own control extension: ${list.length} extensions loaded against the ${input.extensions.length} this call named. An extension that is not one of the paths this call named is not this child's to run`,
 			);
 		}
-		return at;
-	});
+		named.push(at);
+	}
+	if (owned !== 1) {
+		throw new StartupError(
+			"resources",
+			`the child loaded ${owned} extensions reporting this host's own control extension at ${CONTROL_EXTENSION_PATH}, and this call passes exactly one factory for it: ${list.length} extensions loaded against the ${input.extensions.length} this call named. A child with no control commands is not one this host can move, and a second registration of them is not this composition's, so either is refused rather than run with`,
+		);
+	}
+	return named;
 }
 
 /**
@@ -912,6 +944,46 @@ function checkTools(created, input) {
 }
 
 /**
+ * The two control commands, required on the session the moment it exists, the same way the role's tools are. A host
+ * moves a child's session by sending one of them as a prompt, so a child that does not have them both is a child this
+ * host cannot navigate or fork, and that is a refusal here rather than a failure in the middle of a run.
+ *
+ * Each has to be there exactly once, under its bare name, from this composition's own extension. The bare name is
+ * what makes it reachable at all: this Pi renames every command of a name two extensions registered to `name:1`,
+ * `name:2` and so on, so a bare lookup of a colliding name finds nothing, and a command that is there under a
+ * suffixed name is not one a prompt could reach. The source is compared because the bare name alone says nothing
+ * about who registered it — a call's own extension could register the same name and win it.
+ *
+ * What the refusal says. A missing, renamed or foreign command names the fixed command name and nothing else: what
+ * the registry holds is the session's own content, and a path or a description from it belongs in no diagnostic. A
+ * registry this bootstrap cannot read the answer of is the same compatibility finding every other public api gets.
+ *
+ * What this is not: it is a check on the metadata this runtime reports about registrations this process made, not an
+ * authentication of the code behind them, and it says nothing about a registration made after this point. A host
+ * that is about to send one of these commands rechecks before it does.
+ */
+function checkCommands(created) {
+	const runner = created?.session?.extensionRunner;
+	if (typeof runner?.getRegisteredCommands !== "function") throw incompatible("createAgentSessionFromServices()", "a session whose extensionRunner provides getRegisteredCommands()");
+	const reads = "a list of the registered commands, each naming its own invocationName";
+	const registered = answered("session.extensionRunner.getRegisteredCommands()", () => runner.getRegisteredCommands());
+	if (!Array.isArray(registered) || !registered.every((command) => isRecord(command) && isText(command.invocationName))) {
+		throw incompatible("session.extensionRunner.getRegisteredCommands()", reads);
+	}
+	const missing = CONTROL_COMMANDS.filter((name) => {
+		const found = registered.filter((command) => command.invocationName === name);
+		return found.length !== 1 || found[0].sourceInfo?.path !== CONTROL_EXTENSION_PATH;
+	});
+	if (missing.length) {
+		throw new StartupError(
+			"runtime",
+			`the child's session does not have ${missing.length === 1 ? "the control command" : "the control commands"} ${missing.join(", ")} from this host's own control extension, so the call is refused rather than started on a child this host could not move. A command of that name registered twice is renamed by this Pi and is no longer reachable under the bare name a prompt would send, and one registered by anything else is not this composition's`,
+		);
+	}
+	return registered;
+}
+
+/**
  * The two builtins that download a helper on first use, each paired with the factory that builds it and, through its own
  * name, with the message its retry keys on. One entry decides both, so nothing maps a name to a message anywhere else:
  * a `grep` definition wrapped with `find`'s failure is not a thing this composition can produce.
@@ -1026,6 +1098,7 @@ export async function createRuntime(input, sdk) {
 			});
 		}, agentSessionRefused);
 		checkTools(created, input);
+		checkCommands(created);
 		return { ...created, services, diagnostics: services.diagnostics };
 	};
 	// The factory runs inside this call, and the call itself checks that the working directory is there before it runs,

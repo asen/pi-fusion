@@ -22,6 +22,19 @@ import {
 	THINKING_LEVELS,
 	withinDirectory,
 } from "../extensions/backends/pi-bootstrap.mjs";
+import {
+	CONTROL_CANCELLED,
+	CONTROL_COMMANDS,
+	CONTROL_EXTENSION_NAME,
+	CONTROL_EXTENSION_PATH,
+	CONTROL_INVALID_ARGUMENT,
+	CONTROL_UNANSWERED,
+	type ControlCommand,
+	type ControlCommandContext,
+	controlExtension,
+	FORK_COMMAND,
+	NAVIGATE_COMMAND,
+} from "../extensions/backends/pi-control-extension.mjs";
 import { HELPER_RETRY_NOTICE, HELPER_UNAVAILABLE } from "../extensions/backends/pi-helper-retry.mjs";
 import { QUESTION_TOOL_DESCRIPTION, QUESTION_TOOL_NAME, QUESTION_UNANSWERED, questionTool } from "../extensions/backends/pi-question-tool.mjs";
 import {
@@ -98,6 +111,8 @@ interface Recorded {
 	helperAnswers: Record<string, Record<string, any>>;
 	/** Every attempt a composed search tool's own execute made, in order, with the arguments and receiver it got. */
 	helperAttempts: Array<{ tool: string; id: unknown; params: unknown; signal: unknown; onUpdate: unknown; context: unknown; receiver: unknown }>;
+	/** What each factory this composition handed the loader registered, in order, as the loader would report it. */
+	registrations: Array<{ name: string; description: unknown; handler: unknown; sourceInfo: { path: string } }>;
 }
 
 /** What a double should get wrong: how its model runtime fails, what its loader reports, or a parser that throws. */
@@ -129,6 +144,12 @@ interface Fault {
 		agentsFiles?: unknown;
 		/** One accessor that throws instead of answering, named the way the loader names it. */
 		throws?: { getter: "getExtensions" | "getSkills" | "getPrompts" | "getThemes"; error: Error };
+		/**
+		 * What the loader reports for the factories it was handed, which is otherwise one record per factory, spelled
+		 * and resolved the way 0.85.1 spells a named one. A list replaces those records outright, which is how a case
+		 * reports none, two of them, or one whose two paths disagree.
+		 */
+		control?: unknown[];
 		loaded?: { extensions?: unknown; skills?: unknown; prompts?: unknown; themes?: unknown };
 		without?: "resourceLoader" | "getExtensions" | "getSkills" | "getPrompts" | "getThemes";
 	};
@@ -152,6 +173,13 @@ interface Fault {
 	 * `runRpcMode`; `active` replaces the answer outright and `without` takes the method away.
 	 */
 	tools?: { registry?: string[]; late?: string[]; active?: unknown; without?: boolean; throws?: Error };
+	/**
+	 * What the session's own extension runner answers for the commands that are registered. Absent, it answers with
+	 * what the factories this composition handed the loader actually registered, each under its bare name, which is
+	 * what this Pi resolves when no two extensions registered the same name. `list` replaces that answer outright,
+	 * `without` takes the runner or its accessor away, and `throws` is an accessor that fails instead of answering.
+	 */
+	commands?: { list?: unknown; without?: "runner" | "accessor"; throws?: Error };
 	/**
 	 * What one of the two search-tool factories does instead of answering with a definition this bootstrap can read, and
 	 * how a composed definition's own execute behaves. `tool` is the one that misbehaves and the other answers normally;
@@ -195,6 +223,7 @@ function fakeSdk(models: string[] = ["deepseek/deepseek-chat"], fault: Fault = {
 		helperFactories: [],
 		helperAnswers: {},
 		helperAttempts: [],
+		registrations: [],
 	};
 	const available = new Set(models);
 	// The catalog work `createAgentSessionServices` does is what makes a provider error appear after it, and not before.
@@ -307,10 +336,27 @@ function fakeSdk(models: string[] = ["deepseek/deepseek-chat"], fault: Fault = {
 			const namedExtensions: string[] = options.resourceLoaderOptions?.additionalExtensionPaths ?? [];
 			const namedSkills: string[] = options.resourceLoaderOptions?.additionalSkillPaths ?? [];
 			const loaded = fault.loader?.loaded ?? {};
+			// And what it does with a factory it was handed: it runs the factory here, while it loads resources, and
+			// reports the extension under `<inline:name>` as both its path and its resolved path, with everything the
+			// factory registered carrying that same string as its source path. Running it is what makes the commands
+			// below the ones this composition's own factory registered rather than a list this double made up.
+			const handed: any[] = Array.isArray(options.resourceLoaderOptions?.extensionFactories) ? options.resourceLoaderOptions.extensionFactories : [];
+			const controlLoaded = handed.map((named: any) => {
+				const at = `<inline:${named?.name}>`;
+				named?.factory?.({
+					registerCommand: (name: string, command: { description?: unknown; handler?: unknown }) => {
+						calls.registrations.push({ name, description: command?.description, handler: command?.handler, sourceInfo: { path: at } });
+					},
+				});
+				return { path: at, resolvedPath: at, sourceInfo: { path: at, source: named?.name, scope: "temporary", origin: "top-level" } };
+			});
+			const fromFactories = fault.loader?.control ?? controlLoaded;
+			const fromFiles = "extensions" in loaded ? loaded.extensions : namedExtensions.map((at) => ({ path: at, resolvedPath: at }));
 			const loader: Record<string, unknown> = {
 				kind: "loader",
 				getExtensions: () => ({
-					extensions: loaded.extensions ?? namedExtensions.map((at) => ({ path: at, resolvedPath: at })),
+					// A replacement that is not a list is reported exactly as it is, so a malformed answer stays one.
+					extensions: Array.isArray(fromFiles) ? [...fromFactories, ...fromFiles] : fromFiles,
 					errors: fault.loader?.extensions ?? [],
 					runtime: {},
 				}),
@@ -361,8 +407,20 @@ function fakeSdk(models: string[] = ["deepseek/deepseek-chat"], fault: Fault = {
 					if (fault.tools && "active" in fault.tools) return fault.tools.active;
 					return [...registered].filter((name) => allowed.includes(name));
 				},
+				// The runner the session exposes, answering for the commands the loader's factories registered. The
+				// bare name is what this Pi resolves when no two extensions registered one name; a case that wants a
+				// collision, another source or an answer this bootstrap cannot read replaces the list outright.
+				extensionRunner: {
+					getRegisteredCommands: () => {
+						if (fault.commands?.throws) throw fault.commands.throws;
+						if (fault.commands && "list" in fault.commands) return fault.commands.list;
+						return calls.registrations.map((each) => ({ name: each.name, description: each.description, sourceInfo: each.sourceInfo, invocationName: each.name }));
+					},
+				},
 			};
 			if (fault.tools?.without) delete session.getActiveToolNames;
+			if (fault.commands?.without === "runner") delete session.extensionRunner;
+			if (fault.commands?.without === "accessor") session.extensionRunner = {};
 			return { session, extensionsResult: { extensions: [] } };
 		},
 		createAgentSessionRuntime: async (factory: any, options: Record<string, any>) => {
@@ -498,11 +556,39 @@ const child = (args: string[], env: NodeJS.ProcessEnv): Promise<Ran> => run(args
 const installedPackageChild = (args: string[], env: NodeJS.ProcessEnv = {}): Promise<Ran> => run(args, env, { fenced: false });
 
 /**
+ * The half of a subprocess double that answers for the one factory the production composition hands the loader. Both
+ * scripts below share it, because both of them run the whole runtime and the bootstrap requires that factory's own
+ * extension and its two commands: a double that ignored `extensionFactories` would report a child nobody could move
+ * and refuse every one of those runs. It does what the installed loader does and no more — it runs each named factory
+ * it was handed, reports one loaded extension per factory under `<inline:name>` as both paths, and answers the
+ * session's registry with what those factories actually registered, each under its bare name. Nothing here is
+ * hardcoded to succeed: an empty `extensionFactories` still loads nothing and still refuses the call.
+ */
+const factoryDouble = `
+const registrations = [];
+let loadedFromFactories = [];
+const loadFactories = (options) => {
+	const handed = Array.isArray(options?.resourceLoaderOptions?.extensionFactories) ? options.resourceLoaderOptions.extensionFactories : [];
+	loadedFromFactories = handed.map((named) => {
+		const at = "<inline:" + named.name + ">";
+		const sourceInfo = { path: at, source: named.name, scope: "temporary", origin: "top-level" };
+		named.factory({
+			registerCommand: (name, command) => {
+				registrations.push({ name, invocationName: name, description: command.description, handler: command.handler, sourceInfo });
+			},
+		});
+		return { path: at, resolvedPath: at, sourceInfo };
+	});
+};
+const extensionRunner = { getRegisteredCommands: () => registrations.map((each) => ({ ...each })) };
+`;
+
+/**
  * The bootstrap's own `main`, run in a node process with a double for the SDK, because `main` exits the process on a
  * startup failure and `runRpcMode` owns stdout. The double lives in the script rather than in a file of its own, and
  * the guard never fires here: node ran `-e`, not this file.
  */
-const mainScript = `
+const mainScript = `${factoryDouble}
 const { main } = await import(${JSON.stringify(bootstrapUrl)});
 const manager = { kind: "session-manager" };
 const sdk = {
@@ -526,10 +612,11 @@ const sdk = {
 	createFindToolDefinition: (cwd) => ({ name: "find", label: "Find files", execute: async () => ({ content: [], details: undefined }) }),
 	createAgentSessionServices: async (options) => {
 		if (process.env.SCENARIO === "services-throw") throw new Error(process.env.MARKER ?? "the services could not be created");
+		loadFactories(options);
 		return {
 			...options,
 			resourceLoader: {
-				getExtensions: () => ({ extensions: [], errors: [] }),
+				getExtensions: () => ({ extensions: loadedFromFactories, errors: [] }),
 				getSkills: () => ({ skills: [], diagnostics: [] }),
 				getPrompts: () => ({ prompts: [], diagnostics: [] }),
 				getThemes: () => ({ themes: [], diagnostics: [] }),
@@ -537,7 +624,7 @@ const sdk = {
 			diagnostics: [],
 		};
 	},
-	createAgentSessionFromServices: async (options) => ({ session: { getActiveToolNames: () => [...(options.tools ?? [])] }, extensionsResult: {} }),
+	createAgentSessionFromServices: async (options) => ({ session: { getActiveToolNames: () => [...(options.tools ?? [])], extensionRunner }, extensionsResult: {} }),
 	createAgentSessionRuntime: async (factory, options) => {
 		await factory({ cwd: options.cwd, agentDir: options.agentDir, sessionManager: options.sessionManager });
 		return { dispose: async () => {} };
@@ -592,11 +679,11 @@ const touches = (stderr: string): string[] =>
  * `main` with a double behind a Proxy that reports every property read of it. That is what makes an ordering claim
  * about what runs before the SDK is reached a claim about the bootstrap rather than about a double nobody passed.
  */
-const touchScript = `
+const touchScript = `${factoryDouble}
 const { main } = await import(${JSON.stringify(bootstrapUrl)});
 const manager = { kind: "session-manager" };
 const loader = {
-	getExtensions: () => ({ extensions: [], errors: [] }),
+	getExtensions: () => ({ extensions: loadedFromFactories, errors: [] }),
 	getSkills: () => ({ skills: [], diagnostics: [] }),
 	getPrompts: () => ({ prompts: [], diagnostics: [] }),
 	getThemes: () => ({ themes: [], diagnostics: [] }),
@@ -609,8 +696,11 @@ const held = {
 	SessionManager: { create: () => manager, open: () => manager },
 	createGrepToolDefinition: (cwd) => ({ name: "grep", execute: async () => ({ content: [], details: undefined }) }),
 	createFindToolDefinition: (cwd) => ({ name: "find", execute: async () => ({ content: [], details: undefined }) }),
-	createAgentSessionServices: async (options) => ({ ...options, resourceLoader: loader, diagnostics: [] }),
-	createAgentSessionFromServices: async (options) => ({ session: { getActiveToolNames: () => [...(options.tools ?? [])] }, extensionsResult: {} }),
+	createAgentSessionServices: async (options) => {
+		loadFactories(options);
+		return { ...options, resourceLoader: loader, diagnostics: [] };
+	},
+	createAgentSessionFromServices: async (options) => ({ session: { getActiveToolNames: () => [...(options.tools ?? [])], extensionRunner }, extensionsResult: {} }),
 	createAgentSessionRuntime: async (factory, options) => {
 		await factory({ cwd: options.cwd, agentDir: options.agentDir, sessionManager: options.sessionManager });
 		return { dispose: async () => {} };
@@ -710,7 +800,14 @@ test("resource discovery is off and the prompt is Pi's own plus exactly the role
 	]);
 	assert.deepEqual([options.noExtensions, options.noSkills, options.noPromptTemplates, options.noThemes], [true, true, true, true]);
 	assert.deepEqual([options.additionalExtensionPaths, options.additionalSkillPaths, options.additionalPromptTemplatePaths, options.additionalThemePaths], [[], [], [], []]);
-	assert.deepEqual(options.extensionFactories, [], "this build ships no built-in extension of its own, and a default one is not hidden here");
+	// The one factory this composition passes is Fusion's own control extension, named so the loader reports it under
+	// a path this build knows. Nothing else is hidden here, and nothing about the call decides whether it goes in.
+	assert.equal(options.extensionFactories.length, 1);
+	const factory = options.extensionFactories[0] as { name: string; factory: unknown };
+	assert.deepEqual(Object.keys(factory).sort(), ["factory", "name"]);
+	assert.equal(factory.name, CONTROL_EXTENSION_NAME);
+	assert.equal(typeof factory.factory, "function");
+	assert.equal(CONTROL_EXTENSION_PATH, `<inline:${CONTROL_EXTENSION_NAME}>`, "which is how this Pi spells a named factory's path");
 	assert.equal(options.noContextFiles, false, "the project's own instruction files are the one thing a child picks up from the working directory");
 	assert.equal(options.systemPromptOverride("# SYSTEM.md the loader found"), undefined, "a SYSTEM.md cannot replace Pi's base prompt");
 	assert.equal(options.systemPromptOverride(undefined), undefined);
@@ -725,7 +822,11 @@ test("the services are built with the resource options this bootstrap composed",
 	const options = calls.services[0].resourceLoaderOptions;
 	assert.deepEqual([options.noExtensions, options.noSkills, options.noPromptTemplates, options.noThemes], [true, true, true, true]);
 	assert.equal(options.noContextFiles, false);
-	assert.deepEqual(options.extensionFactories, []);
+	assert.deepEqual(
+		(options.extensionFactories as Array<{ name: string }>).map((each) => each.name),
+		[CONTROL_EXTENSION_NAME],
+		"the services get the one factory this composition passes, and no second one",
+	);
 	assert.equal(typeof options.agentsFilesOverride, "function", "the child agent directory's own instruction file is left out by an override the services get");
 	assert.deepEqual(options.appendSystemPromptOverride([]), [composed.contract]);
 	assert.equal(options.systemPromptOverride("anything"), undefined);
@@ -1797,20 +1898,51 @@ test("a resource entry that loaded nothing refuses, and a resource nobody named 
 });
 
 test("an extension with no filesystem path of its own is refused, whatever an explicit entry would cover", async () => {
-	// This composition passes `extensionFactories: []`, so an extension built from a factory is one nobody asked for.
-	// It is refused for reporting no absolute path rather than for how that name is spelled — and refused before the
-	// coverage comparison, so an explicit entry of the filesystem root cannot make a lexical answer accept it.
+	// This composition passes one factory, its own control extension, so any other extension built from a factory is
+	// one nobody asked for. It is refused for reporting no absolute path rather than for how that name is spelled —
+	// and refused before the coverage comparison, so an explicit entry of the filesystem root cannot make a lexical
+	// answer accept it. Each case is that spelling beside the control extension the loader really did load.
 	const root = process.platform === "win32" ? path.parse(process.cwd()).root : "/";
 	for (const spelling of ["<inline>", "<inline:bridge>", "<sdk:ask_orchestrator>", "not-a-path"]) {
 		const inline = fakeSdk(["deepseek/deepseek-chat"], { loader: { loaded: { extensions: [{ path: spelling, resolvedPath: spelling }] } } });
 		await assert.rejects(createRuntime(checkInput({ ...input(), extensions: [root] }), inline.sdk), (error: Error & { stage?: string }) => {
 			assert.equal(error.stage, "resources", spelling);
 			assert.match(error.message, /^the child loaded an extension that reports no absolute filesystem path of its own/, spelling);
-			assert.match(error.message, /this call passes no factory at all: 1 extensions loaded against the 1 this call named/, spelling);
+			assert.match(error.message, /the one factory this call passes is this host's own control extension: 2 extensions loaded against the 1 this call named/, spelling);
 			return true;
 		});
 		assert.deepEqual(inline.calls.getModel, [], `${spelling}: and it refuses before a model is looked up`);
 	}
+});
+
+test("exactly one loaded extension may be this host's own control extension, and it has to be there", async () => {
+	await withDirAsync(async (root) => {
+		// The one entry the loader reports for the factory this composition passes: `<inline:pi-fusion>` as both its
+		// path and its resolved path. A call's own extension paths are named beside it and are unaffected by it.
+		const file = path.join(root, "ext.ts");
+		fs.writeFileSync(file, "export default () => {};\n");
+		const composed = checkInput({ ...input(), extensions: [file] });
+		const fine = fakeSdk();
+		await createRuntime(composed, fine.sdk);
+		assert.deepEqual(fine.calls.getModel, ["deepseek/deepseek-chat"], "the owned entry is admitted and the named path still covers its own");
+		const ownEntry = { path: CONTROL_EXTENSION_PATH, resolvedPath: CONTROL_EXTENSION_PATH };
+		const cases: Array<{ what: string; control: unknown[]; expect: RegExp }> = [
+			{ what: "none of it", control: [], expect: /^the child loaded 0 extensions reporting this host's own control extension at <inline:pi-fusion>/ },
+			{ what: "two of it", control: [ownEntry, { ...ownEntry }], expect: /^the child loaded 2 extensions reporting this host's own control extension at <inline:pi-fusion>/ },
+			{ what: "a resolved path of its own", control: [{ path: CONTROL_EXTENSION_PATH, resolvedPath: path.join(root, "control.ts") }], expect: /reports <inline:pi-fusion> as one of its two paths and something else as the other/ },
+			{ what: "a name of its own", control: [{ path: path.join(root, "control.ts"), resolvedPath: CONTROL_EXTENSION_PATH }], expect: /reports <inline:pi-fusion> as one of its two paths and something else as the other/ },
+		];
+		for (const one of cases) {
+			const { sdk, calls } = fakeSdk(["deepseek/deepseek-chat"], { loader: { control: one.control } });
+			await assert.rejects(createRuntime(composed, sdk), (error: Error & { stage?: string }) => {
+				assert.equal(error.stage, "resources", one.what);
+				assert.match(error.message, one.expect, one.what);
+				return true;
+			});
+			assert.deepEqual(calls.getModel, [], `${one.what}: refused before a model is looked up`);
+			assert.deepEqual(calls.session, [], `${one.what}: and before a session is created`);
+		}
+	});
 });
 
 test("a loaded prompt template or theme is refused, because a role on this backend selects none", async () => {
@@ -2379,6 +2511,225 @@ test("the question tool is the name and the sentence the Claude backend's own qu
 	assert.deepEqual(schema.required, ["question"], "the question is the one parameter and it is required, so a call with none is not a question the host could answer");
 	assert.equal(schema.properties.question.type, "string", "and it is a string rather than a shape a host would have to interpret");
 	assert.ok(claude.includes(JSON.stringify(schema.properties.question.description)), "and asks for the question with the same words");
+});
+
+/*
+ * The control extension this composition puts inside every child, and the two commands it registers. Every case here
+ * drives the module itself or the recording double: nothing starts a child, navigates a session or forks one, so what
+ * these prove is what Fusion composes and what its handlers do with an answer. What a real Pi does with either
+ * command — which hooks run, what a cancellation leaves behind, what a fork writes — is a real child's to show.
+ */
+
+/** The commands the factory registers, by name, as the loader would hold them after running it. */
+const controlCommands = (): Map<string, ControlCommand> => {
+	const registered = new Map<string, ControlCommand>();
+	controlExtension().factory({
+		registerCommand: (name, command) => {
+			registered.set(name, command);
+		},
+	});
+	return registered;
+};
+
+/** A command context that records the operation it was asked for and answers with whatever the case decided. */
+const operations = (answer: (operation: string) => unknown) => {
+	const seen: Array<{ operation: string; id: unknown; options: unknown }> = [];
+	const ctx: ControlCommandContext = {
+		navigateTree: async (id, options) => {
+			seen.push({ operation: "navigateTree", id, options });
+			return answer("navigateTree");
+		},
+		fork: async (id, options) => {
+			seen.push({ operation: "fork", id, options });
+			return answer("fork");
+		},
+	};
+	return { ctx, seen };
+};
+
+test("the control extension registers exactly the two commands a host moves a session with, and nothing else", () => {
+	// Every property the factory touches on the api it was given, so a tool, a hook, a renderer or a widget would
+	// show up here as an access this assertion does not allow.
+	const touched: string[] = [];
+	const registered: Array<{ name: string; command: ControlCommand }> = [];
+	const api = new Proxy(
+		{
+			registerCommand: (name: string, command: ControlCommand) => {
+				registered.push({ name, command });
+			},
+		} as Record<string, unknown>,
+		{
+			get: (target, property) => {
+				touched.push(String(property));
+				return target[String(property)];
+			},
+		},
+	);
+	const extension = controlExtension();
+	assert.deepEqual(Object.keys(extension).sort(), ["factory", "name"], "a named factory and nothing beside it, so the loader reports one path for all of it");
+	assert.equal(extension.name, CONTROL_EXTENSION_NAME);
+	extension.factory(api as unknown as { registerCommand(name: string, command: ControlCommand): void });
+	assert.deepEqual(touched, ["registerCommand", "registerCommand"], "two registrations, and no other api of the extension surface is even read");
+	assert.deepEqual(
+		registered.map((each) => each.name),
+		[...CONTROL_COMMANDS],
+		"the two commands, in the order this build names them",
+	);
+	assert.deepEqual([...CONTROL_COMMANDS], [NAVIGATE_COMMAND, FORK_COMMAND]);
+	assert.equal(Object.isFrozen(CONTROL_COMMANDS), true, "the list is read rather than edited");
+	for (const each of registered) {
+		assert.equal(typeof each.command.description, "string");
+		assert.notEqual(each.command.description.trim(), "", `${each.name} says what it is for in the command menu`);
+		assert.equal(typeof each.command.handler, "function");
+	}
+	assert.notEqual(controlExtension().factory, extension.factory, "built fresh, so nothing is shared between two children of one host");
+});
+
+test("a control command takes one json string and hands that exact id to the one operation it names", async () => {
+	const commands = controlCommands();
+	// An ordinary id, and one carrying the characters a composed argument has to survive: spaces, quotes, a backslash
+	// and a newline. The host sends `JSON.stringify(id)` and this Pi hands a handler everything after the first space,
+	// so what comes back out of the decoding has to be the id exactly, with nothing trimmed or normalized.
+	for (const id of ["entry-7", ' a "quoted" \\ back\\slash\nand a newline ']) {
+		const navigating = operations(() => ({ cancelled: false }));
+		await commands.get(NAVIGATE_COMMAND)!.handler(JSON.stringify(id), navigating.ctx);
+		assert.deepEqual(navigating.seen, [{ operation: "navigateTree", id, options: { summarize: false } }], JSON.stringify(id));
+		const forking = operations(() => ({ cancelled: false }));
+		await commands.get(FORK_COMMAND)!.handler(JSON.stringify(id), forking.ctx);
+		assert.deepEqual(forking.seen, [{ operation: "fork", id, options: { position: "at" } }], JSON.stringify(id));
+	}
+});
+
+test("a control command called with anything but one json string fails before it touches the session", async () => {
+	const commands = controlCommands();
+	// Each of these is the two installs disagreeing rather than a user typing something, so each is the one fixed
+	// sentence and none of them repeats what arrived.
+	const refused = ["", "   ", "entry-7", "not json", "7", "null", "true", '["entry-7"]', '{"id":"entry-7"}', '""', '"   "', '"entry-7" "entry-8"'];
+	for (const name of CONTROL_COMMANDS) {
+		for (const args of refused) {
+			const { ctx, seen } = operations(() => ({ cancelled: false }));
+			await assert.rejects(commands.get(name)!.handler(args, ctx), (error: Error) => {
+				assert.equal(error.message, CONTROL_INVALID_ARGUMENT, `${name} ${JSON.stringify(args)}`);
+				return true;
+			});
+			assert.deepEqual(seen, [], `${name} ${JSON.stringify(args)}: no operation was asked for at all`);
+			assert.equal(CONTROL_INVALID_ARGUMENT.includes(args.trim()) && args.trim() !== "", false, "and the refusal does not repeat what arrived");
+		}
+	}
+});
+
+test("what a session operation answered is what the control command reports, and nothing is guessed at", async () => {
+	const commands = controlCommands();
+	for (const name of CONTROL_COMMANDS) {
+		// A completed operation is the one case a handler returns on. Extra fields the SDK may carry beside
+		// `cancelled` are none of this handler's business and change nothing.
+		assert.equal(await commands.get(name)!.handler('"entry-7"', operations(() => ({ cancelled: false })).ctx), undefined, name);
+		assert.equal(await commands.get(name)!.handler('"entry-7"', operations(() => ({ cancelled: false, sessionFile: "/work/.pi/sessions/s.jsonl", leafId: "entry-9" })).ctx), undefined, name);
+		const answers: Array<{ what: string; answer: unknown; expect: string }> = [
+			{ what: "cancelled", answer: { cancelled: true }, expect: CONTROL_CANCELLED },
+			{ what: "cancelled beside other fields", answer: { cancelled: true, reason: "a hook said so" }, expect: CONTROL_CANCELLED },
+			{ what: "nothing at all", answer: undefined, expect: CONTROL_UNANSWERED },
+			{ what: "null", answer: null, expect: CONTROL_UNANSWERED },
+			{ what: "an empty object", answer: {}, expect: CONTROL_UNANSWERED },
+			{ what: "a cancelled that is a word", answer: { cancelled: "no" }, expect: CONTROL_UNANSWERED },
+			{ what: "a list", answer: [], expect: CONTROL_UNANSWERED },
+			{ what: "a boolean of its own", answer: false, expect: CONTROL_UNANSWERED },
+		];
+		for (const one of answers) {
+			await assert.rejects(commands.get(name)!.handler('"entry-7"', operations(() => one.answer).ctx), (error: Error) => {
+				assert.equal(error.message, one.expect, `${name}: ${one.what}`);
+				return true;
+			});
+		}
+		// An error the operation itself threw is the runtime's own and passes through exactly as it is: not wrapped,
+		// not replaced by one of the sentences above, and not retried.
+		const thrown = new Error("Invalid entry ID for forking");
+		await assert.rejects(
+			commands.get(name)!.handler(
+				'"entry-7"',
+				operations(() => {
+					throw thrown;
+				}).ctx,
+			),
+			(error: Error) => {
+				assert.equal(error, thrown, `${name}: the same error, by identity`);
+				return true;
+			},
+		);
+	}
+});
+
+test("both control commands have to be on the session under their own bare names, from this composition's own extension", async () => {
+	const composed = input();
+	// The clean case: the factory this composition passed registered them, the loader reported them under its own
+	// inline path, and the call starts. The registrations the double recorded are the factory's own.
+	const { sdk, calls } = fakeSdk();
+	await createRuntime(composed, sdk);
+	assert.deepEqual(
+		calls.registrations.map((each) => [each.name, each.sourceInfo.path]),
+		[
+			[NAVIGATE_COMMAND, CONTROL_EXTENSION_PATH],
+			[FORK_COMMAND, CONTROL_EXTENSION_PATH],
+		],
+		"the loader ran the one factory it was handed, and everything it registered carries that factory's own path",
+	);
+	const fromOwn = (name: string) => ({ name, invocationName: name, sourceInfo: { path: CONTROL_EXTENSION_PATH } });
+	const foreign = "/work/.pi/agent/extensions/marker-command-secret-theirs.ts";
+	// A registry that also holds commands nobody here registered: this check asks after two names of its own and
+	// answers for nothing else, so a command from another source and one carrying only the `invocationName` this
+	// check reads — no description, no sourceInfo — leave the call exactly as it was. That second entry is a partial
+	// projection for this test rather than a complete command: the public `RegisteredCommand` also has a `name` and a
+	// `handler`, and nothing here claims otherwise. What it exercises is that an unrelated entry is not held to the
+	// metadata the two owned commands are, because requiring that would refuse a session over fields belonging to
+	// whoever registered it.
+	const beside = fakeSdk(["deepseek/deepseek-chat"], {
+		commands: { list: [{ name: "review", invocationName: "review", description: "Review the diff", sourceInfo: { path: foreign } }, fromOwn(NAVIGATE_COMMAND), { invocationName: "skill:notes" }, fromOwn(FORK_COMMAND)] },
+	});
+	await createRuntime(composed, beside.sdk);
+	assert.deepEqual(beside.calls.getModel, ["deepseek/deepseek-chat"], "the two commands are there under their own names, and the rest of the registry is none of this check's business");
+	const refusals: Array<{ what: string; list: unknown[]; expect: RegExp }> = [
+		{ what: "one of them missing", list: [fromOwn(NAVIGATE_COMMAND)], expect: /does not have the control command pi-fusion-fork from this host's own control extension/ },
+		{ what: "neither of them", list: [], expect: /does not have the control commands pi-fusion-navigate, pi-fusion-fork/ },
+		{
+			// Two extensions registering one name is what this Pi renames, and a bare lookup of that name then finds
+			// nothing at all, so the command a prompt would send is not there however many of it were registered.
+			what: "renamed by a collision",
+			list: [{ ...fromOwn(NAVIGATE_COMMAND), invocationName: `${NAVIGATE_COMMAND}:1` }, { ...fromOwn(NAVIGATE_COMMAND), invocationName: `${NAVIGATE_COMMAND}:2` }, fromOwn(FORK_COMMAND)],
+			expect: /does not have the control command pi-fusion-navigate/,
+		},
+		{ what: "the bare name from another source", list: [{ name: NAVIGATE_COMMAND, invocationName: NAVIGATE_COMMAND, sourceInfo: { path: foreign } }, fromOwn(FORK_COMMAND)], expect: /does not have the control command pi-fusion-navigate/ },
+		{ what: "a command that names no source at all", list: [{ name: FORK_COMMAND, invocationName: FORK_COMMAND }, fromOwn(NAVIGATE_COMMAND)], expect: /does not have the control command pi-fusion-fork/ },
+	];
+	for (const one of refusals) {
+		const shaped = fakeSdk(["deepseek/deepseek-chat"], { commands: { list: one.list } });
+		await assert.rejects(createRuntime(composed, shaped.sdk), (error: Error & { stage?: string }) => {
+			assert.equal(error.stage, "runtime", one.what);
+			assert.match(error.message, one.expect, one.what);
+			assert.ok(!error.message.includes(foreign), `${one.what}: a refusal names the fixed command and nothing the registry holds`);
+			assert.ok(!error.message.includes(":1") && !error.message.includes(":2"), `${one.what}: nor the name this Pi renamed it to`);
+			return true;
+		});
+	}
+	// A registry this bootstrap cannot read the answer of is the same compatibility finding every other public api
+	// gets: it names the api and the shape, and copies nothing of what it was told.
+	const shapes: Array<{ what: string; fault: Fault; expect: RegExp }> = [
+		{ what: "no extension runner", fault: { commands: { without: "runner" } }, expect: /createAgentSessionFromServices\(\) with something other than a session whose extensionRunner provides getRegisteredCommands\(\)/ },
+		{ what: "no accessor on it", fault: { commands: { without: "accessor" } }, expect: /a session whose extensionRunner provides getRegisteredCommands\(\)/ },
+		{ what: "an accessor that throws", fault: { commands: { throws: marked(CONSTRUCTION_MARKERS.session) } }, expect: /getRegisteredCommands\(\) with something other than an answer at all rather than a failure of its own/ },
+		{ what: "an answer that is not a list", fault: { commands: { list: "pi-fusion-navigate" } }, expect: /getRegisteredCommands\(\) with something other than a list of the registered commands, each naming its own invocationName/ },
+		{ what: "a command that is not a record", fault: { commands: { list: ["pi-fusion-navigate"] } }, expect: /a list of the registered commands, each naming its own invocationName/ },
+		{ what: "a command whose invocation name is not one", fault: { commands: { list: [{ invocationName: 7, sourceInfo: { path: CONTROL_EXTENSION_PATH } }] } }, expect: /a list of the registered commands, each naming its own invocationName/ },
+	];
+	for (const one of shapes) {
+		const shaped = fakeSdk(["deepseek/deepseek-chat"], one.fault);
+		await assert.rejects(createRuntime(composed, shaped.sdk), (error: Error & { stage?: string; cause?: unknown }) => {
+			assert.equal(error.stage, "sdk", one.what);
+			assert.match(error.message, one.expect, one.what);
+			assert.equal(error.cause, undefined, `${one.what}: the thrown value is not carried along as a cause`);
+			for (const marker of constructionMarkers) assert.ok(!error.message.includes(marker), `${one.what} must not repeat ${marker}`);
+			return true;
+		});
+	}
 });
 
 test("the thinking levels the bootstrap accepts are Pi's own, and nothing else is a level", () => {
