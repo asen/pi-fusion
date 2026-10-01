@@ -245,7 +245,9 @@ test("a backend the host holds keeps its own role and session shapes behind the 
 
 test("every role a record may name has capabilities, and the host advertises the roles it can run", () => {
 	assert.deepEqual([...KNOWN_ROLE_NAMES].sort(), ["ask", "implement", "plan", "security", "ultracode"]);
-	assert.deepEqual([...ROLE_NAMES].sort(), ["ask", "implement", "plan", "ultracode"], "security is metadata until a backend runs it");
+	// `ROLE_NAMES` is the claude binding's own list, which is what the compatibility tool advertises: security runs on
+	// the pi backend alone, so it is not in it, and the primary tool advertises every role a record may name.
+	assert.deepEqual([...ROLE_NAMES].sort(), ["ask", "implement", "plan", "ultracode"], "security runs on pi alone, so the claude binding has no role of that name");
 	for (const name of KNOWN_ROLE_NAMES) assert.equal(ROLE_SPECS[name].name, name);
 	assert.deepEqual(
 		KNOWN_ROLE_NAMES.filter((name) => ROLE_SPECS[name].canChangeFiles),
@@ -257,6 +259,7 @@ test("every role a record may name has capabilities, and the host advertises the
 	);
 	assert.deepEqual(ROLE_SPECS.ultracode.backends, ["claude"]);
 	assert.deepEqual(ROLE_SPECS.security.backends, ["pi"]);
+	assert.equal(runsOn("security", "pi"), true, "and the backend it does run on binds it");
 	assert.deepEqual([...ROLE_SPECS.implement.backends].sort(), ["claude", "pi"]);
 	assert.equal(canChangeFiles("ask"), false);
 	assert.equal(canChangeFiles("nobody"), true, "a role nothing knows is treated as one that can change files");

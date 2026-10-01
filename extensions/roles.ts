@@ -7,7 +7,7 @@ import { type BackendName, BACKEND_NAMES } from "./backends/types.ts";
  * the host's and the backend's, and this module imports neither.
  */
 
-/** Every role a record may name, which is more than the host advertises: `security` is metadata here and runs nowhere yet. */
+/** Every role a record may name, which is every role a backend of this build runs: `security` runs on Pi and nowhere else. */
 export const KNOWN_ROLE_NAMES = ["plan", "implement", "ultracode", "ask", "security"] as const;
 export type KnownRoleName = (typeof KNOWN_ROLE_NAMES)[number];
 

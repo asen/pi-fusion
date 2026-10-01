@@ -10,8 +10,8 @@
 | `PI_FUSION_ULTRACODE_PERMISSION_MODE` | `bypassPermissions` |
 | `PI_FUSION_ASK_MODEL` | `opus` |
 | `PI_FUSION_ASK_EFFORT` | `high` |
-| `PI_FUSION_PI_<ROLE>_MODEL` | unset; the `pi` backend's model for role `plan`, `implement` or `ask`, as `provider/model-id`. A `pi` call that names no `model` of its own needs it; see [The pi backend's variables](#the-pi-backends-variables) |
-| `PI_FUSION_PI_<ROLE>_EFFORT` | unset; that role's thinking level on the `pi` backend. Optional, and a child given none keeps its own default |
+| `PI_FUSION_PI_<ROLE>_MODEL` | unset; the `pi` backend's model for role `plan`, `implement`, `ask` or `security`, as `provider/model-id`. A `pi` call that names no `model` of its own needs it; see [The pi backend's variables](#the-pi-backends-variables) |
+| `PI_FUSION_PI_<ROLE>_EFFORT` | unset; that role's thinking level on the `pi` backend, for the same four roles. Optional, and a child given none keeps its own default |
 | `PI_FUSION_ULTRACODE_WORKFLOW_SIZE` | unset; `small`, `medium`, `large` or `unrestricted` sets Claude Code's `workflowSizeGuideline` for the child |
 | `PI_FUSION_CLAUDE_BIN` | unset; the Claude Code binary bundled with the SDK. Set it to run another `claude` executable, for example the one on `PATH` |
 | `PI_FUSION_DASHBOARD_OPEN` | unset; `0` stops `/fusion dashboard` from opening the browser and only shows the URL |
@@ -19,7 +19,7 @@
 | `PI_FUSION_BUDGET_WARN_USD` | unset; one amount or a comma-separated list, such as `5,20`: the user is warned once at each amount the session's estimated cost reaches |
 | `PI_FUSION_BUDGET_LIMIT_USD` | unset; one amount: at or over it no new run starts, no run is continued and no review starts. It cancels nothing |
 | `PI_FUSION_PLAN_CONTEXT_PCT` | `35`; the share of its context window, in percent, at which a plan run is handed off to a fresh one instead of continued, and at which a `continue` of any run says so in its result. `0` turns both off |
-| `PI_FUSION_AUTO_REVIEW` | unset; `1` starts an independent review of every `implement` or `ultracode` run a delegation tool started that ends `done` with changed files |
+| `PI_FUSION_AUTO_REVIEW` | unset; `1` starts an independent review of every `implement`, `ultracode` or `security` run a delegation tool started that ends `done` with changed files |
 | `PI_FUSION_HISTORY` | unset; `1` keeps the runs of each Pi session that has a session file on disk, prompts and reports included, so a later Pi process on the same session can show them |
 | `PI_FUSION_HISTORY_DIR` | unset; the directory those files go in. The default is `pi-fusion/history` under `PI_CODING_AGENT_DIR`, which is `~/.pi/agent` |
 
@@ -27,15 +27,17 @@ Each variable applies to the role in its name. A call's `model` or `effort` para
 
 ## The pi backend's variables
 
-`PI_FUSION_PI_PLAN_MODEL`, `PI_FUSION_PI_IMPLEMENT_MODEL` and `PI_FUSION_PI_ASK_MODEL`, and the matching `PI_FUSION_PI_<ROLE>_EFFORT`, say what a role runs as on the `pi` backend. The backend needs no variable to be available, because this build registers it; what it has no default for is the model, so these are how a `pi` call gets one without naming `model` itself.
+`PI_FUSION_PI_PLAN_MODEL`, `PI_FUSION_PI_IMPLEMENT_MODEL`, `PI_FUSION_PI_ASK_MODEL` and `PI_FUSION_PI_SECURITY_MODEL`, and the matching `PI_FUSION_PI_<ROLE>_EFFORT`, say what a role runs as on the `pi` backend. The backend needs no variable to be available, because this build registers it; what it has no default for is the model, so these are how a `pi` call gets one without naming `model` itself. Role `security` runs on `pi` alone, so `PI_FUSION_PI_SECURITY_MODEL` is the only variable that gives that role a model at all.
 
 There is no default model and none is guessed, so each role takes its model from the call's `model` parameter, or from the selection the run it continues actually ran with, or from that role's `PI_FUSION_PI_<ROLE>_MODEL`, in that order; without one of the three the call is refused and says so, before a handle is taken, a child starts or an entry is written. A model is a provider and a model id split at the first slash, such as `deepseek/deepseek-chat` — the id after that slash is opaque and may hold slashes of its own, as `openrouter/deepseek/deepseek-chat` does. The thinking level is optional in the same three places: a first call that names none leaves the child its own default, and the child reports back what that was. A call that names an empty model or an empty level is refused rather than falling through to a recorded or configured value.
+
+One Pi run's model comes from none of those three: the `pi` reviewer of a finished `security` run. It is given the model that run itself recorded having run with, as the reviewer's own, so `PI_FUSION_PI_ASK_MODEL` is never read for it and a `security` run with no recorded model gets no reviewer at all. Its thinking level is the ordinary one for a Pi `ask` run — `PI_FUSION_PI_ASK_EFFORT`, or the child's own default when that is unset — and never the level the `security` run itself ran at. See [Independent reviews](reviews.md#which-backend-reviews-a-run).
 
 What a run ends with is what gets kept. A settled call records the model and level the child actually ran with, and a continuation repeats that recorded selection rather than resolving one again, so changing a variable afterwards does not move a running thread to another model; a call's own `model` or `effort` still wins for that call, and the fields it does not name stay as they were recorded. The levels are `off`, `minimal`, `low`, `medium`, `high`, `xhigh` and `max`; whether a given model offers one of them is the backend's check against the child, not this host's, and a level the child clamped to something else fails the call instead of becoming a selection a continuation would repeat.
 
 The two budget variables are not role variables, and neither are `PI_FUSION_WIDGET`, `PI_FUSION_PLAN_CONTEXT_PCT`, `PI_FUSION_AUTO_REVIEW`, `PI_FUSION_HISTORY` and `PI_FUSION_HISTORY_DIR`. The budget variables and `PI_FUSION_PLAN_CONTEXT_PCT` are read when Pi loads the extension; see [Session usage and budget](#session-usage-and-budget) and [the context cap](runs.md#the-context-cap).
 
-Role `plan` runs at effort `xhigh` on the `claude` backend unless a call passes `effort`; there is no variable for it. On `pi` no role has a model default and the thinking level is optional: a `pi` call takes its model from `model` or `PI_FUSION_PI_<ROLE>_MODEL` and is refused without one, and a call that names no level leaves the child its own. Role `ultracode` always runs at effort `ultracode`, which is Claude Code's `xhigh` tier plus the standing Workflow opt-in. Passing `xhigh` itself would keep the reasoning level but drop the workflows. The workflow agents' model and effort (Opus 5, xhigh) live in the implementer contract, not in a variable.
+Role `plan` runs at effort `xhigh` on the `claude` backend unless a call passes `effort`; there is no variable for it. On `pi` no role has a model default — not one of the four, `security` included — and the thinking level is optional: a `pi` call takes its model from `model` or `PI_FUSION_PI_<ROLE>_MODEL` and is refused without one, and a call that names no level leaves the child its own. Role `ultracode` always runs at effort `ultracode`, which is Claude Code's `xhigh` tier plus the standing Workflow opt-in. Passing `xhigh` itself would keep the reasoning level but drop the workflows. The workflow agents' model and effort (Opus 5, xhigh) live in the implementer contract, not in a variable.
 
 The role contracts are the Markdown files under `contracts/`, passed to each child as an appended system prompt. Edit them to change how a role behaves.
 
@@ -76,4 +78,4 @@ What a finished call counts with is the total its outcome returned, because that
 
 Both variables are read when Pi loads the extension. Changing them in the shell afterwards does nothing until Pi restarts. A variable that is set and names no dollar amount turns its control off, and the first delegation, control or `/fusion` call of the process says so once, for example `fusion: PI_FUSION_BUDGET_LIMIT_USD=1,000 is not a dollar amount; no limit is set`.
 
-All four roles this build runs are always available; there is no switch to turn one off, and no switch turns the reserved `security` role on.
+All five roles this build runs are always available, `security` among them; there is no switch to turn one off, and none to turn one on. Which backends run a role is code, not configuration: `ultracode` runs on `claude` alone and `security` on `pi` alone, and `PI_FUSION_PI_SECURITY_MODEL` gives that role a model rather than enabling it.

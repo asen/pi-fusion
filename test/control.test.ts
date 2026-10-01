@@ -1403,7 +1403,7 @@ test("/fusion review refuses a running run, an ask run, a run that changed nothi
 	host.notices.length = 0;
 	await host.claude({ role: "ask", task: "where is x?" });
 	await host.command("review run-2");
-	assert.deepEqual(host.notices, [["run-2 is an ask run; only implement and ultracode runs are reviewed", "warning"]]);
+	assert.deepEqual(host.notices, [["run-2 is an ask run; only implement, ultracode and security runs are reviewed", "warning"]]);
 	host.notices.length = 0;
 	await host.claude({ role: "implement", task: "read something" });
 	await host.command("review run-3");
@@ -1790,36 +1790,76 @@ test("a run of an earlier Pi process can still be reviewed, and the review is ke
 		),
 	));
 
-test("a restored security run is reviewed by no claude reviewer, and nothing starts, links or records for it", () =>
+/** What another build's pi security run leaves behind: a file-changing role this host runs on the pi backend alone. */
+const PI_SECURITY_REF = { backend: "pi", sessionId: "pi-1", sessionFile: "/sessions/pi-1.jsonl", checkpoint: "entry-9" };
+
+/**
+ * One restored security run in the on-disk history and on the branch, out of an implement run that changed files: its
+ * role is then the only thing under test, and `selection` says whether the run recorded what it ran with.
+ */
+const restoredSecurity = (dir: string, cwd: string, selection?: { model: string; effort: string }) => {
+	const file = path.join(dir, "host-1.json");
+	const kept = JSON.parse(fs.readFileSync(file, "utf8")) as { records: any[] };
+	const { sessionId, checkpoint, ...held } = kept.records[0];
+	assert.ok(held.files?.length, "the run under test has to have changed files, so its role and its selection are the only things left to judge it by");
+	const record = { ...held, role: "security", backend: "pi", ref: PI_SECURITY_REF, ...(selection ? { selection } : {}) };
+	fs.writeFileSync(file, JSON.stringify({ ...kept, records: [record] }));
+	const host = durable("host-1", cwd);
+	host.branch.push({
+		type: "custom",
+		customType: "pi-fusion",
+		data: { run: "run-1", role: "security", backend: "pi", hostSessionId: "host-1", session: PI_SECURITY_REF, ...(selection ? { selection } : {}) },
+	});
+	return host;
+};
+
+test("a restored security run that recorded what it ran with is offered for review like any other file-changing run", () =>
 	withHistory((dir) =>
 		withRepo(
 			async (first, cwd) => {
 				await withScenario("edit", () => first.claude({ role: "implement", task: "add the retry" }));
-				const file = path.join(dir, "host-1.json");
-				const kept = JSON.parse(fs.readFileSync(file, "utf8")) as { records: any[] };
-				const { sessionId, checkpoint, ...held } = kept.records[0];
-				assert.ok(held.files?.length, "the run under test has to have changed files, so its role is the only reason left to refuse it");
-				// What another build's pi security run leaves behind: a full file-changing role this host runs nowhere.
-				const ref = { backend: "pi", sessionId: "pi-1", sessionFile: "/sessions/pi-1.jsonl", checkpoint: "entry-9" };
-				const selection = { model: "deepseek/deepseek-chat", effort: "medium" };
-				fs.writeFileSync(file, JSON.stringify({ ...kept, records: [{ ...held, role: "security", backend: "pi", ref, selection }] }));
-				const second = durable("host-1", cwd);
-				second.branch.push({ type: "custom", customType: "pi-fusion", data: { run: "run-1", role: "security", backend: "pi", hostSessionId: "host-1", session: ref, selection } });
+				const second = restoredSecurity(dir, cwd, { model: "deepseek/deepseek-chat", effort: "medium" });
 				await second.command("status run-1");
 				assert.match(second.notices[0]![0], /^run-1 \(security\) ran in an earlier Pi process/);
-				assert.ok(!second.notices[0]![0].includes("review it with"), "a role no backend runs here is offered for review nowhere");
-				assert.equal(second.completions("review "), null, "and it is completed for review nowhere either");
-				second.notices.length = 0;
-				await second.command("review run-1");
-				assert.deepEqual(second.notices, [
-					["run-1 is a security run, which no backend runs in this build; its review waits for the backend that runs it, and no claude reviewer stands in for it", "warning"],
-				]);
-				assert.deepEqual(second.sent, [], "no review run starts and the host hears nothing of one");
-				assert.equal(await second.text(second.control({ action: "status" })), "no runs in this Pi session yet", "no run of this Pi process was started");
-				assert.equal(second.branch.length, 1, "and no entry was appended for one");
-				const after = heldFile(dir, "host-1");
-				assert.deepEqual(after.records.map((record) => record.handle), ["run-1"], "the history keeps no review run either");
-				assert.equal(after.records[0].reviewedBy, undefined, "and the source is linked to no review");
+				assert.ok(second.notices[0]![0].includes("review it with /fusion review run-1"), second.notices[0]![0]);
+				assert.deepEqual(second.completions("review "), [{ value: "review run-1", label: "review run-1" }], "the restored security run is offered for review");
+				// The review itself is not run here: its reviewer is a pi child, and the pi backend of this host is the
+				// tripwire. The policy that picks that reviewer is `test/review.test.ts`'s, pure and on its own; the
+				// reviewer it is actually bound to — the model, the level, the contract and the tools — is
+				// `test/lifecycle.test.ts`'s, against an injected pi backend.
+				assert.deepEqual(second.sent, [], "reading the status starts nothing");
+				assert.equal(second.branch.length, 1, "and appends no entry");
+			},
+			{ id: "host-1", file: path.join(os.tmpdir(), "host-1.jsonl") },
+		),
+	));
+
+test("a restored security run that recorded no model it ran with is reviewed by nothing, and nothing starts, links or records", () =>
+	withHistory((dir) =>
+		withRepo(
+			async (first, cwd) => {
+				await withScenario("edit", () => first.claude({ role: "implement", task: "add the retry" }));
+				// A model configured for pi ask runs is exactly what must not stand in for the one the run did not
+				// record: the reviewer inherits the source run's model or there is no reviewer.
+				process.env.PI_FUSION_PI_ASK_MODEL = "deepseek/deepseek-chat";
+				try {
+					const second = restoredSecurity(dir, cwd);
+					await second.command("review run-1");
+					assert.deepEqual(second.notices, [
+						[
+							"run-1 recorded no model it ran with, so no reviewer inherits one; review it yourself with fusion, role ask, mode review, backend pi and a model",
+							"warning",
+						],
+					]);
+					assert.deepEqual(second.sent, [], "no review run starts and the host hears nothing of one");
+					assert.equal(await second.text(second.control({ action: "status" })), "no runs in this Pi session yet", "no run of this Pi process was started");
+					assert.equal(second.branch.length, 1, "and no entry was appended for one");
+					const after = heldFile(dir, "host-1");
+					assert.deepEqual(after.records.map((record) => record.handle), ["run-1"], "the history keeps no review run either");
+					assert.equal(after.records[0].reviewedBy, undefined, "and the source is linked to no review");
+				} finally {
+					delete process.env.PI_FUSION_PI_ASK_MODEL;
+				}
 			},
 			{ id: "host-1", file: path.join(os.tmpdir(), "host-1.jsonl") },
 		),

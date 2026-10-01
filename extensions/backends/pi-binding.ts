@@ -27,8 +27,8 @@ export interface PiRole {
 	skills: string[];
 }
 
-/** The roles this build binds on Pi. `security` is metadata until it has a contract and a binding of its own. */
-export const PI_ROLE_NAMES = ["plan", "implement", "ask"] as const;
+/** The roles this build binds on Pi, `security` included: it runs here and on no other backend. */
+export const PI_ROLE_NAMES = ["plan", "implement", "ask", "security"] as const;
 export type PiRoleName = (typeof PI_ROLE_NAMES)[number];
 
 export const PI_MODES = ["answer", "review"] as const;
@@ -37,12 +37,15 @@ export type PiMode = (typeof PI_MODES)[number];
 /**
  * The tools each role's child runs with, as Pi names its own. `ask` reads, searches and runs commands and has no edit
  * or write tool at all, which is what a review and an answer need; `plan` and `implement` get the standard coding set,
- * the same shape their Claude bindings have always had.
+ * the same shape their Claude bindings have always had. `security` gets that same set rather than a read-only one,
+ * because the role investigates and, when its task authorizes one, writes the fix: whether it may change application
+ * code is its contract's rule and the task's, and not a tool this binding takes away from a job that needs it.
  */
 const PI_ROLE_TOOLS: Record<PiRoleName, readonly string[]> = {
 	plan: ["read", "bash", "edit", "write", "grep", "find", "ls"],
 	implement: ["read", "bash", "edit", "write", "grep", "find", "ls"],
 	ask: ["read", "bash", "grep", "find", "ls"],
+	security: ["read", "bash", "edit", "write", "grep", "find", "ls"],
 };
 
 /**
@@ -53,18 +56,29 @@ const PI_ROLE_RESOURCES: Record<PiRoleName, { extensions: readonly string[]; ski
 	plan: { extensions: [], skills: [] },
 	implement: { extensions: [], skills: [] },
 	ask: { extensions: [], skills: [] },
+	security: { extensions: [], skills: [] },
 };
 
-/** The contracts a Pi role runs under: the same prose the Claude roles run under, named here as metadata and no more. */
-const PI_CONTRACTS: Record<PiRoleName, string> = { plan: "plan.md", implement: "implement.md", ask: "ask-answer.md" };
+/**
+ * The contracts a Pi role runs under: the same prose the Claude roles run under, named here as metadata and no more.
+ * `security` runs on no other backend, so its contract is one no Claude role names.
+ */
+const PI_CONTRACTS: Record<PiRoleName, string> = { plan: "plan.md", implement: "implement.md", ask: "ask-answer.md", security: "security.md" };
 const PI_ASK_CONTRACTS: Record<PiMode, string> = { answer: "ask-answer.md", review: "ask-review.md" };
+
+/**
+ * Every contract file a Pi role can run under, the ask modes included: what the extension checks is there at load, so
+ * a contract only Pi names is as much a broken install as one a Claude role names. Names and no paths, like the rest
+ * of this module: where the contracts live is the host's.
+ */
+export const PI_CONTRACT_FILES: readonly string[] = [...new Set([...Object.values(PI_CONTRACTS), ...Object.values(PI_ASK_CONTRACTS)])];
 
 /** The call parameters each Pi role takes. Unlike Claude, every Pi role takes a model, because none of them has one. */
 const PI_ROLE_PARAMETERS: Record<"fresh" | "mode" | "model" | "effort", readonly PiRoleName[]> = {
 	fresh: ["plan"],
 	mode: ["ask"],
-	model: ["plan", "implement", "ask"],
-	effort: ["plan", "implement", "ask"],
+	model: ["plan", "implement", "ask", "security"],
+	effort: ["plan", "implement", "ask", "security"],
 };
 
 /** What a call asks of a Pi role: the role it names, an ask run's mode, and the selection it overrides. */

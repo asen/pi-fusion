@@ -13,11 +13,11 @@ A headless coding session that does work the host handed off: a Claude Code sess
 _Avoid_: subagent, worker, delegate
 
 **Backend**:
-The harness a child runs in, named in every record and route: `claude` and `pi`, both registered in this build. A call that names no backend runs on `claude`, which runs every role; `pi` runs `plan`, `implement` and `ask`, on the user's own Pi provider configuration. A fresh Pi run is one a call asked for by name, and a continuation stays on the backend its record names, `pi` included, whether or not the call names one. A backend owns its own session shape, model binding and stream; the host owns handles, records and scheduling.
+The harness a child runs in, named in every record and route: `claude` and `pi`, both registered in this build. A call that names no backend runs on `claude`, which runs every role but `security`; `pi` runs `plan`, `implement`, `ask` and `security`, on the user's own Pi provider configuration, and a `security` call goes there whether or not it names a backend, because no other backend runs that role. A fresh Pi run is one a call asked for by name, and a continuation stays on the backend its record names, `pi` included, whether or not the call names one. A backend owns its own session shape, model binding and stream; the host owns handles, records and scheduling.
 _Avoid_: adapter, provider, harness, runtime
 
 **Role**:
-The job a child does: `plan`, `implement`, `ultracode` or `ask`, with `security` reserved for a later step. A role fixes the child's contract, tools and default model and effort, says which backends may run it, whether it takes the file-changing slot and whether a review reads it.
+The job a child does: `plan`, `implement`, `ultracode`, `ask` or `security`. A role fixes the child's contract, tools and default model and effort, says which backends may run it, whether it takes the file-changing slot and whether a review reads it. `ultracode` runs on `claude` alone and `security` on `pi` alone; the user asks for `security`, and the host never picks it on its own judgement.
 _Avoid_: agent type, tool, persona
 
 **Run**:
@@ -57,7 +57,7 @@ A message from the host to a running child when the child has no open question. 
 _Avoid_: interrupt, nudge, follow-up
 
 **Review run**:
-A background `ask` run that reviews the working-tree change of an ended `implement` or `ultracode` run. The user starts one with `/fusion review`, or the extension starts it with `PI_FUSION_AUTO_REVIEW`. It gets its own handle and links to the run it reviews.
+A background `ask` run that reviews the working-tree change of an ended `implement`, `ultracode` or `security` run. The user starts one with `/fusion review`, or the extension starts it with `PI_FUSION_AUTO_REVIEW`. It gets its own handle and links to the run it reviews. Which backend it runs on is the reviewed run's role's: an `implement` or `ultracode` run keeps the Claude reviewer it has always had, and a `security` run is reviewed on `pi` with the model that run itself ran with.
 _Avoid_: self-review, verification, QA run
 
 **History**:

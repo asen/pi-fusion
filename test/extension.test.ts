@@ -8,7 +8,7 @@ import { fileURLToPath } from "node:url";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { visibleWidth } from "@earendil-works/pi-tui";
 import { CARD_REPORT_LINES } from "../extensions/cards.ts";
-import { PI_ROLE_NAMES, piRole } from "../extensions/backends/pi-binding.ts";
+import { PI_CONTRACT_FILES, PI_ROLE_NAMES, piRole } from "../extensions/backends/pi-binding.ts";
 import { PI_CHILD_MARKER, PI_CHILD_VARIABLE } from "../extensions/backends/pi-launch.ts";
 import fusion from "../extensions/fusion.ts";
 import { fakeBackend } from "./fake-pi-backend.ts";
@@ -303,10 +303,12 @@ test("the claude tool keeps the exact schema it had: four roles, five efforts an
 	assert.deepEqual(byName("claude").parameters.required, ["task"]);
 });
 
-test("the fusion tool advertises the same roles, a backend and every backend's effort levels, all as plain string enums", () => {
+test("the fusion tool advertises every role a backend runs, a backend and every backend's effort levels, all as plain string enums", () => {
 	const properties = byName("fusion").parameters.properties;
 	assert.deepEqual(Object.keys(properties), ["role", "task", "continue", "context", "background", "fresh", "mode", "backend", "model", "effort"]);
-	assert.deepEqual(properties.role.enum, ["plan", "implement", "ultracode", "ask"], "security is metadata until a backend runs it");
+	assert.deepEqual(properties.role.enum, ["plan", "implement", "ultracode", "ask", "security"], "the primary tool advertises security, which runs on pi alone");
+	assert.deepEqual(byName("claude").parameters.properties.role.enum, ["plan", "implement", "ultracode", "ask"], "and the compatibility tool advertises the four roles claude runs");
+	assert.match(properties.role.description, /^plan, implement, ultracode, ask or security\. Required unless continue is set\.$/);
 	assert.deepEqual(properties.backend.enum, ["claude", "pi"]);
 	assert.equal(properties.backend.type, "string");
 	assert.deepEqual(properties.effort.enum, ["off", "minimal", "low", "medium", "high", "xhigh", "max"]);
@@ -348,12 +350,19 @@ test("the fusion tool says which harness runs what, and the pi backend it regist
 	// pi selection comes from and that a call with none is refused. The compatibility tool stays Claude's own.
 	assert.doesNotMatch(fusionTool.description, /claude backend only/);
 	assert.doesNotMatch(fusionTool.description, /no configuration makes one available here/);
-	assert.match(fusionTool.description, /backend pi runs plan, implement and ask on the user's own Pi provider configuration/);
+	assert.match(fusionTool.description, /backend pi runs plan, implement, ask and security on the user's own Pi provider configuration/);
 	assert.match(fusionTool.description, /PI_FUSION_PI_<ROLE>_MODEL/);
 	assert.match(fusionTool.description, /a provider and a model id, such as deepseek\/deepseek-chat/);
 	assert.match(fusionTool.description, /refused before anything starts/);
 	assert.match(fusionTool.description, /role ultracode runs on the claude backend alone/);
+	assert.match(fusionTool.description, /role security on the pi backend alone/);
+	assert.match(fusionTool.description, /naming claude for it is refused before anything starts/);
 	assert.match(fusionTool.description, /leave backend unset unless the user asks for pi/);
+	// The one role whose work the user has to have asked for, said in the description as well as in the guideline.
+	assert.match(fusionTool.description, /only when the user asks for a security investigation, audit or fix/);
+	assert.match(fusionTool.description, /never puts a secret in its report by value/);
+	assert.match(fusionTool.description, /with none it reports findings and changes no application code/);
+	assert.doesNotMatch(byName("claude").description, /\bsecurity\b/, "the compatibility tool advertises a role it cannot run nowhere");
 	// Pi's tools are Pi's own, so the generic tool says what each pi role actually has rather than letting the claude
 	// lists above stand for them. What the sentence promises is read back out of it and compared with the lists the
 	// binding itself builds, rather than pinned as a second copy of them: a tool added to or taken from a pi role
@@ -364,20 +373,22 @@ test("the fusion tool says which harness runs what, and the pi backend it regist
 			.split(/,\s*|\s+and\s+/)
 			.map((tool) => tool.trim())
 			.filter((tool) => tool !== "");
-	const promised = /roles plan and implement run with (.+?), role ask runs with (.+?) and has no web search or web fetch tool at all/.exec(fusionTool.description);
+	const promised = /roles plan, implement and security run with (.+?), role ask runs with (.+?) and has no web search or web fetch tool at all/.exec(fusionTool.description);
 	assert.ok(promised, `the fusion description no longer says what the pi roles run with: ${fusionTool.description}`);
-	assert.deepEqual(named(promised[1]), piTools("plan"), "the plan and implement sentence promises another tool list than the pi binding builds");
-	assert.deepEqual(piTools("implement"), piTools("plan"), "and that sentence says one list for both of them");
+	assert.deepEqual(named(promised[1]), piTools("plan"), "the plan, implement and security sentence promises another tool list than the pi binding builds");
+	assert.deepEqual(piTools("implement"), piTools("plan"), "and that sentence says one list for all three of them");
+	assert.deepEqual(piTools("security"), piTools("implement"), "a security child investigates and, when its task authorizes one, writes the fix");
 	assert.deepEqual(named(promised[2]), piTools("ask"), "the ask sentence promises another tool list than the pi binding builds");
 	// Said directly beside the parse, because it is the limitation a caller gets wrong: whatever the prose calls them,
 	// no web tool of any name is in what a pi ask child runs with.
 	assert.deepEqual(piTools("ask").filter((tool) => /web|fetch|search/i.test(tool)), [], "a pi ask role must have no web search or web fetch tool at all");
-	assert.deepEqual([...PI_ROLE_NAMES].sort(), ["ask", "implement", "plan"], "the sentence accounts for three pi roles, so a fourth this build binds has to be written into it");
+	assert.deepEqual([...PI_ROLE_NAMES].sort(), ["ask", "implement", "plan", "security"], "the sentence accounts for four pi roles, so a fifth this build binds has to be written into it");
 	assert.match(fusionTool.description, /every pi role also gets ask_orchestrator/);
 	assert.doesNotMatch(byName("claude").description, /find and ls/, "the compatibility tool advertises claude's own tools and no pi list");
 	const backendParameter = fusionTool.parameters.properties.backend.description as string;
-	assert.match(backendParameter, /claude, which runs every role and is what a call that leaves this unset gets/);
-	assert.match(backendParameter, /pi, which runs plan, implement and ask/);
+	assert.match(backendParameter, /claude, which runs every role but security and is what a call that leaves this unset gets for all of them/);
+	assert.match(backendParameter, /pi, which runs plan, implement, ask and security/);
+	assert.match(backendParameter, /role security goes to pi whether or not this names it/);
 	assert.ok(
 		(fusionTool.promptGuidelines ?? []).some((guideline) => /backend parameter/.test(guideline) && /leave backend unset otherwise/.test(guideline)),
 		"no fusion guideline says where the harness the user named goes",
@@ -387,7 +398,7 @@ test("the fusion tool says which harness runs what, and the pi backend it regist
 	// One of exactly two registrations in the suite that take the production defaults on purpose, the pi backend this
 	// build registers included and no tripwire over it. With nothing configured for any pi role, an explicit pi call is
 	// refused by the binding before that backend is asked for a session, a control or a run: no child of any harness is
-	// started and nothing is recorded. All six variables a pi role could resolve a model from are deleted first, and
+	// started and nothing is recorded. Every variable a pi role could resolve a model from is deleted first, and
 	// `productionDefaults` refuses the registration outright if one of them is still set, so the refusal below is the
 	// binding's own and never this process's environment.
 	const kept = PI_SELECTION_VARIABLES.map((name) => [name, process.env[name]] as const);
@@ -400,6 +411,11 @@ test("the fusion tool says which harness runs what, and the pi backend it regist
 		await assert.rejects(defaultFusion.execute("call-1", { role: "implement", task: "x", backend: "pi" }, undefined, undefined, ctx), {
 			message:
 				"role implement has no model for the pi backend: set PI_FUSION_PI_IMPLEMENT_MODEL to a provider and a model id, such as deepseek/deepseek-chat, or name one in the call's model parameter. The pi backend has no default model and resolves none for you",
+		});
+		// And the role pi alone runs, which needs no backend named to go there: the binding refuses it the same way.
+		await assert.rejects(defaultFusion.execute("call-2", { role: "security", task: "audit the token check" }, undefined, undefined, ctx), {
+			message:
+				"role security has no model for the pi backend: set PI_FUSION_PI_SECURITY_MODEL to a provider and a model id, such as deepseek/deepseek-chat, or name one in the call's model parameter. The pi backend has no default model and resolves none for you",
 		});
 		assert.equal(defaults.into.entries, 0, "a call the binding refused records nothing");
 	} finally {
@@ -469,8 +485,13 @@ test("a fusion call with no backend runs the role's claude defaults and records 
 	await assert.rejects(byName("fusion").execute("call-1", { role: "ultracode", task: "x", backend: "pi" }, undefined, undefined, ctx), {
 		message: "role ultracode does not run on the pi backend; use one of claude",
 	});
-	await assert.rejects(byName("fusion").execute("call-1", { role: "security", task: "x" }, undefined, undefined, ctx), {
-		message: "role security is known to records and reviews, and no backend runs it in this build; use one of plan, implement, ultracode, ask",
+	// security runs on pi alone, so naming claude for it is refused by capability, and the compatibility tool, which
+	// advertises four roles and no backend at all, refuses the name itself.
+	await assert.rejects(byName("fusion").execute("call-1", { role: "security", task: "x", backend: "claude" }, undefined, undefined, ctx), {
+		message: "role security does not run on the claude backend; use one of pi",
+	});
+	await assert.rejects(byName("claude").execute("call-1", { role: "security", task: "x" }, undefined, undefined, ctx), {
+		message: "unknown role security; use one of plan, implement, ultracode, ask",
 	});
 });
 
@@ -547,6 +568,47 @@ test("the loader refuses a child, a missing contract and a missing bootstrap in 
 	assert.equal(source.split(MISSING_BOOTSTRAP).length - 1, 1, "the missing-bootstrap refusal must be written in exactly one place, or one of them can drift");
 });
 
+test("the load-time contract check covers every contract either backend's roles name, the pi-only one included", () => {
+	// What the loader adds to the claude roles' own contracts is the binding's own list, so a contract only a pi role
+	// names is checked at load for the same reason: it is a broken install whichever backend would have run it. The
+	// loader is read here rather than run with a file gone, as the order case above reads it.
+	assert.deepEqual([...PI_CONTRACT_FILES].sort(), ["ask-answer.md", "ask-review.md", "implement.md", "plan.md", "security.md"]);
+	for (const role of PI_ROLE_NAMES) {
+		const bound = piRole({ role, model: "deepseek/deepseek-chat" }, undefined, {} as NodeJS.ProcessEnv);
+		assert.ok(PI_CONTRACT_FILES.includes(bound.contract), `the loader never checks the contract role ${role} runs under: ${bound.contract}`);
+	}
+	for (const name of PI_CONTRACT_FILES) assert.ok(fs.existsSync(path.join(repoRoot, "contracts", name)), `this install ships no contracts/${name}`);
+	const source = fs.readFileSync(path.join(repoRoot, "extensions", "fusion.ts"), "utf8");
+	assert.ok(
+		source.includes("new Set([...Object.values(ROLES).map((role) => role.contract), ...Object.values(ASK_CONTRACTS), ...PI_CONTRACT_FILES])"),
+		"the load-time check no longer reads the pi bindings' own contracts beside the claude roles'",
+	);
+});
+
+test("the security contract scopes one investigation, says where the authorization to fix comes from, and fixes its sections", () => {
+	const text = fs.readFileSync(path.join(repoRoot, "contracts", "security.md"), "utf8");
+	// The exact sections, in this order: a reader of a security report has to find the evidence under each finding.
+	const headings = ["## Findings", "## Evidence", "## Changed", "## Verification", "## Unresolved", "## Escalation"];
+	let at = -1;
+	for (const heading of headings) {
+		const found = text.indexOf(`\n${heading}\n`);
+		assert.ok(found > at, `${heading} is missing from contracts/security.md or written out of order`);
+		at = found;
+	}
+	assert.match(text, /^## Findings$/m);
+	assert.match(text, /The task says whether fixes are authorized/);
+	assert.match(text, /reports findings and changes no application code|report what you found and change no application code/);
+	assert.match(text, /ask_orchestrator/, "an ambiguous authorization is a question for the orchestrator, not a guess");
+	assert.match(text, /severity — high, medium or low — and say whether it is confirmed or inferred/);
+	assert.match(text, /Confirm a finding where you can/);
+	assert.match(text, /Never put a secret in your report by value/);
+	assert.match(text, /`path:line`/);
+	assert.match(text, /Do not commit/);
+	assert.match(text, /do not widen the task/);
+	assert.match(text, /Verify every change you make/);
+	assert.match(text, /^## Escalation$/m);
+});
+
 test("the contracts carry the escalation and route sections the tool promises", () => {
 	const contract = (name: string) => fs.readFileSync(path.join(repoRoot, "contracts", name), "utf8");
 	const implement = contract("implement.md");
@@ -562,15 +624,17 @@ test("the contracts carry the escalation and route sections the tool promises", 
 	}
 	assert.match(contract("ask-review.md"), /^## Findings$/m);
 	assert.match(contract("ask-review.md"), /most severe first/);
-	for (const name of ["plan.md", "implement.md", "ultracode.md", "ask-answer.md", "ask-review.md"]) {
+	for (const name of ["plan.md", "implement.md", "ultracode.md", "ask-answer.md", "ask-review.md", "security.md"]) {
 		assert.ok(!/multi-file|one small task/i.test(contract(name)), `${name} still routes by file count`);
 		assert.ok(!/fable_consolidate|opus_implement|fable_implement|workhorse|consolidator/.test(contract(name)), `${name} still uses an old name`);
 	}
 });
 
-test("the four common contracts read as prose any backend's child can run, and say the same things they said", () => {
+test("the common contracts read as prose any backend's child can run, and say the same things they said", () => {
 	const contract = (name: string) => fs.readFileSync(path.join(repoRoot, "contracts", name), "utf8");
-	const common = ["plan.md", "implement.md", "ask-answer.md", "ask-review.md"];
+	// `security.md` is in this list though only the pi binding names it: it is prose about the job and not about a
+	// harness, so the day another backend runs the role it needs no rewrite.
+	const common = ["plan.md", "implement.md", "ask-answer.md", "ask-review.md", "security.md"];
 	for (const name of common) {
 		const text = contract(name);
 		// A vendor, a model or a harness's own tool name: a Pi child runs this prose too, and none of these mean

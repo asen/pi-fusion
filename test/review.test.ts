@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { REVIEW_TEXT_CAP_BYTES, type ReviewSource, reviewable, reviewPrompt } from "../extensions/review.ts";
+import { REVIEW_TEXT_CAP_BYTES, type ReviewSource, reviewable, reviewerFor, reviewPrompt } from "../extensions/review.ts";
 
 const source = (over: Partial<ReviewSource> = {}): ReviewSource => ({
 	handle: "run-1",
@@ -76,16 +76,50 @@ test("the prompt lists at most 500 changed paths and counts the rest", () => {
 	assert.ok(reviewPrompt(source({ files: files.slice(0, 500) })).endsWith("M src/file-499.ts"), "a list at the cap counts nothing more");
 });
 
-test("reviewable takes an implement or ultracode run that ended with changed files and names why it takes no other", () => {
+test("reviewable takes an implement, ultracode or security run that ended with changed files and names why it takes no other", () => {
 	const files = [{ path: "a.ts", status: "M" }];
 	assert.equal(reviewable({ state: "done", role: "implement", files }), undefined);
 	assert.equal(reviewable({ state: "failed", role: "ultracode", files }), undefined);
+	assert.equal(reviewable({ state: "done", role: "security", files }), undefined, "a security run is reviewed like the other roles that change files");
 	assert.equal(reviewable({ state: "running", role: "implement", files }), "is still active; review it when it has ended");
 	assert.equal(reviewable({ state: "waiting", role: "implement", files }), "is still active; review it when it has ended");
-	assert.equal(reviewable({ state: "done", role: "ask", files }), "is an ask run; only implement and ultracode runs are reviewed");
-	assert.equal(reviewable({ state: "done", role: "plan", files }), "is a plan run; only implement and ultracode runs are reviewed");
+	assert.equal(reviewable({ state: "done", role: "ask", files }), "is an ask run; only implement, ultracode and security runs are reviewed");
+	assert.equal(reviewable({ state: "done", role: "plan", files }), "is a plan run; only implement, ultracode and security runs are reviewed");
+	assert.equal(reviewable({ state: "done", role: "security", files: [] }), "changed no files", "and an investigation that changed nothing is reviewed like any other run that did not");
 	assert.equal(reviewable({ state: "cancelled", role: "implement", files }), "ended cancelled without a report to review");
 	assert.equal(reviewable({ state: "aborted", role: "implement", files }), "ended aborted without a report to review");
 	assert.equal(reviewable({ state: "done", role: "implement", files: [] }), "changed no files");
 	assert.equal(reviewable({ state: "done", role: "implement" }), "changed no files", "a run whose files were never listed changed none this can see");
+});
+
+test("a security run is reviewed on pi with the model it ran with, in whatever provider and model form that was", () => {
+	assert.deepEqual(reviewerFor({ role: "security", selection: { model: "deepseek/deepseek-chat", effort: "high" } }), { backend: "pi", model: "deepseek/deepseek-chat" });
+	assert.deepEqual(reviewerFor({ role: "security", selection: { model: "openrouter/deepseek/deepseek-chat", effort: "medium" } }), {
+		backend: "pi",
+		model: "openrouter/deepseek/deepseek-chat",
+	});
+	assert.deepEqual(reviewerFor({ role: "security", selection: { model: " deepseek/deepseek-chat ", effort: "max" } }), { backend: "pi", model: "deepseek/deepseek-chat" });
+});
+
+test("the reviewer inherits the model alone: the source run's thinking level is not on it under any name", () => {
+	const reviewer = reviewerFor({ role: "security", selection: { model: "deepseek/deepseek-chat", effort: "xhigh" } });
+	assert.deepEqual(Object.keys(reviewer).sort(), ["backend", "model"], "an effort key at all would make the source run's level the reviewer's");
+	assert.ok(!("effort" in reviewer), "nothing of the level is inherited");
+	assert.ok(!JSON.stringify(reviewer).includes("xhigh"), JSON.stringify(reviewer));
+});
+
+test("a security run that recorded no model it ran with gets no reviewer, and the refusal says who can review it", () => {
+	const refused = { refused: "recorded no model it ran with, so no reviewer inherits one; review it yourself with fusion, role ask, mode review, backend pi and a model" };
+	assert.deepEqual(reviewerFor({ role: "security" }), refused, "a record with no selection names no model");
+	assert.deepEqual(reviewerFor({ role: "security", selection: { model: "", effort: "high" } }), refused, "and neither does an empty one");
+	assert.deepEqual(reviewerFor({ role: "security", selection: { model: "   ", effort: "high" } }), refused, "or a blank one");
+});
+
+test("every other role keeps the claude reviewer, whatever it ran with and whether this build knows the role at all", () => {
+	for (const role of ["implement", "ultracode", "plan", "ask"]) {
+		assert.deepEqual(reviewerFor({ role }), { backend: "claude" }, `role ${role} is reviewed on claude`);
+		assert.deepEqual(reviewerFor({ role, selection: { model: "deepseek/deepseek-chat", effort: "high" } }), { backend: "claude" }, `role ${role} inherits nothing of its own run`);
+	}
+	assert.deepEqual(reviewerFor({ role: "Security", selection: { model: "deepseek/deepseek-chat", effort: "high" } }), { backend: "claude" }, "the role name is matched exactly");
+	assert.deepEqual(reviewerFor({ role: "whatever-a-record-named", selection: { model: "deepseek/deepseek-chat", effort: "high" } }), { backend: "claude" });
 });

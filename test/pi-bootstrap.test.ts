@@ -3158,7 +3158,10 @@ test("the composer refuses a call it cannot compose", () => {
 test("a role's tools and resources come from its own binding, and an ask child has no way to change a file", () => {
 	const of = (name: string): PiRole => piRole({ role: name, model: "deepseek/deepseek-chat" }, undefined, {});
 	assert.deepEqual(of("ask").tools, ["read", "bash", "grep", "find", "ls"]);
-	for (const name of ["plan", "implement"]) assert.deepEqual(of(name).tools, ["read", "bash", "edit", "write", "grep", "find", "ls"]);
+	// A security child gets the coding set: it investigates, and writes the fix when its task authorizes one, which is
+	// its contract's rule and the task's rather than a tool the binding takes away from a job that needs it.
+	for (const name of ["plan", "implement", "security"]) assert.deepEqual(of(name).tools, ["read", "bash", "edit", "write", "grep", "find", "ls"]);
+	assert.equal(of("security").contract, "security.md", "and it runs under a contract of its own, which no claude role names");
 	for (const tool of ["edit", "write"]) assert.equal(of("ask").tools.includes(tool), false, `an ask child has no ${tool} tool`);
 	for (const name of PI_ROLE_NAMES) {
 		assert.deepEqual([of(name).extensions, of(name).skills], [[], []], `role ${name} names a resource, and no role in this build does`);

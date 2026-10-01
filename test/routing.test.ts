@@ -61,13 +61,46 @@ test("an explicit backend must run the role, and an unknown one names the backen
 	assert.throws(() => fusionRoute({ role: "implement", task: "x", backend: "elsewhere" }, records()), /^Error: unknown backend elsewhere; use one of claude, pi$/);
 });
 
-test("the security role is known to records and reviews, and no call runs it in this build", () => {
-	for (const params of [{ role: "security", task: "x" }, { role: "security", task: "x", backend: "pi" }, { role: "security", task: "x", backend: "claude" }] as FusionParams[]) {
-		assert.throws(() => fusionRoute(params, records()), /^Error: role security is known to records and reviews, and no backend runs it in this build; use one of plan, implement, ultracode, ask$/);
-	}
-	// A security record on the branch is still refused for continuing, rather than run on whatever backend is here.
+test("the security role runs on pi alone: a call with no backend goes there, claude is refused and a record continues there", () => {
+	// Pi is the sole backend the role runs on, so a call that names no backend goes there rather than to the default one.
+	const fresh = fusionRoute({ role: "security", task: "audit the token check" }, records());
+	assert.deepEqual([fresh.backend, fresh.role, fresh.handle], ["pi", "security", "run-1"]);
+	assert.equal(fusionRoute({ role: "security", task: "x", backend: "pi" }, records()).backend, "pi");
+	assert.throws(() => fusionRoute({ role: "security", task: "x", backend: "claude" }, records()), /^Error: role security does not run on the claude backend; use one of pi$/);
+	// The compatibility tool advertises four roles and this is not one of them, so its own list refuses it by name
+	// rather than by a capability that tool never advertised.
+	assert.throws(() => claudeRoute({ role: "security", task: "x" }, records()), /^Error: unknown role security; use one of plan, implement, ultracode, ask$/);
+	assert.throws(() => claudeCall({ role: "security", task: "x" }, records()), /^Error: unknown role security; use one of plan, implement, ultracode, ask$/);
+	// A security record on the branch is continued on the backend it ran on, with the selection that run ran with.
 	const branch = records({ run: "run-1", role: "security", backend: "pi", hostSessionId: "host-1", session: { ...PI_REF }, selection: { ...PI_SELECTION } });
-	assert.throws(() => fusionRoute({ continue: "run-1", task: "x" }, branch), /role security is known to records and reviews/);
+	const continued = fusionCall({ continue: "run-1", task: "and the refresh path?" }, branch);
+	assert.deepEqual(
+		[continued.backend, continued.handle, continued.bound.name, continued.bound.model, continued.bound.contract],
+		["pi", "run-1", "security", "deepseek/deepseek-chat", "security.md"],
+	);
+	// The whole selection the run ran with is what its binding repeats, the thinking level included.
+	assert.deepEqual(piRole(continued.call, continued.record?.selection, piEnv()), { name: "security", model: "deepseek/deepseek-chat", effort: "medium", contract: "security.md", ...PI_CODING_METADATA });
+	assert.equal(fusionRoute({ continue: "run-1", task: "x", backend: "pi" }, branch).backend, "pi");
+	assert.throws(() => fusionRoute({ continue: "run-1", task: "x", backend: "claude" }, branch), /^Error: run-1 ran on the pi backend; omit backend or use pi$/);
+	// A role nothing knows is refused by the roles there are, which is every role a record may name.
+	assert.throws(() => fusionRoute({ role: "audit", task: "x" } as FusionParams, records()), /^Error: unknown role audit; use one of plan, implement, ultracode, ask, security$/);
+});
+
+test("the pi security binding runs implement's tools under its own contract, and takes a model and a level and nothing else", () => {
+	const env = piEnv({ PI_FUSION_PI_SECURITY_MODEL: "deepseek/deepseek-chat", PI_FUSION_PI_SECURITY_EFFORT: "xhigh" });
+	assert.deepEqual(piRole({ role: "security" }, undefined, env), { name: "security", model: "deepseek/deepseek-chat", effort: "xhigh", contract: "security.md", ...PI_CODING_METADATA });
+	// The call's own selection and the recorded one win in the same order as every other pi role's.
+	assert.deepEqual(piRole({ role: "security" }, { model: "openai/gpt-5", effort: "low" }, env), { name: "security", model: "openai/gpt-5", effort: "low", contract: "security.md", ...PI_CODING_METADATA });
+	assert.equal(piRole({ role: "security", model: "openai/gpt-5", effort: "max" }, { model: "deepseek/deepseek-chat", effort: "low" }, env).model, "openai/gpt-5");
+	// A security run is not an ask run and not a plan run: it has no mode to be in and no plan to start fresh from.
+	assert.throws(() => piRole({ role: "security", mode: "review" }, undefined, env), /^Error: mode is not allowed for role security$/);
+	assert.throws(() => piRole({ role: "security", fresh: true }, undefined, env), /^Error: fresh is not allowed for role security$/);
+	assert.equal(piModelVariable("security"), "PI_FUSION_PI_SECURITY_MODEL");
+	assert.throws(
+		() => piRole({ role: "security" }, undefined, piEnv()),
+		/^Error: role security has no model for the pi backend: set PI_FUSION_PI_SECURITY_MODEL to a provider and a model id, such as deepseek\/deepseek-chat, or name one in the call's model parameter\. The pi backend has no default model and resolves none for you$/,
+	);
+	assert.ok(fs.existsSync(path.join(repoRoot, "contracts", "security.md")), "the pi security binding names a contract that is not there");
 });
 
 test("a continued run stays on the backend its record names, and an explicit conflict is refused", () => {
@@ -215,8 +248,7 @@ test("a pi model is a provider and a model id, whatever slashes the id itself ca
 	}
 	assert.throws(() => piRole({ role: "implement" }, undefined, piEnv({ PI_FUSION_PI_IMPLEMENT_MODEL: "deepseek-chat" })), /^Error: PI_FUSION_PI_IMPLEMENT_MODEL names model "deepseek-chat", which is not a pi provider and model id/);
 	assert.throws(() => piRole({ role: "implement", effort: "ultracode" }, undefined, piEnv()), /^Error: the call names effort "ultracode", which is not a pi thinking level; use one of off, minimal, low, medium, high, xhigh, max$/);
-	assert.throws(() => piRole({ role: "ultracode" }, undefined, piEnv()), /^Error: role ultracode does not run on the pi backend; use one of plan, implement, ask$/);
-	assert.throws(() => piRole({ role: "security" }, undefined, piEnv()), /^Error: role security does not run on the pi backend; use one of plan, implement, ask$/);
+	assert.throws(() => piRole({ role: "ultracode" }, undefined, piEnv()), /^Error: role ultracode does not run on the pi backend; use one of plan, implement, ask, security$/);
 });
 
 test("a continued pi ask run keeps its recorded mode unless the call names another", () => {
@@ -422,6 +454,43 @@ test("an injected backend runs through the same lifecycle, records its own ident
 	}
 });
 
+test("a security call goes to the injected pi backend with no backend named, and records that role and its selection", async () => {
+	process.env.PI_FUSION_PI_SECURITY_MODEL = "deepseek/deepseek-chat";
+	process.env.PI_FUSION_PI_SECURITY_EFFORT = "xhigh";
+	try {
+		const { backend, started } = stubBackend();
+		const ext = makeExtension({ pi: backend });
+		const ran = await call(ext, "fusion", { role: "security", task: "audit the token check" }, makeCtx());
+		assert.equal(ran.error, undefined);
+		assert.match(ran.text ?? "", /^## Changed\nfoo\.ts\n\n\[run-1 · security · deepseek\/deepseek-chat · /);
+		// No backend was named: the role runs on pi alone, so that is where the call went, under its own contract.
+		assert.deepEqual(
+			started.map((run) => [run.role.name, run.role.model, run.role.effort, run.role.contract, run.session?.kind]),
+			[["security", "deepseek/deepseek-chat", "xhigh", "security.md", "new"]],
+		);
+		assert.deepEqual(ext.appended, [
+			[
+				"pi-fusion",
+				{
+					run: "run-1",
+					role: "security",
+					backend: "pi",
+					hostSessionId: "host-1",
+					session: { backend: "pi", sessionId: "pi-new", sessionFile: "/sessions/pi-new.jsonl", checkpoint: "entry-42" },
+					selection: { model: "deepseek/deepseek-chat", effort: "xhigh" },
+				},
+			],
+		]);
+		// The compatibility tool advertises no such role, whatever is configured for it.
+		const refused = await call(ext, "claude", { role: "security", task: "audit the token check" }, makeCtx());
+		assert.equal(refused.error, "unknown role security; use one of plan, implement, ultracode, ask");
+		assert.equal(started.length, 1, "and nothing started for the refused call");
+	} finally {
+		delete process.env.PI_FUSION_PI_SECURITY_MODEL;
+		delete process.env.PI_FUSION_PI_SECURITY_EFFORT;
+	}
+});
+
 test("a run of an injected backend keeps its backend, reference and selection in the on-disk history", async () => {
 	const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fusion-routing-history-"));
 	tempDirs.push(dir);
@@ -503,7 +572,7 @@ test("a blank pi model or effort the call names is refused, and no recorded or c
 test("the pi backend this build registers is reached through its binding, which refuses a call nothing configured a model for", async () => {
 	// One of exactly two registrations in the suite that take the production defaults on purpose, with the tripwire left
 	// out: what this case reads is that registration itself. No child may start here, and nothing stops one but the
-	// binding, so all six variables a pi role could resolve a model from are deleted first — `productionDefaults` refuses
+	// binding, so every variable a pi role could resolve a model from is deleted first — `productionDefaults` refuses
 	// the registration outright if one is still set. The refusal below is then the binding's own and not this process's
 	// environment, and it lands before the backend is asked for a session, a control or a run.
 	const kept = PI_SELECTION_VARIABLES.map((name) => [name, process.env[name]] as const);
@@ -516,6 +585,13 @@ test("the pi backend this build registers is reached through its binding, which 
 			"role implement has no model for the pi backend: set PI_FUSION_PI_IMPLEMENT_MODEL to a provider and a model id, such as deepseek/deepseek-chat, or name one in the call's model parameter. The pi backend has no default model and resolves none for you",
 		);
 		assert.doesNotMatch(refused.error ?? "", /not available in this build/, "the backend is registered now, so an unconfigured call is refused by the binding rather than by availability");
+		// The role pi alone runs takes the same path with no backend named at all: routed to pi, then refused by the
+		// binding for having no model, before that backend is asked for a session, a control or a run.
+		const security = await call(ext, "fusion", { role: "security", task: "audit the token check" }, makeCtx());
+		assert.equal(
+			security.error,
+			"role security has no model for the pi backend: set PI_FUSION_PI_SECURITY_MODEL to a provider and a model id, such as deepseek/deepseek-chat, or name one in the call's model parameter. The pi backend has no default model and resolves none for you",
+		);
 		assert.deepEqual(ext.appended, [], "a refused call records nothing");
 		// The handle was not taken either: the next call is still run-1.
 		const ran = await call(ext, "fusion", { role: "implement", task: "do it here" }, makeCtx());
@@ -579,12 +655,22 @@ test("the claude tool refuses to continue a pi run and names the tool that can",
 
 test("every role the tools advertise has capabilities and a binding on each backend it names, so the lists cannot drift", () => {
 	const ext = makeExtension();
-	for (const tool of ["fusion", "claude"]) {
+	// The primary tool advertises every role a record may name, because every one of them runs on a backend of this
+	// build; the compatibility tool advertises the roles claude runs and no other.
+	for (const [tool, roles] of [
+		["fusion", KNOWN_ROLE_NAMES],
+		["claude", ROLE_NAMES],
+	] as const) {
 		const schema = (ext.tools.get(tool) as unknown as { parameters: { properties: { role: { enum: string[] } } } }).parameters;
-		assert.deepEqual(schema.properties.role.enum, [...ROLE_NAMES], `the ${tool} tool advertises another role list than the host runs`);
+		assert.deepEqual(schema.properties.role.enum, [...roles], `the ${tool} tool advertises another role list than the host runs`);
 	}
-	const env = piEnv({ PI_FUSION_PI_PLAN_MODEL: "deepseek/deepseek-chat", PI_FUSION_PI_ASK_MODEL: "deepseek/deepseek-chat" });
-	for (const role of ROLE_NAMES) {
+	assert.deepEqual(
+		[...ROLE_NAMES],
+		KNOWN_ROLE_NAMES.filter((role) => roleSpec(role)?.backends.includes("claude")),
+		"the compatibility tool's list is the roles claude runs, so a role it cannot run is never advertised there",
+	);
+	const env = piEnv({ PI_FUSION_PI_PLAN_MODEL: "deepseek/deepseek-chat", PI_FUSION_PI_ASK_MODEL: "deepseek/deepseek-chat", PI_FUSION_PI_SECURITY_MODEL: "deepseek/deepseek-chat" });
+	for (const role of KNOWN_ROLE_NAMES) {
 		const spec = roleSpec(role);
 		assert.ok(spec, `role ${role} is advertised and has no capabilities`);
 		assert.ok(spec.backends.length, `role ${role} is advertised and runs on no backend`);
@@ -595,10 +681,10 @@ test("every role the tools advertise has capabilities and a binding on each back
 			assert.ok(fs.existsSync(path.join(repoRoot, "contracts", bound.contract)), `the ${backend} binding of ${role} names a contract that is not there: ${bound.contract}`);
 		}
 	}
-	// A role records and reviews know and no tool advertises keeps its capabilities and stays out of the schema.
-	for (const role of KNOWN_ROLE_NAMES) assert.ok(roleSpec(role), `role ${role} is known to records and has no capabilities`);
+	// The one role the two lists differ by is the one that runs on pi alone, and it is the primary tool's alone.
 	assert.deepEqual(
 		KNOWN_ROLE_NAMES.filter((role) => !(ROLE_NAMES as readonly string[]).includes(role)),
 		["security"],
 	);
+	assert.deepEqual(roleSpec("security")?.backends, ["pi"]);
 });

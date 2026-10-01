@@ -21,7 +21,7 @@ import {
 	runChild,
 } from "./backends/claude.ts";
 import { createPiBackend } from "./backends/pi-backend.ts";
-import { piParams, piRole } from "./backends/pi-binding.ts";
+import { PI_CONTRACT_FILES, piParams, piRole } from "./backends/pi-binding.ts";
 import { PI_BOOTSTRAP_PATH } from "./backends/pi-launch.ts";
 import {
 	type Ask,
@@ -52,8 +52,8 @@ import { type ChangedFile, changedFiles, type Snapshot, snapshot } from "./chang
 import { type Dashboard, RunStore, startDashboard } from "./dashboard.ts";
 import { contextShare, continueNote, handoffBlocked, handoffNote, handoffPrompt, handoffShare, planContextPct, planProblems, sharePercent } from "./handoff.ts";
 import { History, type HistoryRecord, historyDir, historyEnabled } from "./history.ts";
-import { reviewable, reviewPrompt } from "./review.ts";
-import { canChangeFiles, isKnownRole, type KnownRoleName, type RoleSpec, roleSpec } from "./roles.ts";
+import { reviewable, reviewerFor, reviewPrompt } from "./review.ts";
+import { canChangeFiles, isKnownRole, KNOWN_ROLE_NAMES, type KnownRoleName, type RoleSpec, roleSpec } from "./roles.ts";
 
 /** A run as the shared lifecycle reads it, whichever backend produced it: the record over the part of a role the host uses. */
 type HostRun = BackendRun<HostRole>;
@@ -141,12 +141,22 @@ export interface FusionParams extends ClaudeParams {
 }
 
 /**
+ * The role the compatibility tool runs, or the sentence it has always refused another name with. The claude tool
+ * advertises these four roles and no more, so a role this build runs on Pi alone is not one it knows: it is refused by
+ * this list rather than by a capability that tool never advertised. One place composes the sentence, because the
+ * parameter check and the claude route both have to refuse such a name the same way.
+ */
+function claudeRoleName(role: string): RoleName {
+	if (!(ROLE_NAMES as readonly string[]).includes(role)) throw new Error(`unknown role ${role}; use one of ${ROLE_NAMES.join(", ")}`);
+	return role as RoleName;
+}
+
+/**
  * The role and mode a claude call names, or an error naming what the role cannot take. This is the parameter half of
  * the Claude binding, so a call can be refused for its parameters before anything resolves a model.
  */
 export function claudeParams(params: ClaudeParams & { role: string }): { name: RoleName; mode: AskMode } {
-	if (!(ROLE_NAMES as readonly string[]).includes(params.role)) throw new Error(`unknown role ${params.role}; use one of ${ROLE_NAMES.join(", ")}`);
-	const name = params.role as RoleName;
+	const name = claudeRoleName(params.role);
 	for (const [parameter, roles] of Object.entries(ROLE_PARAMETERS)) {
 		if (params[parameter as keyof ClaudeParams] !== undefined && !roles.includes(name)) throw new Error(`${parameter} is not allowed for role ${name}`);
 	}
@@ -507,18 +517,15 @@ function namedBackend(value: string): BackendName {
 	return value;
 }
 
-/** True for a role this build runs at all: one the host advertises. A known role it does not advertise is not one. */
-const isRunnableRole = (role: string): boolean => (ROLE_NAMES as readonly string[]).includes(role);
-
 /**
- * The capabilities of a role a call may run, which is fewer than a record may name: `security` is known to records,
- * capabilities and reviews, and no backend runs it in this build, so a call naming it is refused rather than started.
+ * The capabilities of a role a call may run. Every role a record may name is one a backend of this build runs, so the
+ * capabilities are the whole of the check: which backends may run it is the refusal a role bound to one of them gets,
+ * and it is `freshBackend`'s to make. A name no record and no call may use is refused here by the roles there are.
  */
 function executableRole(role: string): RoleSpec {
 	const spec = roleSpec(role);
-	if (spec && isRunnableRole(role)) return spec;
-	if (spec) throw new Error(`role ${role} is known to records and reviews, and no backend runs it in this build; use one of ${ROLE_NAMES.join(", ")}`);
-	throw new Error(`unknown role ${role}; use one of ${ROLE_NAMES.join(", ")}`);
+	if (spec) return spec;
+	throw new Error(`unknown role ${role}; use one of ${KNOWN_ROLE_NAMES.join(", ")}`);
 }
 
 /** The backend a new run goes to: the one the call named, or the sole backend the role runs on, or Claude. */
@@ -607,6 +614,9 @@ export function fusionCall(params: FusionParams, records: RunRecords, planPct: n
 export function claudeRoute(params: ClaudeParams, records: RunRecords, planPct: number = planContextPct()): FusionRoute {
 	const prior = params.continue === undefined ? undefined : records.runs.get(params.continue);
 	if (prior?.backend === "pi") throw new Error(`${prior.handle} ran on the pi backend, which the claude tool does not run; continue it with fusion and continue ${prior.handle}`);
+	// A fresh call's role is checked against the four this tool advertises before the shared route reads a capability:
+	// a role that runs on Pi alone is one this tool does not know, and saying so is what it has always done.
+	if (params.continue === undefined && params.role !== undefined) claudeRoleName(params.role);
 	return fusionRoute({ ...params, backend: claudeBackend.name }, records, planPct);
 }
 
@@ -741,6 +751,8 @@ interface ReviewTarget {
 	files?: ReadonlyArray<ChangedFile>;
 	/** The working directory the run was made in, when that is not this one: a review reads the tree the run changed. */
 	madeIn?: string;
+	/** What the run itself ran with, for a role whose reviewer inherits the model: the verified selection and no other. */
+	selection?: ResolvedSelection;
 	/** Links the source to the review that reads it, wherever the source is kept. */
 	markReviewed(handle: string): void;
 }
@@ -966,20 +978,9 @@ function asEnded(held: HistoryRecord): HistoryRecord | undefined {
 	return { ...held, state: "aborted", endedAt: held.endedAt ?? held.startedAt, failure: HISTORY_ABORTED };
 }
 
-/**
- * Why a run cannot be reviewed here, or undefined when it can be: the shared eligibility rules, and before them the
- * roles this build runs at all. A `security` record can reach this host from a restored history file or a tagged
- * entry another build wrote, and its reviewer is the backend that runs it, which is not here: a Claude ask child must
- * not stand in for one. The wording carries no handle; the caller puts it in front, as it does for every other reason.
- */
-function notReviewableHere(run: { state: string; role: string; files?: ReadonlyArray<unknown> }): string | undefined {
-	if (!isRunnableRole(run.role)) return `is a ${run.role} run, which no backend runs in this build; its review waits for the backend that runs it, and no claude reviewer stands in for it`;
-	return reviewable(run);
-}
-
 /** Why the run the on-disk history kept cannot be reviewed, or undefined when it can be. */
 function heldNotReviewable(held: HistoryRecord): string | undefined {
-	return notReviewableHere({ state: held.state, role: held.role, ...(held.files ? { files: held.files } : {}) });
+	return reviewable({ state: held.state, role: held.role, ...(held.files ? { files: held.files } : {}) });
 }
 
 /**
@@ -1097,6 +1098,14 @@ const guidelines = (tool: string, control: string): string[] => [
 const backendGuideline = (tool: string): string =>
 	`When the user names the harness a task is to run on, pass that name in ${tool}'s backend parameter; leave backend unset otherwise, which runs the role on this build's default harness. A harness the role does not run on is refused before anything starts.`;
 
+/**
+ * The other guideline only the primary tool carries, because it is the only one that advertises the role: `security`
+ * is the user's to ask for. Nothing here lets the host decide that work looks security-sensitive and route it there on
+ * its own, and the task is where the authorization to change application code comes from.
+ */
+const securityGuideline = (tool: string): string =>
+	`Use ${tool} with role security only when the user asks for a security investigation, audit or fix: never on your own judgement that some work looks security-sensitive, where role implement, role ultracode or role ask with mode review is what you use instead. Say in the task whether fixes are authorized, and what is in scope; a security task that does not say reports findings and changes no application code. Role security runs on the pi backend alone, so it needs a provider and model id in ${tool}'s model parameter or in PI_FUSION_PI_SECURITY_MODEL, and like role implement it takes the single active file-changing slot.`;
+
 /** A plain string enum: some providers reject the anyOf of consts that a union of literals becomes. */
 const stringEnum = <T extends readonly string[]>(values: T, description: string) =>
 	Type.Unsafe<T[number]>({ type: "string", enum: [...values], description });
@@ -1114,7 +1123,10 @@ export default function fusion(pi: ExtensionAPI, options: FusionOptions = {}) {
 	// never carries it; nothing is registered here, and the child is left with the tools its role names. Any other value
 	// registers the ordinary surface, because a marker this build does not know is not a child of this build.
 	if (process.env.PI_FUSION_CHILD === "pi") return;
-	for (const name of new Set([...Object.values(ROLES).map((role) => role.contract), ...Object.values(ASK_CONTRACTS)])) {
+	// Every contract any role of either backend can run under, in one check: the Claude roles' own, the ask modes' and
+	// the Pi bindings', which is where a contract no Claude role names comes from. An install missing one of them is a
+	// broken install whichever backend would have run it, so none of them waits for a call to find out.
+	for (const name of new Set([...Object.values(ROLES).map((role) => role.contract), ...Object.values(ASK_CONTRACTS), ...PI_CONTRACT_FILES])) {
 		const contract = path.join(CONTRACTS_DIR, name);
 		if (!fs.existsSync(contract)) throw new Error(`pi-fusion: missing contract ${contract}`);
 	}
@@ -1174,7 +1186,7 @@ export default function fusion(pi: ExtensionAPI, options: FusionOptions = {}) {
 	/** The share of its window, as a percentage, past which a plan run is handed off to a fresh one. */
 	const planPct = planContextPct();
 	let budgetNoted = false;
-	/** Whether an implement or ultracode run that changed files gets an independent review without being asked. */
+	/** Whether an implement, ultracode or security run that changed files gets an independent review without being asked. */
 	const autoReview = process.env.PI_FUSION_AUTO_REVIEW?.trim() === "1";
 	/** Whether this Pi session keeps its runs on disk, so a later process on the same host session can show them. */
 	const historyOn = historyEnabled();
@@ -1815,7 +1827,7 @@ export default function fusion(pi: ExtensionAPI, options: FusionOptions = {}) {
 	};
 
 	/** Why the live run cannot be reviewed, or undefined when it can be. */
-	const notReviewable = (run: LiveRun): string | undefined => notReviewableHere({ state: run.state, role: run.role.name, ...(run.files ? { files: run.files } : {}) });
+	const notReviewable = (run: LiveRun): string | undefined => reviewable({ state: run.state, role: run.role.name, ...(run.files ? { files: run.files } : {}) });
 
 	/** The run a review reads: one this Pi process started, or one an earlier process left in the history. */
 	const liveSource = (run: LiveRun, ctx: any): ReviewTarget => ({
@@ -1826,6 +1838,9 @@ export default function fusion(pi: ExtensionAPI, options: FusionOptions = {}) {
 		...(run.report === undefined ? {} : { report: run.report }),
 		...(run.failure === undefined ? {} : { failure: run.failure }),
 		...(run.files === undefined ? {} : { files: run.files }),
+		// The selection this host verified, which is the only one a reviewer may inherit: what the child claimed in
+		// progress and what a refused outcome carried are both on the snapshot, and neither says what the run ran with.
+		...(run.verified?.selection === undefined ? {} : { selection: run.verified.selection }),
 		markReviewed: (handle) => {
 			run.reviewedBy = handle;
 			record(() => store.reviewed(run.id, handle));
@@ -1842,6 +1857,7 @@ export default function fusion(pi: ExtensionAPI, options: FusionOptions = {}) {
 		...(held.report === undefined ? {} : { report: held.report }),
 		...(held.failure === undefined ? {} : { failure: held.failure }),
 		...(held.files === undefined ? {} : { files: held.files }),
+		...(held.selection === undefined ? {} : { selection: held.selection }),
 		markReviewed: (handle) => {
 			held.reviewedBy = handle;
 			saveHistory(ctx, held.hostSessionId, held);
@@ -1856,16 +1872,28 @@ export default function fusion(pi: ExtensionAPI, options: FusionOptions = {}) {
 	const startReview = (source: ReviewTarget, origin: "review" | "auto-review", ctx: any): { run: LiveRun } | { refused: string } => {
 		if (source.madeIn) return { refused: `${source.handle} was made in ${source.madeIn}, not in this working directory; review it from there` };
 		// Refused before the budget is read, a handle is taken, the source is linked to a review or any child starts.
-		const reason = notReviewableHere({ state: source.state, role: source.role, ...(source.files ? { files: source.files } : {}) });
+		const reason = reviewable({ state: source.state, role: source.role, ...(source.files ? { files: source.files } : {}) });
 		if (reason) return { refused: `${source.handle} ${reason}` };
 		const blocked = ledger.blocked();
 		if (blocked) return { refused: budgetBlockMessage(blocked) };
+		// Which backend reviews the run, and what its reviewer inherits of it, is review policy, and a run it refuses is
+		// refused here: before a handle is taken, before the source is linked to a review and before any child starts.
+		const reviewer = reviewerFor({ role: source.role, ...(source.selection === undefined ? {} : { selection: source.selection }) });
+		if ("refused" in reviewer) return { refused: `${source.handle} ${reviewer.refused}` };
 		const handle = `run-${coverLiveHandles(runRecords(ctx.sessionManager.getBranch())).highest + 1}`;
-		const role = roleFor({ role: "ask", task: "", mode: "review" });
 		const hostSessionId: string = ctx.sessionManager.getSessionId();
-		// Every role keeps the reviewer it has always had: a fresh Claude ask child, whichever backend the source ran on.
-		const backend = backends.claude;
-		if (!backend) return { refused: unavailable("claude", `${handle} would review ${source.handle}`, false) };
+		const backend = backends[reviewer.backend];
+		if (!backend) return { refused: unavailable(reviewer.backend, `${handle} would review ${source.handle}`, false) };
+		// Each backend binds its own ask review role: the Claude reviewer the Claude roles have always had, and a Pi
+		// reviewer on the model the source run ran with, at whatever level this host configures a Pi ask run at. A
+		// binding that refuses the reviewer is this review's refusal and not the run's: nothing has started yet.
+		let role: HostRole;
+		try {
+			role = reviewer.backend === "claude" ? roleFor({ role: "ask", task: "", mode: "review" }) : piRole({ role: "ask", mode: "review", model: reviewer.model });
+		} catch (error) {
+			const why = error instanceof Error ? error.message : String(error);
+			return { refused: `${handle} would review ${source.handle}, and its reviewer could not be bound: ${why.length > SUMMARY_CHARS ? `${why.slice(0, SUMMARY_CHARS)}…` : why}` };
+		}
 		const intent: SessionIntent = { kind: "new" };
 		const session = backend.session(intent);
 		const prompt = reviewPrompt({
@@ -2413,23 +2441,24 @@ export default function fusion(pi: ExtensionAPI, options: FusionOptions = {}) {
 		executionMode: "sequential",
 		label: "Fusion",
 		description:
-			"Delegate work to a child: a headless coding session in this working directory, run through one of this build's backends. The role picks the job. plan: Claude Fable, which can read the code, run commands and write scratch files, challenges a goal and your proposed plan and consolidates it into an agreed, numbered task list with acceptance criteria. A plan call continues the last plan run of the backend it routes to, so follow-ups can refer to the earlier agreement, until that run's context passes its cap, when the call starts a fresh plan run carrying the agreed plan and says so; fresh starts a new plan run. implement: Claude Opus implements one clear, bounded task with full tools and reports what changed and how it was verified. If the task needs a broader scope or a design decision, it stops and reports under Escalation instead of widening the task. ultracode: Claude Fable in Claude Code with ultracode on orchestrates Claude Opus 5 agents at xhigh effort, one agent at a time, to implement, verify and review a task, several tasks in dependency order, or a whole agreed plan. It is slower and costlier than implement. ask: Claude Opus with read-only tools (Read, Bash, Grep, Glob, WebSearch, WebFetch) answers a question about the code with file and line references, or with mode review gives an independent review of a change, findings ranked by severity. It has no Edit or Write, and its contract forbids changing files through Bash. backend picks the harness a child runs in, and the claude models above are what every role runs as when a call names no backend: leave backend unset unless the user asks for pi. backend pi runs plan, implement and ask on the user's own Pi provider configuration, under the same contracts as the claude roles; role ultracode runs on the claude backend alone. On pi the tools are Pi's own and are not the claude lists above: roles plan and implement run with read, bash, edit, write, grep, find and ls, role ask runs with read, bash, grep, find and ls and has no web search or web fetch tool at all, and every pi role also gets ask_orchestrator, which is how a pi child asks you a question. A pi call's model is a provider and a model id, such as deepseek/deepseek-chat, taken from the call's model parameter, then the selection the run it continues actually ran with, then PI_FUSION_PI_<ROLE>_MODEL for that role; a pi call with none of those is refused before anything starts, because nothing here resolves a pi model for you. Every run gets a handle such as run-3, shown in the stats line. continue with a handle sends the task as a follow-up to that run: the child keeps its context from the run's last successful call, across a resume of this session, /tree and forks, and stays on the backend it ran on. A new run has not seen this conversation, so its task must be self-contained. Calls run one at a time: Pi serializes any turn that contains one. Returns the child's report, or with background true the handle at once and the report later as a message; manage a background run with fusion_control. If the child asks a question, the call returns the question at once and the run waits in the background until you answer it with fusion_control message. Only one run that can change files is active at a time, waiting included; ask runs can go next to it. The claude tool is this same delegation forced to the claude backend, kept for compatibility, and fusion_control and claude_control both act on every run.",
-		promptSnippet: "Delegate planning (plan), bounded implementation (implement), complex, high-risk implementation (ultracode) or read-only questions and reviews (ask) to a coding child",
-		promptGuidelines: [...guidelines(TOOL_NAME, CONTROL_TOOL_NAME), backendGuideline(TOOL_NAME)],
+			"Delegate work to a child: a headless coding session in this working directory, run through one of this build's backends. The role picks the job. plan: Claude Fable, which can read the code, run commands and write scratch files, challenges a goal and your proposed plan and consolidates it into an agreed, numbered task list with acceptance criteria. A plan call continues the last plan run of the backend it routes to, so follow-ups can refer to the earlier agreement, until that run's context passes its cap, when the call starts a fresh plan run carrying the agreed plan and says so; fresh starts a new plan run. implement: Claude Opus implements one clear, bounded task with full tools and reports what changed and how it was verified. If the task needs a broader scope or a design decision, it stops and reports under Escalation instead of widening the task. ultracode: Claude Fable in Claude Code with ultracode on orchestrates Claude Opus 5 agents at xhigh effort, one agent at a time, to implement, verify and review a task, several tasks in dependency order, or a whole agreed plan. It is slower and costlier than implement. ask: Claude Opus with read-only tools (Read, Bash, Grep, Glob, WebSearch, WebFetch) answers a question about the code with file and line references, or with mode review gives an independent review of a change, findings ranked by severity. It has no Edit or Write, and its contract forbids changing files through Bash. security: investigates one scoped security concern, area or change on the user's own Pi provider configuration, with the same tools as role implement. It confirms a finding where it can, reports each with a severity and with whether it is confirmed or inferred, and never puts a secret in its report by value. Its task says whether fixes are authorized: with none it reports findings and changes no application code, and with one it writes the smallest fix that closes a finding and verifies it. Ask for it only when the user asks for a security investigation, audit or fix. backend picks the harness a child runs in, and the claude models above are what every role but security runs as when a call names no backend: leave backend unset unless the user asks for pi. backend pi runs plan, implement, ask and security on the user's own Pi provider configuration, under the same contracts as the claude roles, security's own contract included; role ultracode runs on the claude backend alone, and role security on the pi backend alone, so a call that names it goes to pi whether or not it names a backend and naming claude for it is refused before anything starts. On pi the tools are Pi's own and are not the claude lists above: roles plan, implement and security run with read, bash, edit, write, grep, find and ls, role ask runs with read, bash, grep, find and ls and has no web search or web fetch tool at all, and every pi role also gets ask_orchestrator, which is how a pi child asks you a question. A pi call's model is a provider and a model id, such as deepseek/deepseek-chat, taken from the call's model parameter, then the selection the run it continues actually ran with, then PI_FUSION_PI_<ROLE>_MODEL for that role; a pi call with none of those is refused before anything starts, because nothing here resolves a pi model for you. Every run gets a handle such as run-3, shown in the stats line. continue with a handle sends the task as a follow-up to that run: the child keeps its context from the run's last successful call, across a resume of this session, /tree and forks, and stays on the backend it ran on. A new run has not seen this conversation, so its task must be self-contained. Calls run one at a time: Pi serializes any turn that contains one. Returns the child's report, or with background true the handle at once and the report later as a message; manage a background run with fusion_control. If the child asks a question, the call returns the question at once and the run waits in the background until you answer it with fusion_control message. Only one run that can change files is active at a time, waiting included; ask runs can go next to it. The claude tool is this same delegation forced to the claude backend, kept for compatibility, and fusion_control and claude_control both act on every run.",
+		promptSnippet:
+			"Delegate planning (plan), bounded implementation (implement), complex, high-risk implementation (ultracode), read-only questions and reviews (ask) or a scoped security investigation or fix the user asked for (security) to a coding child",
+		promptGuidelines: [...guidelines(TOOL_NAME, CONTROL_TOOL_NAME), securityGuideline(TOOL_NAME), backendGuideline(TOOL_NAME)],
 		parameters: Type.Object({
-			role: Type.Optional(stringEnum(ROLE_NAMES, "plan, implement, ultracode or ask. Required unless continue is set.")),
+			role: Type.Optional(stringEnum(KNOWN_ROLE_NAMES, "plan, implement, ultracode, ask or security. Required unless continue is set.")),
 			task: Type.String({
 				description:
-					"For plan: the goal, your proposed plan, constraints and decisions already made; the child reads the code itself, so do not paste file contents. For implement and ultracode: the task or tasks, agreed or direct: what to change, where, acceptance criteria, and how to verify each one. For ask: the question, or for mode review the change to review (a diff, a commit range or files) and what it must do. With continue: the follow-up message.",
+					"For plan: the goal, your proposed plan, constraints and decisions already made; the child reads the code itself, so do not paste file contents. For implement and ultracode: the task or tasks, agreed or direct: what to change, where, acceptance criteria, and how to verify each one. For ask: the question, or for mode review the change to review (a diff, a commit range or files) and what it must do. For security: the concern, area or change to investigate, what the code is meant to guarantee, and whether fixes are authorized; without that it reports findings and changes no application code. With continue: the follow-up message.",
 			}),
 			continue: Type.Optional(Type.String({ description: "A run's handle, such as run-3: continue that run instead of starting a new one, on the backend it ran on." })),
 			context: Type.Optional(Type.String({ description: "Extra context the child needs: decisions, related files, results of earlier tasks." })),
 			background: Type.Optional(Type.Boolean({ description: "Return at once with the run's handle and let the run go on; you get its report as a message when it ends. Default false." })),
 			fresh: Type.Optional(Type.Boolean({ description: "plan only, not with continue: start a new plan run instead of continuing the last one." })),
 			mode: Type.Optional(stringEnum(ASK_MODES, "ask only: answer (default) for a question, review for an independent review of a change. A continued ask run keeps its mode unless this names another.")),
-			backend: Type.Optional(stringEnum(BACKEND_NAMES, "The harness the child runs in: claude, which runs every role and is what a call that leaves this unset gets, or pi, which runs plan, implement and ask on the user's own Pi provider configuration and needs a provider and model id from the call's model parameter or PI_FUSION_PI_<ROLE>_MODEL. Name pi only when the user asks for it. With continue it must name the backend that run is on, if it names one at all.")),
-			model: Type.Optional(Type.String({ description: "A model instead of the role's default: on the claude backend a Claude Code alias or id, for implement and ask only; on the pi backend a provider and model id such as deepseek/deepseek-chat, which every pi role takes." })),
-			effort: Type.Optional(stringEnum(FUSION_EFFORTS, "The child's effort instead of the role's default, for plan, implement and ask: low, medium, high, xhigh or max on the claude backend, and any of these pi thinking levels on the pi backend.")),
+			backend: Type.Optional(stringEnum(BACKEND_NAMES, "The harness the child runs in: claude, which runs every role but security and is what a call that leaves this unset gets for all of them, or pi, which runs plan, implement, ask and security on the user's own Pi provider configuration and needs a provider and model id from the call's model parameter or PI_FUSION_PI_<ROLE>_MODEL. Name pi only when the user asks for it; role security goes to pi whether or not this names it, because no other harness runs it, and naming claude for it is refused. With continue it must name the backend that run is on, if it names one at all.")),
+			model: Type.Optional(Type.String({ description: "A model instead of the role's default: on the claude backend a Claude Code alias or id, for implement and ask only; on the pi backend a provider and model id such as deepseek/deepseek-chat, which every pi role takes and no pi role has a default for." })),
+			effort: Type.Optional(stringEnum(FUSION_EFFORTS, "The child's effort instead of the role's default, for plan, implement, ask and security: low, medium, high, xhigh or max on the claude backend, and any of these pi thinking levels on the pi backend, which is the only one role security runs on.")),
 		}),
 		async execute(toolCallId, params, signal, onUpdate, ctx) {
 			return delegate(TOOL_NAME, toolCallId, params, signal, onUpdate, ctx);
