@@ -10,7 +10,7 @@
  * Two kinds of case live here, and their children are not the same program. The ten cases of `stage-a` and
  * `stage-b` run a bootstrap this file generates: a runtime built only from the package's public exports
  * (never `dist/bundle/cli.js`), with a bridge extension of the harness's own for the commands and the
- * notifications those rows measure. The two cases of `production` run the real thing instead —
+ * notifications those rows measure. The five cases of `production` run the real thing instead —
  * `createPiBackend` from `extensions/backends/pi-backend.ts` over the production storage layout, bootstrap
  * input, launch, transport, preparation, session restore, task turn, outcome mapping and process cleanup,
  * with `extensions/backends/pi-bootstrap.mjs` as the child's own program. A production case still sets up through the
@@ -28,8 +28,10 @@
  * command, no argument and no bootstrap, and it calls the production `startPiChild` itself — so the default start
  * binding, which is what a call passing no seam would take, is measured by nothing here.
  *
- * What the network shape of a production case is, and what it is not. A production call passes no question callback,
- * so no child of one runs the question tool; the host agent directory a production case composes holds one
+ * What the network shape of a production case is, and what it is not. Two of the five production cases pass a question
+ * callback of this harness's own, so their child runs the question tool and every dialog it opens is answered, held or
+ * cancelled by this file and never by a person; the other three pass none and get no question tool at all. Whichever
+ * it is, the host agent directory a production case composes holds one
  * `models.json` naming the loopback fixture, one `AGENTS.md` sentinel and no `auth.json` at all; no provider variable,
  * no credential of the user's and no paid model is anywhere in it; the environment the composition composed has to
  * carry `PI_OFFLINE=1` exactly or this harness refuses to launch the child; and the call input composes no catalog
@@ -41,9 +43,12 @@
  * The one window that registration leaves open, named rather than designed around: between the transport spawning a
  * production child and `startPiChild` resolving, that child's pid is in no registry of this harness's, so an interrupt
  * inside it leaks the process instead of killing it. It is not the window the pid-file sweep closes and nothing here
- * closes it the same way — a sweep works because the fixture commands of row 6 write their pids to files it can read,
- * and a production child writes no such file. It is bounded by the transport's own startup bound and by nothing else,
- * and closing it would need a seam inside the transport, which this harness does not add.
+ * closes it the same way — a sweep works because the fixture commands of row 6 and the owned script of
+ * `prod-detached-cancelled` write their pids to files it can read, and a production child writes no such file of its
+ * own: what those files name is a descendant of its shell tool, never the child. It is bounded by the transport's own
+ * startup bound and by nothing else, and closing it would need a seam inside the transport, which this harness does
+ * not add. Those files are an oracle for this harness's own proofs and assertions and its own last-resort cleanup, and
+ * they are never an input to production's cleanup: what that cleanup acts on is the process table it reads for itself.
  *
  * Every child of either kind runs in a disposable temp root that also holds HOME, the child's agent directory, the
  * fake project, the session directory, TMPDIR, the XDG directories and both compile caches. The fake user profile
@@ -61,7 +66,7 @@
  * In the ten generated-bootstrap cases every assertion about Fusion's record rules is a SIMULATION of
  * `extensions/fusion.ts` (`recordRun`, `nextSession`) run by the in-harness ledger, and is labelled as such.
  * Only the Pi side — what the fork contains, what the leaf is, what goes out on the wire — is measured. The
- * two `production` cases simulate nothing: what a run publishes there is `extensions/backends/pi-outcome.ts`'s
+ * five `production` cases simulate nothing: what a run publishes there is `extensions/backends/pi-outcome.ts`'s
  * own answer, and the ledger takes no part in them.
  *
  * Exit codes: 0 when every selected case is a measured pass, 1 when any case failed or is unproven, and 2
@@ -81,6 +86,10 @@ import { fileURLToPath } from "node:url";
 import { createPiBackend } from "../../extensions/backends/pi-backend.ts";
 import { piRole } from "../../extensions/backends/pi-binding.ts";
 import { PI_BOOTSTRAP_PATH } from "../../extensions/backends/pi-launch.ts";
+// The one cap a production case has to reproduce rather than restate: how much of a tool's own first argument the
+// progress mapper puts in a `tool_call` event's `brief`. Imported so a pinned event cannot drift from the window the
+// mapper actually cuts to, and so no number here is a second copy of that decision.
+import { PI_ACTIVITY_CHARS } from "../../extensions/backends/pi-outcome.ts";
 import { piPaths } from "../../extensions/backends/pi-storage.ts";
 import { PI_BOUNDS, startPiChild } from "../../extensions/backends/pi-transport.ts";
 import { failed } from "../../extensions/backends/types.ts";
@@ -168,6 +177,22 @@ const PROD_REQUIRED_OFFLINE = "1";
  * following it silently.
  */
 const PROD_CHECKPOINT_REFUSAL = "the pi child did not read back as standing at the recorded checkpoint";
+/**
+ * The fixed sentence `extensions/backends/pi-outcome.ts` maps a cancelled turn to, written out here for the same
+ * reason: a change to that text fails the cancellation cases instead of being followed silently. It is the whole of
+ * what a cancelled production run says for itself — no question, no answer, no prompt, no path and no pid is in it,
+ * and the marker checks of the two cancellation cases below are what hold it to that.
+ */
+const PROD_CANCELLED_MESSAGE = "the run was cancelled";
+/**
+ * What this harness's own question callback rejects with when it was told to hold a question rather than answer it.
+ * Fixed text with no question, no answer and no identifier in it, and deliberately recognisable: the cancellation
+ * cases assert that it reaches no diagnostic, no run text and no terminal event, which is only worth asserting if a
+ * leak would actually be visible.
+ */
+const PROD_QUESTION_HELD = "SPIKE-PROD-HELD the harness held this question until the run's own cancellation reached it";
+/** The literal platform tool the detached-descendant case needs. Never composed, never looked up on `PATH`. */
+const PROD_SETSID = "/usr/bin/setsid";
 /** How much of a run's own text a printed summary carries. A summary is a preview, never the answer. */
 const PROD_TEXT_PREVIEW_CHARS = 120;
 /** How far a computed cost and the one Pi reported may differ before the arithmetic below is called wrong. */
@@ -200,6 +225,15 @@ const GLOBAL_DEADLINE_MS = 10 * 60_000;
  * case says is that the call did not come back inside that patience.
  */
 const PROD_CALL_DEADLINE_MS = PI_BOUNDS.startupMs + PI_BOUNDS.ackMs + PI_BOUNDS.requestMs + PI_BOUNDS.shutdownStepMs + EXIT_DEADLINE_MS;
+/**
+ * How long a case that cancels its call mid-turn may wait for the thing it cancels *on* — a question the child has
+ * opened, or a descendant of its shell tool that has written its pid — before the case fails. It is the same
+ * arithmetic over the transport's own defaults: a startup, the acknowledgement of the prompt and the one request that
+ * carries the tool call, which is everything that has to happen before the trigger can fire. It sits deliberately
+ * below `PROD_CALL_DEADLINE_MS`, so a trigger that never fires is reported as the trigger's own failure rather than
+ * as the call running out of patience, and the call is cancelled and awaited to the end either way.
+ */
+const PROD_TRIGGER_DEADLINE_MS = PI_BOUNDS.startupMs + PI_BOUNDS.ackMs + PI_BOUNDS.requestMs;
 /** "agent_settled was last" is only a claim about a window: nothing can be observed in zero time. */
 const SETTLE_QUIET_MS = 1500;
 
@@ -833,6 +867,83 @@ function processStartTime(pid) {
 	}
 }
 
+/**
+ * Fields 3, 4, 5 and 6 of /proc/<pid>/stat — the run state, the parent, the process group and the session — plus
+ * field 22, the start identity, all read exactly the way `processStartTime` reads that one: from after the comm field's
+ * own closing parenthesis, so a command name holding a space or a bracket cannot shift them. It is how "this descendant
+ * called setsid" is proved rather than assumed: a session leader's session and group are its own pid, and a process
+ * still inside its parent's session is not one. `state` travels beside them because a zombie satisfies every relation
+ * above while being a process nobody is running any more, and `start` because a pid the operating system has handed to
+ * somebody else satisfies them too — so all three questions are answered off one read rather than three.
+ *
+ * Undefined off Linux and for a pid that has gone, which the caller fails on rather than reading as either answer.
+ */
+function processRelations(pid) {
+	try {
+		const stat = fs.readFileSync(`/proc/${pid}/stat`, "utf8");
+		const fields = stat.slice(stat.lastIndexOf(")") + 2).split(" ");
+		const state = fields[0];
+		const start = fields[19];
+		const [ppid, pgrp, session] = [Number(fields[1]), Number(fields[2]), Number(fields[3])];
+		if (typeof state !== "string" || state === "") return undefined;
+		return [ppid, pgrp, session].every((value) => Number.isInteger(value) && value > 0) ? { state, ppid, pgrp, session, start } : undefined;
+	} catch {
+		return undefined;
+	}
+}
+
+/** The two /proc run states that are a process nobody is running any more: reaped-but-unwaited, and dead. */
+const FINISHED_STATES = new Set(["Z", "X"]);
+
+/**
+ * Whether this platform answers the reads the predicate below is built on at all, asked once and of this process
+ * itself — which is the one pid that is certainly there. Without it, "no /proc entry" and "no /proc" would be the same
+ * answer, and every live process would read as over on a platform that simply has no such filesystem.
+ */
+const PROC_READABLE = processRelations(process.pid) !== undefined;
+
+/**
+ * Whether a process this harness was watching is over, answered from one read and with no wait, retry or timer in it.
+ * It exists because `pidAlive` deliberately answers a different question — "would a signal reach this pid at all",
+ * EPERM included — which is the right question for deciding whether to signal and the wrong one for deciding whether
+ * the thing being measured has ended: a zombie still answers `kill(pid, 0)`, and a pid the operating system has since
+ * handed to somebody else answers it as that other process.
+ *
+ * So, in order: no `/proc` entry at all, or a run state of `Z` or `X`, is gone. For a pid this harness registered, a
+ * start identity that no longer matches what was recorded is gone too — the process it was is over and the pid now
+ * names something else — which is `isOurProcess`'s own rule read for this purpose, off the same single read as the run
+ * state rather than through a second one: this is one `/proc/<pid>/stat` read and nothing else, so a process that ends
+ * between two reads cannot be seen half one way and half the other. Anything else is still live, and the reading is
+ * returned beside the verdict so a failure can say what it saw.
+ *
+ * Off a platform without `/proc` it answers the only question that can be answered there, which is `pidAlive`'s own,
+ * and says so in the reason rather than pretending to more: a zombie cannot be told from a live process without a run
+ * state to read, so nothing on such a platform is stricter than it always was.
+ *
+ * `pidAlive`'s own semantics are untouched: this is a second predicate for a second question, not a replacement, and
+ * `isOurProcess` stays exactly what cleanup asks before it signals anything.
+ */
+function processEnded(pid) {
+	if (!Number.isFinite(pid) || pid <= 0) return { gone: true, why: "no pid" };
+	if (!PROC_READABLE) {
+		return pidAlive(pid)
+			? { gone: false, why: "still signal-reachable, and this platform has no /proc to read a run state from" }
+			: { gone: true, why: "no longer signal-reachable, which is the most this platform can say" };
+	}
+	const relations = processRelations(pid);
+	if (relations === undefined) return { gone: true, why: "no /proc entry" };
+	if (FINISHED_STATES.has(relations.state)) return { gone: true, why: `state ${relations.state}` };
+	// Registered and recycled: the pid is alive, and what it is alive as is not what this harness started. The recorded
+	// identity is compared to the one this read already carries — both absent is the same match `isOurProcess` makes for
+	// a platform that answers neither.
+	if (spawnedPids.has(pid)) {
+		const recorded = spawnedPids.get(pid);
+		const same = recorded === undefined ? relations.start === undefined : recorded === relations.start;
+		if (!same) return { gone: true, why: "start identity changed, so this pid was recycled" };
+	}
+	return { gone: false, why: `state ${relations.state}` };
+}
+
 /** The earliest observation of a pid wins: a later re-registration could only pin a recycled one. */
 const registerPid = (pid) => {
 	if (!Number.isFinite(pid) || pid <= 0 || spawnedPids.has(pid)) return;
@@ -864,8 +975,8 @@ function killTree(pid) {
 }
 
 /**
- * A pid written by one of the harness's own fixture commands. `echo $$ >` truncates the file before it
- * writes, so content without a trailing newline may still be half-written and must read as absent rather
+ * A pid written by one of the harness's own fixture commands or owned scripts. `echo $$ >` truncates the file before
+ * it writes, so content without a trailing newline may still be half-written and must read as absent rather
  * than as a truncated pid that belongs to somebody else.
  */
 function readPidFile(file) {
@@ -3271,7 +3382,7 @@ async function caseCompactionCheckpoint(root, server, result) {
 /* ------------------------------------------------------------ the production group */
 
 /**
- * The two cases below drive the real backend rather than a stand-in for it: `createPiBackend` with five seams of this
+ * The five cases below drive the real backend rather than a stand-in for it: `createPiBackend` with five seams of this
  * harness's own — the host agent directory this case owns, the contract prose in place of the file this install ships,
  * the wrapped start described in the file header, the environment `productionEnv` composes, and the `onCall` report
  * that module already keeps for a test — and production's own everything else. No bounds, no cleanup, no bootstrap
@@ -3281,12 +3392,24 @@ async function caseCompactionCheckpoint(root, server, result) {
  * `extensions/backends/pi-bootstrap.mjs`, and the SDK behind it is this repository's Pi.
  *
  * What that buys, and what it does not. It measures this composition against a real child: which requests one call
- * sends, what a restore of a recorded checkpoint does to a real transcript, what a fork of one contains, what the
+ * sends, what a restore of a recorded checkpoint does to a real transcript, what a fork of one contains, what a
+ * question of the child's own is answered or cancelled as, what a cancellation mid-turn leaves of the child and of a
+ * descendant that left its process group, what the
  * outcome mapping then publishes, and whether the child and its storage are actually gone afterwards. It measures
  * nothing about a real provider, a real credential or a paid model: the loopback fixture is the only model endpoint
  * configured, the composed child environment must carry `PI_OFFLINE=1` exactly before a launch happens, and neither of
  * those is a sandbox or evidence about what a child could reach by another route. It changes no policy either: the exact-leaf gate, the record rules and the retention rules are the shipped ones, and a
  * refusal is reported as the composition reported it rather than worked around here.
+ *
+ * The three cases that came last are the loud half of the group, and what they add is one question answered with a
+ * steer beside it, one question held until the run's own cancellation reached it, and one cancellation onto a shell
+ * tool that had already put a `setsid` descendant outside the process group Pi kills. Each of the three still ends at
+ * the same strict ground the quiet two do — a disposition with no concern, this call's own storage gone, every process
+ * of it over — and none of them terminates anything itself before asserting that: the pid files the owned script
+ * writes are an oracle for those proofs and assertions and a last-resort net for this harness's own cleanup, never an
+ * input to production's, and a native cleanup that failed is a failed case rather than something this file tidies up
+ * over. "Over" is `processEnded`'s question rather than `pidAlive`'s, so a zombie never passes as a survivor and a
+ * recycled pid never passes as the process it used to be.
  */
 
 /** Session files of this case's own durable session directory, sorted, or nothing at all while there are none. */
@@ -3364,6 +3487,126 @@ async function withinDeadline(what, controller, work, ms = PROD_CALL_DEADLINE_MS
 }
 
 /**
+ * One event-driven latch, which is the whole of how a case waits for something to happen *inside* a call: a promise
+ * that resolves the first time `open` is called, and nothing else.
+ *
+ * What that claim is and is not. The latch holds no timer and polls nothing: it is opened by the event it is waiting
+ * for and by nothing else, so nothing here samples, sleeps or wakes up to look. It is **not** an unbounded wait, and
+ * the bound is deliberate and elsewhere: `awaitTrigger` races every trigger against a real rejecting timer, so a latch
+ * that never opens ends the call through its own signal rather than hanging. `close` is there so that a latch and a
+ * watcher are the same shape to a caller.
+ */
+function latch(what) {
+	let opened;
+	const ready = new Promise((resolve) => {
+		opened = resolve;
+	});
+	return { what, ready, open: () => opened(), close: () => {} };
+}
+
+/**
+ * The same readiness for a descendant that has written its pid, and the one reason it is a watcher rather than a
+ * poll: between a process starting and this harness knowing its pid there is a window an interrupt would leak it in,
+ * and a watcher closes that window to one filesystem event instead of one poll period. One `fs.watch` on the
+ * directory the fixture script writes into, read once when it is installed — a file finished before that fires no
+ * event — and again on every event, resolving when every named file parses as a whole pid. `readPidFile` is what
+ * "whole" means: a file without its trailing newline is a half-written one and reads as absent.
+ *
+ * The same honest bound as `latch`: no timer and no poll are in here, and the wait is still bounded, by
+ * `awaitTrigger`'s own rejecting timer rather than by anything this watcher does.
+ *
+ * It registers nothing and proves nothing: what to do with the pids, and whether they are really this run's, is the
+ * caller's, which is also where the containment, identity and detachment proofs live. `close` takes the watcher off,
+ * and the caller's `finally` is what calls it. `found` is the live view of what has parsed so far, which is the one
+ * thing worth printing when readiness never came: "neither file" and "one of the two" are different failures.
+ */
+function watchPidFiles(what, files) {
+	const labels = Object.keys(files);
+	const found = {};
+	let settle;
+	const ready = new Promise((resolve, reject) => {
+		settle = { resolve, reject };
+	});
+	const look = () => {
+		for (const label of labels) {
+			if (found[label] !== undefined) continue;
+			const pid = readPidFile(files[label]);
+			if (pid !== undefined) found[label] = pid;
+		}
+		if (labels.every((label) => found[label] !== undefined)) settle.resolve({ ...found });
+	};
+	let watcher;
+	try {
+		// One directory for every file, which is what makes a single watcher enough; `persistent: false` so a watcher
+		// nobody closed could never be what keeps this process alive.
+		const dirs = new Set(labels.map((label) => path.dirname(files[label])));
+		if (dirs.size !== 1) throw new Error(`refusing to watch: ${JSON.stringify([...dirs])} is more than one directory, and this watcher is one directory's`);
+		watcher = fs.watch([...dirs][0], { persistent: false }, () => {
+			try {
+				look();
+			} catch (error) {
+				settle.reject(error);
+			}
+		});
+		look();
+	} catch (error) {
+		settle.reject(error);
+	}
+	return { what, found, ready, close: () => watcher?.close() };
+}
+
+/**
+ * The trigger of a cancellation that has to land in the middle of a call: the thing the case cancels *on*, awaited
+ * under its own bound and never instead of the call itself. The call's own settled promise is in the race for one
+ * reason only — a call that was already over has nothing left to cancel, and saying so is better than spending the
+ * whole bound on a trigger that can no longer fire — and the caller awaits that same promise to the end afterwards,
+ * so nothing here races the call away or abandons it.
+ *
+ * The timer and the watcher both go in the `finally`, whichever way this ended, so no clock of this harness's and no
+ * watch of its own outlives the call it belonged to. Every promise in the race has both handlers attached by `race`
+ * itself, so a trigger or a bound that settles after the winner leaves nothing unhandled behind.
+ */
+async function awaitTrigger(label, trigger, settled, ms = PROD_TRIGGER_DEADLINE_MS) {
+	let timer;
+	const bounded = new Promise((_resolve, reject) => {
+		timer = setTimeout(() => reject(new Error(`${label}: ${trigger.what} was not ready inside the harness's patience of ${ms}ms, so the call was cancelled and awaited to the end without it`)), ms);
+	});
+	try {
+		const first = await Promise.race([trigger.ready.then(() => "ready"), settled.then(() => "ended"), bounded]);
+		if (first === "ended") throw new Error(`${label}: the call was over before ${trigger.what} was ready, so there was nothing left for this case to cancel`);
+	} finally {
+		clearTimeout(timer);
+		trigger.close();
+	}
+}
+
+/**
+ * A question this harness was told to hold rather than answer, held on the dialog's own `AbortSignal` and on nothing
+ * else: no timer, no poll and no sleep is in the hold itself, and the bound on the whole call is `awaitTrigger`'s
+ * rejecting timer and `withinDeadline`'s patience, both of which end it through the run's own signal. What aborts the
+ * dialog's signal is the router ending that dialog, which is what a cancellation of the run does to one — so this
+ * rejects exactly when the cancellation has reached the question, with fixed text that names neither the question nor
+ * anything about the run.
+ *
+ * `released` is called once, immediately before the rejection, and it is the point of the callback: it is this
+ * harness's own record that the dialog's signal aborted, which is evidence of the cancellation reaching the question
+ * that does not depend on which side of the task's own race happened to win and therefore on whether the task kept the
+ * dialog's outcome at all.
+ */
+const holdQuestion = (signal, released) =>
+	new Promise((_resolve, reject) => {
+		const give = () => {
+			released?.();
+			reject(new Error(PROD_QUESTION_HELD));
+		};
+		if (signal.aborted) {
+			give();
+			return;
+		}
+		signal.addEventListener("abort", give, { once: true });
+	});
+
+/**
  * One production case's own ground: the directories, sentinels and guards every case has, plus the host agent
  * directory this one gives the backend. When the case starts that directory holds exactly two files — one
  * `models.json` naming the loopback fixture, which is the one a production child reads, and one `AGENTS.md` whose
@@ -3412,9 +3655,11 @@ function setupProductionCase(root, server, name) {
  * `RpcChild` keeps, so a pid the operating system has since reused is never one this harness signals. It follows that
  * a child spawned by the transport and not yet handed over is in no registry here: an interrupt in that window leaks
  * the process rather than killing it. Nothing here closes that window, and it is not the one the pid-file sweep
- * closes: that sweep works by reading pid files the fixture commands of row 6 write, and a production child writes
- * none. It is bounded by the transport's own startup bound and by nothing else, and closing it would need a seam
- * inside the transport, which this harness does not add.
+ * closes: that sweep works by reading pid files a fixture command or an owned script wrote, and a production child
+ * writes none of its own — the two that `prod-detached-cancelled` reads name a descendant of its shell tool and the
+ * script that shell tool ran. It is bounded by the
+ * transport's own startup bound and by nothing else, and closing it would need a seam inside the transport, which
+ * this harness does not add.
  *
  * A path outside the root is a refusal here rather than a diagnostic, the same rule every other child of this harness
  * launches under, and what is checked is everything the composition composed rather than a list somebody kept up to
@@ -3492,11 +3737,32 @@ function productionStart(prod) {
  * it ran, and the composed-start evidence. The role is the explicit one on a first call and the recorded selection on
  * a continuation, which is what `piRole` is given a recorded selection for.
  *
- * The call is given a signal of its own, which is how a real host runs one, and nothing ever aborts it except the
- * harness running out of patience in `withinDeadline`: a call that answers in time ran to the end uncancelled. The
- * controller is this call's alone, so one case's patience can never reach another's child.
+ * The call is given a signal of its own, which is how a real host runs one, and the only two things that ever abort it
+ * are the harness running out of patience in `withinDeadline` and a case that asked for a `trigger`: a call with
+ * neither that answers in time ran to the end uncancelled. The controller is this call's alone, so one case's
+ * patience can never reach another's child.
+ *
+ * The three optional halves, and why each is composed here rather than in a case:
+ *
+ * - `question` turns the call's questions on, because the presence of an `onQuestion` is the whole of what does that
+ *   in `pi-prepare.ts`. The callback records the prompt exactly as the child asked it and holds it to the one the case
+ *   named in `expect`, pushes whatever `steers` this call carries, signals the case's own `opened` latch, and then
+ *   either returns the one configured answer or holds the dialog until its own signal aborts. The order is deliberate:
+ *   a steer goes in before the latch opens, so a case whose trigger cancels on that latch can never pre-empt its own
+ *   steer, and the answer comes last of all.
+ * - `steers` is pushed through a real `backend.control()` queue, which is the same object the run lifecycle hands a
+ *   backend, and is pushed from the question callback and nowhere else — a steer only means something while a turn is
+ *   live, and a question being open is the one moment this harness can be sure of one. A call with steers and no
+ *   question is therefore a composition error and is refused rather than pushed at some guessed moment.
+ * - `trigger` is a cancellation that has to land mid-call. The run's promise is created first, awaited by nothing yet;
+ *   the trigger is then awaited under its own bound; and only then is this call's controller aborted and the same
+ *   promise awaited to the end through `withinDeadline`. Nothing is raced against the call and nothing is abandoned,
+ *   and a trigger that failed still cancels and still awaits — it is reported afterwards, once the call is over.
  */
-async function productionCall(prod, result, { label, prompt, intent, recorded }) {
+async function productionCall(prod, result, { label, prompt, intent, recorded, question, steers, trigger }) {
+	if (steers !== undefined && question === undefined) {
+		throw new Error(`the production call ${label} names steers and no question: this harness pushes a call's steers from its question callback, so a call with no question has no moment it can be sure of to push one at`);
+	}
 	const role = piRole({ role: "implement", ...(recorded === undefined ? { model: PROD_MODEL, effort: PROD_EFFORT } : {}) }, recorded, {});
 	const reports = [];
 	const events = [];
@@ -3514,34 +3780,101 @@ async function productionCall(prod, result, { label, prompt, intent, recorded })
 		env: prod.env,
 		onCall: (report) => reports.push(report),
 	});
+	const queue = steers === undefined ? undefined : backend.control();
+	// What the case then asserts on: the prompts the child actually asked, how many steers this queue took in, and how
+	// many held dialogs were released by their own signal aborting. A push the queue would not take is `false` and is
+	// not counted here either, which is what makes `admitted` the number the steer report's own `pushed` has to agree
+	// with; `released` is this harness's own race-independent evidence that a cancellation reached a held question.
+	const asked = { prompts: [], admitted: 0, released: 0 };
+	const onQuestion =
+		question === undefined
+			? undefined
+			: async (text, signal) => {
+					asked.prompts.push(text);
+					// Pinned where it happens rather than after the call: a question that is not the one the fixture scripted
+					// makes every assertion below it about something else, and it is worth saying so at the moment it arrives.
+					result.check(text === question.expect, `${label}: the child asked ${JSON.stringify(text)} rather than the exact question this case scripted`);
+					for (const steer of steers ?? []) {
+						if (queue.push(steer)) asked.admitted += 1;
+					}
+					question.opened?.();
+					if (question.answer === undefined) {
+						return await holdQuestion(signal, () => {
+							asked.released += 1;
+						});
+					}
+					return question.answer;
+				};
 	const from = prod.server.requests.length;
-	const run = await withinDeadline(
-		`the production call ${label}`,
-		controller,
-		backend.run({
-			role,
-			prompt,
-			cwd: prod.dirs.project,
-			session: backend.session(intent ?? { kind: "new" }),
-			signal: controller.signal,
-			onProgress: () => {
-				counts.progress += 1;
-			},
-			onEvent: (event) => events.push(event),
-		}),
-	);
-	const call = { label, role, run, reports, report: reports[0], events, contracts, progress: counts.progress, requests: prod.server.requests.slice(from), start: evidence };
+	const running = backend.run({
+		role,
+		prompt,
+		cwd: prod.dirs.project,
+		session: backend.session(intent ?? { kind: "new" }),
+		signal: controller.signal,
+		...(queue === undefined ? {} : { input: queue }),
+		...(onQuestion === undefined ? {} : { onQuestion }),
+		onProgress: () => {
+			counts.progress += 1;
+		},
+		onEvent: (event) => events.push(event),
+	});
+	// Settled once, right here, for two reasons: a rejection that lands while a trigger is being waited for is already
+	// observed and can never be an unhandled one, and the trigger's own race can see a call that is already over.
+	// `withinDeadline` below still attaches its own handlers to the same promise and still reports it whole.
+	const settled = running.then((value) => ({ ok: true, value }), (error) => ({ ok: false, error }));
+	let triggerFailure;
+	if (trigger !== undefined) {
+		try {
+			await awaitTrigger(label, trigger, settled);
+			result.say(`${label}: ${trigger.what} is ready, so this call is now cancelled through its own signal`);
+		} catch (error) {
+			triggerFailure = error;
+		}
+		// Either way. A trigger that failed is still a case that has a call running, and the only way to end one from
+		// outside is its own signal: it is cancelled and awaited below, and the failure is reported once that is done.
+		controller.abort();
+	}
+	const run = await withinDeadline(`the production call ${label}`, controller, running);
+	const call = {
+		label,
+		role,
+		// Kept because the checks over a cancellation need it: a run's prompt is a thing no diagnostic may repeat, and
+		// the marker check for that is composed from the call rather than restated by every case.
+		prompt,
+		run,
+		reports,
+		report: reports[0],
+		events,
+		contracts,
+		progress: counts.progress,
+		requests: prod.server.requests.slice(from),
+		start: evidence,
+		questions: asked,
+		...(queue === undefined ? {} : { queue }),
+	};
 	result.say(
 		`${label}: ok ${!failed(run)}, stopReason ${run.stopReason}, session ${run.session?.sessionId ?? "-"} at ${run.session?.checkpoint ?? "-"}, tokens ${run.tokensIn}/${run.tokensOut}, cost ${run.costUsd ?? 0}, turns ${run.numTurns ?? 0}, events ${JSON.stringify(events.map((event) => event.type))}, provider requests ${call.requests.length}, progress ${call.progress}`,
 	);
 	result.say(
 		`${label} text: ${JSON.stringify((run.text ?? "").slice(0, PROD_TEXT_PREVIEW_CHARS))}${run.errorMessage === undefined ? "" : `, message ${JSON.stringify(run.errorMessage)}`}`,
 	);
+	if (question !== undefined) result.say(`${label} questions: ${asked.prompts.length} asked, ${asked.admitted} steer(s) admitted into the queue, ${asked.released} released by their own signal aborting`);
+	// After the two summary lines, so a trigger that failed still prints what the call it cancelled came back with.
+	if (triggerFailure !== undefined) throw triggerFailure;
 	return call;
 }
 
-/** What the composition put in the launch, checked rather than assumed, and the call input it wrote beside it. */
-function checkComposedStart(result, prod, call) {
+/**
+ * What the composition put in the launch, checked rather than assumed, and the call input it wrote beside it.
+ *
+ * `questionTool` is the one thing a caller chooses, and it chooses between two assertions rather than relaxing one: a
+ * call that passed no question callback has to have composed `questionTool: false` and a tool list with no
+ * `ask_orchestrator` in it at all, and a call that passed one has to have composed `true` with that name in the list
+ * exactly once and last — last because `pi-launch.ts` appends it after the role's own tools, and the list a session
+ * is built with is the allow list, so a name that moved or appeared twice is a composition this case did not measure.
+ */
+function checkComposedStart(result, prod, call, { questionTool = false } = {}) {
 	const evidence = call.start;
 	const input = evidence.inputs[0];
 	result.check(evidence.attempts === 1 && evidence.resolved === 1, `${call.label}: ${evidence.attempts} start attempt(s) and ${evidence.resolved} child(ren) for one call`);
@@ -3572,8 +3905,18 @@ function checkComposedStart(result, prod, call) {
 		`${call.label} network shape: PI_OFFLINE ${JSON.stringify(evidence.offline)}, allowModelNetwork ${JSON.stringify(evidence.inputs.map((recorded) => recorded.allowModelNetwork))}, catalogBaseUrl composed ${JSON.stringify(evidence.inputs.map((recorded) => recorded.hasCatalogBaseUrl))} (a harness precondition and a composed default, not a sandbox)`,
 	);
 	result.check(call.contracts.length === 1 && call.contracts[0] === call.role.contract, `${call.label}: the contract asked for was ${JSON.stringify(call.contracts)} rather than the role's own`);
-	result.check(input?.questionTool === false, `${call.label}: the call input's questionTool is ${JSON.stringify(input?.questionTool)}, and no production call here can answer a question`);
-	result.check(input?.tools?.includes("ask_orchestrator") === false, `${call.label}: the call input's tools name the question tool: ${JSON.stringify(input?.tools)}`);
+	if (questionTool) {
+		const tools = input?.tools ?? [];
+		result.check(input?.questionTool === true, `${call.label}: the call input's questionTool is ${JSON.stringify(input?.questionTool)}, and this call passed a question callback`);
+		result.check(
+			tools.filter((tool) => tool === "ask_orchestrator").length === 1,
+			`${call.label}: the call input's tools name the question tool ${tools.filter((tool) => tool === "ask_orchestrator").length} time(s): ${JSON.stringify(tools)}`,
+		);
+		result.check(tools.at(-1) === "ask_orchestrator", `${call.label}: the question tool is not the last of the composed tools ${JSON.stringify(tools)}`);
+	} else {
+		result.check(input?.questionTool === false, `${call.label}: the call input's questionTool is ${JSON.stringify(input?.questionTool)}, and this call passed no question callback`);
+		result.check(input?.tools?.includes("ask_orchestrator") === false, `${call.label}: the call input's tools name the question tool: ${JSON.stringify(input?.tools)}`);
+	}
 	result.check(input?.modelsPath === prod.paths.userModelsPath, `${call.label}: the child reads its models from ${input?.modelsPath} rather than the host agent directory's own`);
 	result.check(
 		typeof input?.authPath === "string" && path.dirname(path.dirname(input.authPath)) === prod.paths.callsDir,
@@ -3589,14 +3932,24 @@ function checkComposedStart(result, prod, call) {
  * What a child's own ending has to look like for a production call to have left nothing behind. It is read off the
  * exit report the stage that stopped the child reported, whichever stage that was, and every field of it is one the
  * production retention decision is made from.
+ *
+ * `counters` is the one thing a caller may widen, and it widens by naming values rather than by switching a check
+ * off: a counter named here may take one of exactly the values listed for it, and every counter not named must still
+ * be zero. `total`, where a caller gives one, is the exact sum over the named counters — which is how "one dialog was
+ * cancelled once, by one of the two mechanisms that can cancel one" is asserted without picking which mechanism.
+ *
+ * `failure` is the transport's own verdict on how the child ended, and it is named rather than always required to be
+ * absent because the two are different endings: a child this host asked to stop that then stopped carries none, and a
+ * cancelled one carries the `aborted` failure the cancellation itself was noted as. Either way it is pinned to exactly
+ * one value, and the retention decision reads none of it — a failure of that kind is not a concern.
  */
-function checkCleanExit(result, label, exit) {
+function checkCleanExit(result, label, exit, { counters = {}, total, failure } = {}) {
 	if (exit === undefined) {
 		result.check(false, `${label}: the stage that stopped this child reported no exit at all`);
 		return;
 	}
 	const cleanup = exit.cleanup;
-	result.check(exit.failure === undefined, `${label}: the transport's verdict on how the child ended is ${JSON.stringify(exit.failure?.kind)}`);
+	result.check(exit.failure?.kind === failure, `${label}: the transport's verdict on how the child ended is ${JSON.stringify(exit.failure?.kind)} rather than ${JSON.stringify(failure)}`);
 	result.check(exit.stoppedByUs === true, `${label}: the child ended itself rather than being stopped by this host`);
 	result.check(cleanup.root === "exited" || cleanup.root === "stopped", `${label}: its root is ${cleanup.root} rather than one that says the root is over`);
 	result.check(cleanup.stdio === "closed", `${label}: its pipes are ${cleanup.stdio}`);
@@ -3604,15 +3957,27 @@ function checkCleanExit(result, label, exit) {
 	result.check(cleanup.leftovers.length === 0, `${label}: ${cleanup.leftovers.length} verified leftover process(es)`);
 	result.check(cleanup.skipped.length === 0, `${label}: ${cleanup.skipped.length} target(s) whose identity it could not prove`);
 	result.check(cleanup.deadlineHit === false, `${label}: the cleanup hit its own deadline`);
-	// Stricter than the retention decision on purpose, and knowingly so: every counter that is not zero fails these
-	// cases, deliberately, although only `streamsUnclosed` is itself a concern the disposition reads. The rest — a
-	// stray settle, a late response, a dropped frame, a cancelled dialog — is timing evidence about the wire rather
-	// than something left behind, so a nonzero one of those is a finding to look at and not proof of an unclean
-	// cleanup; it fails here because these are the quiet qualification cases — one prompt, one text answer, no steer,
-	// no question and no cancellation — where nothing should have produced one, and a case that started counting them
-	// is no longer the case this group is measuring. The value is printed so what it was is visible either way.
+	// Stricter than the retention decision on purpose, and knowingly so: a counter no caller named has to be zero,
+	// deliberately, although only `streamsUnclosed` is itself a concern the disposition reads. The rest — a stray
+	// settle, a late response, a dropped frame, a cancelled dialog — is timing evidence about the wire rather than
+	// something left behind, so a nonzero one of those is a finding to look at and not proof of an unclean cleanup; it
+	// fails here because a case that started counting one it did not expect is no longer the case this group is
+	// measuring. What a case may do instead is name the counters its *own* shape legitimately produces and the exact
+	// values they may take — a cancellation cancels one open dialog once, and that is a counter, not a leftover — and
+	// `streamsUnclosed` is never one of those, because it is the only one retention actually reads. Every value is
+	// printed so what it was is visible either way.
 	const counted = Object.entries(exit.counters).filter(([, value]) => value !== 0);
-	result.check(counted.length === 0, `${label}: counters that are not zero: ${JSON.stringify(counted)} (timing evidence about the wire; only streamsUnclosed is itself a cleanup concern)`);
+	const unexpected = counted.filter(([name, value]) => !(counters[name] ?? []).includes(value));
+	result.check(
+		unexpected.length === 0,
+		`${label}: counters that are not zero and were not named by this case: ${JSON.stringify(unexpected)} (named: ${JSON.stringify(counters)}; timing evidence about the wire, and only streamsUnclosed is itself a cleanup concern)`,
+	);
+	if (total !== undefined) {
+		const named = Object.keys(counters);
+		const sum = named.reduce((running, name) => running + (exit.counters[name] ?? 0), 0);
+		result.check(sum === total, `${label}: the counters ${JSON.stringify(named)} add up to ${sum} rather than the ${total} this case's own shape produces`);
+	}
+	if (counted.length > 0) result.say(`${label}: counters that are not zero: ${JSON.stringify(counted)}`);
 	const stderr = exit.stderr;
 	result.check(
 		stderr.serving === true && stderr.lastStage === PROD_LAST_STAGE && stderr.stageCount === PROD_STAGE_COUNT,
@@ -3624,13 +3989,50 @@ function checkCleanExit(result, label, exit) {
 }
 
 /**
+ * The cut `extensions/backends/pi-outcome.ts` makes on a value it bounds, reproduced exactly: the first `max` code
+ * points, with one ellipsis appended when and only when something was dropped. It is code points rather than units so
+ * a cut never halves a character, which is that module's own rule and the reason this is written out rather than done
+ * with `slice`. The cap itself is never a number of this file's own — `PI_ACTIVITY_CHARS` is imported — so a pinned
+ * `brief` follows the window the mapper actually cuts to instead of a copy of it that could drift.
+ */
+function codePointCut(value, max) {
+	const points = [...value];
+	return points.length <= max ? value : `${points.slice(0, max).join("")}…`;
+}
+
+/**
+ * The two events one tool call of the child's own becomes for a monitor, composed exactly the way
+ * `extensions/backends/pi-outcome.ts`'s mapper composes them — the same fields in the same order — so that comparing
+ * a whole event list compares whole events rather than a few of their fields. A spec is complete on purpose: `brief`
+ * is what that mapper's own one-argument summary comes to, bounded by `codePointCut` above, `input` its bounded
+ * argument record and `result` the
+ * bounded text of the tool's own result, and a case that left one of them to chance would be a case that had stopped
+ * measuring what the mapper does with a record. `id` is required because every fixture step here carries one, and the
+ * mapper leaves a result with no id out altogether rather than filing it under nothing.
+ */
+function expectedToolEvents({ name, id, brief = "", input, result = "", isError = false }) {
+	if (typeof name !== "string" || typeof id !== "string") throw new Error(`a tool event spec names a tool and the id its call carries, and this one is ${JSON.stringify({ name, id })}`);
+	return [
+		{ type: "tool_call", name, brief, id, ...(input === undefined ? {} : { input }) },
+		{ type: "tool_result", toolUseId: id, text: result, isError },
+	];
+}
+
+/**
  * Everything an ordinary production call owes, whichever session it ran in: a turn that finished, one report at the
  * task stage, one child started and stopped cleanly, a disposition with no concern and the call directory gone with
  * it, the structured session reference a record would carry and no flat checkpoint beside it, the exact selection the
- * call asked for, this turn's own canonical accounting, the two events a monitor should see, and one loopback request
+ * call asked for, this turn's own canonical accounting, the events a monitor should see, and loopback requests each
  * carrying this call's contract and the project's context and neither of the two sentinels nothing points a child at.
+ *
+ * Three things a caller may say, and none of them relaxes anything. `requests` is how many requests this turn's work
+ * takes, and the accounting is then the sum over all of them rather than one request's: tokens, the price
+ * `models.json` puts on them, and the assistant messages the turn counted, which is one per request. `tools` is the
+ * tool calls the child makes along the way, in order, each becoming the exact pair of events above and nothing else
+ * between them. `questionTool` travels through to `checkComposedStart`. The default of all three is the quiet call
+ * this helper has always checked: one request, no tool, no question, and exactly two events.
  */
-function checkProductionCall(result, prod, call, { text }) {
+function checkProductionCall(result, prod, call, { text, tools = [], requests = 1, questionTool = false }) {
 	const run = call.run;
 	const report = call.report;
 	const session = run.session;
@@ -3670,39 +4072,238 @@ function checkProductionCall(result, prod, call, { text }) {
 
 	result.check(run.selection?.model === PROD_MODEL && run.selection?.effort === PROD_EFFORT, `${call.label}: the selection read back as ${JSON.stringify(run.selection)}`);
 	result.check(run.modelId === PROD_MODEL, `${call.label}: the run names model ${run.modelId}`);
-	result.check(call.requests.length === 1, `${call.label}: ${call.requests.length} provider request(s) for one turn`);
+	result.check(call.requests.length === requests, `${call.label}: ${call.requests.length} provider request(s) for a turn this case expects ${requests} of`);
 	const request = call.requests[0];
-	result.check(run.numTurns === 1, `${call.label}: the turn counted ${run.numTurns} assistant message(s)`);
-	const sent = request?.usageSent;
+	result.check(run.numTurns === requests, `${call.label}: the turn counted ${run.numTurns} assistant message(s) rather than the ${requests} its requests produced`);
+	// The sum over every request of the turn, which is what the canonical accounting is a delta of: one request's own
+	// usage would under-report a turn that took several, and a sum that is short of one of them names which.
+	const usages = call.requests.map((one) => one.usageSent);
+	const whole = usages.every((sent) => sent !== undefined);
+	const promptTokens = whole ? usages.reduce((running, sent) => running + sent.prompt_tokens, 0) : undefined;
+	const completionTokens = whole ? usages.reduce((running, sent) => running + sent.completion_tokens, 0) : undefined;
 	result.check(
-		run.tokensIn === sent?.prompt_tokens && run.tokensOut === sent?.completion_tokens && run.cacheRead === 0 && run.cacheWrite === 0,
-		`${call.label}: the canonical accounting is ${run.tokensIn}/${run.tokensOut} (cache ${run.cacheRead}/${run.cacheWrite}) against the usage the fixture sent, ${JSON.stringify(sent)}`,
+		whole && run.tokensIn === promptTokens && run.tokensOut === completionTokens && run.cacheRead === 0 && run.cacheWrite === 0,
+		`${call.label}: the canonical accounting is ${run.tokensIn}/${run.tokensOut} (cache ${run.cacheRead}/${run.cacheWrite}) against the usage the fixture sent across ${usages.length} request(s), ${JSON.stringify(usages)}`,
 	);
-	const expected = sent === undefined ? undefined : fixtureCost(sent);
+	const expected = whole ? usages.reduce((running, sent) => running + fixtureCost(sent), 0) : undefined;
 	result.check(
 		expected !== undefined && typeof run.costUsd === "number" && Math.abs(run.costUsd - expected) < PROD_COST_EPSILON,
-		`${call.label}: the reported cost ${run.costUsd} is not ${expected}, which is what models.json prices ${JSON.stringify(sent)} at per million tokens (${JSON.stringify(MODEL_COST)})`,
+		`${call.label}: the reported cost ${run.costUsd} is not ${expected}, which is what models.json prices ${JSON.stringify(usages)} at per million tokens (${JSON.stringify(MODEL_COST)})`,
 	);
 	result.check(
-		JSON.stringify(call.events) === JSON.stringify([{ type: "init", sessionId: session?.sessionId }, { type: "turn_result", ok: true }]),
+		JSON.stringify(call.events) === JSON.stringify([{ type: "init", sessionId: session?.sessionId }, ...tools.flatMap(expectedToolEvents), { type: "turn_result", ok: true }]),
 		`${call.label}: the events a monitor saw are ${JSON.stringify(call.events)}`,
 	);
 	result.check(call.progress >= 2, `${call.label}: progress was reported ${call.progress} time(s)`);
 
-	result.say(`${call.label} request: ${describeRequest(request ?? { messages: [] })}`);
-	result.check(request?.model === FIXTURE_MODEL, `${call.label}: the request asked for ${request?.model}`);
-	result.check(request?.authorizationMatchesFixtureKey === true, `${call.label}: the request did not carry the dummy fixture key`);
-	result.check(request?.systemText?.includes(PROD_CONTRACT_SENTINEL) === true, `${call.label}: the contract this call was given is not in the system content`);
-	result.check(request?.systemText?.includes(PROJECT_CONTEXT_SENTINEL) === true, `${call.label}: the project's own AGENTS.md sentinel is not in the system content`);
-	result.check(request?.systemText?.includes(PROD_HOST_AGENT_SENTINEL) === false, `${call.label}: the host agent directory's context sentinel reached the system content`);
-	result.check(request?.systemText?.includes(USER_CONTEXT_SENTINEL) === false, `${call.label}: the fake user profile's context sentinel reached the system content`);
-	checkComposedStart(result, prod, call);
+	// Every request of the turn, not the first alone: the model, the key and the four sentinels are what each one of
+	// them has to carry, and a second request that dropped the contract or picked up a sentinel is the interesting one.
+	for (const [index, one] of call.requests.entries()) {
+		const at = `${call.label} request ${index + 1}`;
+		result.say(`${at}: ${describeRequest(one)}`);
+		result.check(one.model === FIXTURE_MODEL, `${at}: the request asked for ${one.model}`);
+		result.check(one.authorizationMatchesFixtureKey === true, `${at}: the request did not carry the dummy fixture key`);
+		result.check(one.systemText?.includes(PROD_CONTRACT_SENTINEL) === true, `${at}: the contract this call was given is not in the system content`);
+		result.check(one.systemText?.includes(PROJECT_CONTEXT_SENTINEL) === true, `${at}: the project's own AGENTS.md sentinel is not in the system content`);
+		result.check(one.systemText?.includes(PROD_HOST_AGENT_SENTINEL) === false, `${at}: the host agent directory's context sentinel reached the system content`);
+		result.check(one.systemText?.includes(USER_CONTEXT_SENTINEL) === false, `${at}: the fake user profile's context sentinel reached the system content`);
+	}
+	result.check(call.requests.length > 0, `${call.label}: no provider request arrived, so the checks over them looked at nothing`);
+	checkComposedStart(result, prod, call, { questionTool });
 	return { entries, request };
 }
 
 /**
+ * Everything a production call the harness cancelled mid-turn owes, which is the other half of the two checks above
+ * and is deliberately no looser than them. A cancellation is a failure with a shape of its own: the run says it was
+ * cancelled and says so in `pi-outcome.ts`'s own fixed sentence and nothing else; it publishes the identity the
+ * preparation verified and *no* checkpoint, flat or structured, because a cancelled turn produced none; the call
+ * stopped at its task with that task refusing for `aborted`; the child was started, stopped once and ended with a
+ * cleanup that left nothing at all; this call's own storage is gone, which is the disposition's own decision and only
+ * ever licensed by a concern list that is empty; and every process of it is over.
+ *
+ * What `tool` is for: a cancellation lands on a tool call, so the events a monitor saw are the init, that call, at
+ * most one result for it — Pi may or may not get as far as failing the tool before the child stops, and both are
+ * honest — and the failed terminal event. Nothing else may be among them. The call itself is pinned whole, because
+ * every field of it is the mapper's own composition; the optional result is pinned on its type, the id it is filed
+ * under and whether it was an error, and its text is left as the child's own, because what a cancelled tool writes
+ * into a result is the child's business and not something this harness fixes.
+ *
+ * **The two surfaces, and why they are not the same check.** A progress event deliberately carries a bounded copy of
+ * a tool's own arguments: that is what the mapper is for, and a monitor showing a shell command is the feature rather
+ * than a leak. A diagnostic is the opposite — `pi-outcome.ts` composes every sentence of one out of fixed text, and
+ * nothing of the call, the child or the question may reach it. So:
+ *
+ * - `markers` is checked against the **diagnostic** surfaces alone: `run.errorMessage`, `run.cleanupNotice`, the
+ *   terminal `turn_result` message, and `run.stderr`, which is additionally pinned to the empty string because the
+ *   child's own stderr is the transport's to keep and is never a field of a run.
+ * - `softMarkers` is checked against the two surfaces that are allowed to carry a tool's own text but not a prompt,
+ *   a question or a session identity: `run.activity`, which the mapper writes the tool's name and brief into, and the
+ *   optional tool result's own text. They are checked against the diagnostic surface as well, because anything the
+ *   looser surface may not carry the stricter one certainly may not.
+ * - Every call's own prompt and both halves of its session identity are composed here rather than named by a case, and
+ *   are forbidden on both surfaces.
+ * - The `tool_call` event's own `brief` and `input` are checked against neither. They are the argument, bounded, and
+ *   a case that marker-checked its own command there would be asserting that the mapper does not do its job.
+ *
+ * No list's values are ever printed in a failure: a marker is named by its list and index, because the whole point of
+ * one is that it should not appear in output.
+ *
+ * **What `question` is, and is not, evidence of.** A run cancelled with a dialog open has two ends in flight, and the
+ * run's own signal is the whole of what classifies either of them: the task names the cancellation whichever end
+ * arrives first, and both of its paths retain the dialog's recorded outcome beside that reason — the question branch
+ * carries the outcome it raced on, and the gate the turn branch reaches reads the same recorded one. So the outcome is
+ * required, its end is pinned exactly and its admission has to say nothing was written. What says the cancellation
+ * reached the question is the case's own assertion on `questions.released`, which is this harness's record of the held
+ * dialog's signal aborting and is independent proof rather than a second reading of the same evidence.
+ *
+ * What it will not do: terminate anything. A process still running here is a failed case, and the harness's own
+ * registry is a net for the end of the run rather than something that could make a native cleanup that failed read as
+ * a pass. "Over" is `processEnded`'s question rather than `pidAlive`'s, so a zombie and a recycled pid both read as
+ * over rather than as a survivor.
+ */
+function checkProductionAbort(result, prod, call, { tool, toolEnd, requests = 1, counters = {}, countersTotal, question, questionTool = false, markers = [], softMarkers = [], terminated = [] }) {
+	const run = call.run;
+	const report = call.report;
+	const label = call.label;
+
+	result.check(failed(run) === true, `${label}: the cancelled call was reported as a run that finished`);
+	result.check(run.aborted === true, `${label}: the run's aborted flag is ${run.aborted}`);
+	result.check(run.stopReason === "aborted", `${label}: stopReason ${run.stopReason}`);
+	result.check(run.errorMessage === PROD_CANCELLED_MESSAGE, `${label}: the run's message is ${JSON.stringify(run.errorMessage)} rather than the fixed sentence for a cancelled turn`);
+	result.check(run.cleanupNotice === undefined, `${label}: the run carries a cleanup line (${JSON.stringify(run.cleanupNotice)}), so its child's ending left something behind`);
+	result.check(run.text === "", `${label}: the run's text is ${JSON.stringify(run.text)}, and a cancelled turn whose only answer was a tool call has none`);
+	// Exactly the empty string, which is `finishRun`'s own first act: the child's stderr is the transport's to keep, for
+	// a person to look at where it is kept, and a run's own field is not that place.
+	result.check(run.stderr === "", `${label}: the run carries ${JSON.stringify((run.stderr ?? "").slice(0, PROD_TEXT_PREVIEW_CHARS))} as its stderr rather than the empty string`);
+	result.say(`${label} activity: ${JSON.stringify(run.activity)}`);
+
+	result.check(call.reports.length === 1, `${label}: ${call.reports.length} call report(s) for one call`);
+	result.check(report?.stage === "task", `${label}: the call stopped at ${report?.stage} rather than its task`);
+	result.check(report?.startCalled === true && report?.startResolved === true, `${label}: start called ${report?.startCalled}, resolved ${report?.startResolved}`);
+	const ended = report?.ended;
+	result.check(ended?.kind === "task", `${label}: the call ended ${ended?.kind} rather than at a task`);
+	const task = ended?.kind === "task" ? ended.result : undefined;
+	result.check(task?.ok === false && task.reason === "aborted", `${label}: the turn ended ${task?.ok === true ? "ok" : JSON.stringify(task?.reason)} rather than refusing for a cancellation`);
+
+	// The session the preparation verified, and nothing a continuation could stand on: that is the whole of what a
+	// cancelled run may publish, and a checkpoint on either the reference or the flat field would be one too many.
+	result.check(run.session?.backend === "pi" && typeof run.session?.sessionId === "string", `${label}: the published session is ${JSON.stringify(run.session)}`);
+	result.check(run.session?.checkpoint === undefined, `${label}: the published session names checkpoint ${run.session?.checkpoint}, and a cancelled turn produced none`);
+	result.check(run.checkpoint === undefined, `${label}: a flat checkpoint ${run.checkpoint} was published`);
+	result.check(run.sessionId === run.session?.sessionId, `${label}: the scalar id ${run.sessionId} is not the reference's ${run.session?.sessionId}`);
+
+	// The dialog, required whichever side of the task's own race arrived first. A run cancelled with a question open has
+	// two ends in flight — the turn the transport abandons and the fatal outcome the router produces — and the signal is
+	// what classifies both of them as the cancellation they are; each path retains the outcome the router recorded, the
+	// question branch by carrying the one it raced on and the turn branch through the gate that reads it. So the outcome
+	// is pinned rather than reported, and what says the cancellation actually reached the question is asserted by the
+	// case itself, off this harness's own callback: the held dialog's signal aborting, which is independent of the race.
+	if (question === undefined) {
+		result.check(task?.outcome === undefined, `${label}: the turn kept a question outcome (${JSON.stringify(task?.outcome?.end)}) for a call that asked none`);
+	} else {
+		const outcome = task?.outcome;
+		result.check(outcome !== undefined, `${label}: the turn kept no question outcome beside the cancellation it reported, and both of its cancellation paths retain the one the router recorded`);
+		result.check(outcome?.end === question.end, `${label}: the dialog ended ${JSON.stringify(outcome?.end)} rather than ${JSON.stringify(question.end)}`);
+		// Not pinned to one code: a cancellation reaches the dialog through the transport's own abort listener and the
+		// router's, in that order, and which of the two got there first decides whether the answer came back `closed` or
+		// `duplicate`. Both say the same thing — nothing was admitted for writing — and that is what is asserted.
+		result.check(outcome?.admission !== undefined && outcome.admission.code !== "sent", `${label}: the answer to the cancelled dialog was admitted as ${JSON.stringify(outcome?.admission)}`);
+		result.say(`${label} question outcome: end ${outcome?.end}, admission ${JSON.stringify(outcome?.admission?.code)}, error kept ${outcome !== undefined && "error" in outcome}`);
+	}
+
+	// The steer account, which is zero on both cancellation cases: neither pushes one, and a queue that counted a
+	// delivery nobody asked for would be a steer this harness did not send.
+	const steers = task?.steers;
+	result.check(steers !== undefined, `${label}: the turn reported no steer account at all`);
+	result.check(
+		steers?.open === false && steers?.pushed === 0 && steers?.sent === 0 && steers?.rejected === 0 && steers?.refused === 0 && steers?.failed === 0 && steers?.dropped === 0 && steers?.lastFailure === undefined,
+		`${label}: the steer account is ${JSON.stringify(steers)} rather than a closed queue nothing was pushed into`,
+	);
+
+	// `aborted` rather than absent: a cancellation is noted as this child's own ending by the transport, which is not a
+	// concern the retention decision reads and is exactly the verdict a cancelled child has to carry.
+	checkCleanExit(result, `${label} exit`, task?.exit, { counters, failure: "aborted", ...(countersTotal === undefined ? {} : { total: countersTotal }) });
+	result.check(report?.disposition?.safe === true && report?.disposition?.concerns?.length === 0, `${label}: disposition ${JSON.stringify(report?.disposition)}`);
+	result.check(report?.storage?.attempted === true && report?.storage?.disposed === true, `${label}: storage attempted ${report?.storage?.attempted}, disposed ${report?.storage?.disposed}`);
+	result.check(path.dirname(report?.storage?.callDir ?? "") === prod.paths.callsDir, `${label}: the call directory ${report?.storage?.callDir} is not under the layout's own calls directory`);
+	result.check(report?.storage?.callDir !== undefined && !fs.existsSync(report.storage.callDir), `${label}: the call directory ${report?.storage?.callDir} is still on disk`);
+	result.check(callDirs(prod).length === 0, `${label}: the calls directory still holds ${JSON.stringify(callDirs(prod))}`);
+	// `processEnded` rather than `pidAlive`: the question here is whether the process this call started is over, and a
+	// zombie answers `kill(pid, 0)` while being over, so the signal-reachability question would read one as alive.
+	for (const pid of call.start.pids) {
+		const over = processEnded(pid);
+		result.check(over.gone, `${label}: the child pid ${pid} is not over (${over.why})`);
+	}
+
+	// The descendants production's own cleanup says it signalled and then verified gone. A case names the ones it put
+	// there on purpose; the list is printed either way, because what a cleanup reached is the finding.
+	const cleanup = task?.exit?.cleanup;
+	const reached = (cleanup?.terminated ?? []).map((process) => process.pid);
+	for (const pid of terminated) result.check(reached.includes(pid), `${label}: the cleanup's terminated list ${JSON.stringify(reached)} does not name the pid ${pid} this case proved was live and detached`);
+	result.say(`${label} cleanup: terminated ${JSON.stringify(reached)}, leftovers ${JSON.stringify((cleanup?.leftovers ?? []).map((process) => process.pid))}, skipped ${JSON.stringify((cleanup?.skipped ?? []).map((process) => process.pid))}`);
+
+	result.check(call.requests.length === requests, `${label}: ${call.requests.length} provider request(s) reached the fixture for a call this case cancelled after ${requests}`);
+	result.check(prod.server.unscripted.length === 0, `${label}: the fixture saw ${prod.server.unscripted.length} unscripted request(s): ${JSON.stringify(prod.server.unscripted.map((request) => request.note))}`);
+
+	// The init, the tool call this case cancelled on, at most one result for it, and the failed terminal event, and
+	// nothing else among them. The result is optional because the child may or may not reach the point of failing the
+	// tool before it is stopped, and both are honest; what is pinned about one that did arrive is its type, the id it is
+	// filed under and whether it was an error, and its text is read and printed rather than fixed, because what a
+	// cancelled tool writes is the child's own and is not something this harness decides.
+	const [callEvent, resultEvent] = expectedToolEvents(tool);
+	const events = call.events;
+	result.check(events.length === 3 || events.length === 4, `${label}: a monitor saw ${events.length} event(s) rather than the init, the tool call, an optional result and the terminal one: ${JSON.stringify(events)}`);
+	result.check(JSON.stringify(events[0]) === JSON.stringify({ type: "init", sessionId: run.session?.sessionId }), `${label}: the first event is ${JSON.stringify(events[0])} rather than this run's own init`);
+	result.check(JSON.stringify(events[1]) === JSON.stringify(callEvent), `${label}: the tool call event is ${JSON.stringify(events[1])} rather than ${JSON.stringify(callEvent)}`);
+	const seenResult = events.length === 4 ? events[2] : undefined;
+	if (seenResult !== undefined) {
+		result.check(
+			seenResult.type === resultEvent.type && seenResult.toolUseId === resultEvent.toolUseId && seenResult.isError === toolEnd?.isError && typeof seenResult.text === "string",
+			`${label}: the tool result event is ${JSON.stringify({ type: seenResult.type, toolUseId: seenResult.toolUseId, isError: seenResult.isError })} rather than an error result of the kind this case expects, filed under ${JSON.stringify(resultEvent.toolUseId)}`,
+		);
+	}
+	result.check(
+		JSON.stringify(events.at(-1)) === JSON.stringify({ type: "turn_result", ok: false, message: PROD_CANCELLED_MESSAGE }),
+		`${label}: the terminal event is ${JSON.stringify(events.at(-1))} rather than the failed one carrying the fixed cancellation sentence`,
+	);
+	result.say(`${label} tool result event: ${seenResult === undefined ? "none arrived before the child was stopped" : `isError ${seenResult.isError}, text ${JSON.stringify(String(seenResult.text).slice(0, PROD_TEXT_PREVIEW_CHARS))}`}`);
+
+	// The two surfaces, checked apart, and the three lists over them.
+	//
+	// `diagnostics` is what `pi-outcome.ts` composes out of fixed text alone, so nothing of the call, the child or its
+	// question may be anywhere in it. `soft` is the pair that is *allowed* to carry a tool's own command — the mapper
+	// writes the tool's name and brief into an activity line, and a cancelled tool writes whatever it likes into its
+	// result — and still may not carry a prompt, a question or a session identity.
+	//
+	// `common` is every call's own: its prompt and both halves of the session identity it ran in, which are forbidden
+	// on both surfaces and are composed here rather than repeated by each case. `markers` is a case's own additions to
+	// the diagnostic surface alone, which is where a path belongs — a case root or a script path is legitimately inside
+	// an activity line. `softMarkers` is a case's additions to the softer surface, and they are checked against the
+	// diagnostic one too, because anything the looser surface may not carry the stricter one certainly may not.
+	//
+	// No marker's value is ever printed in a failure: each is named by its list and position, because a marker turning
+	// up in output is the leak being looked for.
+	const diagnostics = [run.errorMessage, run.cleanupNotice, events.at(-1)?.message, run.stderr].filter((value) => typeof value === "string");
+	const soft = [run.activity, seenResult?.text].filter((value) => typeof value === "string");
+	const common = [call.prompt, run.session?.sessionId, run.session?.sessionFile].filter((value) => typeof value === "string" && value !== "");
+	const leakCheck = (list, name, surfaces, what) => {
+		for (const [index, marker] of list.entries()) {
+			const leaked = surfaces.filter((value) => value.includes(marker)).length;
+			result.check(leaked === 0, `${label}: the value this case keeps as evidence alone at ${name}[${index}] reached ${leaked} of the ${surfaces.length} ${what}`);
+		}
+	};
+	leakCheck(common, "common", [...diagnostics, ...soft], "diagnostic, activity and tool-result texts");
+	leakCheck(markers, "markers", diagnostics, "diagnostic texts a person is shown");
+	leakCheck(softMarkers, "softMarkers", [...diagnostics, ...soft], "diagnostic, activity and tool-result texts");
+	result.check(common.length === 3, `${label}: ${common.length} of the prompt, session id and session file were available to check as markers, so that check looked at less than it should`);
+
+	checkComposedStart(result, prod, call, { questionTool });
+}
+
+/**
  * What the production group deliberately does not measure, said out loud so that nobody reads a passing group as
- * covering it. None of the four below is exercised by either case, and nothing here claims an answer for them.
+ * covering it. None of the four below is exercised by any case of the group, and nothing here claims an answer.
  */
 function sayProductionNotRun(result) {
 	result.phase("NOT RUN in this group");
@@ -3757,7 +4358,7 @@ async function caseProductionTrustedCheckpoints(root, server, result) {
 	// from outside the child the only evidence for that is that reopening appended no entry of its own in front of B's
 	// own prompt. A reopening that wrote one — a thinking-level entry, say — would mean the leaf had been pushed off the
 	// checkpoint and the navigation was a real move, which is a different gate passing under the same green result. So
-	// it fails the case here, and the 12/12 result is what protects the no-op claim rather than a line of output.
+	// it fails the case here, and the 15/15 result is what protects the no-op claim rather than a line of output.
 	result.check(
 		inFrontOfB.length === 0,
 		`B: reopening appended ${JSON.stringify(inFrontOfB.map((entry) => entry.type))} of its own in front of B's prompt, so B's restore was a real move back to the checkpoint rather than Pi's current-leaf no-op, and B is no longer the case this phase measures`,
@@ -3941,6 +4542,435 @@ async function caseProductionUserTarget(root, server, result) {
 	sayProductionNotRun(result);
 }
 
+/** The question the child asks in the answered case, the answer it gets, the steer pushed while it waits, and the id. */
+const PROD_Q_PROMPT = "PROD-Q-MARKER which branch should I take?";
+const PROD_Q_ANSWER = "PROD-Q-ANSWER";
+const PROD_Q_STEER = "PROD-Q-STEER pushed while the question was still being held.";
+const PROD_Q_CALL_ID = "call_prod_q1";
+
+/**
+ * Production: one question of the child's own, answered through the production question routing, with one steer
+ * pushed into the call's own queue while that question was still open.
+ *
+ * What makes this the routing's case rather than the protocol's. Nothing here writes an `extension_ui_response`, waits
+ * for an `extension_ui_request` or knows that a dialog is what carries a question: the call is given an `onQuestion`,
+ * which is the whole of what turns questions on in `pi-prepare.ts`, and every step between the child's tool call and
+ * the answer reaching it — the launch input's question tool, the transport's ui callback, the router's arbitration,
+ * the watch that decides whether an outcome was fatal — is the shipped one. What this harness supplies is the answer
+ * and the moment it arrives, which is a host's own part.
+ *
+ * And what the steer proves beside it: that the queue a real host hands a backend reaches a live turn. It is pushed
+ * from inside the question callback, so it is pushed while the child is blocked on its dialog and before the answer
+ * exists — and the second provider request is then where both land, the tool result first and the steer as the
+ * ordinary user message after it, which is exactly the ordering row 5 measured on a generated child.
+ */
+async function caseProductionQuestionAnswered(root, server, result) {
+	const prod = setupProductionCase(root, server, result.name);
+	server.install([toolCallStep("prod-q-ask", "ask_orchestrator", { question: PROD_Q_PROMPT }, PROD_Q_CALL_ID), textStep("prod-q-final", PROD_Q_ANSWER)]);
+	result.say(`production composition: createPiBackend over host agent directory ${prod.hostAgent}`);
+	result.say(
+		"what this measures: the production composition's own question path end to end — the composed question tool, the transport's dialog, the router's one decision per dialog and the watch over it — with this harness supplying only the answer and the moment it arrives",
+	);
+
+	result.phase("Q: the child asks, the harness steers and then answers, and the turn finishes");
+	const q = await productionCall(prod, result, {
+		label: "Q",
+		prompt: "PROD-Q ask the orchestrator which branch to take.",
+		question: { expect: PROD_Q_PROMPT, answer: PROD_Q_ANSWER },
+		steers: [PROD_Q_STEER],
+	});
+	// The callback's own evidence first, because every assertion below it is only worth something if the question this
+	// harness answered is the one the child asked: exactly one, with the prompt the fixture put in the tool call.
+	result.check(q.questions.prompts.length === 1, `the question callback was called ${q.questions.prompts.length} time(s) for one scripted question`);
+	result.check(q.questions.admitted === 1, `${q.questions.admitted} of this call's steers were admitted into the queue while the question was held`);
+	result.check(q.questions.released === 0, `${q.questions.released} dialog(s) of an answered call were released by their own signal aborting, so the hold path ran where the answer path should have`);
+
+	const evidence = checkProductionCall(result, prod, q, {
+		text: PROD_Q_ANSWER,
+		tools: [{ name: "ask_orchestrator", id: PROD_Q_CALL_ID, brief: "", input: { question: PROD_Q_PROMPT }, result: PROD_Q_ANSWER, isError: false }],
+		requests: 2,
+		questionTool: true,
+	});
+
+	result.phase("the steer account, as the queue itself reports it");
+	const task = q.report?.ended?.kind === "task" ? q.report.ended.result : undefined;
+	const steers = task?.ok === true ? task.steers : undefined;
+	result.say(`steer report: ${JSON.stringify(steers)}`);
+	result.check(
+		steers?.pushed === 1 && steers?.sent === 1 && steers?.rejected === 0 && steers?.refused === 0 && steers?.failed === 0 && steers?.dropped === 0 && steers?.open === false && steers?.lastFailure === undefined,
+		`the steer this case pushed is not accounted for as one the child admitted: ${JSON.stringify(steers)}`,
+	);
+	result.check(steers?.pushed === q.questions.admitted, `the queue took in ${steers?.pushed} steer(s) and this harness pushed ${q.questions.admitted}`);
+
+	result.phase("the second request: the answer as a tool result, and the steer after it");
+	const second = q.requests[1];
+	result.say(`request 2 roles: ${JSON.stringify(second?.roles)}`);
+	result.check(
+		JSON.stringify(second?.roles) === JSON.stringify(["system", "user", "assistant", "tool", "user"]),
+		`request 2's role sequence is ${JSON.stringify(second?.roles)} rather than the prompt, the tool-calling answer, its result and the steer`,
+	);
+	const toolMessage = second?.messages[3];
+	result.check(toolMessage?.toolCallId === PROD_Q_CALL_ID, `the tool result is correlated to ${JSON.stringify(toolMessage?.toolCallId)} rather than the id the fixture issued`);
+	result.check(toolMessage?.text === PROD_Q_ANSWER, `the tool result carries ${JSON.stringify(toolMessage?.text)} rather than exactly the answer this harness sent`);
+	const steerMessage = second?.messages[4];
+	result.check(steerMessage?.text === PROD_Q_STEER, `the last message of request 2 is ${JSON.stringify(steerMessage?.text)} rather than exactly the steer this case pushed`);
+	result.check(!conversationTexts(second ?? { messages: [] }).some((text) => text.includes(PROD_QUESTION_HELD)), "the harness's own hold sentence reached the provider, so the held path ran for a question it was told to answer");
+
+	result.phase("the transcript and the layout afterwards");
+	result.check(sessionFiles(prod).length === 1, `the session directory holds ${JSON.stringify(sessionFiles(prod))} rather than one transcript`);
+	result.check(callDirs(prod).length === 0, `the calls directory still holds ${JSON.stringify(callDirs(prod))}`);
+	for (const line of describeEntries(evidence.entries)) result.say(`  ${line}`);
+	result.check(server.unscripted.length === 0, `the fixture saw ${server.unscripted.length} unscripted request(s)`);
+	sayProductionNotRun(result);
+}
+
+/** The question the cancelled case asks, and the id its tool call carries. There is no answer: it is held. */
+const PROD_QC_PROMPT = "PROD-QC-MARKER a question nobody is going to answer?";
+const PROD_QC_CALL_ID = "call_prod_qc1";
+
+/**
+ * Production: the same question, held until the run's own cancellation reached it, which is the only way a real host
+ * ends a waiting run from outside.
+ *
+ * The order is the whole of the case, and it is event-driven where it matters: the callback signals a latch the moment
+ * the child's question arrives, the call's own `AbortController` is aborted on that latch and on nothing else, and the
+ * same call is then awaited to the end so the composition performs its own shutdown and cleanup before anything is
+ * read. Nothing here polls or sleeps to find its moment — and it is still bounded, by `awaitTrigger`'s own rejecting
+ * timer, which cancels and awaits the call rather than letting a question that never arrives hang the case.
+ *
+ * What is then asserted is a cancellation that is deterministically a cancellation. A run cancelled while a dialog was
+ * open has two ends racing — the turn the transport abandons, and the fatal question the router produces — and the
+ * task's own precedence names the signal whichever of them arrives first: so the reason is `aborted` and the run says
+ * `pi-outcome.ts`'s fixed sentence for one, either way.
+ *
+ * What the race does not decide is whether the dialog's own outcome is retained beside that reason: the question branch
+ * carries the outcome it raced on, and the turn branch reaches the gate that reads the same recorded one, so either
+ * path keeps it and this case requires it — the exact end, and an admission saying nothing was written. What says the
+ * cancellation actually reached the question is a separate observation, this harness's own callback: the held dialog's
+ * signal aborting, counted as `released`, which neither branch can hide.
+ *
+ * The evidence stays evidence, and each piece of it to its own surface. The question is the `ask_orchestrator` call's
+ * own argument, so it is held off the diagnostic surfaces and the terminal event alone — the bounded copy a monitor
+ * sees in the `tool_call` event is the mapper doing its job, and the activity line and the cancelled tool's own result
+ * are the looser surface that may carry it. This harness's own hold sentence is nobody's argument and reaches no
+ * surface at all. The marker lists hold both to exactly that.
+ */
+async function caseProductionQuestionCancelled(root, server, result) {
+	const prod = setupProductionCase(root, server, result.name);
+	// One step only: the turn that follows an answer is not scripted, so a second provider request would be recorded as
+	// an unscripted one and fail the case rather than being answered.
+	server.install([toolCallStep("prod-qc-ask", "ask_orchestrator", { question: PROD_QC_PROMPT }, PROD_QC_CALL_ID)]);
+	result.say(`production composition: createPiBackend over host agent directory ${prod.hostAgent}`);
+	result.say(
+		"what this measures: a run cancelled while its child was blocked on a question of its own, and that the production composition reports it as a cancellation — not as a question that failed — with the dialog's own recorded outcome kept beside that reason whichever end of the task's race arrived first",
+	);
+
+	result.phase("QC: the question opens, the run is cancelled, and the call is awaited to the end");
+	const opened = latch("the production child's own question, opened and held");
+	const qc = await productionCall(prod, result, {
+		label: "QC",
+		prompt: "PROD-QC ask a question I am going to cancel.",
+		question: { expect: PROD_QC_PROMPT, opened: opened.open },
+		trigger: opened,
+	});
+	result.check(qc.questions.prompts.length === 1, `the question callback was called ${qc.questions.prompts.length} time(s) for one scripted question`);
+	// The race-independent half: whichever end the task reported, the dialog this harness was holding was released by
+	// its own signal aborting, which is the router ending it and is what a cancellation reaching a question looks like
+	// from here. Exactly one, because there was one dialog and `holdQuestion` releases each one once.
+	result.check(qc.questions.released === 1, `${qc.questions.released} held dialog(s) were released by their own signal aborting, so the cancellation did not reach the question this case held`);
+
+	checkProductionAbort(result, prod, qc, {
+		tool: { name: "ask_orchestrator", id: PROD_QC_CALL_ID, brief: "", input: { question: PROD_QC_PROMPT } },
+		// The dialog was cancelled rather than answered, so the tool it was opened by failed: that is what a question
+		// with no answer leaves, and the text it failed with is the child's own and is read rather than fixed here.
+		toolEnd: { isError: true },
+		requests: 1,
+		// One dialog, cancelled exactly once, by one of the two mechanisms that can cancel one — the transport's own
+		// shutdown, which counts `uiCancelledByTransport`, or a frame that could not be written, which counts
+		// `droppedFrames`. Which of the two it was is a finding to read and not something to pin; that it happened once
+		// and that nothing else started counting is the assertion.
+		counters: { uiCancelledByTransport: [0, 1], droppedFrames: [0, 1] },
+		countersTotal: 1,
+		question: { end: "aborted" },
+		questionTool: true,
+		// The case root and the question itself on the diagnostic surface alone: no sentence of a cancellation names a
+		// path of this call's, and the question text here is the `ask_orchestrator` call's own argument, which the
+		// looser surface is allowed to carry a bounded copy of exactly as it may carry a shell command. The harness's
+		// own hold sentence is the one addition to both surfaces, because it is this harness's text and the tool's
+		// argument it is not.
+		markers: [prod.dirs.caseRoot, PROD_QC_PROMPT],
+		softMarkers: [PROD_QUESTION_HELD],
+	});
+
+	result.phase("the transcript and the layout afterwards");
+	result.check(sessionFiles(prod).length === 1, `the session directory holds ${JSON.stringify(sessionFiles(prod))} rather than the one transcript the cancelled turn opened`);
+	const ref = qc.run.session;
+	if (ref !== undefined && fs.existsSync(ref.sessionFile)) for (const line of describeEntries(readSessionEntries(ref.sessionFile))) result.say(`  ${line}`);
+	else result.say("  (the cancelled run published no session file to read back)");
+	result.say(
+		"no workaround: nothing here answers the question after the cancellation, retries it, stops the child itself or terminates anything — the cancellation goes in through the run's own signal and everything after it is the composition's own",
+	);
+	sayProductionNotRun(result);
+}
+
+/** The id the detached case's shell tool call carries, and the owned script its whole command is the path of. */
+const PROD_D_CALL_ID = "call_prod_d1";
+const PROD_D_SCRIPT_NAME = "spawn.sh";
+/** Exactly owner read, write and execute: the script is this harness's own and nothing else has business reaching it. */
+const PROD_D_SCRIPT_MODE = 0o700;
+/** How long the owned shell and its detached descendant live, which is far longer than the case needs either of them. */
+const PROD_D_SLEEP_SECONDS = 300;
+/**
+ * The fixed sentence a proof that did not hold refuses the trigger with, and the whole of what travels with it is the
+ * closed set of labels `proveDetachedDescendant` composes — no path, no environment and no /proc line of its own.
+ */
+const PROD_D_PROOF_REFUSAL = "refusing to cancel: this case could not prove a live owned shell with a detached setsid descendant";
+
+/**
+ * The script the shell tool is handed the absolute path of, and the only thing that tool's `command` argument is. It
+ * exists rather than an inline command for one reason: a `command` that was a whole multi-line program would make the
+ * thing the progress mapper bounds into an event the program itself, and what this case measures is a cancellation
+ * rather than how a long argument is cut. One path in, one path bounded, and the program on disk where a person can
+ * read it.
+ *
+ * What it does, in the order it does it: writes its own pid, starts `/usr/bin/setsid` — named literally, never looked
+ * up on `PATH` — on a shell that writes *its* own pid and then execs a long sleep, and then execs a long sleep itself.
+ * Both `exec`s matter: the pid each file names stays the pid of the process that is still there when the cancellation
+ * lands, so neither reading is of a shell that has since been replaced by something with another pid.
+ *
+ * Every path baked into it is absolute and inside the case's own root, which is what `assertInsideRoot` has already
+ * held them to. The background job is not a process-group leader — Pi spawns its shell detached, so the shell leads the
+ * group and its child does not — so `setsid` sets a new session in place rather than forking, which is what keeps the
+ * detached pid a child of the owned shell and makes the parentage below provable at all.
+ */
+const detachedScriptSource = (shellPidFile, detachedPidFile) =>
+	[
+		"#!/bin/sh",
+		"# Generated by test/spikes/pi-session-lifecycle.mjs for prod-detached-cancelled. Rewritten on every run.",
+		`echo $$ > "${shellPidFile}"`,
+		`${PROD_SETSID} /bin/sh -c 'echo $$ > "${detachedPidFile}"; exec sleep ${PROD_D_SLEEP_SECONDS}' &`,
+		`exec sleep ${PROD_D_SLEEP_SECONDS}`,
+		"",
+	].join("\n");
+
+/**
+ * Everything the detached case has to know before it cancels anything, read once and answered whole. It proves, off
+ * one reading per pid: that the two pid files name two different processes; that both are alive and that neither
+ * `/proc` run state is one of the finished ones, so a zombie cannot pass as a live descendant; that both environments
+ * name this run's own root, which is how a pid read out of a file is told from a recycled one; that the detached pid
+ * is a child of the owned shell; that it is its own process group and session leader, which is what `setsid` did; and
+ * that its session is not the shell's, which is the boundary Pi's own abort stops at.
+ *
+ * `failures` is a closed set of fixed sentences of this file's own: a refusal composed from them names which proof did
+ * not hold and carries no path, no environment and no /proc field with it.
+ */
+function proveDetachedDescendant(found, root) {
+	const relations = { shell: processRelations(found.shell), detached: processRelations(found.detached) };
+	const proof = {
+		pids: { ...found },
+		distinct: found.shell !== found.detached,
+		alive: { shell: pidAlive(found.shell), detached: pidAlive(found.detached) },
+		relations,
+		environs: { shell: environMentions(found.shell, root), detached: environMentions(found.detached, root) },
+		failures: [],
+	};
+	const shell = relations.shell;
+	const detached = relations.detached;
+	if (!proof.distinct) proof.failures.push("the two pid files name one process rather than two");
+	if (!proof.alive.shell || !proof.alive.detached) proof.failures.push("one of the two pids is not alive");
+	if (!proof.environs.shell || !proof.environs.detached) proof.failures.push("one of the two pids' environments does not name this run's own root");
+	if (shell === undefined || detached === undefined) proof.failures.push("one of the two pids has no readable /proc entry");
+	else {
+		if (FINISHED_STATES.has(shell.state) || FINISHED_STATES.has(detached.state)) proof.failures.push("one of the two pids is already a finished process");
+		if (detached.ppid !== found.shell) proof.failures.push("the detached pid is not a child of the owned shell");
+		if (detached.pgrp !== found.detached || detached.session !== found.detached) proof.failures.push("the detached pid is not its own process group and session leader");
+		if (detached.session === shell.session) proof.failures.push("the detached pid is still in the owned shell's own session");
+	}
+	proof.ok = proof.failures.length === 0;
+	return proof;
+}
+
+/**
+ * Production: a cancellation that lands on a live shell tool which has already put a descendant outside the process
+ * group Pi kills, and what the production cleanup does about it.
+ *
+ * Why it is the interesting cancellation. Row 6 measured, on a generated child, that Pi's own abort is a process-group
+ * SIGKILL and stops at the group boundary: a descendant that called `setsid` outlives it. The production transport
+ * answers that with an owned cleanup that reads the process table *before* the abort goes out — while the live child
+ * still owns its descendants — and then signals each of them by pid. So this case is the one that says whether that
+ * actually reaches a `setsid` descendant of a tool's shell, and the evidence is production's own cleanup report: the
+ * detached pid has to be in `terminated`, the leftovers and skipped lists have to be empty, and both pids have to be
+ * dead when this harness looks.
+ *
+ * **The barrier, which is the order this case is correct by.** Nothing is registered, cancelled or asserted until the
+ * whole of `proveDetachedDescendant` has held: both pid files parse whole, the two pids differ, both are alive and
+ * neither is a finished `/proc` state, both environments name this run's own root, the detached pid is a child of the
+ * owned shell, it is its own process group and session leader, and its session is not the shell's. Readiness is one
+ * `fs.watch` and the proof is one reading per pid — no poll and no sleep — and the bound on the whole wait is
+ * `awaitTrigger`'s own rejecting timer. A proof that did not hold rejects the trigger with this file's own fixed text,
+ * and `productionCall` still cancels the call and still awaits it to the end before the case fails on it.
+ *
+ * Registration comes *after* that proof, deliberately: a pid this harness could not prove is one it will not put in a
+ * registry that signals things. The proof is captured, printed and asserted again after the cleanup, so a green result
+ * is one where the thing production had to reach was shown to have been there.
+ *
+ * What the pid files are and are not. They are this harness's own oracle for those proofs and, through the sweep in
+ * `cleanup`, its own last-resort net for the end of the run; they are never an input to production's cleanup, which
+ * reads the process table for itself. Nothing here signals either pid: a survivor fails the case, and the registry
+ * sweep that would eventually reach it cannot turn a native cleanup that failed into a pass. "Gone" is
+ * `processEnded`'s question rather than `pidAlive`'s, so a zombie and a recycled pid both read as over.
+ *
+ * It is a Linux qualification and says so: `/usr/bin/setsid` is named literally and `/proc` is what the parentage, the
+ * group, the session and the run state are read from, so a platform without them leaves the case unproven rather than
+ * skipped or passed.
+ */
+async function caseProductionDetachedCancelled(root, server, result) {
+	const prod = setupProductionCase(root, server, result.name);
+	result.say(`production composition: createPiBackend over host agent directory ${prod.hostAgent}`);
+	let executable = false;
+	try {
+		fs.accessSync(PROD_SETSID, fs.constants.X_OK);
+		executable = true;
+	} catch {
+		executable = false;
+	}
+	if (process.platform !== "linux" || !executable) {
+		result.unproven = `this case needs linux and an executable ${PROD_SETSID}, and this host is ${process.platform} with ${executable ? "one" : "none"}: the detached-descendant half of the production cancellation cannot be measured here`;
+		result.say(result.unproven);
+		result.say("not skipped and not passed: a platform that cannot produce a detached descendant cannot say anything about a cleanup that reaches one");
+		return;
+	}
+
+	const pidsDir = assertInsideRoot(root, "production detached pids directory", path.join(prod.dirs.caseRoot, "pids"));
+	fs.mkdirSync(pidsDir, { recursive: true });
+	const shellPidFile = assertInsideRoot(root, "production detached shell pid file", path.join(pidsDir, "shell"));
+	const detachedPidFile = assertInsideRoot(root, "production detached descendant pid file", path.join(pidsDir, "detached"));
+	const scriptPath = assertInsideRoot(root, "production detached spawn script", path.join(pidsDir, PROD_D_SCRIPT_NAME));
+	write(scriptPath, detachedScriptSource(shellPidFile, detachedPidFile));
+	fs.chmodSync(scriptPath, PROD_D_SCRIPT_MODE);
+	const mode = fs.statSync(scriptPath).mode & 0o777;
+	result.check(mode === PROD_D_SCRIPT_MODE, `the owned spawn script is mode 0${mode.toString(8)} rather than exactly 0${PROD_D_SCRIPT_MODE.toString(8)}`);
+	result.say(`owned spawn script: ${scriptPath} (mode 0${mode.toString(8)})`);
+	for (const line of detachedScriptSource(shellPidFile, detachedPidFile).split("\n").filter(Boolean)) result.say(`  ${line}`);
+	// The whole of the tool's own argument: one absolute path inside this case's root and nothing else, so what the
+	// progress mapper bounds into an event is a path rather than a program.
+	const command = scriptPath;
+	server.install([toolCallStep("prod-d-shell", "bash", { command }, PROD_D_CALL_ID)]);
+	result.say(
+		"what this measures: production's own owned cleanup against a descendant that left the process group Pi's abort kills — the process table it reads before the abort, the per-pid signals after it, and the report it hands back",
+	);
+
+	result.phase("D: the owned script runs, its detached descendant is proved, and the run is then cancelled");
+	const probe = { what: "an owned shell and a detached setsid descendant of it, both proved", proof: undefined, registered: undefined };
+	const watch = watchPidFiles(probe.what, { shell: shellPidFile, detached: detachedPidFile });
+	// The barrier: readiness, then the whole proof, then registration, and only then the cancellation. A proof that did
+	// not hold rejects this trigger with fixed text, and `productionCall` still cancels the call and awaits it to the
+	// end before the case fails on it — so a case that could not prove its descendant leaves nothing running either.
+	// Registration is last on purpose: a pid this harness could not prove is not one it will put in a signalling
+	// registry, and the pid-file sweep in `cleanup` is the net that still reaches such a process at the end of the run.
+	const trigger = {
+		what: probe.what,
+		ready: watch.ready.then((found) => {
+			const proven = proveDetachedDescendant(found, root);
+			probe.proof = proven;
+			if (!proven.ok) throw new Error(`${PROD_D_PROOF_REFUSAL}: ${proven.failures.join("; ")}`);
+			for (const pid of [found.shell, found.detached]) registerPid(pid);
+			probe.registered = { shell: spawnedPids.has(found.shell), detached: spawnedPids.has(found.detached) };
+		}),
+		close: () => watch.close(),
+	};
+	let d;
+	try {
+		d = await productionCall(prod, result, {
+			label: "D",
+			prompt: "PROD-D run a script that outlives its own shell.",
+			trigger,
+		});
+	} catch (error) {
+		// Readiness that never came and a proof that did not hold are different failures, and only these two say which.
+		// The call has already been cancelled and awaited by then, so this prints and rethrows.
+		result.say(`the pid files the watcher had read when this failed: ${JSON.stringify(watch.found)}`);
+		result.say(`the proof this case had reached when it failed: ${JSON.stringify(probe.proof)}`);
+		throw error;
+	}
+
+	result.phase("the proof taken before the cancellation, asserted again now");
+	const proof = probe.proof;
+	result.say(`recorded pids: pi child ${JSON.stringify(d.start.pids)}, shell ${proof?.pids?.shell}, detached ${proof?.pids?.detached}`);
+	result.say(`alive when the barrier read them: ${JSON.stringify(proof?.alive)}`);
+	result.say(`environments naming this run's own root: ${JSON.stringify(proof?.environs)}`);
+	result.say(`/proc relations: ${JSON.stringify(proof?.relations)}`);
+	result.say(`registered after the proof: ${JSON.stringify(probe.registered)}`);
+	result.check(proof !== undefined, "the barrier never ran, so this case proved nothing about a detached descendant");
+	result.check(proof?.ok === true, `the barrier's own proof did not hold: ${JSON.stringify(proof?.failures)}`);
+	const shell = proof?.pids?.shell;
+	const detached = proof?.pids?.detached;
+	// Each clause of that proof restated here rather than left to `ok`, so a failure names the one that did not hold.
+	result.check(proof?.distinct === true, `the two pid files name ${shell} and ${detached}, which are not two distinct processes`);
+	result.check(proof?.alive?.shell === true && proof?.alive?.detached === true, `one of the recorded pids was not alive when the barrier read it: ${JSON.stringify(proof?.alive)}`);
+	result.check(proof?.environs?.shell === true && proof?.environs?.detached === true, `the recorded pids' environments do not both name this run's own root: ${JSON.stringify(proof?.environs)}`);
+	const shellRelation = proof?.relations?.shell;
+	const detachedRelation = proof?.relations?.detached;
+	result.check(shellRelation !== undefined && detachedRelation !== undefined, "one of the recorded pids had no readable /proc entry at the barrier, so the detachment was never proved");
+	result.check(
+		shellRelation !== undefined && detachedRelation !== undefined && !FINISHED_STATES.has(shellRelation.state) && !FINISHED_STATES.has(detachedRelation.state),
+		`one of the recorded pids was a finished process at the barrier: states ${JSON.stringify([shellRelation?.state, detachedRelation?.state])}`,
+	);
+	result.check(
+		detachedRelation !== undefined && detachedRelation.ppid === shell,
+		`the detached pid's parent is ${detachedRelation?.ppid} rather than the owned shell ${shell}, so what was proved detached is not a descendant of this case's own script`,
+	);
+	result.check(
+		detachedRelation !== undefined && detachedRelation.session === detached && detachedRelation.pgrp === detached,
+		`the detached pid's session and process group are ${JSON.stringify([detachedRelation?.session, detachedRelation?.pgrp])} rather than its own pid ${detached}, so it is not a session leader and setsid did not take`,
+	);
+	result.check(
+		shellRelation !== undefined && detachedRelation !== undefined && detachedRelation.session !== shellRelation.session,
+		`the detached pid is still in its parent's session ${shellRelation?.session}, so it never left the group Pi's own abort kills`,
+	);
+	result.check(probe.registered?.shell === true && probe.registered?.detached === true, `the proven pids were not both put in this harness's own registry: ${JSON.stringify(probe.registered)}`);
+
+	checkProductionAbort(result, prod, d, {
+		// The command is the script's own path, so the brief is that path cut to the mapper's own activity window — the
+		// cap is imported rather than restated, and `codePointCut` is this file's own faithful reproduction of that cut
+		// over the imported cap rather than the mapper's own function.
+		tool: { name: "bash", id: PROD_D_CALL_ID, brief: codePointCut(scriptPath, PI_ACTIVITY_CHARS), input: { command } },
+		// The shell was killed under the tool, so the call it was serving failed: that is what an interrupted command
+		// leaves, and whatever text the child put in it is the child's own and is read rather than fixed here.
+		toolEnd: { isError: true },
+		requests: 1,
+		questionTool: false,
+		// The one thing this case adds to the strict cleanup ground: the detached pid has to be in the list production's
+		// own cleanup says it signalled and then verified gone.
+		terminated: detached === undefined ? [] : [detached],
+		// Diagnostic surface only, every one of them: no sentence of a cancellation names a path of this call's. They
+		// are deliberately not soft markers — the activity line legitimately carries the script path, which is what the
+		// mapper is for, and marker-checking it there would be asserting that the mapper does not do its job.
+		markers: [prod.dirs.caseRoot, pidsDir, scriptPath, shellPidFile, detachedPidFile],
+	});
+
+	result.phase("both processes, asserted gone rather than terminated here");
+	const over = { shell: processEnded(shell), detached: processEnded(detached) };
+	result.say(`after the production cleanup reported: ${JSON.stringify(over)}`);
+	result.check(over.shell.gone, `the owned shell ${shell} is not over after the production cleanup (${over.shell.why})`);
+	result.check(over.detached.gone, `the detached descendant ${detached} is not over after the production cleanup (${over.detached.why}), so the owned cleanup did not reach past the process-group boundary`);
+	// Only a pid that is really over is forgotten, and off the readings just asserted rather than a second deadness read
+	// of its own: a fresh read could answer differently from the one this case passed or failed on, and nothing here
+	// waits, polls or retries for a kinder answer. One that survived stays in the registry so the end of the run still
+	// reaches it, and the failure above is what reports it rather than this file quietly tidying up over it.
+	for (const [which, pid] of Object.entries({ shell, detached })) if (pid !== undefined && over[which].gone) spawnedPids.delete(pid);
+	result.say(
+		"no workaround: nothing here sent a signal, swept a pid file into production's cleanup or waited for a process to go — the cancellation went in through the run's own signal, and what is gone above is production's own cleanup's result",
+	);
+
+	result.phase("the transcript and the layout afterwards");
+	result.check(sessionFiles(prod).length === 1, `the session directory holds ${JSON.stringify(sessionFiles(prod))} rather than the one transcript the cancelled turn opened`);
+	const ref = d.run.session;
+	if (ref !== undefined && fs.existsSync(ref.sessionFile)) for (const line of describeEntries(readSessionEntries(ref.sessionFile))) result.say(`  ${line}`);
+	else result.say("  (the cancelled run published no session file to read back)");
+	sayProductionNotRun(result);
+}
+
 const CASES = [
 	{ name: "row8-model-thinking", row: 8, title: "strict model and thinking checks", run: caseModelThinking },
 	{ name: "row1-durable-checkpoint", row: 1, title: "a completed run's checkpoint survives the child process", run: caseDurableCheckpoint },
@@ -3959,12 +4989,23 @@ const CASES = [
 	{ name: "row7-retry-compaction", row: 7, title: "retry, threshold and overflow compaction, and queued work before agent_settled", run: caseRetryCompaction },
 	{ name: "prod-trusted-checkpoints", row: "prod", title: "the production backend: a new session, two restores and a fork at a trusted checkpoint", run: caseProductionTrustedCheckpoints },
 	{ name: "prod-user-target-refused", row: "prod", title: "the production backend: a recorded checkpoint that is a user message, refused by the exact-leaf gate", run: caseProductionUserTarget },
+	{ name: "prod-question-answered", row: "prod", title: "the production backend: a question of the child's own, answered, with a steer pushed while it waited", run: caseProductionQuestionAnswered },
+	{ name: "prod-question-cancelled", row: "prod", title: "the production backend: a question held until the run's own cancellation reached it", run: caseProductionQuestionCancelled },
+	{
+		name: "prod-detached-cancelled",
+		row: "prod",
+		title: "the production backend: a cancellation onto a live shell tool with a detached setsid descendant (linux)",
+		run: caseProductionDetachedCancelled,
+	},
 ];
 
+// The order inside a group is the order the cases are meant to be read in: for `production`, the two quiet
+// qualification cases first, then the question answered, then the two cancellations — the question held, and the one
+// that lands on a shell tool with a descendant outside the group Pi kills.
 const GROUPS = {
 	"stage-a": ["row8-model-thinking", "row1-durable-checkpoint", "row2-older-checkpoint", "row3-fork-at", "row4-failures", "row4-cancelled-operations"],
 	"stage-b": ["row2-compaction-checkpoint", "row5-questions", "row6-cancellation", "row7-retry-compaction"],
-	production: ["prod-trusted-checkpoints", "prod-user-target-refused"],
+	production: ["prod-trusted-checkpoints", "prod-user-target-refused", "prod-question-answered", "prod-question-cancelled", "prod-detached-cancelled"],
 };
 
 /* ------------------------------------------------------------------ the spike */
@@ -4126,9 +5167,14 @@ function environMentions(pid, root) {
 }
 
 /**
- * A descendant whose pid file the fixture command has written but which no poll has registered yet: the file
- * exists before the next poll reads it, and an interrupt in that window consults only the in-memory registry.
- * Sweeping the files closes it, and the environment check is what makes signalling the pid safe.
+ * A descendant whose pid file a fixture command or an owned script has written but which nothing has registered yet:
+ * the file exists before the next poll reads it, and an interrupt in that window consults only the in-memory
+ * registry. Sweeping the files closes it, and the environment check is what makes signalling the pid safe.
+ *
+ * It is the net for a second window too, and that one is deliberate: `prod-detached-cancelled` registers a pid only
+ * once it has proved what that pid is, so a proof that did not hold leaves a live process the registry never took.
+ * This is what still reaches it at the end of the run — and it stays cleanup rather than evidence, because no case
+ * asserts on it and nothing here feeds a pid file into production's own cleanup.
  */
 function sweepPidFiles(root) {
 	const swept = [];

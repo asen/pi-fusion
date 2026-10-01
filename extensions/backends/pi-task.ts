@@ -21,7 +21,12 @@ import type { ChildControl, PiSessionRef, ResolvedSelection } from "./types.ts";
  * cancellation, a child that has gone, then a question whose outcome was fatal. The child's end is observed with both
  * handlers, because a cleanup that produced no report rejects and is still the end of the child, and one microtask
  * turn is spent before the first request so a child that had already finished is read as gone rather than sent a
- * prompt.
+ * prompt. The fatal question that wins the turn's own race does not go through that gate: there the run's own signal
+ * alone overrides the classification, read where that branch runs — a run that was cancelled is cancellation, with the
+ * dialog's own outcome kept as evidence beside it, and every other run is the question, whatever else is true of the
+ * child.
+ * A cancellation this gate reads for itself keeps an outcome already recorded for the same reason, so where the two
+ * land together it does not matter which of them this task was looking at when they did.
  *
  * **What the readbacks establish.** Before the prompt: that the session is standing exactly where the caller said it
  * was, which for a continuation is the recorded checkpoint itself and for a new session is a leaf that is either
@@ -174,7 +179,9 @@ export interface PiTaskUsage {
 /**
  * Where a task stopped, one name per end and no collapsing of two into one. `aborted`, `exited` and `rejected` are
  * the turn's own ends of those names, and the first two are also what the gate and a transport error of that kind
- * say; `turn` is a turn that failed or came back merely acknowledged; `question` a dialog nobody could answer;
+ * say; `aborted` is a cancelled run besides, whatever else was in flight when the signal went, the fatal question that
+ * won the turn's own race included; `turn` is a turn that failed or came back merely acknowledged; `question` a dialog
+ * nobody could answer on a run nobody cancelled;
  * `unobserved` a turn whose records this host saw fewer of than the turn itself counted; `extension` an extension
  * error from either side; `failed` a turn that produced no finished answer; `state`, `leaf`, `usage` and `text` the
  * four readbacks; `cleanup` a shutdown that reported a failure or threw; and `transport` everything else that threw
@@ -667,10 +674,17 @@ export async function runPiTask(request: PiTaskRequest): Promise<PiTaskResult> {
 
 	const takeNow = (): Taken => ({ evidence: takeEvidence(), ...takeSteers() });
 
+	/**
+	 * The gate, in its own order and with the question outcome read once for whichever end reads it. A cancellation
+	 * keeps an outcome that had already been recorded, as the evidence it is and exactly as the fatal-question race
+	 * does: where a dialog failed and the signal then went, the run is a cancellation and still carries what became of
+	 * that dialog. One that has not been recorded leaves the refusal the shape it always had, and `exited` reads
+	 * neither of them, because a child that went away is what this gate found. The order of the three is unchanged.
+	 */
 	const gate = (): Decided | undefined => {
-		if (request.signal?.aborted === true) return { reason: "aborted" };
-		if (ended) return { reason: "exited" };
 		const fatal = prepared.questions?.fatal;
+		if (request.signal?.aborted === true) return { reason: "aborted", ...(fatal === undefined ? {} : { outcome: fatal }) };
+		if (ended) return { reason: "exited" };
 		return fatal === undefined ? undefined : { reason: "question", outcome: fatal };
 	};
 
@@ -755,10 +769,18 @@ export async function runPiTask(request: PiTaskRequest): Promise<PiTaskResult> {
 		const first = fatal === undefined ? await finished : await Promise.race([finished, fatal]);
 
 		if (first.kind === "question") {
+			// Cancellation outranks the question that won this race, and the run's own signal is the whole of what says
+			// so: a host that cancelled this run is why its child is being stopped, however the dialog that was open at
+			// the same moment happened to end. Read once, where the branch runs, because the outcome's own end is not the
+			// classification — a dialog that ended `aborted` on a run nobody cancelled is still a question, and an ask
+			// that failed on a run that was cancelled is still cancellation. The outcome travels either way, as the
+			// evidence of what that dialog did.
+			const cancelled = request.signal?.aborted === true;
+			const reason: PiTaskReason = cancelled ? "aborted" : "question";
 			// The one shutdown of this path, started while the turn is still in flight, because the turn ends when the
 			// stop ends it. All three are awaited: the stop's report, the turn's own end, and the steer in flight.
 			queue?.end();
-			const stopping = stopChild("question");
+			const stopping = stopChild(reason);
 			const [stopReport, done] = await Promise.all([stopping, finished, queue?.idle() ?? Promise.resolve()]);
 			// Taken after the stop on this path alone: an active task is being ended, so what the ending produced is
 			// part of what there is to look at rather than evidence a decision was already made on.
@@ -766,10 +788,10 @@ export async function runPiTask(request: PiTaskRequest): Promise<PiTaskResult> {
 			const broke = faulted();
 			return {
 				ok: false,
-				// The question is what ended this task, and a snapshot that faulted on the way out does not rename it.
-				// The fault travels as the secondary value it is, where the turn's own thrown value has not taken that
-				// place, and nothing about it asks for a second stop.
-				reason: "question",
+				// The cancellation, or the question where there was none, is what ended this task, and a snapshot that
+				// faulted on the way out does not rename it. The fault travels as the secondary value it is, where the
+				// turn's own thrown value has not taken that place, and nothing about it asks for a second stop.
+				reason,
 				outcome: first.outcome,
 				...(done.kind === "turn" ? { turn: done.turn } : detail(done.error)),
 				...(broke === undefined || done.kind === "threw" ? {} : { error: broke.error }),

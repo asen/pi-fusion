@@ -2173,11 +2173,14 @@ class PiChildImpl implements PiChild {
 	 *
 	 * The order is what the native side makes possible and no more than that. External admission stops first and every
 	 * unsent frame of the caller's goes, settling its owner once, which is also what frees the room the controls need.
+	 * For a live child with a turn the descendants are then observed once, while that child still owns them and before
+	 * its own abort can re-parent one of them away — at most one table timeout in front of the cleanup's own deadline,
+	 * and a read that failed is left to show as that cleanup's own `discovery` rather than swallowed with the error.
 	 * `clear_queue` and `abort` then go out in that order with nothing awaited between them, because 0.85.1 reads one
 	 * stdin line at a time and starts each command's handler in the order it read them: there is no handshake to wait
 	 * for and none is invented. Whatever comes back before that is observed normally. Then, for an abort this side was
-	 * able to admit, one bounded wait for its own answer, the turn settling or the exit; and then the tree's own cleanup
-	 * — never a bare kill.
+	 * able to admit, one bounded wait for its own answer, the turn settling or the exit; and then the tree's own
+	 * cleanup — never a bare kill.
 	 */
 	private async runFinalize(cause: PiFinalCause): Promise<PiExit> {
 		this.state = "closing";
@@ -2198,6 +2201,24 @@ class PiChildImpl implements PiChild {
 		// Only a turn is worth waiting on: with none there is nothing for an abort to answer, and closing the child's
 		// stdin — which the tree's own cleanup does first — is what an orderly Pi shutdown is.
 		if (this.alive() && turn) {
+			// Remembered here and nowhere else, because this is the last moment the live child still owns its descendants:
+			// Pi's own abort kills a tool's shell, and a detached `setsid` descendant of one is re-parented out of this
+			// root's subtree as that shell dies, so a walk after the abort would no longer find it. One read and no more
+			// — nothing here samples, retries or polls — bounded by the owned cleanup's own `tableTimeoutMs` and by
+			// nothing else, because the aggregate `deadlineMs` starts inside `shutdown()` below. So the cost is at most
+			// that one table timeout in front of the whole deadline rather than inside it: separately bounded and
+			// additive, deliberately, because an observation that ate the deadline would cost the cleanup its own steps.
+			//
+			// The rejection is swallowed for one reason and no other: so this sequence carries on to `clear_queue`, to
+			// `abort` and to the cleanup, and so an error from an observation cannot take the place of the root's own
+			// end or of the turn's. What it can and cannot absorb is exact. Every way a production table read fails —
+			// its own timeout, a reader that threw, a result that is absent — sets the tree's own sticky discovery
+			// failure rather than rejecting here, so the cleanup comes back `discovery: "unavailable"`, which is a
+			// concern, an unsafe disposition and a call whose storage is kept: the conservative answer, because a
+			// descendant may have been missed, and nothing here clears it, restores it or makes up for it. The one
+			// rejection this `catch` does absorb is a malformed truthy non-array table, which the survey's own walk
+			// throws on and which exists only through injected facilities, never through the table this build reads.
+			await this.tree.observe().catch(() => undefined);
 			this.control("clear_queue");
 			const aborting = this.control("abort", true);
 			for (const id of [...this.openUi]) this.cancelDialog(id);

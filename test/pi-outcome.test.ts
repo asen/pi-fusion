@@ -569,6 +569,39 @@ test("every other ending reports what was verified before it, and nothing it was
 	assert.equal(failureMessage(quiet), "implement aborted while bash npm test");
 });
 
+/*
+ * The one task result that carries both: a run cancelled while a dialog of it was open comes back under the `aborted`
+ * reason with that dialog's own outcome kept on it as evidence. The reason is what this mapping reads, so such a run
+ * is a cancellation here too, said in the one fixed sentence for one and with no question suffix on it — the suffix
+ * belongs to the `question` reason alone, and a person told their own cancellation is not told about a dialog they
+ * never asked about. Everything that outcome carried stays evidence, in none of the four texts a person reads.
+ */
+test("a cancelled task that kept a question's outcome is a cancellation here, and the dialog reaches no text", () => {
+	const prepared = { session: SESSION, selection: SELECTION };
+	const ended: PiEnded = { kind: "task", result: refusedTaskOf({ reason: "aborted", outcome: OUTCOME, error: SECRETS.error }), prepared };
+
+	const diagnostic = diagnose(ended, disposition(ended), SAFE);
+	assert.deepEqual([diagnostic?.stage, diagnostic?.stopReason], ["task", "aborted"]);
+	assert.equal(diagnostic?.message, "the run was cancelled", "the fixed sentence for a cancellation, naming no dialog");
+
+	const run = newRun(ROLE);
+	run.activity = "bash npm test";
+	finishRun(run, ended, disposition(ended), SAFE, 10);
+	assert.deepEqual([run.aborted, run.stopReason], [true, "aborted"]);
+	assert.equal(run.errorMessage, "the run was cancelled");
+	assert.equal(run.cleanupNotice, undefined, "an ending that left no concern leaves nothing for a person to look at");
+	assert.equal(run.activity, "bash npm test", "and the line its child was cut off on is what a cancellation keeps");
+	for (const [where, text] of [
+		["the failure message", run.errorMessage ?? ""],
+		["the cleanup notice", run.cleanupNotice ?? ""],
+		["the activity line", run.activity ?? ""],
+		["the run's text", run.text ?? ""],
+		["what a user is shown for one", failureMessage(run)],
+	] as const) {
+		noSecrets(text, `${where} of a cancellation that kept a dialog's outcome`);
+	}
+});
+
 test("what an ending left for a person is one line on the run, composed here alone and absent when there is nothing", () => {
 	const prepared = { session: SESSION, selection: SELECTION };
 	const bothHalves = `${CLEANUP_ATTENTION}: leftovers; ${STORAGE_LEFT}`;

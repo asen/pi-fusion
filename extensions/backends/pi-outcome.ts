@@ -484,7 +484,9 @@ function publishUsage(run: PiRun, result: PiTaskDone): void {
  *
  * It is also the one composer of the run's `cleanupNotice`: every ending whose concerns or whose storage report leave
  * something for a person to look at gets that one line, and every other ending carries none at all. A cancelled run
- * shows it as its activity too, because that is the only field the host's own failure message reads for one.
+ * mirrors it into its activity as well: this backend's own fallback, so the fact is on the one field a cancelled run
+ * is shown even where nothing else reads it, and a consistent mirror of the notice rather than the only way it can be
+ * read — the host's shared cancellation path copies that same notice itself, once and after this run has finalized.
  *
  * The `_reportedDisposition` parameter is the caller's own record of the storage decision it made and is not read
  * here, for the reason `diagnose` gives, and is named apart from the module's own `disposition()` for the same one:
@@ -521,9 +523,11 @@ export function finishRun(run: PiRun, ended: PiEnded, _reportedDisposition: PiDi
 		const parts = [...(leftBehind.length === 0 ? [] : [leftBehind.join(", ")]), ...(storageLeft ? [STORAGE_LEFT] : [])];
 		run.cleanupNotice = `${CLEANUP_ATTENTION}: ${parts.join("; ")}`;
 	} else delete run.cleanupNotice;
-	// And the one place a cancelled run says it for itself: the host shows such a run its activity and nothing else,
-	// so the same text goes there too. A plain cancellation keeps whatever line the child was last on, because that
-	// is the useful thing to show for one.
+	// And the one place a cancelled run says it for itself, as this backend's fallback: the activity line is what such a
+	// run is shown, so the same text is mirrored there. It is not the only field anyone reads it from — the host's shared
+	// cancellation path propagates the notice on its own, once and after this run has finalized — so the two agree
+	// because both carry the one text composed above. A plain cancellation keeps whatever line the child was last on,
+	// because that is the useful thing to show for one.
 	if (run.aborted && run.cleanupNotice !== undefined) run.activity = run.cleanupNotice;
 	if (ended.kind === "prepare") {
 		const refused = ended.refused;

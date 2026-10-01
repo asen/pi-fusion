@@ -753,6 +753,108 @@ test("a cancelled run stops where it is, under its own reason, and waits for the
 	assert.deepEqual(between.seen.shutdowns, ["aborted"]);
 });
 
+/*
+ * The two ends can land together: a host cancels a run while a dialog of it is open, and the fatal question is what
+ * wins the turn's own race. What ended the run is then the cancellation and not the dialog, read off the run's signal
+ * alone, because a dialog that could not be answered on a run that was already cancelled is downstream of it. The
+ * outcome is kept either way as the evidence of what became of that dialog, and the two rows below are the two shapes
+ * it can have: one the cancellation itself ended, and one whose ask failed on its own while the run was cancelled.
+ */
+test("a run cancelled while a question is pending ends as cancellation, with the dialog's own outcome kept as evidence", async () => {
+	const rows: Array<{ what: string; outcome: PiQuestionOutcome }> = [
+		{ what: "a dialog the cancellation itself ended", outcome: { id: "dialog-9", question: "which name?", end: "aborted" } },
+		{ what: "an ask that failed on its own", outcome: FATAL },
+	];
+	for (const row of rows) {
+		const questions = watchOf();
+		const cancelling = new AbortController();
+		const gate = deferred<PiTurn>();
+		const steering = deferred<PiResponse>();
+		const observer = taskObserver();
+		const scripted = childOf({
+			requests: { get_tree: [ok("get_tree", { tree: [], leafId: null })], steer: [steering.promise] },
+			turn: gate.promise,
+			// As on the question path it is the stop that ends this turn, and the steer in flight is released with it.
+			exit: () => {
+				gate.resolve(turnOf({ outcome: "aborted", events: 1 }));
+				steering.resolve(ok("steer", {}));
+				return exitOf();
+			},
+		});
+		const queue = new PiSteerQueue();
+		const running = runPiTask({ prepared: preparedOf(scripted.child, { questions: questions.watch }), prompt: PROMPT, observer, input: queue, signal: cancelling.signal });
+		await drain();
+		queue.push("in flight");
+		queue.push("never sent");
+		await drain();
+		observer.onEvent(messageEnd(assistantMessage()));
+		// The cancellation first and the dialog's end after it, which is the order a router that ends its dialogs on the
+		// run's signal produces. No gate sits between the race and this branch, so the signal is read where it is read.
+		cancelling.abort();
+		questions.fail(row.outcome);
+		const stopped = refused(await running);
+
+		assert.equal(stopped.reason, "aborted", `${row.what} is cancellation on a run that was cancelled`);
+		assert.equal(stopped.outcome, row.outcome, "and the outcome the watch kept travels on it, exactly as it was");
+		assert.deepEqual(scripted.seen.shutdowns, ["aborted"], "one stop, asked for as the cancellation it was");
+		assert.deepEqual(scripted.seen.steps, ["get_tree", "turn", "steer", "shutdown"], "no readback is taken off a child stopped mid-turn");
+		assert.equal(stopped.turn?.outcome, "aborted", "the turn the stop ended is still awaited and still evidence");
+		assert.deepEqual({ open: stopped.steers?.open, sent: stopped.steers?.sent, dropped: stopped.steers?.dropped }, { open: false, sent: 1, dropped: 1 }, "the input was closed before the stop, the one in flight waited for and the rest dropped");
+		assert.equal(Object.isFrozen(stopped.evidence), true, "the evidence is the observer's own frozen snapshot");
+		assert.equal(stopped.evidence.assistantMessages, 1, "and what the stream produced is still counted in it");
+		assert.deepEqual(stopped.session, SESSION, "the prepared session, with no checkpoint added to it");
+	}
+});
+
+/*
+ * The other way round, and the gate's own: the turn wins its race on its own, so nothing of the question is read
+ * there — and by the time the gate after that turn runs, the signal has gone and a dialog of this run has already
+ * failed. That gate is a cancellation like any other, and it carries the outcome that was already recorded for the
+ * same reason the race's own branch does: a run cancelled over a dialog nobody could answer should not lose what
+ * became of that dialog just because the turn came back first. The evidence stays the snapshot taken before the wait
+ * for the steer in flight, so what arrives during that wait is not in it.
+ */
+test("a cancellation the gate after the turn reads carries a question outcome already recorded, and the frozen evidence", async () => {
+	const questions = watchOf();
+	const cancelling = new AbortController();
+	const gate = deferred<PiTurn>();
+	const steering = deferred<PiResponse>();
+	const observer = taskObserver();
+	const scripted = childOf({
+		requests: { get_tree: [ok("get_tree", { tree: [], leafId: null })], steer: [steering.promise] },
+		turn: gate.promise,
+	});
+	const queue = new PiSteerQueue();
+	const running = runPiTask({ prepared: preparedOf(scripted.child, { questions: questions.watch }), prompt: PROMPT, observer, input: queue, signal: cancelling.signal });
+	await drain();
+	queue.push("in flight");
+	queue.push("never sent");
+	await drain();
+	// The turn's own record, and then the turn itself, ending as the child's own abort: the question has not failed yet,
+	// so the race is won by the turn and the branch that reads a question is never entered.
+	observer.onEvent(messageEnd(assistantMessage()));
+	gate.resolve(turnOf({ outcome: "aborted", events: 1 }));
+	await drain();
+	assert.deepEqual(scripted.seen.steps, ["get_tree", "turn", "steer"], "the turn is over and the task is waiting on the steer in flight");
+
+	// Both land in that wait: the evidence is already frozen, and the gate past it is what reads either of them.
+	cancelling.abort();
+	questions.fail(FATAL);
+	observer.onEvent(messageEnd(assistantMessage()));
+	steering.resolve(ok("steer", {}));
+	const stopped = refused(await running);
+
+	assert.equal(stopped.reason, "aborted", "the gate reads the cancellation first, as it always has");
+	assert.equal(stopped.outcome, FATAL, "and carries the outcome the watch had already recorded, exactly as it was");
+	assert.deepEqual(scripted.seen.shutdowns, ["aborted"], "one stop, asked for as the cancellation it was");
+	assert.deepEqual(scripted.seen.steps, ["get_tree", "turn", "steer", "shutdown"], "no readback is taken past that gate");
+	assert.equal(stopped.turn?.outcome, "aborted", "the turn that came back is still evidence of what happened");
+	assert.deepEqual({ open: stopped.steers?.open, sent: stopped.steers?.sent, dropped: stopped.steers?.dropped }, { open: false, sent: 1, dropped: 1 }, "the input was closed before the stop, the one in flight waited for and the rest dropped");
+	assert.equal(Object.isFrozen(stopped.evidence), true, "the evidence is a frozen snapshot");
+	assert.equal(stopped.evidence.assistantMessages, 1, "frozen before the wait: the record that arrived during it is not one of this turn's");
+	assert.deepEqual(stopped.session, SESSION, "the prepared session, with no checkpoint added to it");
+});
+
 test("the statistics, the text and the stop are each read strictly, and a cleanup that failed publishes nothing", async () => {
 	const rows: Array<{ what: string; reason: PiTaskReason; stats?: Answer; text?: Answer; state?: Record<string, unknown> }> = [
 		{ what: "a failed statistics answer", reason: "usage", stats: no("get_session_stats", statsOf()) },

@@ -535,6 +535,36 @@ test("the module writes its control-character rule as code points, and holds non
 	assert.deepEqual(embedded, [], "and nothing in the module is written as a control byte of its own");
 });
 
+/*
+ * Where the descendants are remembered is the whole of what lets the cleanup find them: Pi's own abort kills a tool's
+ * shell, and a detached descendant of one is re-parented out of the root's subtree as that shell dies, so an
+ * observation moved after `abort` would see less while reporting exactly the same shutdown. The dynamic cases below
+ * read that report and would pass either way, so this reads the finalization's own text for the one ordering that
+ * matters. A read of the file rather than of anything it does: no process, no child and nothing about any other file.
+ */
+test("the finalization observes the tree once before it sends `clear_queue` and then `abort`", () => {
+	const source = fs.readFileSync(fileURLToPath(new URL("../extensions/backends/pi-transport.ts", import.meta.url)), "utf8");
+	const opens = source.indexOf("private async runFinalize(");
+	assert.notEqual(opens, -1, "the one memoized finalization is still a method of that name");
+	const ends = source.indexOf("\n\t}\n", opens);
+	assert.ok(ends > opens, "and it still ends at its own closing brace, so this reads that method and no other");
+	const body = source.slice(opens, ends);
+
+	const awaited = "await this.tree.observe()";
+	const observed = body.indexOf(awaited);
+	const cleared = body.indexOf('this.control("clear_queue")');
+	const aborted = body.indexOf('this.control("abort", true)');
+	assert.ok(observed !== -1, "the finalization still observes the tree");
+	assert.ok(cleared !== -1 && aborted !== -1, "and still sends both shutdown controls");
+	assert.ok(observed < cleared, "the observation is awaited before `clear_queue`, while the live child still owns its descendants");
+	assert.ok(cleared < aborted, "and the two controls keep their own order after it");
+	assert.equal(body.indexOf("this.tree.observe()", observed + awaited.length), -1, "it observes once: nothing here samples, retries or polls");
+	assert.ok(
+		body.includes(`${awaited}.catch(() => undefined)`),
+		"and its rejection is swallowed, so an observation that threw cannot stand in for the root's own end, the turn's, or the controls that follow it; a table read that could not be made still shows up as the cleanup's own `discovery`",
+	);
+});
+
 test("a child that never served fails by what its own stderr said, and a silent refusal guesses nothing", () => {
 	const silent = new StderrReader(piBounds({ maxStderrLineBytes: 16 }));
 	silent.push(buf(`${"noise ".repeat(20)}\nplain\n`));

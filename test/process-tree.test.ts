@@ -715,6 +715,47 @@ test("a table that answers once and then fails buys no blind group send afterwar
 });
 
 /*
+ * An observation a caller makes before it ends its child is one more table read, and a read it could not make is the
+ * one thing this report may never forget: a descendant that may have been missed is exactly what `unavailable` says,
+ * and a caller above reads that as a concern it keeps the call's storage for. So the flag is sticky by design — a
+ * failed read stays failed however well every read after it works, and nothing restores or compensates for it. The
+ * shutdown itself is untouched by it: it runs on the reads that did work and ends the tree as it always would.
+ */
+test("an observation whose table read failed leaves the report unavailable, however well the shutdown then reads", { skip: needsTable }, async () => {
+	const dir = newDir();
+	try {
+		let reads = 0;
+		const seam = recorder({
+			table: async (real) => {
+				reads += 1;
+				return reads === 1 ? undefined : real.table();
+			},
+		});
+		const tree = new ChildTree(400, grace({ facilities: seam.facilities }));
+		startRoot(tree, dir, { spawn: [{ role: "middle", mode: "detached" }] });
+		await ready(dir, ["root", "middle"]);
+		const middle = pidOf(dir, "middle");
+
+		// The observation, whose one read is the one that fails: it finds nothing, and it says nothing about that here.
+		assert.deepEqual(await tree.observe(), []);
+		assert.equal(seam.events[0], "table-unavailable", "the failed read is the observation's own");
+
+		const report = await tree.shutdown();
+		assert.ok(reads > 1, "the shutdown read the table again, and every read of its own worked");
+		assert.equal(report.discovery, "unavailable", "and the one read nobody could make is still what the report says");
+		// The cleanup is the ordinary one all the same: the root ends on its own input, and the descendant the reads
+		// that worked did find is terminated with it.
+		assert.deepEqual([report.root, report.exit.code, report.exit.signal], ["exited", 0, null]);
+		assert.equal(report.deadlineHit, false);
+		assert.deepEqual(pids(report.terminated), [middle]);
+		assert.deepEqual([report.leftovers, report.skipped], [[], []]);
+		assert.equal(await gone(middle), true);
+	} finally {
+		reap(dir);
+	}
+});
+
+/*
  * The cleanup is something a caller awaits, and after a normal root exit the awaited grace can be the only thing this
  * process still has to do. A node process with nothing referenced left exits, so this runs the whole thing in a plain
  * node process with no test runner and no host around it: if the shutdown's own waits did not hold the loop open, the
