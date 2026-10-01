@@ -421,6 +421,7 @@ test("one new-session call runs the whole composition, stops its child once, and
 	assert.deepEqual([run.tokensIn, run.tokensOut, run.cacheRead, run.cacheWrite], [215, 40, 10, 5]);
 	assert.equal(run.costUsd, 0.5);
 	assert.deepEqual([run.contextTokens, run.contextWindow], [1_200, 64_000]);
+	assert.equal(run.cleanupNotice, undefined, "an ending that left nothing behind leaves a person nothing to look at");
 
 	const report = reportOf(harness.reports);
 	assert.equal(report.stage, "task");
@@ -523,6 +524,9 @@ test("a turn that read back whole on a child that left processes behind is demot
 	assert.match(run.errorMessage ?? "", new RegExp(`^${CLEANUP_UNCERTAIN}: leftovers\\.`));
 	assert.match(run.errorMessage ?? "", /trusted only to the point it stood at before the turn/);
 	assert.ok(run.errorMessage?.endsWith(STORAGE_RETAINED), `a demoted success says its storage was kept too: ${run.errorMessage}`);
+	// The line a person is pointed at, on a run nobody cancelled: what the cleanup left and the directory it kept.
+	assert.equal(run.cleanupNotice, `${CLEANUP_ATTENTION}: leftovers; ${STORAGE_LEFT}`);
+	assert.equal((run.activity ?? "").includes(CLEANUP_ATTENTION), false, "and the line its child was last on is left alone, because a failed run is shown its own message");
 	assert.equal(terminal(harness.events).message, run.errorMessage);
 	assert.deepEqual(run.session, { backend: "pi", sessionId: SESSION_ID, sessionFile: SESSION_FILE }, "the identity it stood on before the turn, never the leaf that turn produced");
 	assert.equal(run.text, ANSWER, "the work read back, and what it said is still reported");
@@ -589,13 +593,14 @@ test("a cancelled call takes nothing it cannot account for, and asks for at most
 	assert.equal(taskRun.aborted, true);
 	assert.equal(taskRun.stopReason, "aborted");
 	assert.deepEqual(task.seen.shutdowns, ["aborted"]);
-	assert.equal(taskRun.activity, `${CLEANUP_ATTENTION}: leftovers; ${STORAGE_LEFT}`, "the one line a cancelled run is shown says both what the cleanup left and that the storage stayed");
+	assert.equal(taskRun.cleanupNotice, `${CLEANUP_ATTENTION}: leftovers; ${STORAGE_LEFT}`, "the one line a cancelled run is shown says both what the cleanup left and that the storage stayed");
+	assert.equal(taskRun.activity, taskRun.cleanupNotice, "and it is the activity as well, because that is the field the host reads for a run its own signal aborted");
 	assert.ok(taskRun.errorMessage?.endsWith(STORAGE_RETAINED));
 	const taskReport = reportOf(task.reports);
 	assert.equal(taskReport.stage, "task");
 	assert.deepEqual(taskReport.disposition, { safe: false, concerns: ["leftovers"] });
 	assert.equal(fs.existsSync(taskReport.storage?.callDir ?? ""), true);
-	assert.equal((taskRun.activity ?? "").includes(taskReport.storage?.callDir ?? "no directory"), false, "and it names no path");
+	assert.equal((taskRun.cleanupNotice ?? "").includes(taskReport.storage?.callDir ?? "no directory"), false, "and it names no path");
 });
 
 test("storage that could not be removed is a note on a success and a sentence on a failure, and never a value or a path", async (t) => {
@@ -621,7 +626,8 @@ test("storage that could not be removed is a note on a success and a sentence on
 	assert.deepEqual([report.storage?.attempted, report.storage?.disposed], [true, false]);
 	assert.equal(report.storage?.disposeError?.error, refusedDispose, "the exact value, in the report and nowhere else");
 	assert.equal(fs.existsSync(report.storage?.callDir ?? ""), true, "and the directory is still there to be looked at");
-	for (const shown of [run.text, run.errorMessage ?? "", JSON.stringify(success.events)]) {
+	assert.equal(run.cleanupNotice, `${CLEANUP_ATTENTION}: ${STORAGE_LEFT}`, "a directory still there is worth saying even on a run that succeeded");
+	for (const shown of [run.text, run.errorMessage ?? "", run.cleanupNotice ?? "", JSON.stringify(success.events)]) {
 		assert.equal(shown.includes("SECRET-dispose-refused"), false, `what the disposer threw reaches nothing a person reads: ${shown}`);
 		assert.equal(shown.includes(report.storage?.callDir ?? "no directory"), false, `and neither does the path: ${shown}`);
 	}

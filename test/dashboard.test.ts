@@ -153,6 +153,40 @@ test("finish records each terminal status with its text, failure and end time", 
 	}
 });
 
+test("a finish told to clear the activity drops the line its snapshot carried, and one that is not keeps it", () => {
+	// A backend may mirror what its ending left behind into the activity of the outcome it returns, and a host that
+	// has already put that sentence in the failure asks for the line to go rather than be shown twice.
+	const warning = "cleaning up needs attention: leftovers; this call's storage is left behind";
+	const failure = `implement cancelled; ${warning}`;
+	const snapshot = { activity: warning, toolCalls: 2, tokensIn: 10, tokensOut: 5 };
+
+	const cleared = started();
+	cleared.store.progress("run-1", { activity: "bash npm test", toolCalls: 1, tokensIn: 5, tokensOut: 1 });
+	cleared.tick(20);
+	cleared.store.finish("run-1", { status: "cancelled", failure, snapshot, clearActivity: true });
+	const clearedDetail = detailOf(cleared.store);
+	assert.equal(clearedDetail.activity, undefined, "the mirrored line is gone, so the monitor does not say it twice");
+	assert.equal(cleared.store.summaries()[0]!.activity, undefined);
+	assert.equal(clearedDetail.failure, failure, "and the failure is the one place it is shown");
+	assert.equal(clearedDetail.failure?.split(warning).length, 2, `exactly one copy of the warning: ${clearedDetail.failure}`);
+	// Everything else the snapshot carried is applied as it always was: this drops one line and nothing else.
+	assert.deepEqual([clearedDetail.toolCalls, clearedDetail.tokensIn, clearedDetail.tokensOut], [2, 10, 5]);
+
+	// Without the flag nothing changes: the snapshot's own line is what a finished run shows.
+	const kept = started();
+	kept.store.progress("run-1", { activity: "bash npm test", toolCalls: 1, tokensIn: 5, tokensOut: 1 });
+	kept.tick(20);
+	kept.store.finish("run-1", { status: "cancelled", failure: "implement cancelled", snapshot });
+	assert.equal(detailOf(kept.store).activity, warning);
+	assert.equal(kept.store.summaries()[0]!.activity, warning);
+
+	// And a finish that clears nothing keeps the line the run was last on, snapshot or no snapshot.
+	const untouched = started();
+	untouched.store.progress("run-1", { activity: "bash npm test", toolCalls: 1, tokensIn: 5, tokensOut: 1 });
+	untouched.store.finish("run-1", { status: "done", clearActivity: false });
+	assert.equal(detailOf(untouched.store).activity, "bash npm test");
+});
+
 test("finish stops the tasks still running and leaves the ended ones exactly as they were", () => {
 	for (const status of ["done", "failed", "aborted"] as const) {
 		const { store, tick } = started();

@@ -782,6 +782,12 @@ interface LiveRun {
 	before?: Snapshot;
 	report?: string;
 	failure?: string;
+	/**
+	 * What the backend said its ending left behind, for a run this host cancelled: fixed text the backend composed and
+	 * this host only carries, kept because a cancelled run's own failure line is composed here rather than read off the
+	 * outcome. It is never read as progress and never parsed; it is the backend's sentence, already in `failure`.
+	 */
+	cleanupNotice?: string;
 	stats?: string;
 	/** What the host must read with this run's outcome, such as the plan handoff that gave the run its own handle. */
 	note?: string;
@@ -1721,8 +1727,12 @@ export default function fusion(pi: ExtensionAPI, options: FusionOptions = {}) {
 					const selection = keptSelection(child.selection, run.backend);
 					run.verified = { ...(ref === undefined ? {} : { ref }), ...(selection === undefined ? {} : { selection }) };
 				}
+				// A cancelled run's line is this host's own, so nothing the outcome says about the child's own ending would
+				// otherwise reach anyone: `failureMessage` is never called for one. The backend's `cleanupNotice` is
+				// carried whole and appended once, here, which is why every reader downstream takes `run.failure` as it is.
+				if (run.cancelled && child.cleanupNotice !== undefined) run.cleanupNotice = child.cleanupNotice;
 				const failure = run.cancelled
-					? `${role.name} cancelled${run.cancelledBy === "user" ? " by the user" : ""}`
+					? `${role.name} cancelled${run.cancelledBy === "user" ? " by the user" : ""}${run.cleanupNotice === undefined ? "" : `; ${run.cleanupNotice}`}`
 					: failed(child)
 						? failureMessage(child)
 						: recorded.invalid;
@@ -1743,6 +1753,11 @@ export default function fusion(pi: ExtensionAPI, options: FusionOptions = {}) {
 						...(failure === undefined ? {} : { failure }),
 						snapshot: child,
 						...(verified === undefined ? {} : { ref: verified }),
+						// A backend that mirrors this notice into the activity of its own outcome — which the Pi one does,
+						// because a cancelled run is shown its activity and nothing else — would otherwise leave the monitor
+						// showing the same sentence twice: once in the failure composed above and once as the line the run
+						// was on. Only this branch sets it, and `run.cleanupNotice` is set nowhere but the cancelled one.
+						...(run.cleanupNotice === undefined ? {} : { clearActivity: true }),
 						...changed,
 					}),
 				);
@@ -2176,7 +2191,10 @@ export default function fusion(pi: ExtensionAPI, options: FusionOptions = {}) {
 				// run.ended is a resolved placeholder until the run's child starts, so the end signal is what to wait on.
 				await watched(run);
 				await run.ended;
-				notice(`${run.handle} cancelled`, "info");
+				// A backend that had something to say about what the stop left behind says it here too, because this
+				// notice is the whole of what the user who cancelled the run sees of its end.
+				const left = run.cleanupNotice;
+				notice(left === undefined ? `${run.handle} cancelled` : `${run.handle} cancelled; ${left}`, left === undefined ? "info" : "warning");
 				return;
 			}
 			if (command.kind === "steer") {
@@ -2533,8 +2551,14 @@ export default function fusion(pi: ExtensionAPI, options: FusionOptions = {}) {
 		run.cancelled = true;
 		run.delivered = true;
 		run.controller.abort();
+		// The same barrier `/fusion cancel` waits on, and for the same reason: `run.ended` is a resolved placeholder until
+		// the run's child has started, so a cancel that raced the start would otherwise read the run's fields before the
+		// outcome filled them in and report a stop the backend had not finished making.
+		await watched(run);
 		await run.ended;
-		return reply(`${handle} cancelled`, { ...runDetails(run), handle, state: run.state });
+		// The cancel takes the run's report, so what its backend said the stop left behind travels with this reply or
+		// with nothing: the host is told no other way about a run it cancelled itself.
+		return reply(run.cleanupNotice === undefined ? `${handle} cancelled` : `${handle} cancelled; ${run.cleanupNotice}`, { ...runDetails(run), handle, state: run.state });
 	};
 
 	pi.registerTool({

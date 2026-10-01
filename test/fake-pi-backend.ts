@@ -62,6 +62,16 @@ export interface FakeScript {
 	/** What the outcome becomes when the run is aborted, over a cancelled run's own defaults. */
 	onAbort?: Omit<FakeScript, "onAbort" | "questions" | "pending" | "throws">;
 	costUsd?: number;
+	/** The line the child was last on, as an outcome may report one. Absent it changes nothing: no outcome carried one before. */
+	activity?: string;
+	/**
+	 * The fixed line a backend puts on an outcome to say what the ending left for a person to look at. A Pi backend
+	 * writes one for a cleanup that did not finish or a call directory it kept; a Claude one never does. It is scripted
+	 * on the terminal outcome, and on the aborted one through `onAbort`, because a cancelled run is where it matters.
+	 * A backend that writes one may mirror it into `activity` as well, which the Pi one does for a cancelled run, so a
+	 * script that sets both is what an outcome of that shape looks like to this host.
+	 */
+	cleanupNotice?: string;
 }
 
 /** One run the host started on this backend, as the backend saw it, with the channels the test drives it through. */
@@ -332,6 +342,8 @@ function child(
 		aborted,
 		...(aborted ? {} : { stopReason: script.fail ? "error" : "stop" }),
 		...(script.fail ? { errorMessage: failure } : {}),
+		...(script.activity === undefined ? {} : { activity: script.activity }),
+		...(script.cleanupNotice === undefined ? {} : { cleanupNotice: script.cleanupNotice }),
 		stderr: "",
 	};
 }

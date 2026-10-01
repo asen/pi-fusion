@@ -80,6 +80,8 @@ function makeHost(options: HostOptions = {}) {
 	const handlers = new Map<string, (event: any, ctx: any) => Promise<unknown> | unknown>();
 	const branch: unknown[] = options.branch ?? [];
 	const notices: string[] = [];
+	/** The same notices with the level each was shown at, for a test that reads how loud one was. */
+	const notified: Array<{ text: string; level?: string }> = [];
 	const sent: Array<[any, any]> = [];
 	const api = {
 		registerTool: (tool: any) => tools.set(tool.name, tool),
@@ -97,7 +99,10 @@ function makeHost(options: HostOptions = {}) {
 	const ui = {
 		setStatus() {},
 		setWidget() {},
-		notify: (text: string) => notices.push(text),
+		notify: (text: string, level?: string) => {
+			notices.push(text);
+			notified.push({ text, ...(level === undefined ? {} : { level }) });
+		},
 		editor: (title: string, prefill?: string) =>
 			new Promise<string | undefined>((resolve) => {
 				editors.push({ title, ...(prefill === undefined ? {} : { prefill }) });
@@ -118,6 +123,7 @@ function makeHost(options: HostOptions = {}) {
 	return {
 		branch,
 		notices,
+		notified,
 		sent,
 		ctx,
 		tools,
@@ -624,6 +630,106 @@ test("a message to a running pi child is a steer, and cancelling a pending one r
 		assert.equal(cancelled.text, "run-1 cancelled");
 		assert.deepEqual(host.entries(), [{ run: "run-1", role: "implement", backend: "pi", hostSessionId: "host-1" }], "a cancel before any identity records the handle alone");
 		assert.deepEqual(host.sent, [], "a cancelled run sends no notice");
+	});
+});
+
+/** The fixed line a backend may put on a cancelled run's outcome to say what its own ending left for a person. */
+const CLEANUP_WARNING = "cleaning up needs attention: leftovers; this call's storage is left behind";
+
+/** How often one text holds another, so a line composed once is shown to be appended once and not twice. */
+const times = (text: string, needle: string): number => text.split(needle).length - 1;
+
+/** The outcome a Pi backend returns for a run it was told to stop after its cleanup left something behind. */
+const CLEANUP_ABORT = { cleanupNotice: CLEANUP_WARNING, activity: CLEANUP_WARNING };
+
+/** The whole run as the monitor serves it, which is the store the extension fills read back over its own api. */
+async function monitorFailure(host: ReturnType<typeof makeHost>, handle: string): Promise<{ failure?: unknown; activity?: unknown }> {
+	host.notices.length = 0;
+	await host.command("dashboard");
+	const url = host.notices.map((text) => /^fusion dashboard: (\S+)$/.exec(text)?.[1]).find(Boolean);
+	assert.ok(url, `the dashboard did not report its url: ${host.notices.join("\n")}`);
+	try {
+		const runs = (await payload(`${url}api/runs`)).runs as Array<{ id: string; handle?: string }>;
+		const run = runs.find((entry) => entry.handle === handle);
+		assert.ok(run, `no run ${handle} in the monitor`);
+		return (await payload(`${url}api/runs/${run.id}`)) as { failure?: unknown; activity?: unknown };
+	} finally {
+		await host.command("dashboard stop");
+	}
+}
+
+test("a cancelled run carries its backend's own warning about what the ending left, once, wherever that run is read", async () => {
+	const dir = tempDir("pi-cancel-warning");
+	const sessionFile = path.join(dir, "host-1.jsonl");
+	await withEnv({ ...piEnv(), PI_FUSION_HISTORY: "1", PI_FUSION_HISTORY_DIR: dir }, async () => {
+		const pi = fakeBackend({ scripts: [{ pending: true, onAbort: CLEANUP_ABORT }] });
+		const host = makeHost({ backends: both(pi), branch: [], sessionFile });
+		await host.fusion({ role: "implement", task: "long work", backend: "pi", background: true });
+		await pi.started();
+
+		// The host cancelled this one itself, so the reply to that call is the only place it hears the run's end.
+		const reply = (await host.control({ action: "cancel", run: "run-1" })).text ?? "";
+		assert.equal(reply, `run-1 cancelled; ${CLEANUP_WARNING}`);
+		assert.equal(times(reply, CLEANUP_WARNING), 1, `the cancel reply says it twice: ${reply}`);
+
+		// The failure is composed once, and every surface that shows a failure shows that one text: the report a wait
+		// hands back, the record the history keeps and the run the monitor serves.
+		const failure = `implement cancelled; ${CLEANUP_WARNING}`;
+		const report = await ended(host, "run-1");
+		assert.match(report, new RegExp(`^run-1 \\(implement\\) cancelled\\.\n\n${failure}\n\n\\[run-1 · implement · `));
+		assert.equal(times(report, CLEANUP_WARNING), 1, `the wait report says it twice: ${report}`);
+		const held = new History(dir).load("host-1").records.at(-1)!;
+		assert.equal(held.failure, failure, "the history keeps the once-composed failure and composes nothing of its own");
+		assert.equal(times(held.failure ?? "", CLEANUP_WARNING), 1);
+
+		// The status of a run that has ended carries no failure text at all, and so no copy of the warning either.
+		const status = (await host.control({ action: "status", run: "run-1" })).text ?? "";
+		assert.equal(times(status, CLEANUP_WARNING), 0, `a status reply shows no failure, so it shows no warning: ${status}`);
+		assert.deepEqual(host.sent, [], "a run the host cancelled itself still sends no notice");
+
+		// And the monitor: once in the failure, and not a second time as the line the run was on. This backend mirrors
+		// the notice into its outcome's activity, as the Pi one does for a cancelled run, so without the host asking
+		// for that copy to go the same sentence would stand beside the failure in the run's own card.
+		const monitored = await monitorFailure(host, "run-1");
+		assert.equal(monitored.failure, failure);
+		assert.equal(times(String(monitored.failure ?? ""), CLEANUP_WARNING), 1, `the monitor's failure says it twice: ${monitored.failure}`);
+		assert.equal(monitored.activity, undefined, "the mirrored line is gone from the monitor rather than repeating the failure");
+	});
+});
+
+test("the user's own cancel says what the ending left too, and a cancellation that left nothing reads as it always did", async () => {
+	await withEnv(piEnv(), async () => {
+		const pi = fakeBackend({ scripts: [{ pending: true, onAbort: CLEANUP_ABORT }] });
+		const host = makeHost({ backends: both(pi) });
+		await host.fusion({ role: "implement", task: "long work", backend: "pi", background: true });
+		await pi.started();
+		await host.command("cancel run-1");
+		const shown = host.notified.at(-1);
+		assert.deepEqual(shown, { text: `run-1 cancelled; ${CLEANUP_WARNING}`, level: "warning" }, "a cancel that left something behind is shown as a warning");
+		assert.equal(times(shown?.text ?? "", CLEANUP_WARNING), 1, `the notice says it twice: ${shown?.text}`);
+		// The user cancelled it, so the host still gets the end notice, carrying the same failure and one copy of it.
+		await until("the completion notice", () => host.sent.length > 0);
+		const notice = host.sent[0]![0].content as string;
+		assert.match(notice, new RegExp(`^Background run run-1 \\(implement\\) cancelled\\.\n\nimplement cancelled by the user; ${CLEANUP_WARNING}\n\n\\[run-1 · implement · `));
+		assert.equal(times(notice, CLEANUP_WARNING), 1, `the background notice says it twice: ${notice}`);
+	});
+
+	// A backend with nothing to say leaves every cancellation string exactly as it was, on either backend.
+	await withEnv(piEnv(), async () => {
+		const pi = fakeBackend({ scripts: [{ pending: true }] });
+		const claude = fakeBackend({ name: "claude", scripts: [{ pending: true }] });
+		const host = makeHost({ backends: both(pi, claude) });
+		await host.fusion({ role: "implement", task: "long work", backend: "pi", background: true });
+		await pi.started();
+		assert.equal((await host.control({ action: "cancel", run: "run-1" })).text, "run-1 cancelled");
+
+		await host.fusion({ role: "implement", task: "more long work", backend: "claude", background: true });
+		await claude.started();
+		await host.command("cancel run-2");
+		assert.deepEqual(host.notified.at(-1), { text: "run-2 cancelled", level: "info" });
+		await until("the completion notice", () => host.sent.length > 0);
+		const notice = host.sent[0]![0].content as string;
+		assert.match(notice, /^Background run run-2 \(implement\) cancelled\.\n\nimplement cancelled by the user\n\n\[run-2 · implement · /);
 	});
 });
 

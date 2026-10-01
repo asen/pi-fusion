@@ -187,6 +187,14 @@ export interface ChildRun<TRole> {
 	aborted: boolean;
 	stopReason?: string;
 	errorMessage?: string;
+	/**
+	 * What this run's ending left for a person to go and look at, in the backend's own fixed text: which parts of a
+	 * child's cleanup did not finish, and whether a directory of the call is still there. It is set only when there is
+	 * something to say — a run that ended cleanly carries none — and it is bounded by construction: a path, a thrown
+	 * value, the child's stderr and anything the child itself wrote are evidence where they are kept and reach none of
+	 * it. The lifecycle carries it whole and reads nothing out of it, so a backend that adds nothing changes nothing.
+	 */
+	cleanupNotice?: string;
 	stderr: string;
 }
 

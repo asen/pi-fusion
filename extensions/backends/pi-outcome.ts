@@ -175,6 +175,13 @@ export interface PiRunDiagnostic {
 export interface PiDisposal {
 	attempted: boolean;
 	failed: boolean;
+	/**
+	 * The third case, beside removed and attempted-and-failed: a removal nobody tried, because the ending left something
+	 * this host will not remove a directory under. It reads the same way to a person as one that failed — the directory
+	 * is still there — which is why it is on this record rather than re-derived: the caller that decided not to try is
+	 * the only one that knows it did not.
+	 */
+	retained?: boolean;
 }
 
 /** The demoted success: the work read back and the child's own ending did not, so no checkpoint is published. */
@@ -199,11 +206,13 @@ export const RUN_CANCELLED = "the run was cancelled before its pi child was star
 export const RUN_UNVERIFIED = "this host cannot say how the pi child's run ended";
 
 /**
- * What a cancelled run shows instead of the line it was cut off on. The host's own failure message reads a
- * cancelled run's activity and nothing else — no error message, no text — so a cancellation that left a child's
- * cleanup unfinished or a call's storage behind would otherwise say only that it was cancelled. The concern labels
- * are this module's own eight and the storage phrase is fixed, so what this composes is bounded by construction
- * and carries no path, no id and no value from anywhere.
+ * What heads the one line this module writes for a person to act on: the run's own `cleanupNotice`, which says which
+ * parts of a child's cleanup did not finish and whether the call's storage is still there. It is composed here and
+ * nowhere else, because two composers of one sentence would disagree: a cancelled run is shown its activity and
+ * nothing else by the host's own failure message, and a run the host itself cancelled is shown neither its activity
+ * nor its error message, so the field is what carries the fact through either path. The concern labels are this
+ * module's own eight and the storage phrase is fixed, so what this composes is bounded by construction and carries
+ * no path, no id and no value from anywhere.
  */
 export const CLEANUP_ATTENTION = "cleaning up needs attention";
 
@@ -473,6 +482,10 @@ function publishUsage(run: PiRun, result: PiTaskDone): void {
  * turn, never the checkpoint the turn produced; every other ending publishes whatever identity was verified before
  * it failed, with the live counts the stream left as they are, because that is all there is to report.
  *
+ * It is also the one composer of the run's `cleanupNotice`: every ending whose concerns or whose storage report leave
+ * something for a person to look at gets that one line, and every other ending carries none at all. A cancelled run
+ * shows it as its activity too, because that is the only field the host's own failure message reads for one.
+ *
  * The `_reportedDisposition` parameter is the caller's own record of the storage decision it made and is not read
  * here, for the reason `diagnose` gives, and is named apart from the module's own `disposition()` for the same one:
  * what this run reports is derived from the ending, so no disposition a caller holds can turn a demoted run into a
@@ -497,14 +510,21 @@ export function finishRun(run: PiRun, ended: PiEnded, _reportedDisposition: PiDi
 		run.stopReason = diagnostic.stopReason;
 		run.errorMessage = diagnostic.message;
 	}
-	// The one place a cancelled run can still say this: the host shows a cancelled run its activity and nothing
-	// else, so a cleanup that left something behind goes there or nowhere. A plain cancellation keeps whatever line
-	// the child was last on, because that is the useful thing to show for one.
+	// The one composition of that line, for every ending rather than for a cancelled one alone: what the cleanup left
+	// and a directory still on disk are worth saying whichever way the run ended, and a caller that wrote a second
+	// version of it would be a second authority on the same fact. The storage half covers both ways a directory
+	// stays — a removal that was tried and failed, and one this call decided not to try — because they read the same
+	// to whoever has to go and look at it.
 	const leftBehind = decided.disposition.concerns;
-	if (run.aborted && (leftBehind.length > 0 || disposal.failed)) {
-		const parts = [...(leftBehind.length === 0 ? [] : [leftBehind.join(", ")]), ...(disposal.failed ? [STORAGE_LEFT] : [])];
-		run.activity = `${CLEANUP_ATTENTION}: ${parts.join("; ")}`;
-	}
+	const storageLeft = disposal.failed || disposal.retained === true;
+	if (leftBehind.length > 0 || storageLeft) {
+		const parts = [...(leftBehind.length === 0 ? [] : [leftBehind.join(", ")]), ...(storageLeft ? [STORAGE_LEFT] : [])];
+		run.cleanupNotice = `${CLEANUP_ATTENTION}: ${parts.join("; ")}`;
+	} else delete run.cleanupNotice;
+	// And the one place a cancelled run says it for itself: the host shows such a run its activity and nothing else,
+	// so the same text goes there too. A plain cancellation keeps whatever line the child was last on, because that
+	// is the useful thing to show for one.
+	if (run.aborted && run.cleanupNotice !== undefined) run.activity = run.cleanupNotice;
 	if (ended.kind === "prepare") {
 		const refused = ended.refused;
 		if (refused.session !== undefined) publish(run, { session: refused.session, ...(refused.selection === undefined ? {} : { selection: refused.selection }) });

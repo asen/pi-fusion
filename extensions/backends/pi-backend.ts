@@ -4,7 +4,7 @@ import { fileURLToPath } from "node:url";
 import type { OwnedCleanup } from "../process-tree.ts";
 import type { PiRole } from "./pi-binding.ts";
 import { hostAgentDir } from "./pi-launch.ts";
-import { CLEANUP_ATTENTION, DISPOSE_FAILED, DISPOSE_WARNING, disposition, finishRun, newRun, type PiDisposal, type PiDisposition, type PiEnded, type PiPreparedIdentity, type PiRun, type PiSession, piSession, progressMapper, STORAGE_LEFT } from "./pi-outcome.ts";
+import { DISPOSE_FAILED, DISPOSE_WARNING, disposition, finishRun, newRun, type PiDisposal, type PiDisposition, type PiEnded, type PiPreparedIdentity, type PiRun, type PiSession, piSession, progressMapper } from "./pi-outcome.ts";
 import { type PiPrepareRequest, type PiPrepareResult, preparePiChild } from "./pi-prepare.ts";
 import { type PreparedCall, prepareCallStorage, type StorageRequest } from "./pi-storage.ts";
 import { PiSteerQueue, type PiTaskRequest, type PiTaskResult, runPiTask, taskObserver } from "./pi-task.ts";
@@ -32,8 +32,8 @@ import { type Backend, type ChildEvent, failed, type RunRequest, type SessionInt
  * start seam never entered there is definitely no child, so the storage goes; with it entered there may be one this
  * host was never handed, so the call ends `unverified` and the storage stays. That is conservative on purpose — a
  * seam that spawned nothing still leaves this host unable to say so. Retention is said out loud either way: a run
- * whose storage was kept carries `STORAGE_RETAINED` after its own diagnostic, and a cancelled one carries the same
- * fact in its activity line, because that line is the whole of what a person is shown for a cancelled run.
+ * whose storage was kept carries `STORAGE_RETAINED` after its own diagnostic, and the disposal this module reports for
+ * it says the directory stayed, which is what `pi-outcome.ts` composes the run's own `cleanupNotice` line out of.
  *
  * **One finalize, one report.** Every ending that has a run to report goes through `finalize`, which closes the steer
  * queue, decides the disposition once for the storage it may remove, finishes the record, adds the retention sentence
@@ -129,8 +129,11 @@ export interface PiBackendDeps {
 /** The contract as this install ships it: read where it lies, by name, with nothing resolved against a user path. */
 const readRoleContract = (name: string): string => readFileSync(path.join(PI_CONTRACTS_DIR, name), "utf8");
 
-/** Nothing attempted and nothing left behind, which is what every path that removes no storage reports. */
+/** Nothing attempted and nothing left behind, which is what every path with no storage of its own reports. */
 const NO_DISPOSAL: PiDisposal = { attempted: false, failed: false };
+
+/** A removal nobody tried, because the ending left a concern: the directory is still there, so it is reported as such. */
+const STORAGE_KEPT: PiDisposal = { attempted: false, failed: false, retained: true };
 
 /** The message a failure that has to be thrown from here carries, with the original's own text where it has one. */
 const composeFailure = (error: unknown): string => `${error instanceof Error ? error.message : CALL_NOT_COMPOSED} ${DISPOSE_FAILED}`;
@@ -174,37 +177,30 @@ async function runPiCall(request: RunRequest<PiRole, PiSession, PiSteerQueue>, d
 		report.ended = ended;
 		report.disposition = decided;
 		let disposal = NO_DISPOSAL;
-		if (storage !== undefined && decided.safe) {
-			let broke = false;
-			try {
-				storage.dispose();
-			} catch (error) {
-				broke = true;
-				if (report.storage !== undefined) report.storage.disposeError = { error };
-			}
-			if (report.storage !== undefined) {
-				report.storage.attempted = true;
-				report.storage.disposed = !broke;
-			}
-			disposal = { attempted: true, failed: broke };
+		if (storage !== undefined) {
+			if (decided.safe) {
+				let broke = false;
+				try {
+					storage.dispose();
+				} catch (error) {
+					broke = true;
+					if (report.storage !== undefined) report.storage.disposeError = { error };
+				}
+				if (report.storage !== undefined) {
+					report.storage.attempted = true;
+					report.storage.disposed = !broke;
+				}
+				disposal = { attempted: true, failed: broke };
+			} else disposal = STORAGE_KEPT;
 		}
 		const final = finishRun(run, ended, decided, disposal, now() - started);
-		// Storage kept is a decision this call made, so it is said rather than left implicit: after the diagnostic, which
-		// is what says why it was kept, and in the activity line as well for an aborted run, because a run shown its
-		// activity is shown nothing else. Both are fixed text — the concern names are a closed set of labels — and neither
-		// names the directory.
-		//
-		// The caveat that line carries, which this module cannot fix from here: `failureMessage` in the host reads
-		// `activity` for a run whose own signal aborted it, so an abort that came from the call itself does reach a
-		// person there; a run the host deliberately cancelled takes the host's own `cancelled` branch instead, which
-		// never looks at `activity`, so for that one this sentence is written and not shown. Task 8 owns that branch.
+		// Storage kept is a decision this call made, so it is said rather than left implicit: one more fixed sentence after
+		// the diagnostic, which is what says why it was kept, and never the directory's own path. The shorter line a
+		// person is shown for a cancelled run is not composed here: `finishRun` was told the directory stayed, through
+		// `retained` on the disposal above, and it is the one composer of the run's `cleanupNotice` and of the activity a
+		// cancelled run carries it in.
 		if (storage !== undefined && !decided.safe) {
 			final.errorMessage = final.errorMessage === undefined ? STORAGE_RETAINED : `${final.errorMessage} ${STORAGE_RETAINED}`;
-			// Composed from this caller's own facts rather than from whatever `finishRun` wrote: the concerns are the ones
-			// just decided and are never empty on this branch — an unsafe disposition is an unsafe disposition because it
-			// listed at least one — so the line is the same shape every time and nothing here reads or matches the text a
-			// module below it produced.
-			if (final.aborted) final.activity = `${CLEANUP_ATTENTION}: ${decided.concerns.join(", ")}; ${STORAGE_LEFT}`;
 		}
 		const message = final.errorMessage ?? (disposal.failed ? DISPOSE_WARNING : undefined);
 		emit({ type: "turn_result", ok: !failed(final), ...(message === undefined ? {} : { message }) });

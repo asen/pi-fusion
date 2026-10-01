@@ -735,7 +735,7 @@ export class RunStore {
 
 	finish(
 		id: string,
-		outcome: { status: Exclude<RunStatus, "running" | "waiting">; text?: string; failure?: string; snapshot?: RunProgress; files?: readonly ChangedFile[]; ref?: SessionRef },
+		outcome: { status: Exclude<RunStatus, "running" | "waiting">; text?: string; failure?: string; snapshot?: RunProgress; files?: readonly ChangedFile[]; ref?: SessionRef; clearActivity?: boolean },
 	): void {
 		const run = this.runs.get(cap(String(id)));
 		if (!run) return;
@@ -749,6 +749,10 @@ export class RunStore {
 		run.endedAt = at;
 		delete run.question;
 		if (outcome.snapshot) this.apply(run, outcome.snapshot);
+		// After the snapshot, because the snapshot is what would have set the line: a caller that already put what the
+		// ending left into this run's failure asks for the activity to go rather than say the same thing a second time.
+		// It is the caller's own instruction, internal to this host — nothing on the page or in a request reaches it.
+		if (outcome.clearActivity === true) delete run.activity;
 		const text = capBytes(String(outcome.text ?? ""), TEXT_CAP_BYTES);
 		run.text = text.text;
 		run.textTruncated = text.truncated;

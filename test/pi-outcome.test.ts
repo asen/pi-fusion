@@ -19,6 +19,7 @@ import {
 	PI_EVENT_TEXT_MAX_CHARS,
 	PI_UNTRUSTED_SESSION,
 	type PiConcern,
+	type PiDisposal,
 	type PiEnded,
 	type PiRun,
 	piSession,
@@ -154,12 +155,14 @@ const OUTCOME: PiQuestionOutcome = { id: "ui-1", question: SECRETS.question, end
 
 const SAFE = { attempted: true, failed: false };
 const LEFT_BEHIND = { attempted: true, failed: true };
+/** The third storage report: a removal nobody tried, which is what a caller makes of an ending it will not remove one under. */
+const RETAINED: PiDisposal = { attempted: false, failed: false, retained: true };
 
 /** An ending that happened, which is the only kind `diagnose` takes: a run that never started is `finishRun`'s own. */
 type Ended = Exclude<PiEnded, { kind: "none" }>;
 
 /** One ending's own disposition, so no case can hand `finishRun` a disposition its ending did not produce. */
-const finishedOf = (ended: PiEnded, disposal = SAFE, ms = 1_234): PiRun => finishRun(newRun(ROLE), ended, disposition(ended), disposal, ms);
+const finishedOf = (ended: PiEnded, disposal: PiDisposal = SAFE, ms = 1_234): PiRun => finishRun(newRun(ROLE), ended, disposition(ended), disposal, ms);
 
 /** What the record layer reads off a finished run, in the shape `recordDecision` takes one. */
 const outcomeOf = (run: PiRun) => ({
@@ -564,6 +567,54 @@ test("every other ending reports what was verified before it, and nothing it was
 	quiet.activity = "bash npm test";
 	finishRun(quiet, { kind: "none" }, disposition({ kind: "none" }), SAFE, 10);
 	assert.equal(failureMessage(quiet), "implement aborted while bash npm test");
+});
+
+test("what an ending left for a person is one line on the run, composed here alone and absent when there is nothing", () => {
+	const prepared = { session: SESSION, selection: SELECTION };
+	const bothHalves = `${CLEANUP_ATTENTION}: leftovers; ${STORAGE_LEFT}`;
+
+	// Nothing at all: a turn that read back whole on a child that let go, and a directory that was removed.
+	const settled: PiEnded = { kind: "task", result: doneOf(), prepared };
+	assert.equal(finishedOf(settled).cleanupNotice, undefined);
+	// A record that already carried one loses it, because the field is this ending's own answer and not a log.
+	const stale = newRun(ROLE);
+	stale.cleanupNotice = "left over from some other ending";
+	finishRun(stale, settled, disposition(settled), SAFE, 10);
+	assert.equal(Object.hasOwn(stale, "cleanupNotice"), false, "a clean ending leaves the key absent rather than stale or empty");
+
+	// The storage half alone: an ending that left no concern, whose removal was tried and threw.
+	assert.equal(finishedOf(settled, LEFT_BEHIND).cleanupNotice, `${CLEANUP_ATTENTION}: ${STORAGE_LEFT}`);
+
+	// Both halves, for a removal nobody tried: a cancellation onto a child that left a process behind. The directory
+	// reads the same to whoever has to look at it whether the removal failed or was never attempted.
+	const messyCancel: PiEnded = { kind: "task", result: refusedTaskOf({ reason: "aborted", exit: exitWithCleanup({ leftovers: [processOf(5)] }) }), prepared };
+	const cancelled = finishedOf(messyCancel, RETAINED);
+	assert.equal(cancelled.cleanupNotice, bothHalves);
+	assert.equal(cancelled.activity, bothHalves, "a cancelled run carries it as its activity too, because that is all the host shows for one");
+
+	// And the same line for an ending nobody cancelled: a demoted turn says it without being aborted, and the line
+	// its child was last on is left alone, because a run that failed is shown its own message instead.
+	const demoted: PiEnded = { kind: "task", result: doneOf({ exit: exitWithCleanup({ leftovers: [processOf(5)] }) }), prepared };
+	const working = newRun(ROLE);
+	working.activity = "bash npm test";
+	finishRun(working, demoted, disposition(demoted), RETAINED, 10);
+	assert.deepEqual([working.aborted, working.cleanupNotice, working.activity], [false, bothHalves, "bash npm test"]);
+
+	// It is this module's own labels and phrases and nothing else: every marker a refusal carried stays where it is.
+	const leaky = exitWithCleanup({ stdio: "held", skipped: [processOf(9)] }, { stderr: { serving: false, stageCount: 1, truncatedLines: 0, lines: 1, tail: SECRETS.stderr, dropped: 0 } });
+	const carrying: PiEnded = {
+		kind: "prepare",
+		refused: { ok: false, reason: "startup", error: SECRETS.error, shutdownError: SECRETS.shutdown, outcome: OUTCOME, session: { backend: "pi", sessionId: SESSION_ID, sessionFile: `/sessions/${SECRETS.path}/pi-1.jsonl` }, selection: SELECTION, exit: leaky },
+	};
+	const kept = finishedOf(carrying, RETAINED);
+	assert.equal(kept.cleanupNotice, `${CLEANUP_ATTENTION}: stdio-held, skipped; ${STORAGE_LEFT}`, "the concern labels in this module's own order");
+	for (const [where, run] of [
+		["a cancellation", cancelled],
+		["a demoted turn", working],
+		["a refusal that kept every value it had", kept],
+	] as const) {
+		noSecrets(run.cleanupNotice ?? "", `what ${where} left for a person to look at`);
+	}
 });
 
 test("the progress mapper counts inside its own window, bounds everything it shows and never throws back", () => {
