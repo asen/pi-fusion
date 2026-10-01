@@ -4,11 +4,12 @@ import type { BootstrapInput, BootstrapSession } from "./pi-launch.ts";
 /**
  * What `pi-bootstrap.mjs` exports, declared so a TypeScript caller and a test can use it without the bootstrap itself
  * needing a loader: the file that runs in the child stays plain ESM, and this is the only place its shape is typed.
+ * The two protocol constants are the exception, declared where they live and re-exported here exactly as the bootstrap
+ * re-exports them, so a caller reading them off either module reads one declaration.
  */
 
 export declare const BOOTSTRAP_INPUT_VERSION: number;
-export declare const STARTUP_EXIT_CODE: number;
-export declare const DIAGNOSTIC_EVENT: string;
+export { DIAGNOSTIC_EVENT, STARTUP_EXIT_CODE } from "./pi-bootstrap-protocol.mjs";
 export declare const SDK_PACKAGE: string;
 /** Pi's thinking levels, repeated in the plain-ESM bootstrap and asserted against the TypeScript side's own list. */
 export declare const THINKING_LEVELS: readonly string[];

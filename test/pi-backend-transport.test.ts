@@ -26,9 +26,11 @@ import { type ChildEvent, failed } from "../extensions/backends/types.ts";
  * search path. Everything the seam is handed otherwise travels through untouched, and the command the composition
  * handed in is asserted below to be that same `node`, so a launch that stopped being one fails this case rather than
  * being rewritten by it. What the seam is not evidence about is the default binding: the wrapper calls the real
- * `startPiChild` itself, so nothing here exercises the start production uses when no seam is passed. That no
- * production file of any extension this repository ships imports, constructs or registers this backend at all, and
- * the import boundaries around it, stay pinned by `test/pi-backend.test.ts`.
+ * `startPiChild` itself, so nothing here exercises the start production uses when no seam is passed. That
+ * `extensions/fusion.ts` is the one production file that constructs this backend, and the import boundaries around
+ * it, stay pinned by `test/pi-backend.test.ts`; that no case of the suite ever reaches a line of that registered
+ * backend — `test/tripwire.ts` stands in its place in every host but two, and in those two the binding refuses the
+ * pi call for having no model before that backend is asked for anything — stays pinned by `test/backends.test.ts`.
  */
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");

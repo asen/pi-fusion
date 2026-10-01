@@ -533,7 +533,9 @@ The mutated guard copy is only ever reachable from the disposable root and only 
 - **Fixture-simulated caller behaviour.** `piRole`, `prepareCallStorage`, `bootstrapInput`, `writeCallInput`, `piLaunch` and
   the bootstrap are production; the process that calls them, the RPC framing this harness speaks and every
   handshake are the harness's. Fusion's own transport, records, history, dashboard, questions, steering,
-  cancellation and process cleanup are **not** exercised, and no Pi backend is registered.
+  cancellation and process cleanup are **not** exercised, and no Pi backend is registered. That last clause is true of
+  this dated round and of this harness, which registers nothing; it is **superseded as a statement about the build** by
+  task 8.3, where `extensions/fusion.ts` registers the Pi backend. Nothing this round measured changes with it.
 - **Injected network behaviour.** Every model and catalog response came from a loopback HTTP fixture, including the
   canary model and the `last-modified`/`etag` validators that make the cache warm. That says what the installed SDK
   does with those fields, not what the real catalog service returns. No live or paid provider request and no real

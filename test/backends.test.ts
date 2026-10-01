@@ -33,6 +33,17 @@ const modulesNamedIn = (source: string): string[] => ts.preProcessFile(source, t
 
 const dependenciesOf = (name: string): string[] => modulesNamedIn(fs.readFileSync(path.join(repoRoot, "extensions", name), "utf8"));
 
+/**
+ * Every host-side production module of every extension this repository ships: the TypeScript ones, with declarations
+ * left out, because a `.d.mts` naming a module is a type reference rather than something a process imports. The plain
+ * ESM beside them is the child's own program and the modules it is composed of, which run in a child and not here.
+ */
+const productionModules = (dir = path.join(repoRoot, "extensions")): string[] =>
+	fs
+		.readdirSync(dir, { recursive: true, withFileTypes: true })
+		.filter((entry) => entry.isFile() && /\.(m|c)?ts$/.test(entry.name) && !/\.d\.(m|c)?ts$/.test(entry.name))
+		.map((entry) => path.join(entry.parentPath, entry.name));
+
 /** Fails to compile once the adapter's mode and the host's list of ask modes are no longer the same two values. */
 type Exactly<A, B> = [A] extends [B] ? ([B] extends [A] ? true : never) : never;
 const MODE_STAYS_ASK_MODE: Exactly<NonNullable<Role["mode"]>, AskMode> = true;
@@ -85,6 +96,126 @@ test("the pi storage layout depends on node itself, so a path is composed before
 	const names = dependenciesOf("backends/pi-storage.ts");
 	assert.ok(names.length > 0, "the storage layout does its own file work, so it names node's own modules");
 	for (const name of names) assert.match(name, /^node:/, `the storage layout must name no host, no backend and no SDK; it names ${names.join(", ")}`);
+});
+
+test("the program a Pi child runs is the child's alone, and the host reads the two protocol constants from a module that imports nothing", () => {
+	// The host extension reaches the transport through the pi backend, so whatever the transport names is loaded in this
+	// host's own process. What reading the two constants off the bootstrap cost was the dependency itself: the host
+	// evaluated the child's entry module, so an install missing that program was a module error at import time instead
+	// of the fixed existence refusal the loader composes for it by name. It is not a claim about the modules behind
+	// that entry — the host imports `pi-control-extension.mjs` and `pi-question-tool.mjs` through the restore and the
+	// launch anyway — nor about the public SDK, which the child's own program loads when it runs.
+	assert.deepEqual(dependenciesOf("backends/pi-bootstrap-protocol.mjs"), [], "the shared protocol constants must stand on their own, so a host pays nothing to read them");
+	const transport = dependenciesOf("backends/pi-transport.ts");
+	assert.ok(transport.includes("./pi-bootstrap-protocol.mjs"), `the transport must read the diagnostic marker and the startup exit code from the protocol module; it names ${transport.join(", ")}`);
+	assert.ok(!transport.includes("./pi-bootstrap.mjs"), "the transport must not import the program a child runs");
+	// And no other host module either, through any form a reference takes. `extensions/backends/pi-launch.ts` still
+	// names that file, as the path it composes for a launch rather than a module it imports, which is exactly the
+	// difference the compiler's own scanner reads and a pattern over the text would not.
+	for (const file of productionModules()) {
+		const named = modulesNamedIn(fs.readFileSync(file, "utf8"));
+		assert.ok(
+			!named.some((name) => name.endsWith("pi-bootstrap.mjs")),
+			`${relative(file)} imports the program a Pi child runs, which belongs in the child; the host reads what it shares with it from ./pi-bootstrap-protocol.mjs`,
+		);
+	}
+	const launch = fs.readFileSync(path.join(repoRoot, "extensions", "backends", "pi-launch.ts"), "utf8");
+	assert.ok(launch.includes('"pi-bootstrap.mjs"'), "the launch module no longer names the child's program as a path, so the audit above is reading files that never mention it");
+	assert.deepEqual(modulesNamedIn(launch).filter((name) => name.endsWith("pi-bootstrap.mjs")), [], "and it names it as that path alone");
+});
+
+/**
+ * Every test file the audit below reads, walked rather than listed: a registration written in a file one directory
+ * down would be outside `test/*.test.ts`, which is where the runner looks, and still a registration. `test/spikes`
+ * is left out by name, because those are manual harnesses that run no case of this suite, and anything that is not
+ * a `.test.ts` is left out with them. The order is the walk's own, so the pins below can be written in it.
+ */
+function testFiles(dir = path.join(repoRoot, "test")): string[] {
+	const found: string[] = [];
+	for (const item of fs.readdirSync(dir, { withFileTypes: true }).sort((a, b) => (a.name < b.name ? -1 : 1))) {
+		const at = path.join(dir, item.name);
+		if (item.isDirectory()) {
+			if (item.name !== "spikes") found.push(...testFiles(at));
+		} else if (item.name.endsWith(".test.ts")) found.push(at);
+	}
+	return found;
+}
+
+/** A path as the pins below name one, so a walk on Windows reads back the same as a walk here. */
+const relative = (file: string): string => path.relative(repoRoot, file).split(path.sep).join("/");
+
+/**
+ * Every registration of the Fusion extension in one file, as the source text of the whole call: a call of the default
+ * export of `extensions/fusion.ts`, under whatever name that file imported it as, found through the compiler's own
+ * parser rather than a pattern over the text. That is what makes it robust to the forms a registration actually
+ * takes — a call that spans lines or sits inside a helper comes back whole, an import is no call at all, and a
+ * `host.fusion(...)` of a test's own helper is a property access rather than this.
+ *
+ * What it does not see, said plainly: it follows the default import and nothing else. A file that reached the
+ * extension through a namespace import, a re-export, a dynamic import or a reference passed around as a value would
+ * register one this finds no call for. That is why the population below is pinned as well as the markers — a
+ * detector that stopped seeing the registrations that are there fails on the counts instead of passing silently.
+ */
+function fusionRegistrations(source: string): string[] {
+	const file = ts.createSourceFile("registration.ts", source, ts.ScriptTarget.Latest, true);
+	let local: string | undefined;
+	for (const statement of file.statements) {
+		if (!ts.isImportDeclaration(statement)) continue;
+		const from = statement.moduleSpecifier;
+		if (!ts.isStringLiteral(from) || !from.text.endsWith("extensions/fusion.ts")) continue;
+		const name = statement.importClause?.name;
+		if (name) local = name.text;
+	}
+	if (local === undefined) return [];
+	const calls: string[] = [];
+	const visit = (node: ts.Node): void => {
+		if (ts.isCallExpression(node) && ts.isIdentifier(node.expression) && node.expression.text === local) calls.push(node.getText(file));
+		ts.forEachChild(node, visit);
+	};
+	visit(file);
+	return calls;
+}
+
+/**
+ * Where the suite registers the extension today, and how often in each place. It is pinned, not counted, for two
+ * reasons: a registration that appears somewhere new is a decision somebody should make on purpose, and a detector
+ * that quietly stopped finding the calls that are there would otherwise pass this whole audit with nothing to check.
+ */
+const REGISTRATIONS: Record<string, number> = {
+	"test/control.test.ts": 1,
+	"test/extension.test.ts": 4,
+	"test/lifecycle.test.ts": 1,
+	"test/routing.test.ts": 2,
+	"test/session.test.ts": 1,
+};
+const REGISTRATIONS_TOTAL = 9;
+
+test("every Fusion registration in the suite names the backends it takes, and the registrations are the ones pinned here", () => {
+	// A registration that names neither marker would run with the pi backend this build registers, which is a real
+	// harness: a case that routed to it would start a child instead of failing in a way a test can read. So every
+	// registration has to say which of the two it is, and a bare one that somebody adds later fails here.
+	const TRIPWIRE = "piTripwire";
+	const DEFAULTS = "productionDefaults";
+	const defaults: string[] = [];
+	const counted: Record<string, number> = {};
+	for (const file of testFiles()) {
+		const where = relative(file);
+		for (const call of fusionRegistrations(fs.readFileSync(file, "utf8"))) {
+			counted[where] = (counted[where] ?? 0) + 1;
+			const tripwire = call.includes(TRIPWIRE);
+			const production = call.includes(DEFAULTS);
+			assert.ok(tripwire || production, `${where} registers the extension without naming ${TRIPWIRE} or ${DEFAULTS}: ${call}`);
+			assert.ok(!(tripwire && production), `${where} registers the extension naming both ${TRIPWIRE} and ${DEFAULTS}, which cannot both be what it takes: ${call}`);
+			if (production) defaults.push(where);
+		}
+	}
+	assert.deepEqual(counted, REGISTRATIONS, "the suite registers the extension somewhere new, or the detector above stopped seeing a registration that is still there");
+	assert.equal(
+		Object.values(counted).reduce((all, one) => all + one, 0),
+		REGISTRATIONS_TOTAL,
+		"the total is pinned beside the map so a count moved from one file to another still has to be looked at",
+	);
+	assert.deepEqual(defaults, ["test/extension.test.ts", "test/routing.test.ts"], "exactly two cases read this build's own pi registration, and every other one keeps the tripwire in its place");
 });
 
 test("a pi model is a provider and a model id split at the first slash, so a provider's own slashes survive", () => {

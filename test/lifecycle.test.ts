@@ -10,6 +10,7 @@ import type { BackendName, HostBackend, SessionIntent } from "../extensions/back
 import fusion from "../extensions/fusion.ts";
 import { History, type HistoryRecord } from "../extensions/history.ts";
 import { type FakeBackend, fakeBackend, type FakeScript } from "./fake-pi-backend.ts";
+import { piTripwire } from "./tripwire.ts";
 
 /**
  * The shared run lifecycle, driven end to end against backends injected in memory: the registered tools, the host
@@ -91,7 +92,9 @@ function makeHost(options: HostOptions = {}) {
 		sendMessage: (message: unknown, opts: unknown) => sent.push([message, opts]),
 		registerMessageRenderer: () => {},
 	} as unknown as ExtensionAPI;
-	fusion(api, options.backends ? { backends: options.backends } : {});
+	// The tripwire under whatever the case registered: a host here that named only claude still gets no pi backend it
+	// could run, and a case that injects one of its own puts it over this.
+	fusion(api, { backends: { ...piTripwire(), ...options.backends } });
 	const sessionManager: Record<string, unknown> = { getSessionId: () => options.sessionId ?? "host-1", getBranch: () => branch };
 	if (options.sessionFile !== undefined) sessionManager.getSessionFile = () => options.sessionFile;
 	const editors: Array<{ title: string; prefill?: string }> = [];

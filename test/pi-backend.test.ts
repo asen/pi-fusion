@@ -31,7 +31,8 @@ import { recordDecision } from "../extensions/fusion.ts";
  * starts a Pi child, speaks the native protocol, builds a session, reaches a provider, runs a model or sends a paid
  * request: every answer a child gives below is a literal written here, and the two host seams a real call would read —
  * the SDK's own agent-directory accessor and this install's contract files — are injected in every run, so neither is
- * ever reached. Nothing in production constructs this backend either, so none of it is reachable by a user.
+ * ever reached. One production file constructs this backend, the host extension that registers it, and the last case
+ * below reads out of the source that it is still the only one.
  *
  * The one real thing is the local filesystem: the ordinary cases prepare their call storage the way production does,
  * under a root each case owns and removes, so a directory that is disposed of or left behind is one that was really
@@ -774,7 +775,7 @@ test("everything in front of the child throws rather than reporting a run, and a
 	assert.deepEqual([bothReport.storage?.attempted, bothReport.storage?.disposed], [true, false]);
 });
 
-test("the host's own callbacks cannot change what a call reports, and nothing in this build constructs this backend", async (t) => {
+test("the host's own callbacks cannot change what a call reports, and the host extension is the one file that constructs this backend", async (t) => {
 	// Every callback a host passes, throwing, and the run is the same run. Each is counted before it throws, so what
 	// this reads is that they were called rather than that a throw was swallowed somewhere.
 	const counted = { progress: 0, events: 0, reports: 0 };
@@ -865,10 +866,23 @@ test("the host's own callbacks cannot change what a call reports, and nothing in
 	for (const specifier of specifiers) assert.ok(specifier.startsWith(".") || specifier.startsWith("node:"), `a package specifier would be a way to an sdk, and this one is ${specifier}`);
 	assert.equal(/\bimport\s*\(/.test(source), false, "and it reaches for nothing dynamically either");
 
-	// And nothing constructs it: no production file names this module at all.
+	// And one production file constructs it: the host extension, which registers this build's pi backend beside the
+	// claude one. Every other module of every extension this repository ships still names it nowhere, so the one way a
+	// call reaches a line of it is that registration.
 	assert.deepEqual(
 		productionFiles().filter((file) => fs.readFileSync(file, "utf8").includes("pi-backend")),
-		[],
-		"the pi backend is registered nowhere, so no production file imports it",
+		[path.join(EXTENSIONS_DIR, "fusion.ts")],
+		"the pi backend is constructed by the host extension and named by no other production file",
 	);
+
+	/*
+	 * The default start binding, read out of the source because nothing anywhere executes it. Every case in this file
+	 * injects a `start` seam, `test/pi-backend-transport.test.ts` injects one that calls the real `startPiChild`
+	 * itself, and the manual spike wraps it the same way, so no test of any kind — suite or manual — takes the
+	 * expression below. A static read is therefore the whole of what qualifies it: it says the production default is
+	 * still `startPiChild` and that there is exactly one place the choice is made, and nothing about that choice ever
+	 * having been exercised.
+	 */
+	const defaultStart = "(deps.start ?? startPiChild)(options)";
+	assert.equal(source.split(defaultStart).length - 1, 1, `the default start binding must be chosen in exactly one place, as ${defaultStart}`);
 });

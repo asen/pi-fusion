@@ -8,8 +8,11 @@ import { fileURLToPath } from "node:url";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { visibleWidth } from "@earendil-works/pi-tui";
 import { CARD_REPORT_LINES } from "../extensions/cards.ts";
+import { PI_ROLE_NAMES, piRole } from "../extensions/backends/pi-binding.ts";
 import { PI_CHILD_MARKER, PI_CHILD_VARIABLE } from "../extensions/backends/pi-launch.ts";
 import fusion from "../extensions/fusion.ts";
+import { fakeBackend } from "./fake-pi-backend.ts";
+import { PI_SELECTION_VARIABLES, piTripwire, productionDefaults } from "./tripwire.ts";
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 process.env.PI_FUSION_CLAUDE_BIN = path.join(repoRoot, "test", "fake-claude.mjs");
@@ -74,7 +77,9 @@ const api = {
 	},
 } as unknown as ExtensionAPI;
 
-fusion(api);
+// The tripwire in place of the pi backend this build registers: nothing in this file runs a pi child, and the one case
+// that reads the production registration makes its own below.
+fusion(api, { backends: { ...piTripwire() } });
 
 const ctx = {
 	cwd: repoRoot,
@@ -317,6 +322,104 @@ test("the fusion tool advertises the same roles, a backend and every backend's e
 	}
 });
 
+/** What one registration advertised and appended. The case below makes two of its own beside this file's. */
+interface RecordedHost {
+	tools: Map<string, RegisteredTool>;
+	entries: number;
+}
+
+const recordedHost = (): { into: RecordedHost; api: ExtensionAPI } => {
+	const into: RecordedHost = { tools: new Map(), entries: 0 };
+	const api = {
+		registerTool: (tool: RegisteredTool) => into.tools.set(tool.name, tool),
+		registerCommand: () => {},
+		on: () => {},
+		appendEntry: () => {
+			into.entries++;
+		},
+		registerMessageRenderer: () => {},
+	} as unknown as ExtensionAPI;
+	return { into, api };
+};
+
+test("the fusion tool says which harness runs what, and the pi backend it registers binds a call before anything starts", async () => {
+	const fusionTool = byName("fusion");
+	// The generic tool no longer advertises one harness: it names the default, the roles the pi backend runs, where a
+	// pi selection comes from and that a call with none is refused. The compatibility tool stays Claude's own.
+	assert.doesNotMatch(fusionTool.description, /claude backend only/);
+	assert.doesNotMatch(fusionTool.description, /no configuration makes one available here/);
+	assert.match(fusionTool.description, /backend pi runs plan, implement and ask on the user's own Pi provider configuration/);
+	assert.match(fusionTool.description, /PI_FUSION_PI_<ROLE>_MODEL/);
+	assert.match(fusionTool.description, /a provider and a model id, such as deepseek\/deepseek-chat/);
+	assert.match(fusionTool.description, /refused before anything starts/);
+	assert.match(fusionTool.description, /role ultracode runs on the claude backend alone/);
+	assert.match(fusionTool.description, /leave backend unset unless the user asks for pi/);
+	// Pi's tools are Pi's own, so the generic tool says what each pi role actually has rather than letting the claude
+	// lists above stand for them. What the sentence promises is read back out of it and compared with the lists the
+	// binding itself builds, rather than pinned as a second copy of them: a tool added to or taken from a pi role
+	// fails here instead of leaving the help text saying what the roles used to run with.
+	const piTools = (role: string): string[] => piRole({ role, model: "deepseek/deepseek-chat" }, undefined, {} as NodeJS.ProcessEnv).tools;
+	const named = (prose: string): string[] =>
+		prose
+			.split(/,\s*|\s+and\s+/)
+			.map((tool) => tool.trim())
+			.filter((tool) => tool !== "");
+	const promised = /roles plan and implement run with (.+?), role ask runs with (.+?) and has no web search or web fetch tool at all/.exec(fusionTool.description);
+	assert.ok(promised, `the fusion description no longer says what the pi roles run with: ${fusionTool.description}`);
+	assert.deepEqual(named(promised[1]), piTools("plan"), "the plan and implement sentence promises another tool list than the pi binding builds");
+	assert.deepEqual(piTools("implement"), piTools("plan"), "and that sentence says one list for both of them");
+	assert.deepEqual(named(promised[2]), piTools("ask"), "the ask sentence promises another tool list than the pi binding builds");
+	// Said directly beside the parse, because it is the limitation a caller gets wrong: whatever the prose calls them,
+	// no web tool of any name is in what a pi ask child runs with.
+	assert.deepEqual(piTools("ask").filter((tool) => /web|fetch|search/i.test(tool)), [], "a pi ask role must have no web search or web fetch tool at all");
+	assert.deepEqual([...PI_ROLE_NAMES].sort(), ["ask", "implement", "plan"], "the sentence accounts for three pi roles, so a fourth this build binds has to be written into it");
+	assert.match(fusionTool.description, /every pi role also gets ask_orchestrator/);
+	assert.doesNotMatch(byName("claude").description, /find and ls/, "the compatibility tool advertises claude's own tools and no pi list");
+	const backendParameter = fusionTool.parameters.properties.backend.description as string;
+	assert.match(backendParameter, /claude, which runs every role and is what a call that leaves this unset gets/);
+	assert.match(backendParameter, /pi, which runs plan, implement and ask/);
+	assert.ok(
+		(fusionTool.promptGuidelines ?? []).some((guideline) => /backend parameter/.test(guideline) && /leave backend unset otherwise/.test(guideline)),
+		"no fusion guideline says where the harness the user named goes",
+	);
+	assert.doesNotMatch(byName("claude").description, /\bbackend\b/, "the compatibility tool advertises no backend and says nothing about one");
+
+	// One of exactly two registrations in the suite that take the production defaults on purpose, the pi backend this
+	// build registers included and no tripwire over it. With nothing configured for any pi role, an explicit pi call is
+	// refused by the binding before that backend is asked for a session, a control or a run: no child of any harness is
+	// started and nothing is recorded. All six variables a pi role could resolve a model from are deleted first, and
+	// `productionDefaults` refuses the registration outright if one of them is still set, so the refusal below is the
+	// binding's own and never this process's environment.
+	const kept = PI_SELECTION_VARIABLES.map((name) => [name, process.env[name]] as const);
+	for (const [name] of kept) delete process.env[name];
+	try {
+		const defaults = recordedHost();
+		fusion(defaults.api, productionDefaults());
+		const defaultFusion = defaults.into.tools.get("fusion");
+		assert.ok(defaultFusion, "the production-default registration advertises no fusion tool");
+		await assert.rejects(defaultFusion.execute("call-1", { role: "implement", task: "x", backend: "pi" }, undefined, undefined, ctx), {
+			message:
+				"role implement has no model for the pi backend: set PI_FUSION_PI_IMPLEMENT_MODEL to a provider and a model id, such as deepseek/deepseek-chat, or name one in the call's model parameter. The pi backend has no default model and resolves none for you",
+		});
+		assert.equal(defaults.into.entries, 0, "a call the binding refused records nothing");
+	} finally {
+		for (const [name, value] of kept) if (value !== undefined) process.env[name] = value;
+	}
+
+	// And a host that registers a backend of its own in place of the default runs one explicit pi call through the same
+	// lifecycle. The fake is in-memory and starts nothing: no pi child, process, protocol or provider is behind it.
+	const fake = fakeBackend();
+	const injected = recordedHost();
+	fusion(injected.api, { backends: { ...piTripwire(), pi: fake.backend } });
+	const injectedFusion = injected.into.tools.get("fusion");
+	assert.ok(injectedFusion, "the registration that injected a pi backend advertises no fusion tool");
+	const ran = await injectedFusion.execute("call-1", { role: "implement", task: "do the pi thing", backend: "pi", model: "deepseek/deepseek-chat" }, undefined, undefined, ctx);
+	assert.match(ran.content[0]!.text, /^## Changed\nfoo\.ts/);
+	assert.equal(fake.starts.length, 1, "one explicit pi call starts exactly one child on the backend the host registered");
+	assert.deepEqual([fake.starts[0]!.role.name, fake.starts[0]!.role.model], ["implement", "deepseek/deepseek-chat"]);
+	assert.equal(injected.into.entries, 1, "and that run recorded its own handle");
+});
+
 test("every prompt guideline names the tool that carries it, and together they name every role", () => {
 	for (const [tool, control] of [
 		["fusion", "fusion_control"],
@@ -396,7 +499,9 @@ test("a marked pi child registers nothing at all, and any other value registers 
 		if (marker === undefined) delete process.env[PI_CHILD_VARIABLE];
 		else process.env[PI_CHILD_VARIABLE] = marker;
 		try {
-			fusion(recorder);
+			// What is registered is what this case reads, so the tripwire stands in for the pi backend here too: nothing
+			// below runs a call, and a registration that took the production one would still be one more of them.
+			fusion(recorder, { backends: { ...piTripwire() } });
 		} finally {
 			if (before === undefined) delete process.env[PI_CHILD_VARIABLE];
 			else process.env[PI_CHILD_VARIABLE] = before;
@@ -411,6 +516,35 @@ test("a marked pi child registers nothing at all, and any other value registers 
 	for (const marker of ["", "1", "claude", "PI", "pi ", "0"]) {
 		assert.deepEqual(registered(marker), host, `marker ${JSON.stringify(marker)} changed what the extension registers, and only the pi marker means anything`);
 	}
+});
+
+test("the loader refuses a child, a missing contract and a missing bootstrap in that order, before it builds the pi backend", () => {
+	// A static read of the source and no more. It says the four are written in this order; it does not run the loader
+	// with a file missing, and nothing in this suite removes a contract or the bootstrap from this repository to watch
+	// one throw. A smoke of a real install with one of them gone stays a manual check.
+	// The third of them is only reachable because no module of this host imports the program a child runs, which is
+	// `test/backends.test.ts`'s own static read: while one did, an install missing that program failed as node's module
+	// error at import time instead of here. A missing source of this host's own still fails that way, and the two
+	// constants the transport shares with a child are in one of them, `backends/pi-bootstrap-protocol.mjs`.
+	const source = fs.readFileSync(path.join(repoRoot, "extensions", "fusion.ts"), "utf8");
+	const MISSING_BOOTSTRAP = "throw new Error(`pi-fusion: missing pi bootstrap ${PI_BOOTSTRAP_PATH}`)";
+	const steps = [
+		["the child marker guard", 'if (process.env.PI_FUSION_CHILD === "pi") return;'],
+		["the contract validation", "if (!fs.existsSync(contract)) throw new Error(`pi-fusion: missing contract ${contract}`);"],
+		["the bootstrap validation", `if (!fs.existsSync(PI_BOOTSTRAP_PATH)) ${MISSING_BOOTSTRAP};`],
+		["the pi backend registration", "hostBackend(createPiBackend())"],
+	] as const;
+	const found = steps.map(([what, snippet]) => {
+		const at = source.indexOf(snippet);
+		assert.notEqual(at, -1, `${what} is no longer written in extensions/fusion.ts as ${snippet}`);
+		return [what, at] as const;
+	});
+	for (const [index, [what, at]] of found.entries()) {
+		if (index === 0) continue;
+		const [earlier, position] = found[index - 1]!;
+		assert.ok(position < at, `${what} is written before ${earlier}, and each of these must refuse a broken install before the next one costs anything`);
+	}
+	assert.equal(source.split(MISSING_BOOTSTRAP).length - 1, 1, "the missing-bootstrap refusal must be written in exactly one place, or one of them can drift");
 });
 
 test("the contracts carry the escalation and route sections the tool promises", () => {

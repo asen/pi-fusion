@@ -7,6 +7,7 @@ import { fileURLToPath } from "node:url";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import fusion, { nextSession, runRecords } from "../extensions/fusion.ts";
 import { planContextPct, planProblems } from "../extensions/handoff.ts";
+import { piTripwire } from "./tripwire.ts";
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 process.env.PI_FUSION_CLAUDE_BIN = path.join(repoRoot, "test", "fake-claude.mjs");
@@ -52,7 +53,8 @@ function makeExtension(): Extension {
 		},
 		registerMessageRenderer: () => {},
 	} as unknown as ExtensionAPI;
-	fusion(api);
+	// Nothing here runs a pi child, so the tripwire stands where this build registers its pi backend.
+	fusion(api, { backends: { ...piTripwire() } });
 	return ext;
 }
 

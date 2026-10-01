@@ -20,7 +20,9 @@ import {
 	type Role,
 	runChild,
 } from "./backends/claude.ts";
+import { createPiBackend } from "./backends/pi-backend.ts";
 import { piParams, piRole } from "./backends/pi-binding.ts";
+import { PI_BOOTSTRAP_PATH } from "./backends/pi-launch.ts";
 import {
 	type Ask,
 	BACKEND_NAMES,
@@ -1088,13 +1090,20 @@ const guidelines = (tool: string, control: string): string[] => [
 	`Report to the user which ${tool} roles you used and why, what role plan agreed when it ran, what role implement or role ultracode changed and how it was verified, and what role ultracode's review found; summarize rather than pasting the child reports verbatim.`,
 ];
 
+/**
+ * The one guideline the compatibility tool cannot carry, because it advertises no backend parameter at all: which
+ * harness a run goes to is the user's to name, so the tool that takes that name is the only one told where it goes.
+ */
+const backendGuideline = (tool: string): string =>
+	`When the user names the harness a task is to run on, pass that name in ${tool}'s backend parameter; leave backend unset otherwise, which runs the role on this build's default harness. A harness the role does not run on is refused before anything starts.`;
+
 /** A plain string enum: some providers reject the anyOf of consts that a union of literals becomes. */
 const stringEnum = <T extends readonly string[]>(values: T, description: string) =>
 	Type.Unsafe<T[number]>({ type: "string", enum: [...values], description });
 
-/** What this build of pi-fusion can run: the backends a host registers on top of the Claude one it always has. */
+/** What this build of pi-fusion can run: the backends a host registers over the Claude and Pi ones it always has. */
 export interface FusionOptions {
-	/** The backends this runtime runs a child in, merged over the Claude backend. Nothing reads this from the user. */
+	/** The backends this runtime runs a child in, merged over this build's own. Nothing reads this from the user. */
 	backends?: Partial<Record<BackendName, HostBackend>>;
 }
 
@@ -1109,11 +1118,25 @@ export default function fusion(pi: ExtensionAPI, options: FusionOptions = {}) {
 		const contract = path.join(CONTRACTS_DIR, name);
 		if (!fs.existsSync(contract)) throw new Error(`pi-fusion: missing contract ${contract}`);
 	}
+	// Every Pi child is launched by running this one program, which ships beside the module that names it. An install
+	// missing it could still route a call to Pi and would only find out once a child was being started, so it is read
+	// here, beside the contracts and for the same reason: a backend this host cannot launch is a broken install.
+	// Nothing in this host imports that program, which is what leaves this a refusal of its own: the two constants the
+	// transport shares with a child come from `backends/pi-bootstrap-protocol.mjs` instead, so an absent child program
+	// is caught here, after the contracts, rather than as node's own module error before a line of this ran. That
+	// protocol module is not this check's business — it is one of this host's own sources, and an install missing one
+	// of those cannot load this extension at all. What is checked is that one entry file and nothing else, and the
+	// modules it imports are not all the child's: `pi-control-extension.mjs` reaches this host through
+	// `backends/pi-session-restore.ts` and `pi-question-tool.mjs` through `backends/pi-launch.ts`, so an install
+	// missing either fails as a module error of this host's own before `fusion()` runs at all. `pi-helper-retry.mjs`
+	// is the one that is the child's alone: an install missing it passes this check and fails when the child starts.
+	if (!fs.existsSync(PI_BOOTSTRAP_PATH)) throw new Error(`pi-fusion: missing pi bootstrap ${PI_BOOTSTRAP_PATH}`);
 
 	/**
-	 * The harnesses this runtime can run a child in. The Claude backend is always one of them; another is registered
-	 * here or nowhere, never named by a variable or a call. A backend nobody registered is still recognized by records
-	 * and by routing, so a call that would go there is refused with what happened instead of read as a Claude run.
+	 * The harnesses this runtime can run a child in: the Claude backend and the Pi one, both this build's own, with a
+	 * host's own registration over either of them. Nothing reads a backend from the user, and a backend this build
+	 * knows and a host left out is still recognized by records and by routing, so a call that would go there is
+	 * refused with what happened instead of read as a Claude run.
 	 */
 	// A backend is reached by the name it is registered under, and it tags every record and every run with the name it
 	// calls itself. Those two disagreeing would run a child on one backend and record it as another, so a registration
@@ -1123,13 +1146,25 @@ export default function fusion(pi: ExtensionAPI, options: FusionOptions = {}) {
 		if (!isBackendName(key)) throw new Error(`pi-fusion: ${shown(key)} is not a backend this build knows; use one of ${BACKEND_NAMES.join(", ")}`);
 		if (registered.name !== key) throw new Error(`pi-fusion: the backend registered as ${key} calls itself ${shown(registered.name)}; a backend must be registered under its own name`);
 	}
-	const backends: Partial<Record<BackendName, HostBackend>> = { claude: hostBackend(claudeBackend), ...options.backends };
+	// Constructing a Pi backend takes nothing: the factory reads no file, resolves no path and starts nothing, so a host
+	// that never delegates to Pi pays for this line and no more.
+	const backends: Partial<Record<BackendName, HostBackend>> = { claude: hostBackend(claudeBackend), pi: hostBackend(createPiBackend()), ...options.backends };
 
 	/** Why a routed call goes nowhere: its backend is one this build knows and does not run, and nothing has started. */
 	const unavailable = (backend: BackendName, what: string, continued: boolean): string => {
-		const available = Object.keys(backends).join(", ");
+		// A key a host overrode with nothing is a backend it left out, not one it registered, so it is not offered here.
+		// The test is truthiness rather than `!== undefined` on purpose: the types say the only way to leave a backend
+		// out is `undefined`, but a host that is not compiled against them can pass `null`, and a null backend offered
+		// as somewhere to take the work would be a lie that the next call turns into a crash.
+		const names = Object.entries(backends).filter(([, registered]) => registered).map(([name]) => name);
+		const why = `the ${backend} backend is not available in this build: ${what}, `;
+		// A host that registered nothing at all has nowhere to send the work. Composing the ordinary sentence around an
+		// empty list would say "runs  only" and "Take the work to  with a role it runs", so it is replaced rather than
+		// filled in: the whole of what can be said is that nothing here runs this.
+		if (names.length === 0) return `${why}and this pi-fusion runs no backend at all. Nothing was started and nothing was recorded. Nothing can run this here; no configuration makes ${backend} available here.`;
+		const available = names.join(", ");
 		const instead = continued ? `Read what that run reported and start a new run on ${available}` : `Take the work to ${available} with a role it runs, or do it yourself`;
-		return `the ${backend} backend is not available in this build: ${what}, and this pi-fusion runs ${available} only. Nothing was started and nothing was recorded. ${instead}; no configuration makes ${backend} available here.`;
+		return `${why}and this pi-fusion runs ${available} only. Nothing was started and nothing was recorded. ${instead}; no configuration makes ${backend} available here.`;
 	};
 
 	const store = new RunStore();
@@ -2378,9 +2413,9 @@ export default function fusion(pi: ExtensionAPI, options: FusionOptions = {}) {
 		executionMode: "sequential",
 		label: "Fusion",
 		description:
-			"Delegate work to a child: a headless coding session in this working directory, run through one of this build's backends. The role picks the job. plan: Claude Fable, which can read the code, run commands and write scratch files, challenges a goal and your proposed plan and consolidates it into an agreed, numbered task list with acceptance criteria. A plan call continues the last plan run of the backend it routes to, so follow-ups can refer to the earlier agreement, until that run's context passes its cap, when the call starts a fresh plan run carrying the agreed plan and says so; fresh starts a new plan run. implement: Claude Opus implements one clear, bounded task with full tools and reports what changed and how it was verified. If the task needs a broader scope or a design decision, it stops and reports under Escalation instead of widening the task. ultracode: Claude Fable in Claude Code with ultracode on orchestrates Claude Opus 5 agents at xhigh effort, one agent at a time, to implement, verify and review a task, several tasks in dependency order, or a whole agreed plan. It is slower and costlier than implement, and it runs on the claude backend only. ask: Claude Opus with read-only tools (Read, Bash, Grep, Glob, WebSearch, WebFetch) answers a question about the code with file and line references, or with mode review gives an independent review of a change, findings ranked by severity. It has no Edit or Write, and its contract forbids changing files through Bash. This build runs children on the claude backend only: leave backend unset, because a call naming another backend is refused before anything starts and no configuration makes one available here. The parameter stays, because a record and a route still name the backend a run went to. Every run gets a handle such as run-3, shown in the stats line. continue with a handle sends the task as a follow-up to that run: the child keeps its context from the run's last successful call, across a resume of this session, /tree and forks, and stays on the backend it ran on. A new run has not seen this conversation, so its task must be self-contained. Calls run one at a time: Pi serializes any turn that contains one. Returns the child's report, or with background true the handle at once and the report later as a message; manage a background run with fusion_control. If the child asks a question, the call returns the question at once and the run waits in the background until you answer it with fusion_control message. Only one run that can change files is active at a time, waiting included; ask runs can go next to it. The claude tool is this same delegation forced to the claude backend, kept for compatibility, and fusion_control and claude_control both act on every run.",
+			"Delegate work to a child: a headless coding session in this working directory, run through one of this build's backends. The role picks the job. plan: Claude Fable, which can read the code, run commands and write scratch files, challenges a goal and your proposed plan and consolidates it into an agreed, numbered task list with acceptance criteria. A plan call continues the last plan run of the backend it routes to, so follow-ups can refer to the earlier agreement, until that run's context passes its cap, when the call starts a fresh plan run carrying the agreed plan and says so; fresh starts a new plan run. implement: Claude Opus implements one clear, bounded task with full tools and reports what changed and how it was verified. If the task needs a broader scope or a design decision, it stops and reports under Escalation instead of widening the task. ultracode: Claude Fable in Claude Code with ultracode on orchestrates Claude Opus 5 agents at xhigh effort, one agent at a time, to implement, verify and review a task, several tasks in dependency order, or a whole agreed plan. It is slower and costlier than implement. ask: Claude Opus with read-only tools (Read, Bash, Grep, Glob, WebSearch, WebFetch) answers a question about the code with file and line references, or with mode review gives an independent review of a change, findings ranked by severity. It has no Edit or Write, and its contract forbids changing files through Bash. backend picks the harness a child runs in, and the claude models above are what every role runs as when a call names no backend: leave backend unset unless the user asks for pi. backend pi runs plan, implement and ask on the user's own Pi provider configuration, under the same contracts as the claude roles; role ultracode runs on the claude backend alone. On pi the tools are Pi's own and are not the claude lists above: roles plan and implement run with read, bash, edit, write, grep, find and ls, role ask runs with read, bash, grep, find and ls and has no web search or web fetch tool at all, and every pi role also gets ask_orchestrator, which is how a pi child asks you a question. A pi call's model is a provider and a model id, such as deepseek/deepseek-chat, taken from the call's model parameter, then the selection the run it continues actually ran with, then PI_FUSION_PI_<ROLE>_MODEL for that role; a pi call with none of those is refused before anything starts, because nothing here resolves a pi model for you. Every run gets a handle such as run-3, shown in the stats line. continue with a handle sends the task as a follow-up to that run: the child keeps its context from the run's last successful call, across a resume of this session, /tree and forks, and stays on the backend it ran on. A new run has not seen this conversation, so its task must be self-contained. Calls run one at a time: Pi serializes any turn that contains one. Returns the child's report, or with background true the handle at once and the report later as a message; manage a background run with fusion_control. If the child asks a question, the call returns the question at once and the run waits in the background until you answer it with fusion_control message. Only one run that can change files is active at a time, waiting included; ask runs can go next to it. The claude tool is this same delegation forced to the claude backend, kept for compatibility, and fusion_control and claude_control both act on every run.",
 		promptSnippet: "Delegate planning (plan), bounded implementation (implement), complex, high-risk implementation (ultracode) or read-only questions and reviews (ask) to a coding child",
-		promptGuidelines: guidelines(TOOL_NAME, CONTROL_TOOL_NAME),
+		promptGuidelines: [...guidelines(TOOL_NAME, CONTROL_TOOL_NAME), backendGuideline(TOOL_NAME)],
 		parameters: Type.Object({
 			role: Type.Optional(stringEnum(ROLE_NAMES, "plan, implement, ultracode or ask. Required unless continue is set.")),
 			task: Type.String({
@@ -2392,7 +2427,7 @@ export default function fusion(pi: ExtensionAPI, options: FusionOptions = {}) {
 			background: Type.Optional(Type.Boolean({ description: "Return at once with the run's handle and let the run go on; you get its report as a message when it ends. Default false." })),
 			fresh: Type.Optional(Type.Boolean({ description: "plan only, not with continue: start a new plan run instead of continuing the last one." })),
 			mode: Type.Optional(stringEnum(ASK_MODES, "ask only: answer (default) for a question, review for an independent review of a change. A continued ask run keeps its mode unless this names another.")),
-			backend: Type.Optional(stringEnum(BACKEND_NAMES, "The harness the child runs in. Leave it unset: this build runs claude only and refuses a call that names another backend. With continue it must name the backend that run is on, if it names one at all.")),
+			backend: Type.Optional(stringEnum(BACKEND_NAMES, "The harness the child runs in: claude, which runs every role and is what a call that leaves this unset gets, or pi, which runs plan, implement and ask on the user's own Pi provider configuration and needs a provider and model id from the call's model parameter or PI_FUSION_PI_<ROLE>_MODEL. Name pi only when the user asks for it. With continue it must name the backend that run is on, if it names one at all.")),
 			model: Type.Optional(Type.String({ description: "A model instead of the role's default: on the claude backend a Claude Code alias or id, for implement and ask only; on the pi backend a provider and model id such as deepseek/deepseek-chat, which every pi role takes." })),
 			effort: Type.Optional(stringEnum(FUSION_EFFORTS, "The child's effort instead of the role's default, for plan, implement and ask: low, medium, high, xhigh or max on the claude backend, and any of these pi thinking levels on the pi backend.")),
 		}),

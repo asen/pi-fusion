@@ -1,6 +1,7 @@
 import { accessSync, constants, readFileSync, realpathSync, statSync } from "node:fs";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
+import { DIAGNOSTIC_EVENT, STARTUP_EXIT_CODE } from "./pi-bootstrap-protocol.mjs";
 import { CONTROL_COMMANDS, CONTROL_EXTENSION_PATH, controlExtension } from "./pi-control-extension.mjs";
 import { HELPER_UNAVAILABLE, withHelperRetry } from "./pi-helper-retry.mjs";
 import { QUESTION_TOOL_NAME, questionTool } from "./pi-question-tool.mjs";
@@ -27,11 +28,13 @@ import { QUESTION_TOOL_NAME, questionTool } from "./pi-question-tool.mjs";
 /** The input shape this bootstrap reads. It has to match `BOOTSTRAP_INPUT_VERSION` in `pi-launch.ts`. */
 export const BOOTSTRAP_INPUT_VERSION = 1;
 
-/** What the process exits with when it could not start at all: a configuration failure, in sysexits terms. */
-export const STARTUP_EXIT_CODE = 78;
-
-/** How a diagnostic line says who wrote it, so a transport reading stderr can tell it from a child's own output. */
-export const DIAGNOSTIC_EVENT = "pi-fusion-bootstrap";
+/**
+ * What the process exits with when it could not start, and how a diagnostic line says who wrote it. Both are
+ * `./pi-bootstrap-protocol.mjs`'s own, because the host's transport reads them to recognize a stage line and a startup
+ * refusal and must be able to do that without loading this program. They are re-exported here because this is where
+ * every caller has read them so far, so one file holds the values and both spellings of the import still work.
+ */
+export { DIAGNOSTIC_EVENT, STARTUP_EXIT_CODE };
 
 export const SDK_PACKAGE = "@earendil-works/pi-coding-agent";
 

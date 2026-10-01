@@ -9,11 +9,11 @@ The Pi model that talks with the user and decides which work to hand off.
 _Avoid_: orchestrator, main model, parent
 
 **Child**:
-A headless coding session that does work the host handed off. In this build every child is a Claude Code session.
+A headless coding session that does work the host handed off: a Claude Code session, or a Pi session when the call names the `pi` backend.
 _Avoid_: subagent, worker, delegate
 
 **Backend**:
-The harness a child runs in, named in every record and route: `claude`, and `pi`, which records and routing know and which no child runs in this build. A backend owns its own session shape, model binding and stream; the host owns handles, records and scheduling.
+The harness a child runs in, named in every record and route: `claude` and `pi`, both registered in this build. A call that names no backend runs on `claude`, which runs every role; `pi` runs `plan`, `implement` and `ask`, on the user's own Pi provider configuration. A fresh Pi run is one a call asked for by name, and a continuation stays on the backend its record names, `pi` included, whether or not the call names one. A backend owns its own session shape, model binding and stream; the host owns handles, records and scheduling.
 _Avoid_: adapter, provider, harness, runtime
 
 **Role**:

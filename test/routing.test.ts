@@ -11,6 +11,7 @@ import { hostBackend } from "../extensions/backends/types.ts";
 import fusion, { claudeCall, claudeRoute, type FusionParams, fusionCall, fusionRoute, ROLE_NAMES, roleFor, type RunRecords, runRecords } from "../extensions/fusion.ts";
 import { KNOWN_ROLE_NAMES, roleSpec } from "../extensions/roles.ts";
 import { History } from "../extensions/history.ts";
+import { PI_SELECTION_VARIABLES, piTripwire, productionDefaults } from "./tripwire.ts";
 
 const tempDirs: string[] = [];
 after(() => {
@@ -308,7 +309,8 @@ interface Extension {
 	appended: Array<[string, any]>;
 }
 
-function makeExtension(backends?: Partial<Record<"claude" | "pi", HostBackend>>): Extension {
+/** The recording host one registration is made on, built apart so each of the two registrations below is one line. */
+function recorder(): { ext: Extension; api: ExtensionAPI } {
 	const ext: Extension = { tools: new Map(), commands: new Map(), appended: [] };
 	const api = {
 		registerTool: (tool: any) => ext.tools.set(tool.name, tool),
@@ -317,9 +319,26 @@ function makeExtension(backends?: Partial<Record<"claude" | "pi", HostBackend>>)
 		appendEntry: (customType: string, data: unknown) => ext.appended.push([customType, data]),
 		registerMessageRenderer: () => {},
 	} as unknown as ExtensionAPI;
-	fusion(api, backends ? { backends } : {});
-	return ext;
+	return { ext, api };
 }
+
+/**
+ * The extension as every case here registers it: the tripwire in place of the pi backend this build registers by
+ * default, with the backends the case named over it. A case that wants the defaults themselves says so with
+ * `defaultExtension`, and there is exactly one of those in this file.
+ */
+const makeExtension = (backends: Partial<Record<"claude" | "pi", HostBackend>> = {}): Extension => {
+	const { ext, api } = recorder();
+	fusion(api, { backends: { ...piTripwire(), ...backends } });
+	return ext;
+};
+
+/** The extension exactly as a host with no backends of its own gets it, this build's own pi backend included. */
+const defaultExtension = (): Extension => {
+	const { ext, api } = recorder();
+	fusion(api, productionDefaults());
+	return ext;
+};
 
 /** A host whose notices the test reads, which is where /fusion says what it found. */
 const makeCtx = (branch: unknown[] = [], sessionId = "host-1") => {
@@ -481,28 +500,61 @@ test("a blank pi model or effort the call names is refused, and no recorded or c
 	assert.throws(() => fusionRoute({ role: "implement", task: "x", effort: " " }, records()), /^Error: unknown effort  ; use one of low, medium, high, xhigh, max$/);
 });
 
-test("a backend this build does not run is refused before a handle, a snapshot, a child or an entry", async () => {
-	process.env.PI_FUSION_PI_IMPLEMENT_MODEL = "deepseek/deepseek-chat";
+test("the pi backend this build registers is reached through its binding, which refuses a call nothing configured a model for", async () => {
+	// One of exactly two registrations in the suite that take the production defaults on purpose, with the tripwire left
+	// out: what this case reads is that registration itself. No child may start here, and nothing stops one but the
+	// binding, so all six variables a pi role could resolve a model from are deleted first — `productionDefaults` refuses
+	// the registration outright if one is still set. The refusal below is then the binding's own and not this process's
+	// environment, and it lands before the backend is asked for a session, a control or a run.
+	const kept = PI_SELECTION_VARIABLES.map((name) => [name, process.env[name]] as const);
+	for (const [name] of kept) delete process.env[name];
 	try {
-		const ext = makeExtension();
+		const ext = defaultExtension();
 		const refused = await call(ext, "fusion", { role: "implement", task: "do the thing", backend: "pi" }, makeCtx());
-		assert.match(refused.error ?? "", /the pi backend is not available in this build/i);
-		assert.match(refused.error ?? "", /Nothing was started and nothing was recorded/);
+		assert.equal(
+			refused.error,
+			"role implement has no model for the pi backend: set PI_FUSION_PI_IMPLEMENT_MODEL to a provider and a model id, such as deepseek/deepseek-chat, or name one in the call's model parameter. The pi backend has no default model and resolves none for you",
+		);
+		assert.doesNotMatch(refused.error ?? "", /not available in this build/, "the backend is registered now, so an unconfigured call is refused by the binding rather than by availability");
 		assert.deepEqual(ext.appended, [], "a refused call records nothing");
 		// The handle was not taken either: the next call is still run-1.
 		const ran = await call(ext, "fusion", { role: "implement", task: "do it here" }, makeCtx());
 		assert.equal(ran.error, undefined);
 		assert.equal((ext.appended[0]![1] as { run: string }).run, "run-1");
 	} finally {
-		delete process.env.PI_FUSION_PI_IMPLEMENT_MODEL;
+		for (const [name, value] of kept) if (value !== undefined) process.env[name] = value;
 	}
 });
 
-test("an unavailable backend is refused without asking the user to configure it", async () => {
-	const ext = makeExtension();
+test("a backend a host left out is refused without asking the user to configure it", async () => {
+	// An explicit undefined over this build's own default, which is the one way a host registers no pi backend at all.
+	const ext = makeExtension({ pi: undefined });
 	const refused = await call(ext, "fusion", { role: "implement", task: "x", backend: "pi" }, makeCtx());
+	assert.match(refused.error ?? "", /the pi backend is not available in this build/i);
+	assert.match(refused.error ?? "", /Nothing was started and nothing was recorded/);
+	assert.match(refused.error ?? "", /this pi-fusion runs claude only/, "a key overridden with nothing is not a backend to take the work to");
 	assert.doesNotMatch(refused.error ?? "", /PI_FUSION_PI_/, "a backend that runs nowhere is never a configuration problem");
 	assert.match(refused.error ?? "", /no configuration makes pi available here/);
+	// Whole, so the list of harnesses that are left is pinned as well: the backend the host left out is not in it.
+	assert.equal(
+		refused.error,
+		"the pi backend is not available in this build: run-1 would run role implement on it, and this pi-fusion runs claude only. Nothing was started and nothing was recorded. Take the work to claude with a role it runs, or do it yourself; no configuration makes pi available here.",
+	);
+	assert.deepEqual(ext.appended, [], "a refused call records nothing");
+});
+
+test("a host that left out every backend says so, rather than offering an empty list of harnesses", async () => {
+	// Both keys overridden with nothing, which is a host that registered no backend at all. The sentence that names
+	// where the work goes instead has nowhere to point, so it is replaced rather than composed around an empty list.
+	const ext = makeExtension({ claude: undefined, pi: undefined });
+	const refused = await call(ext, "fusion", { role: "implement", task: "x" }, makeCtx());
+	assert.equal(
+		refused.error,
+		"the claude backend is not available in this build: run-1 would run role implement on it, and this pi-fusion runs no backend at all. Nothing was started and nothing was recorded. Nothing can run this here; no configuration makes claude available here.",
+	);
+	assert.doesNotMatch(refused.error ?? "", /runs {2}only/, "an empty list must never read as a harness this build runs");
+	assert.doesNotMatch(refused.error ?? "", /to {2}with/, "nor as somewhere to take the work to");
+	assert.deepEqual(ext.appended, [], "a refused call records nothing");
 });
 
 test("both control tools act on a run either tool started", async () => {

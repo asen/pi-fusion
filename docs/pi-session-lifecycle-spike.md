@@ -14,18 +14,20 @@ children instead of a bootstrap this file generates. The three added on 2026-10-
 native question and cancellation evidence the earlier two could not give: a question of the child's own answered
 through the host's callback, a question held until the run's own cancellation reached it, and a mid-turn cancellation
 onto a live shell tool with a detached `setsid` descendant. This document changes no runtime code and proposes no
-product behaviour. No Pi backend is registered in
-`extensions/fusion.ts` and no production file constructs one, so this harness's `production` group is the only
-code outside the suite that builds the composition at all, and nothing here claims a user can reach it.
+product behaviour. `extensions/fusion.ts` has registered the same composition this harness drives since task 8.3,
+so a user does reach it — through that registration, never through anything on this page — while this
+harness's `production` group remains the only code outside the suite that constructs it. Everything here stays a
+measurement of that composition against real children rather than a statement of product behaviour, and
+[docs/pi-backend-plan.md](pi-backend-plan.md)'s task 8.3 paragraph is the current status of the registration.
 
 Findings are marked **measured** (this spike ran it against Pi 0.85.1), **source** (read in the installed Pi, not
 executed here) or **untested** (neither). One more label has no counterpart in the configuration-write spike:
 **simulated Fusion policy**, and it belongs to the ten generated-bootstrap cases alone. The record rules of
 `extensions/fusion.ts` (`nextSession`, `recordRun`, fixed by `test/session.test.ts`) are not something those ten
-cases can call, and the unregistered Pi composition that now maps a run into a record takes no part in them
-either, so an in-harness ledger re-implements them and prints every decision it makes as a
-simulation. In those ten, only the Pi side is measured: what a restore contains, what a fork contains, what goes
-out on the wire, what a failure leaves behind, what a cancellation reaches. Where the two disagree this page says
+cases can call, and the Pi composition that maps a run into a record — registered in `extensions/fusion.ts` since
+task 8.3 — takes no part in them either, so an in-harness ledger re-implements them and prints every decision it
+makes as a simulation. In those ten, only the Pi side is measured: what a restore contains, what a fork contains,
+what goes out on the wire, what a failure leaves behind, what a cancellation reaches. Where the two disagree this page says
 so, and in one place they do. The five `production` cases simulate nothing and the ledger takes no part in them:
 what a run there publishes is `extensions/backends/pi-outcome.ts`'s own answer, read back as the run, the call
 report and the events a monitor saw.
@@ -164,20 +166,24 @@ from the full runs this page's Verification section records, not from any earlie
 
 Fifteen of fifteen are measured passes, and the harness prints `15/15 selected rows are measured passes`. That
 holds for the current source, task 8.2's three native cases included: the host executed it once on 2026-10-01,
-`--case production` at `5/5` and the full harness at `15/15`, both exit 0, and the current round of the
-Verification section below records that execution and its root. The `2/2` and `12/12` of the two earlier rounds are
-kept there as the results of the revisions that preceded it. Several claims *inside* those rows are not measurements,
+`--case production` at `5/5` and the full harness at `15/15`, both exit 0, and the Verification section below
+records that execution and its root as task 8.2's round. The production group alone was then rerun once more, on
+2026-10-01 against the same composition `extensions/fusion.ts` now registers — which this harness constructs
+itself rather than routing a call through that registration — at `5/5` and exit 0 from a root of its
+own; that rerun is the current round of the Verification section, and the **full fifteen-case matrix stays task
+8.2's run and was not repeated with it**. The `2/2` and `12/12` of the two earlier rounds are
+kept there as the results of the revisions that preceded them. Several claims *inside* those rows are not measurements,
 and a passing row must not be read as covering them:
 
 | Row | Claim | Status | Reason |
 | --- | --- | --- | --- |
-| 1, 2, 3, 4 | every record decision the ledger makes | simulated Fusion policy | the ledger re-implements `nextSession` and `recordRun` and labels each line; it takes no part in the two production rows, where the outcome is the backend's own |
+| 1, 2, 3, 4 | every record decision the ledger makes | simulated Fusion policy | the ledger re-implements `nextSession` and `recordRun` and labels each line; it takes no part in the five production rows, where the outcome is the backend's own |
 | production | the actual leaf a native navigation to a user target leaves behind | source | the refusal stops the child before the harness can ask it where its leaf is, so "the parent of that entry" is read from 0.85.1's source and not from this child |
-| production | a checkpoint that is a `custom_message` or a session label, and a branch with no thinking-level entry | not run | reaching the first two would mean naming an extension resource no role in this build names, and the third a hand-fabricated transcript; the exact-leaf gate's behaviour for all three stays unmeasured |
+| production | a checkpoint that is a `custom_message` or a session label, and a branch with no thinking-level entry | not run | reaching the first two would mean naming an extension resource no role in this build names, and the third a hand-fabricated transcript; the exact-leaf gate's behaviour for all three stays unmeasured, and each is a documented limit of the registered build rather than a gate on it: a continuation of one proceeds only on exact identity, file and leaf readbacks and is refused otherwise, and whether one could satisfy them is unmeasured |
 | 2 | `/tree` stays refused while a run is unfinished | unproven | there is no host in the harness; only the record *selection* a `/tree` move makes can be simulated, and its effect on the child measured |
 | 3 | a forked host gets its own child session on first use | simulated Fusion policy | the fork's measured half is its content; the first-use rule needs a host |
 | 3 | the fork id the record should carry | measured incompatible | Pi allocates the id itself, see row 3 below |
-| 4 | what a record with no checkpoint should mean for Fusion | measured; the Fusion rule is user-approved policy | Pi's behaviour is measured here; the rule that a Pi record with no trusted checkpoint fails closed is approved product policy, recorded in the plan, and implemented in the unregistered backend composition — no registered backend applies it for a user, because no backend is registered |
+| 4 | what a record with no checkpoint should mean for Fusion | measured; the Fusion rule is user-approved policy | Pi's behaviour is measured here; the rule that a Pi record with no trusted checkpoint fails closed is approved product policy, recorded in the plan, and implemented in the backend composition `extensions/fusion.ts` has registered since task 8.3, which is what applies it for a user; what this harness measures is Pi's own behaviour and never that application |
 | 4 | the guard that refuses to submit a task after a cancelled operation | simulated Fusion policy | the guard is a harness function; what is measured is that Pi reported the cancellation and that no request and no durable write followed |
 | 6 | Pi's own `SIGTERM` and `SIGHUP` cleanup path | source | `killTrackedDetachedChildren` is registered by `runRpcMode` for those signals and is itself a group kill; not exercised here |
 | 7 | manual compaction | not used | manual compact is no evidence about automatic ordering, so the case drives the automatic threshold and overflow paths instead |
@@ -480,7 +486,12 @@ ignores a user-level context file. This agrees with the configuration-write spik
 
 The first two cases were measured 2026-09-30 and re-executed once on the review-corrected source on 2026-10-01;
 task 8.2's three — the answered question, the question held into a cancellation, and the cancellation onto a
-detached descendant — were measured on 2026-10-01. Pi 0.85.1 on node v24.18.0, Linux throughout. The five cases of
+detached descendant — were measured on 2026-10-01. The whole group was then rerun once, also on 2026-10-01 and
+against the same composition `extensions/fusion.ts` has registered since task 8.3, constructed here rather than
+reached through that registration: `--case production` exit 0 at `5/5`
+from the owned root `/tmp/pi-fusion-task8-register-final-M7IaEn` under a sanitized environment with an exact
+`PI_OFFLINE=1`, 265 lines on stdout and nothing on stderr. The **full fifteen-case matrix stays task 8.2's run**
+and was not part of that rerun. Pi 0.85.1 on node v24.18.0, Linux throughout. The five cases of
 this group build `createPiBackend` and
 drive the production storage layout, the call input, `extensions/backends/pi-bootstrap.mjs`, the control
 extension, the transport, the preparation, the session restore, the question routing, the task turn, the outcome
@@ -614,10 +625,18 @@ inside the child and every role's metadata in this build names none, so manufact
 being measured; a branch that carries no thinking-level entry, which would need a hand-fabricated transcript when
 this group only reads transcripts a real child wrote; a fork whose session file is not on disk when the host
 looks, which production never reaches here because the forked turn wrote its own; and the leaf a native
-navigation to a user target leaves behind. Beyond those four: a question answered by a real user rather than by the
+navigation to a user target leaves behind. Those four are **documented limits of the registered build rather than
+gates on it**: a continuation there proceeds only once the session identity, the session file and the leaf read
+back exactly as recorded, with no fallback and no repair, so an instance of one of those shapes that fails those
+readbacks is refused with the exact-leaf gate's own reason instead of continuing on a leaf nobody has measured,
+while whether an instance of one could satisfy them is unmeasured; what stays unmeasured costs a continuation a
+refusal and nothing worse. Beyond those four:
+a question answered by a real user rather than by the
 host's callback, and a second question competing with a first, are not run; the cancellations measured here are the
 run's own, so an operation an extension cancelled still runs only on a generated child in
-`row4-cancelled-operations`; no host-wired Pi run exists to exercise, because none does; and Linux with this one
+`row4-cancelled-operations`; no host-wired Pi run is exercised here, though `extensions/fusion.ts` has registered
+this composition since task 8.3, so what this group leaves out is the host's own surface rather than a backend
+nobody could reach; and Linux with this one
 loopback fixture is the whole of the platform and provider coverage, the detached-descendant case included, which
 needs `/proc` and that literal `setsid` path and reports itself unproven without them.
 
@@ -677,9 +696,10 @@ things against a real child, not a change to any row's own label.
 - **The production group is a composition measurement, not a product one.** It shows that `createPiBackend`
   drives a real child through a new session, a current-leaf resume, an older-checkpoint navigation and an exact
   fork, refuses a user-message checkpoint, carries one question to an answer, and cancels a run both while a
-  question is held and mid-turn with a detached descendant to clean up. It says nothing about a registered backend:
-  no host wiring, no `fusion` tool call, no card, history or dashboard label and no default registration is
-  exercised by it, the question is answered by a callback the harness injects rather than by a user, and its start
+  question is held and mid-turn with a detached descendant to clean up. It says nothing about what the task 8.3
+  registration then does with that composition: no host wiring, no `fusion` tool call, no card, history or
+  dashboard label and not the default registration itself is exercised by it, the question is answered by a
+  callback the harness injects rather than by a user, and its start
   seam is the harness's own wrapper rather than the binding a real call would take. Four more seams are the harness's own
   as well — the host agent directory, the contract prose, the composed environment and the `onCall` report — so
   what it measures is the composition under those five injections and not a call as a host would make one.
@@ -708,8 +728,9 @@ These are decisions, not missing measurements, unless the entry says otherwise.
 
 The first three have since been decided by the user, as product policy rather than as anything this spike measured.
 They are recorded under "Recovery and identity transport" in [docs/pi-backend-plan.md](pi-backend-plan.md); the
-backend composition the production group drives now carries them, no registered backend exists to apply them for
-a user, and no measurement on this page changed. The entries after them are still open.
+backend composition the production group drives carries them, and since task 8.3 `extensions/fusion.ts` registers
+that composition, so they do apply for a user; no measurement on this page changed, and none of it is evidence
+about that application. The entries after them are still open.
 
 - **What a record with no checkpoint means for a Pi child.** The measurement is in: reopening a failed new call's
   session whole replays the failed prompt and produces two consecutive user messages. **Settled, user-approved
@@ -750,11 +771,14 @@ a user, and no measurement on this page changed. The entries after them are stil
 **This section records the historical step-1 gate exactly as it was given, and it is not current implementation
 status.** The go decision and its five conditions below are kept unchanged as the gate this spike closed; where a
 sentence of theirs described work as still to be done, it is now marked as what was true when the gate was
-written. Current status lives in [docs/pi-backend-plan.md](pi-backend-plan.md), whose task 7 paragraph is
-authoritative: steps 2 and 3 are complete, and step 4's transport, restore, question routing, preparation, task
-turn, outcome mapping and backend composition are implemented and unregistered. Pi is still disabled, no
-production file constructs a backend, and task 8's host wiring remains, as do the native gates this page still
-names; task 8.2's native question and cancellation evidence is the current round of the Verification section below.
+written. Current status lives in [docs/pi-backend-plan.md](pi-backend-plan.md), whose **task 8.3 paragraph is the
+authoritative one**: steps 1 to 4 are complete, `extensions/fusion.ts` registers the Pi backend beside the Claude
+one, and `plan`, `implement` and `ask` run on Pi for a call that names it, on the user's own provider
+configuration. The restore shapes this page still names as unmeasured are accepted limits of that build rather
+than gates on it: a continuation proceeds only on exact identity, file and leaf readbacks, with no fallback and no
+repair, and one that fails them is refused. What remains is steps 5 and 6 — `security` execution and the user-configured
+live DeepSeek smoke run. Task 8.2's native question and cancellation evidence and the production group's rerun
+against the registered composition are the Verification section's two most recent rounds below.
 
 **Go.** Implementation step 1 of the plan is complete: the configuration-write spike chose the execution shape and
 this spike measured the session semantics that step's gate named. Every case is a measured pass, no case failed
@@ -799,13 +823,56 @@ ownership strategy, identity-safe late signals, cleanup after a normal exit as w
 `clear_queue`-before-`abort` shutdown ordering, and the guard this harness only simulates: a Pi adapter has to
 refuse a cancelled navigation or fork itself, before any task prompt. That last one no longer has no code behind
 it: `extensions/backends/pi-session-restore.ts` accepts a restore only on a non-cancelled result and a verified
-postcondition, and `extensions/backends/pi-task.ts` sends no task prompt otherwise, both inside the unregistered
-composition the production group drives. What is still owed for it is native evidence of a *cancelled* navigation
-or fork through that composition, which no case in the production group runs, and the host wiring of task 8.
+postcondition, and `extensions/backends/pi-task.ts` sends no task prompt otherwise, both inside the composition
+the production group drives, which `extensions/fusion.ts` has registered since task 8.3. What is still owed for it
+is native evidence of a *cancelled* navigation or fork through that composition, which no case in the production
+group runs; task 8's host wiring is no longer owed, because it landed in 8.3.
 
 ## Verification
 
-### 2026-10-01, the current round: task 8.2's three native cases, verified after the review corrections
+### 2026-10-01, the current round: the production group rerun against the registered composition (task 8.3)
+
+Task 8.3 registered this composition in `extensions/fusion.ts` — the host's own wiring, defaults and user-facing
+documentation, none of it this harness's — and moved the two constants both ends of a child's wire agree on into
+the import-free `extensions/backends/pi-bootstrap-protocol.mjs`, which the child's program imports and re-exports
+and which the transport reads instead of that program. Nothing in this harness changed for any of it, so this
+round is a rerun of unchanged harness source against the composition as the host now registers it.
+
+Run on 2026-10-01 against Pi 0.85.1 on node v24.18.0, Linux, in the foreground, on direct Node under a sanitized
+`env -i` with `PATH` alone copied, the locale as a literal `C.UTF-8`, `umask 077`, owned `HOME`, temporary, XDG,
+cache and working directories, and no provider variable or real credential anywhere in it, in the owned root
+`/tmp/pi-fusion-task8-register-final-M7IaEn`.
+
+- `--case production`: exit **0**, `5/5 selected rows are measured passes`, **265 lines on stdout and nothing on
+  stderr**. Every production child's composed environment carried `PI_OFFLINE=1`, that value and no other, which
+  is this harness's own hard pre-launch refusal. What it reaches, stated exactly: this harness constructs and
+  drives **the same production composition `extensions/fusion.ts` now registers**, through `createPiBackend` and
+  its own five injected seams, so the protocol split between this host and the child's program and the
+  bootstrap's re-export of those two constants are exercised in it — while **no call was routed through
+  `fusion.ts` or that default registration**, and the default start binding is **still not dynamically
+  qualified**, because the start seam injected here calls the production `startPiChild` itself.
+- **The full fifteen-case matrix was not rerun here.** The `15/15` this page reports stays task 8.2's run, in the
+  round below; this round is the five-case `production` selection and nothing else.
+- The network shape, stated exactly and no wider: the scripted loopback fixture was the only model endpoint
+  configured, no call composed a catalog base url, and no paid inference was anywhere in it. None of that is a
+  network sandbox — this round had **no fetch guard and no egress boundary**, and it watched nothing about what a
+  child's process opened.
+- What this round does not cover: any macOS or Windows matrix, any live provider or paid call, any dynamic
+  qualification of the default start binding, and any host-wired `fusion` tool call, card, history or dashboard
+  label, since this harness drives the composition directly rather than through the host's surface. The host's own
+  verification of the registration — its typecheck, its focused sets, and its two complete suite attempts, whose
+  only failures were unchanged `test/browser.test.ts` timing cases that found no row to click, so **no green full
+  suite is claimed** — is recorded in the task 8.3 paragraph of
+  [docs/pi-backend-plan.md](pi-backend-plan.md) rather than here.
+- The four unmeasured restore shapes this page names — a `custom_message` or session-label checkpoint, a branch
+  with no thinking-level entry, a deferred empty fork whose session file is not yet on disk, and the actual leaf a
+  user-target navigation leaves behind — are untouched by this round and are **documented limits of the registered
+  build rather than gates on it**: a continuation proceeds only on exact identity, file and leaf readbacks, with no
+  fallback and no repair, so an instance of one of them that fails those readbacks is refused with the exact-leaf
+  gate's own reason, and whether one could satisfy them is unmeasured. The bounded
+  spawn-to-handoff interrupt window stays open, and the five injected seams are unchanged.
+
+### 2026-10-01, task 8.2's three native cases, verified after the review corrections — kept as the record of the fifteen-case matrix, and historical on registration since task 8.3
 
 Task 8.2 added the three `production` cases above — the answered question, the question held into the run's own
 cancellation, and the mid-turn cancellation onto a detached `setsid` descendant — and changed two production
@@ -878,7 +945,8 @@ under a sanitized `env -i` with `PATH` alone copied, the locale as a literal `C.
   a fork whose session file is not yet on disk, and the actual leaf a user-target navigation leaves behind — are
   untouched by it, the bounded spawn-to-handoff interrupt window stays open, and the transport's new observation
   closes re-parenting *after* that observation rather than that window. The five injected seams are unchanged, and
-  **Pi stays disabled and unregistered**.
+  **Pi stays disabled and unregistered** — as of this round, which task 8.3's registration and the round above
+  supersede on that point alone.
 
 ### 2026-10-01, the review-corrected harness source, executed once — kept as the record of the twelve-case matrix
 

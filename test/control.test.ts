@@ -9,6 +9,7 @@ import { fileURLToPath } from "node:url";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import fusion, { parseFusion } from "../extensions/fusion.ts";
 import { HISTORY_VERSION } from "../extensions/history.ts";
+import { piTripwire } from "./tripwire.ts";
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 process.env.PI_FUSION_CLAUDE_BIN = path.join(repoRoot, "test", "fake-claude.mjs");
@@ -73,7 +74,9 @@ function makeHost(cwd = repoRoot, mode: "tui" | "print" = "print", session: { id
 		sendMessage: (message: unknown, options: unknown) => sent.push([message, options]),
 		registerMessageRenderer: (customType: string, renderer: Renderer) => renderers.set(customType, renderer),
 	} as unknown as ExtensionAPI;
-	fusion(api);
+	// Every run of this file is a claude one, and the tripwire is what keeps the pi backend this build registers out of
+	// reach of a case that routed to it by accident.
+	fusion(api, { backends: { ...piTripwire() } });
 	const theme = { fg: (_color: string, text: string) => text, bold: (text: string) => text, dim: (text: string) => text };
 	const ui = {
 		setStatus(_key: string, _text: string | undefined) {},

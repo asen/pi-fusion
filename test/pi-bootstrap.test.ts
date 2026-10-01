@@ -5,6 +5,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import test from "node:test";
 import { fileURLToPath, pathToFileURL } from "node:url";
+import { DIAGNOSTIC_EVENT as PROTOCOL_DIAGNOSTIC_EVENT, STARTUP_EXIT_CODE as PROTOCOL_STARTUP_EXIT_CODE } from "../extensions/backends/pi-bootstrap-protocol.mjs";
 import {
 	type BootstrapSdk,
 	checkInput,
@@ -2856,6 +2857,33 @@ test("a diagnostic line carries a stage, a version and an error, and no identity
 		assert.equal(field in failure, false, `a diagnostic has no ${field}`);
 	}
 	assert.equal(diagnostic("input", { sdk: undefined, error: undefined }), JSON.stringify({ event: DIAGNOSTIC_EVENT, stage: "input" }));
+});
+
+test("the marker and the startup exit code are the protocol module's own, and the bootstrap re-exports what it writes with", () => {
+	// Both ends of the wire stand on one declaration: this program writes them in the child and the host's transport
+	// recognizes them there, and a second copy of either would be two protocols that agree until one of them is edited.
+	// That the host no longer imports this program to read them, and that the protocol module imports nothing at all,
+	// are `test/backends.test.ts`'s own static reads; what this case pins is where the values live and that every
+	// caller reading them off the bootstrap — every assertion in this file included — reads the same ones.
+	assert.equal(DIAGNOSTIC_EVENT, PROTOCOL_DIAGNOSTIC_EVENT, "the marker the bootstrap re-exports is the protocol module's own");
+	assert.equal(STARTUP_EXIT_CODE, PROTOCOL_STARTUP_EXIT_CODE, "and so is the exit code a startup refusal uses");
+	assert.deepEqual([PROTOCOL_DIAGNOSTIC_EVENT, PROTOCOL_STARTUP_EXIT_CODE], ["pi-fusion-bootstrap", 78], "the two values a child writes and a host reads, recorded here as well as declared there");
+	// Where they are declared, read off the two sources: the protocol module declares both, and the bootstrap names it
+	// and declares neither. Spacing and the order of the two names are formatting these are robust to; a second copy of
+	// a value is not, which is the whole of what they refuse.
+	const protocolSource = fs.readFileSync(path.join(repoRoot, "extensions", "backends", "pi-bootstrap-protocol.mjs"), "utf8");
+	assert.match(protocolSource, new RegExp(`export\\s+const\\s+DIAGNOSTIC_EVENT\\s*=\\s*${JSON.stringify(PROTOCOL_DIAGNOSTIC_EVENT)}`), "the protocol module declares the marker");
+	assert.match(protocolSource, new RegExp(`export\\s+const\\s+STARTUP_EXIT_CODE\\s*=\\s*${PROTOCOL_STARTUP_EXIT_CODE}\\b`), "the protocol module declares the exit code");
+	const bootstrapSource = fs.readFileSync(PI_BOOTSTRAP_PATH, "utf8");
+	assert.match(bootstrapSource, /from\s+"\.\/pi-bootstrap-protocol\.mjs"/, "the bootstrap takes both from the protocol module rather than writing them down again");
+	for (const name of ["DIAGNOSTIC_EVENT", "STARTUP_EXIT_CODE"]) {
+		assert.ok(bootstrapSource.includes(name), `the bootstrap no longer mentions ${name}, so this case is reading a file that could not drift`);
+		assert.doesNotMatch(
+			bootstrapSource,
+			new RegExp(`(const|let|var)\\s+${name}\\s*=`),
+			`the bootstrap declares ${name} of its own beside the protocol module's, and the child and the host can now disagree about it`,
+		);
+	}
 });
 
 test("the preflight's own failures name no session id and no transcript path", () => {

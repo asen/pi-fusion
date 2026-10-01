@@ -10,8 +10,8 @@
 | `PI_FUSION_ULTRACODE_PERMISSION_MODE` | `bypassPermissions` |
 | `PI_FUSION_ASK_MODEL` | `opus` |
 | `PI_FUSION_ASK_EFFORT` | `high` |
-| `PI_FUSION_PI_<ROLE>_MODEL` | unset; the `pi` backend's model for role `plan`, `implement` or `ask`, as `provider/model-id`. It enables nothing; see [The pi backend's variables](#the-pi-backends-variables) |
-| `PI_FUSION_PI_<ROLE>_EFFORT` | unset; that role's thinking level on the `pi` backend. It enables nothing either |
+| `PI_FUSION_PI_<ROLE>_MODEL` | unset; the `pi` backend's model for role `plan`, `implement` or `ask`, as `provider/model-id`. A `pi` call that names no `model` of its own needs it; see [The pi backend's variables](#the-pi-backends-variables) |
+| `PI_FUSION_PI_<ROLE>_EFFORT` | unset; that role's thinking level on the `pi` backend. Optional, and a child given none keeps its own default |
 | `PI_FUSION_ULTRACODE_WORKFLOW_SIZE` | unset; `small`, `medium`, `large` or `unrestricted` sets Claude Code's `workflowSizeGuideline` for the child |
 | `PI_FUSION_CLAUDE_BIN` | unset; the Claude Code binary bundled with the SDK. Set it to run another `claude` executable, for example the one on `PATH` |
 | `PI_FUSION_DASHBOARD_OPEN` | unset; `0` stops `/fusion dashboard` from opening the browser and only shows the URL |
@@ -27,19 +27,37 @@ Each variable applies to the role in its name. A call's `model` or `effort` para
 
 ## The pi backend's variables
 
-`PI_FUSION_PI_PLAN_MODEL`, `PI_FUSION_PI_IMPLEMENT_MODEL` and `PI_FUSION_PI_ASK_MODEL`, and the matching `PI_FUSION_PI_<ROLE>_EFFORT`, configure the `pi` backend's binding. **They enable nothing.** This build runs children on the `claude` backend only: a call that names `backend: "pi"` is refused before a handle is taken or a child starts, whatever these variables say, and no variable, file or flag makes that backend available. They are here because the binding they configure is settled ahead of the adapter, and because a record written by a build that has one reads back through the same rules.
+`PI_FUSION_PI_PLAN_MODEL`, `PI_FUSION_PI_IMPLEMENT_MODEL` and `PI_FUSION_PI_ASK_MODEL`, and the matching `PI_FUSION_PI_<ROLE>_EFFORT`, say what a role runs as on the `pi` backend. The backend needs no variable to be available, because this build registers it; what it has no default for is the model, so these are how a `pi` call gets one without naming `model` itself.
 
-What the binding does, when something runs it: there is no default model and none is guessed, so each role takes its model from the call's `model` parameter, or from the selection the run it continues actually ran with, or from that role's `PI_FUSION_PI_<ROLE>_MODEL`, in that order; without one of the three the call is refused and says so. A model is a provider and a model id split at the first slash, such as `deepseek/deepseek-chat` — the id after that slash is opaque and may hold slashes of its own, as `openrouter/deepseek/deepseek-chat` does. The thinking level is optional in the same three places: a first call that names none leaves the child its own default, and the child reports back what that was. A call that names an empty model or an empty level is refused rather than falling through to a recorded or configured value.
+There is no default model and none is guessed, so each role takes its model from the call's `model` parameter, or from the selection the run it continues actually ran with, or from that role's `PI_FUSION_PI_<ROLE>_MODEL`, in that order; without one of the three the call is refused and says so, before a handle is taken, a child starts or an entry is written. A model is a provider and a model id split at the first slash, such as `deepseek/deepseek-chat` — the id after that slash is opaque and may hold slashes of its own, as `openrouter/deepseek/deepseek-chat` does. The thinking level is optional in the same three places: a first call that names none leaves the child its own default, and the child reports back what that was. A call that names an empty model or an empty level is refused rather than falling through to a recorded or configured value.
 
-What a run ends with is what gets kept. A settled call records the model and level the child actually ran with, and a continuation repeats that recorded selection rather than resolving one again, so changing a variable afterwards does not move a running thread to another model; a call's own `model` or `effort` still wins for that call, and the fields it does not name stay as they were recorded. The levels are `off`, `minimal`, `low`, `medium`, `high`, `xhigh` and `max`; whether a given model offers one of them is the adapter's check against the child, not this host's.
+What a run ends with is what gets kept. A settled call records the model and level the child actually ran with, and a continuation repeats that recorded selection rather than resolving one again, so changing a variable afterwards does not move a running thread to another model; a call's own `model` or `effort` still wins for that call, and the fields it does not name stay as they were recorded. The levels are `off`, `minimal`, `low`, `medium`, `high`, `xhigh` and `max`; whether a given model offers one of them is the backend's check against the child, not this host's, and a level the child clamped to something else fails the call instead of becoming a selection a continuation would repeat.
 
 The two budget variables are not role variables, and neither are `PI_FUSION_WIDGET`, `PI_FUSION_PLAN_CONTEXT_PCT`, `PI_FUSION_AUTO_REVIEW`, `PI_FUSION_HISTORY` and `PI_FUSION_HISTORY_DIR`. The budget variables and `PI_FUSION_PLAN_CONTEXT_PCT` are read when Pi loads the extension; see [Session usage and budget](#session-usage-and-budget) and [the context cap](runs.md#the-context-cap).
 
-Role `plan` runs at effort `xhigh` unless a call passes `effort`; there is no variable for it. Role `ultracode` always runs at effort `ultracode`, which is Claude Code's `xhigh` tier plus the standing Workflow opt-in. Passing `xhigh` itself would keep the reasoning level but drop the workflows. The workflow agents' model and effort (Opus 5, xhigh) live in the implementer contract, not in a variable.
+Role `plan` runs at effort `xhigh` on the `claude` backend unless a call passes `effort`; there is no variable for it. On `pi` no role has a model default and the thinking level is optional: a `pi` call takes its model from `model` or `PI_FUSION_PI_<ROLE>_MODEL` and is refused without one, and a call that names no level leaves the child its own. Role `ultracode` always runs at effort `ultracode`, which is Claude Code's `xhigh` tier plus the standing Workflow opt-in. Passing `xhigh` itself would keep the reasoning level but drop the workflows. The workflow agents' model and effort (Opus 5, xhigh) live in the implementer contract, not in a variable.
 
 The role contracts are the Markdown files under `contracts/`, passed to each child as an appended system prompt. Edit them to change how a role behaves.
 
 The `implement` and `ultracode` contracts' "do not commit" is an instruction in those contracts, not an enforced restriction.
+
+## Where the pi backend writes
+
+A Pi child's storage lives in a `pi-fusion` subtree inside the host's own agent directory — what `PI_CODING_AGENT_DIR` names, or `~/.pi/agent`:
+
+- `pi-fusion/children/` is the one child agent directory every Pi call shares: the model catalog cache, the helpers Pi downloads, and this project's durable session directory, which is what a resume or a fork of a Pi run continues from.
+- `pi-fusion/calls/<role>-<random>/` is one call's own directory: the input file its child is launched with and the compiler caches that child writes. It goes when the call ends, unless stopping the child left something to look at, and then it is kept.
+
+The user's own `models.json` and `auth.json` in the host agent directory are the child's inputs. Fusion creates neither for a user who has none, copies no credential and writes no provider configuration of its own. That is not a read-only claim about the auth path: an `auth.json` that already exists is the file the child is handed, and Pi's own credential store may refresh it and write that one file back in place, and create and remove a transient `auth.json.lock` beside it, around a read as much as around a refresh. That shared write is authorized. A user with no auth file gets a private path inside that call's own directory instead, which goes when the directory does.
+
+`PI_CODING_AGENT_DIR` moves the host agent directory and this whole subtree with it; beyond that one root no variable relocates any of these paths. Nothing collects what a kept call directory leaves behind: there is no garbage collector and no cleanup command, so a directory that stayed is yours to look at and delete — once the cleanup concern that kept it is resolved and nothing of that call is still running, because the directory was kept precisely because this host could not see the end of that child. Which one belongs to which run is read from its role name and the time it was made, against the run in `/fusion status`, the history or the dashboard; no path is ever put in a message.
+
+The child's environment is the host's, copied as it is: provider keys, `PI_OFFLINE` exactly as the user set it, and everything else this Pi process carries. The host agent directory's own `bin` is appended to the child's `PATH`, and to the child's alone, so a helper Pi has already downloaded is found rather than fetched again.
+
+A child may use the network — the model requests it makes, a refresh of the shared model catalog, which is permitted rather than required, and a helper download Pi decides it needs. None of that is sandboxed, proxied or limited by this extension.
+
+There is no switch for the backend itself: no variable, file or flag turns `pi` on or off, and nothing falls back to another backend when a Pi call fails.
+
 ## Session usage and budget
 
 The extension adds up what the delegation calls of this Pi session have spent. Each call reports its own running total, and the newest total replaces the one before it, so an update while a child works never counts twice; a continued run is another call and adds its own. `/fusion status` always ends with the totals, whether or not a budget variable is set:

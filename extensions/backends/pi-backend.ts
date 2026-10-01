@@ -15,8 +15,10 @@ import { type Backend, type ChildEvent, failed, type RunRequest, type SessionInt
  * One Pi call composed out of the parts that already exist: the contract the host reads, the storage the call runs
  * on, the preparation that starts and verifies a child, the task turn on that child, and the mapping that says what
  * the run reports and whether the storage may go. It decides nothing of its own — every judgement below is one of
- * those modules' — and it is registered nowhere: nothing in this build constructs a backend from it, so no user can
- * reach a line of it. There is no exported instance for the same reason.
+ * those modules'. The one thing that constructs it is `fusion.ts`, which registers a backend of it under the name
+ * `pi` beside the Claude one; a host that hands `fusion()` a `backends.pi` of its own replaces that registration
+ * entirely, which is how the suite keeps a real Pi child out of its runs. There is no exported instance, because a
+ * module-level one would be a second backend nobody decided to build.
  *
  * **The order, which is also the order ownership is taken in.** A signal that has already aborted ends the call
  * before a contract is read; then the contract, then the host agent directory, then the call's own storage, and only
@@ -234,9 +236,11 @@ async function runPiCall(request: RunRequest<PiRole, PiSession, PiSteerQueue>, d
 		let storage: PreparedCall;
 		try {
 			// `StorageRequest` calls this field `handle`, and it is the name of a directory rather than the host's own
-			// handle for the run: a `RunRequest` carries no handle, so this slice passes the role's name as a label that
-			// is safe to put in a path, and `mkdtemp` is what makes one invocation's directory unique. Passing the real
-			// host handle is the run lifecycle's to do when it composes these calls.
+			// handle for the run: a `RunRequest` carries no handle at all, so the role's name goes in as a label that is
+			// safe to put in a path and `mkdtemp` is what makes one invocation's directory unique. That is the accepted
+			// limit rather than a step on the way to something else: a directory this call retained is identified by its
+			// role and its time, which are the surfaces a person is pointed at, and a path never reaches a diagnostic,
+			// so nothing a user is shown depends on the label being the handle.
 			storage = (deps.storage ?? prepareCallStorage)({ hostAgentDir: agentDir, cwd: request.cwd, handle: role.name });
 		} catch (error) {
 			report.stage = "storage";
@@ -369,8 +373,9 @@ async function runPiCall(request: RunRequest<PiRole, PiSession, PiSteerQueue>, d
 }
 
 /**
- * A Pi backend over these seams. It is a factory rather than an instance because nothing registers one: a module-level
- * instance would be a backend this build could run by accident, and Pi is refused before a handle is taken.
+ * A Pi backend over these seams. It is a factory rather than an instance because the seams are its caller's to
+ * choose: `fusion.ts` calls it with none and registers what it gets, every test calls it with its own, and a
+ * module-level instance would be one more backend nobody decided to build.
  */
 export function createPiBackend(deps: PiBackendDeps = {}): Backend<PiRole, PiSession, PiSteerQueue> {
 	return {

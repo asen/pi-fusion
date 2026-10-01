@@ -1,7 +1,7 @@
 import { StringDecoder } from "node:string_decoder";
 import type { Readable, Writable } from "node:stream";
 import { ChildTree, type CleanupReport, type ExitOutcome, KILL_GRACE_MS, type LaunchedProcess, type LaunchOptions, type OwnedCleanup } from "../process-tree.ts";
-import { DIAGNOSTIC_EVENT, STARTUP_EXIT_CODE } from "./pi-bootstrap.mjs";
+import { DIAGNOSTIC_EVENT, STARTUP_EXIT_CODE } from "./pi-bootstrap-protocol.mjs";
 
 /**
  * The Pi transport: one child process, read and written as the native RPC protocol, and the bounds everything it can
@@ -12,6 +12,12 @@ import { DIAGNOSTIC_EVENT, STARTUP_EXIT_CODE } from "./pi-bootstrap.mjs";
  * answers it each take what they are given and answer: nothing there starts a process, opens a stream, writes a byte
  * or imports an SDK, so a test of them needs no child at all. The second half is the lifecycle, which owns the child,
  * its two pipes and its clocks, and is assembled out of those pieces.
+ *
+ * The two facts it shares with the child — the marker a bootstrap diagnostic carries, and the exit code a startup
+ * refusal uses — come from `./pi-bootstrap-protocol.mjs`, which imports nothing and runs nothing. The child's own
+ * program is never imported here: reading them off it would pull that program and everything behind it into the host
+ * for two literals, and would make an install missing it a module error of this host's rather than the refusal the
+ * extension's own loader composes for a backend it cannot launch.
  *
  * Why the bounds are stated once, here: what a child writes decides how much of this host's memory it uses, and a host
  * that cannot say where that limit is in one place cannot say it at all. These are internal options of one backend,
