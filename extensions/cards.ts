@@ -29,6 +29,7 @@ export interface CardDetails {
 	reviewedBy?: string;
 	reviews?: string;
 	question?: string;
+	control?: "fusion_control" | "claude_control";
 	background?: boolean;
 	kind?: string;
 	by?: string;
@@ -116,6 +117,7 @@ export function cardDetails(value: unknown): CardDetails {
 		if (typeof read === "number" && Number.isFinite(read)) details[field] = read;
 	}
 	if (Array.isArray(source.files)) details.files = source.files.filter((file): file is string => typeof file === "string" && file !== "").slice(0, CARD_FILES).map(plainText);
+	if (source.control === "fusion_control" || source.control === "claude_control") details.control = source.control;
 	if (typeof source.background === "boolean") details.background = source.background;
 	if (typeof source.historical === "boolean") details.historical = source.historical;
 	if (source.usage !== undefined) details.usage = source.usage;
@@ -140,8 +142,8 @@ export function headerLine(theme: CardTheme, parts: { label: string; details: Ca
 }
 
 /** Both ways to answer a run that waits, so the card says it wherever the question shows. */
-function answerHint(handle: string | undefined): string {
-	return `answer: /fusion answer ${handle ?? "run-N"} <text> or fusion_control message`;
+function answerHint(handle: string | undefined, control: CardDetails["control"]): string {
+	return `answer: /fusion answer ${handle ?? "run-N"} <text> or ${control === "claude_control" ? "claude_control" : "fusion_control"} message`;
 }
 
 /** A Markdown heading as a card shows it: the headings the host must act on stand out from the rest. */
@@ -155,11 +157,11 @@ function heading(theme: CardTheme, line: string): string {
  * The body under a card's header: the first report lines collapsed, the whole report with its changed paths and its
  * open question expanded. Nothing here knows the width; the card wraps or truncates what it gets.
  */
-export function bodyLines(theme: CardTheme, text: string, opts: { expanded: boolean; question?: string; handle?: string; files?: string[]; filesChanged?: number }): string[] {
+export function bodyLines(theme: CardTheme, text: string, opts: { expanded: boolean; question?: string; handle?: string; control?: CardDetails["control"]; files?: string[]; filesChanged?: number }): string[] {
 	const body = plainText(text);
 	const question = opts.question === undefined ? undefined : plainText(opts.question);
 	if (!opts.expanded) {
-		if (question) return [theme.fg("warning", firstLine(question)), theme.fg("muted", answerHint(opts.handle))];
+		if (question) return [theme.fg("warning", firstLine(question)), theme.fg("muted", answerHint(opts.handle, opts.control))];
 		const report = body
 			.split("\n")
 			.map((line) => line.trimEnd())
@@ -176,7 +178,7 @@ export function bodyLines(theme: CardTheme, text: string, opts: { expanded: bool
 		lines.push(theme.fg("muted", `files (${opts.filesChanged ?? files.length})`), ...shown);
 		if (rest > 0) lines.push(theme.fg("muted", `… ${rest} more`));
 	}
-	if (question) lines.push(...painted(theme, "warning", cap(question, CARD_QUESTION_CHARS)), theme.fg("muted", answerHint(opts.handle)));
+	if (question) lines.push(...painted(theme, "warning", cap(question, CARD_QUESTION_CHARS)), theme.fg("muted", answerHint(opts.handle, opts.control)));
 	return lines;
 }
 

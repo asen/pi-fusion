@@ -242,6 +242,23 @@ test("the claude and claude_control tools render their call and result as cards 
 	assert.match(thrown.render(200)[0]!, /<error>failed<\/error>/, "a tool that threw carries no state, so the row's error names one");
 });
 
+test("waiting tool cards use the invoking control pair, while background cards preserve the run's pair", () => {
+	const result = { content: [{ type: "text", text: "Which name?" }], details: { handle: "run-1", state: "waiting", question: "Which name?", control: "claude_control" } };
+	for (const name of ["fusion", "claude", "fusion_control", "claude_control"]) {
+		const control = name.startsWith("claude") ? "claude_control" : "fusion_control";
+		for (const expanded of [false, true]) {
+			const card = byName(name).renderResult!(result, { expanded, isPartial: false }, renderTheme, renderContext({ action: "wait" }, { expanded }));
+			assert.equal(card.render(200).at(-1), `<muted>answer: /fusion answer run-1 <text> or ${control} message</muted>`);
+		}
+	}
+	const renderer = renderers.get("pi-fusion-run")!;
+	const message = { content: "Background run asks", details: result.details };
+	for (const expanded of [false, true]) {
+		const card = renderer(message, { expanded, outputPad: 0 }, renderTheme)!;
+		assert.equal(card.render(200).at(-1), "<muted>answer: /fusion answer run-1 <text> or claude_control message</muted>");
+	}
+});
+
 test("a call renders before its arguments have arrived, and an argument of the wrong type draws nothing", () => {
 	const claude = byName("claude");
 	const bare = claude.renderCall!(undefined, renderTheme, renderContext({}));

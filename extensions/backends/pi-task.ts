@@ -1,3 +1,4 @@
+import { CONTROL_COMMANDS } from "./pi-control-extension.mjs";
 import { type PiPrepared, type PiUsageBaseline, usageReading } from "./pi-prepare.ts";
 import type { PiQuestionOutcome } from "./pi-question-routing.ts";
 import { type PiEvent, type PiExit, type PiExtensionError, type PiFailure, type PiResponse, PiTransportError, type PiTurn } from "./pi-transport.ts";
@@ -182,12 +183,13 @@ export interface PiTaskUsage {
  * say; `aborted` is a cancelled run besides, whatever else was in flight when the signal went, the fatal question that
  * won the turn's own race included; `turn` is a turn that failed or came back merely acknowledged; `question` a dialog
  * nobody could answer on a run nobody cancelled;
+ * `command` an ordinary task invoking a reserved session control command;
  * `unobserved` a turn whose records this host saw fewer of than the turn itself counted; `extension` an extension
  * error from either side; `failed` a turn that produced no finished answer; `state`, `leaf`, `usage` and `text` the
  * four readbacks; `cleanup` a shutdown that reported a failure or threw; and `transport` everything else that threw
  * rather than answered.
  */
-export type PiTaskReason = "aborted" | "exited" | "question" | "rejected" | "turn" | "unobserved" | "extension" | "failed" | "leaf" | "state" | "usage" | "text" | "cleanup" | "transport";
+export type PiTaskReason = "aborted" | "exited" | "question" | "command" | "rejected" | "turn" | "unobserved" | "extension" | "failed" | "leaf" | "state" | "usage" | "text" | "cleanup" | "transport";
 
 /** One task that ran and read back whole, with the child stopped and its stop reporting no failure of its own. */
 export interface PiTaskDone {
@@ -581,13 +583,13 @@ function standsAt(read: { leaf: string | null } | undefined, checkpoint: string 
 /**
  * Whether the child is still the same child doing nothing else: the session it was prepared in, by both halves of
  * that identity, the selection it was prepared with, exactly and by both parts, and a session that is neither
- * streaming nor compacting. The selection is compared rather than resolved again, because the one this task may
- * report is the one the preparation verified and a second reading would be a second answer.
+ * streaming nor compacting and has no pending messages. The selection is compared rather than resolved again,
+ * because the one this task may report is the one the preparation verified and a second reading would be a second answer.
  */
 function standsIn(response: PiResponse, prepared: PiPrepared): boolean {
 	const data = answered(response);
 	if (data === undefined) return false;
-	if (data.isStreaming !== false || data.isCompacting !== false) return false;
+	if (data.isStreaming !== false || data.isCompacting !== false || data.pendingMessageCount !== 0) return false;
 	if (data.sessionId !== prepared.session.sessionId || data.sessionFile !== prepared.session.sessionFile) return false;
 	const model = plain(data.model);
 	if (model === undefined || !nonblank(model.provider) || !nonblank(model.id)) return false;
@@ -732,6 +734,11 @@ export async function runPiTask(request: PiTaskRequest): Promise<PiTaskResult> {
 
 		let stop = gate();
 		if (stop) return await settle(stop);
+
+		// These commands acknowledge a prompt without running the task's agent loop and may move its session.
+		// Only the restore path may send them; quoted mentions and other command names remain ordinary task text.
+		const command = request.prompt.trimStart().split(/\s/, 1)[0];
+		if (CONTROL_COMMANDS.some((name) => command === `/${name}`)) return await settle({ reason: "command" });
 
 		const before = await child.request({ type: "get_tree" });
 		stop = gate();

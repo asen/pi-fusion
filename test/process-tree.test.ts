@@ -714,6 +714,46 @@ test("a table that answers once and then fails buys no blind group send afterwar
 	}
 });
 
+test("a readable table cannot verify descendants when the root ended before its first observation", { skip: needsTable }, async () => {
+	for (const when of ["before", "during"] as const) {
+		const dir = newDir();
+		try {
+			let child: LaunchedProcess;
+			let first = true;
+			const seam = recorder({
+				table: async (real) => {
+					const rows = await real.table();
+					if (first && when === "during") {
+						first = false;
+						const exited = new Promise<void>((resolve) => child.once("exit", () => resolve()));
+						child.stdin.end();
+						await exited;
+					}
+					return rows;
+				},
+			});
+			const tree = new ChildTree(200, grace({ facilities: seam.facilities }));
+			child = startRoot(tree, dir, { spawn: [{ role: "middle", mode: "detached" }] });
+			await ready(dir, ["root", "middle"]);
+			if (when === "before") {
+				const exited = new Promise<void>((resolve) => child.once("exit", () => resolve()));
+				child.stdin.end();
+				await exited;
+			}
+			assert.deepEqual(await tree.observe(), [], `${when}: a dead root's descendants are not guessed`);
+			const report = await tree.shutdown();
+			assert.ok(seam.events.filter((event) => event === "table").length >= 2, "later reads really were available");
+			assert.equal(report.discovery, "unavailable", "readable tables after re-parenting cannot prove nothing survived");
+			assert.deepEqual([report.root, report.exit.code, report.stdio], ["exited", 0, "closed"]);
+			assert.deepEqual([report.terminated, report.leftovers], [[], []], "no descendant was observed, so none is claimed");
+			assert.equal(await gone(pidOf(dir, "middle")), false, "the fixture proves why the unknown cleanup must be reported");
+			assert.deepEqual(seam.sends, [], "an unobserved descendant is not blindly signalled");
+		} finally {
+			reap(dir);
+		}
+	}
+});
+
 /*
  * An observation a caller makes before it ends its child is one more table read, and a read it could not make is the
  * one thing this report may never forget: a descendant that may have been missed is exactly what `unavailable` says,
@@ -821,6 +861,7 @@ test("the root's own group is no target once its row is gone, and a remembered d
 		);
 		assert.deepEqual([report.root, report.exit.code], ["exited", 0]);
 		assert.deepEqual(pids(report.terminated), [middle], "the descendant was reached per pid, and forced after its grace");
+		assert.equal(report.discovery, "ok", "a root already observed alive can leave its remembered descendants behind");
 		assert.equal(await gone(middle), true);
 	} finally {
 		reap(dir);

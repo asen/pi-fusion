@@ -269,6 +269,7 @@ test("every reason of every stage has a fixed sentence, and none of them repeats
 		aborted: true,
 		exited: true,
 		question: true,
+		command: true,
 		rejected: true,
 		turn: true,
 		unobserved: true,

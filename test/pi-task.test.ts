@@ -117,6 +117,7 @@ const stateOf = (over: Record<string, unknown> = {}): Record<string, unknown> =>
 	thinkingLevel: "medium",
 	isStreaming: false,
 	isCompacting: false,
+	pendingMessageCount: 0,
 	sessionId: SESSION_ID,
 	sessionFile: SESSION_FILE,
 	...over,
@@ -215,6 +216,7 @@ const done = (result: PiTaskResult) => (result.ok ? result : assert.fail(`this t
 const refused = (result: PiTaskResult): PiTaskRefused => (result.ok ? assert.fail("this task should not have succeeded") : result);
 
 interface RunCase {
+	prompt?: string;
 	before?: unknown;
 	after?: unknown;
 	state?: Record<string, unknown>;
@@ -263,7 +265,7 @@ async function runOnce(over: RunCase = {}) {
 		...(over.exit === undefined ? {} : { exit: over.exit }),
 	});
 	const prepared = preparedOf(scripted.child, over.prepared);
-	const result = await runPiTask({ prepared, prompt: PROMPT, observer });
+	const result = await runPiTask({ prepared, prompt: over.prompt ?? PROMPT, observer });
 	return { result, seen: scripted.seen };
 }
 
@@ -397,6 +399,65 @@ test("the leaf gates hold at both ends: where the session was said to be, and th
 		assert.equal(seen.steps.includes("get_session_stats"), false, `${row.what}: nothing after the leaf is read`);
 		assert.deepEqual(seen.shutdowns, ["host"]);
 	}
+});
+
+test("ordinary tasks refuse Fusion's session control commands before sending anything, but not quoted mentions or other commands", async () => {
+	for (const command of ["pi-fusion-navigate", "pi-fusion-fork"]) {
+		for (const prompt of [`/${command}`, `/${command} "entry-1"`, ` \n/${command}\t"entry-1"`]) {
+			const { result, seen } = await runOnce({ prompt });
+			const stopped = refused(result);
+			assert.equal(stopped.reason, "command", prompt);
+			assert.deepEqual(seen.steps, ["shutdown"], "a reserved command never reaches the child as a task");
+			assert.deepEqual(seen.shutdowns, ["host"], "the prepared child is still stopped once");
+			assert.equal(stopped.session.checkpoint, undefined, "no checkpoint is published");
+		}
+		for (const prompt of [`Explain /${command} "entry-1"`, `\`/${command}\``, `/${command}-other "entry-1"`]) {
+			const { result, seen } = await runOnce({ prompt });
+			assert.equal(result.ok, true, prompt);
+			assert.equal(seen.turns[0]?.text, prompt, "ordinary task text is passed through unchanged");
+		}
+	}
+});
+
+test("a task reads back as complete only with exactly zero pending child messages, without polling or draining", async () => {
+	assert.equal((await runOnce({ state: { pendingMessageCount: 0 } })).result.ok, true);
+	for (const count of [1, 2, undefined, null, "0", false, -1, 0.5, Number.NaN, {}, []]) {
+		const { result, seen } = await runOnce({ state: { pendingMessageCount: count } });
+		const stopped = refused(result);
+		assert.equal(stopped.reason, "state", `pendingMessageCount: ${String(count)}`);
+		assert.deepEqual(seen.steps, ["get_tree", "turn", "get_state", "shutdown"]);
+		assert.deepEqual(seen.shutdowns, ["host"]);
+		assert.equal(stopped.session.checkpoint, undefined, "the unread or unverified queue earns no new checkpoint");
+	}
+});
+
+test("a steer admitted after the task settles but left unread refuses success with its delivery account intact", async () => {
+	const observer = taskObserver();
+	const queue = new PiSteerQueue();
+	const steering = deferred<PiResponse>();
+	const scripted = childOf({
+		requests: {
+			get_tree: [ok("get_tree", { tree: [], leafId: null })],
+			steer: [steering.promise],
+			get_state: [ok("get_state", stateOf({ pendingMessageCount: 1 }))],
+		},
+		turn: () => {
+			observer.onEvent(messageEnd(assistantMessage()));
+			return turnOf({ events: 1 });
+		},
+	});
+	assert.equal(queue.push("also update the docs"), true);
+	const running = runPiTask({ prepared: preparedOf(scripted.child), prompt: PROMPT, observer, input: queue });
+	await drain();
+	assert.equal(queue.open, false, "the settled turn closed the input before waiting on its steer");
+	assert.deepEqual(scripted.seen.steps, ["get_tree", "turn", "steer"], "the task waits only for the steer already in flight");
+	steering.resolve(ok("steer", {}));
+	const result = refused(await running);
+	assert.equal(result.reason, "state");
+	assert.equal(result.steers?.sent, 1, "RPC admission is not model consumption");
+	assert.equal(result.steers?.dropped, 0, "the unread steer was delivered, not dropped by the host queue");
+	assert.deepEqual(scripted.seen.steps, ["get_tree", "turn", "steer", "get_state", "shutdown"]);
+	assert.deepEqual(scripted.seen.shutdowns, ["host"]);
 });
 
 test("the steer queue takes, holds, sends in order and accounts for every steer, and never retries one", async () => {

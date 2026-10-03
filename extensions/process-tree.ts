@@ -163,6 +163,7 @@ export interface CleanupReport {
 	root: "unspawned" | "exited" | "stopped" | "unstoppable";
 	exit: ExitOutcome;
 	stdio: "closed" | "held";
+	/** Unavailable includes a spawned root never observed alive, not just a process-table read that failed. */
 	discovery: "ok" | "unavailable";
 	terminated: ObservedProcess[];
 	leftovers: ObservedProcess[];
@@ -746,7 +747,11 @@ export class ChildTree {
 		const pid = this.proc?.pid;
 		if (pid === undefined) return { table, found: [] };
 		const row = table.get(pid);
-		if (!row || !this.alive() || !this.rootIs(row)) return { table, found: [] };
+		if (!row || !this.alive() || !this.rootIs(row)) {
+			// Without one live-root observation, a later readable table cannot account for re-parented descendants.
+			if (this.rootIdentity === undefined) this.discoveryFailed = true;
+			return { table, found: [] };
+		}
 		this.rootIdentity ??= row;
 		const found = descendantsFrom(rows, pid);
 		for (const descendant of found) {

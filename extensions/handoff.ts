@@ -68,25 +68,24 @@ export function handoffPrompt(prompt: string, from: string, report: string, reas
 }
 
 /** What the host is told when a plan call handed off, so it knows which run holds the agreement now. */
-export function handoffNote(from: string, to: string, reason: HandoffReason): string {
-	return `${to} is a fresh plan run: ${why(from, reason, "had")}, so it was not continued. ${to} carries ${from}'s last report as the plan so far, not the reading and the reasoning behind it. Follow-up plan calls continue ${to} from here; to go back to ${from} anyway, call fusion with continue ${from}.`;
+export function handoffNote(from: string, to: string, reason: HandoffReason, tool = "fusion"): string {
+	return `${to} is a fresh plan run: ${why(from, reason, "had")}, so it was not continued. ${to} carries ${from}'s last report as the plan so far, not the reading and the reasoning behind it. Follow-up plan calls continue ${to} from here; to go back to ${from} anyway, call ${tool} with continue ${from}.`;
 }
 
 /** What a role's own fresh run costs the host, which is what makes the warning about a long run actionable. */
 const AFRESH: Record<string, string> = {
-	plan: "call fusion with role plan and fresh true, restating the plan agreed so far in the task",
 	implement: "start a new run with a self-contained brief: the work so far is in the work tree, and this run's report names what it changed and how it was verified",
 	ultracode: "start a new run with a self-contained brief: the work so far is in the work tree, and this run's report names what it changed and how it was verified",
 	ask: "start a new ask run, which reads what it needs itself",
 };
 
 /** What the host is told when it continues a run by handle whose context has passed the cap: the call still runs. */
-export function continueNote(handle: string, role: string, share: number, pct: number): string {
-	const afresh = AFRESH[role] ?? "start a new run with a self-contained brief";
+export function continueNote(handle: string, role: string, share: number, pct: number, tool = "fusion"): string {
+	const afresh = role === "plan" ? `call ${tool} with role plan and fresh true, restating the plan agreed so far in the task` : AFRESH[role] ?? "start a new run with a self-contained brief";
 	return `${handle}'s context has reached ${sharePercent(share)} of its window, past the ${pct}% cap, so each further call to it carries that context again. This call ran: you named the handle. When the next step can stand on its own, ${afresh}.`;
 }
 
 /** Why a plan call that must hand off cannot, with what the host can do instead. */
-export function handoffBlocked(from: string, reason: HandoffReason): string {
-	return `${why(from, reason, "has")}, so a plan call does not continue it, and its report is not in this Pi process any more, so a fresh run cannot carry the plan so far. Call fusion with role plan and fresh true, restating the agreed plan in the task, or continue ${from} anyway with continue ${from}.`;
+export function handoffBlocked(from: string, reason: HandoffReason, tool = "fusion"): string {
+	return `${why(from, reason, "has")}, so a plan call does not continue it, and its report is not in this Pi process any more, so a fresh run cannot carry the plan so far. Call ${tool} with role plan and fresh true, restating the agreed plan in the task, or continue ${from} anyway with continue ${from}.`;
 }

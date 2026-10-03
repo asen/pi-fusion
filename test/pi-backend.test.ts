@@ -142,6 +142,7 @@ const stateOf = (over: Record<string, unknown> = {}): Record<string, unknown> =>
 	thinkingLevel: "medium",
 	isStreaming: false,
 	isCompacting: false,
+	pendingMessageCount: 0,
 	sessionId: SESSION_ID,
 	sessionFile: SESSION_FILE,
 	...over,

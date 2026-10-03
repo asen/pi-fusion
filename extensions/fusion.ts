@@ -855,7 +855,7 @@ export function failureMessage(run: HostRun): string {
 	const outcome = run.signal
 		? `${name} killed by ${run.signal}`
 		: run.exitCode !== 0
-			? `${name} ${run.exitCode === null ? "did not start" : `exited ${run.exitCode}`}`
+			? `${name} ${run.exitCode === null ? "failed" : `exited ${run.exitCode}`}`
 			: run.abandonedTasks?.length
 				? `${name} exited with ${run.abandonedTasks.join(", ")} still running`
 				: run.stopReason === "error"
@@ -872,6 +872,8 @@ const TOOL_NAME = "fusion";
 const CONTROL_TOOL_NAME = "fusion_control";
 const CLAUDE_TOOL_NAME = "claude";
 const CLAUDE_CONTROL_NAME = "claude_control";
+/** The paired control name for a tool call; reviews and notices without an initiating tool use the primary pair. */
+const controlWith = (tool: string | undefined): NonNullable<CardDetails["control"]> => (tool === CLAUDE_TOOL_NAME || tool === CLAUDE_CONTROL_NAME ? CLAUDE_CONTROL_NAME : CONTROL_TOOL_NAME);
 /** The workflow tools: every tool off hides from the host, so no route to a run is left beside the guards. */
 const FUSION_TOOLS: readonly string[] = [TOOL_NAME, CONTROL_TOOL_NAME, CLAUDE_TOOL_NAME, CLAUDE_CONTROL_NAME];
 /** The mode tools, one per direction: only the one that leaves the current mode is ever active, and neither starts a run. */
@@ -1031,7 +1033,7 @@ function runDetails(run: LiveRun): CardDetails {
 		...(files === undefined ? {} : { filesChanged: files.length, ...(files.length ? { files: files.slice(0, CARD_FILES).map((file) => file.path) } : {}) }),
 		...(run.reviewedBy === undefined ? {} : { reviewedBy: run.reviewedBy }),
 		...(run.reviews === undefined ? {} : { reviews: run.reviews }),
-		...(question === undefined ? {} : { question: question.slice(0, CARD_QUESTION_CHARS) }),
+		...(question === undefined ? {} : { question: question.slice(0, CARD_QUESTION_CHARS), control: controlWith(run.tool) }),
 	};
 }
 
@@ -1052,9 +1054,10 @@ function widgetRun(run: LiveRun): WidgetRun {
 }
 
 /** What the body of a card needs of a run's details, so a renderer passes on the details it already read. */
-function bodyOf(details: CardDetails): { question?: string; handle?: string; files?: string[]; filesChanged?: number } {
+function bodyOf(details: CardDetails): { question?: string; handle?: string; control?: CardDetails["control"]; files?: string[]; filesChanged?: number } {
 	return {
 		...(details.question === undefined ? {} : { question: details.question }),
+		...(details.control === undefined ? {} : { control: details.control }),
 		...(details.handle === undefined ? {} : { handle: details.handle }),
 		...(details.files === undefined ? {} : { files: details.files }),
 		...(details.filesChanged === undefined ? {} : { filesChanged: details.filesChanged }),
@@ -1093,6 +1096,7 @@ function resultCard(
 	// firstLine leaves the text as the host reads it, so a card strips the child's activity here, where it is drawn.
 	if (options.isPartial) return reuse(context, theme.fg("muted", firstLine(plainText(text))), []);
 	const details = cardDetails(result.details);
+	if (details.question !== undefined) details.control = controlWith(label.split(" ")[0]);
 	// A tool that threw returns no details, so the row's own error state is all that names what became of the run.
 	if (!details.state && context.isError) details.state = "failed";
 	return reuse(context, headerLine(theme, { label, details }), bodyLines(theme, text, { expanded: options.expanded, ...bodyOf(details) }), cardMode(options.expanded));
@@ -1120,8 +1124,8 @@ function firstLine(text: string): string {
 	return line.length > ACTIVITY_CHARS * 2 ? `${line.slice(0, ACTIVITY_CHARS * 2)}…` : line;
 }
 
-function askedText(run: LiveRun): string {
-	return `${run.handle} (${roleText(run)}) asks:\n\n${run.questions[0]?.text ?? ""}\n\nThe run waits in the background until you answer with fusion_control message and run ${run.handle}. Ask the user first if the decision is theirs.`;
+function askedText(run: LiveRun, control = controlWith(run.tool)): string {
+	return `${run.handle} (${roleText(run)}) asks:\n\n${run.questions[0]?.text ?? ""}\n\nThe run waits in the background until you answer with ${control} message and run ${run.handle}. Ask the user first if the decision is theirs.`;
 }
 
 /** How a run names itself in its reports: a review names the run it reviews, because its handle alone says nothing. */
@@ -1156,7 +1160,7 @@ function heldNotReviewable(held: HistoryRecord): string | undefined {
  * What a run of an earlier Pi process, as the history kept it, tells the user and the host: what it did and what is
  * left. `cwd` is where this Pi process runs, because a review reads the tree the run changed and no other.
  */
-function heldText(held: HistoryRecord, branch: RunRecord | undefined, cwd: string): string {
+function heldText(held: HistoryRecord, branch: RunRecord | undefined, cwd: string, tool?: string): string {
 	const secs = Math.round(((held.endedAt ?? held.startedAt) - held.startedAt) / 1000);
 	const files = held.filesTotal ?? held.files?.length ?? 0;
 	const body = (held.state === "done" ? held.report : held.failure)?.trim() ?? "";
@@ -1165,7 +1169,7 @@ function heldText(held: HistoryRecord, branch: RunRecord | undefined, cwd: strin
 	// Only a run the branch recorded has a child session to resume; a run killed in flight recorded none, and a
 	// record this host will not act on says why instead of offering a continuation the next call would refuse.
 	if (branch?.refusal) lines.push(branch.refusal);
-	else if (branch) lines.push(`continue it with ${continueWith(branch.backend ?? held.backend)} and continue ${held.handle}`);
+	else if (branch) lines.push(`continue it with ${continueWith(branch.backend ?? held.backend, tool)} and continue ${held.handle}`);
 	if (held.cwd === cwd && heldNotReviewable(held) === undefined) lines.push(`review it with /fusion review ${held.handle}`);
 	return lines.join("\n");
 }
@@ -1175,8 +1179,8 @@ function summary(run: LiveRun): string {
 	return text.length > SUMMARY_CHARS ? `${text.slice(0, SUMMARY_CHARS)}…` : text;
 }
 
-/** The tool that continues a run of this backend: a Pi run is only ever continued through the primary tool. */
-const continueWith = (backend: string | undefined): string => (backend === "pi" ? TOOL_NAME : CLAUDE_TOOL_NAME);
+/** A continuation uses the invoking tool pair when known; a Pi run is only ever continued through the primary tool. */
+const continueWith = (backend: string | undefined, tool?: string): string => (backend === "pi" || tool === TOOL_NAME || tool === CONTROL_TOOL_NAME ? TOOL_NAME : CLAUDE_TOOL_NAME);
 
 function handleNumber(handle: string): number {
 	return Number(HANDLE.exec(handle)?.[1] ?? 0);
@@ -3147,6 +3151,7 @@ export default function fusion(pi: ExtensionAPI, options: FusionOptions = {}) {
 	 * in what a run then is: one lifecycle, one set of handles, one question arbitration, one ledger.
 	 */
 	const delegate = async (tool: string, toolCallId: string, params: FusionParams, signal: AbortSignal | undefined, onUpdate: LiveRun["onUpdate"], ctx: any) => {
+		const controlName = controlWith(tool);
 		// A hidden tool leaves the host's tool list on its next turn, so a call already in this one still lands here.
 		mask();
 		if (!enabled) throw new Error(FUSION_OFF);
@@ -3163,7 +3168,7 @@ export default function fusion(pi: ExtensionAPI, options: FusionOptions = {}) {
 		const records = coverLiveHandles(runRecords(ctx.sessionManager.getBranch()));
 		const refuseActive = (handle: string | undefined) => {
 			if (handle !== undefined && isActive(runs.get(handle))) {
-				throw new Error(`${handle} is still active; send it a message with fusion_control message, or wait for it with fusion_control wait`);
+				throw new Error(`${handle} is still active; send it a message with ${controlName} message, or wait for it with ${controlName} wait`);
 			}
 		};
 		refuseActive(params.continue);
@@ -3182,21 +3187,21 @@ export default function fusion(pi: ExtensionAPI, options: FusionOptions = {}) {
 		refuseActive(handle);
 		const busy = canChangeFiles(role.name) ? active().find((run) => canChangeFiles(run.role.name)) : undefined;
 		if (busy) {
-			throw new Error(`${busy.handle} (${busy.role.name}) is still active; wait for it, message it or cancel it with fusion_control before you start or continue another run that can change files`);
+			throw new Error(`${busy.handle} (${busy.role.name}) is still active; wait for it, message it or cancel it with ${controlName} before you start or continue another run that can change files`);
 		}
 		const blocked = ledger.blocked();
 		if (blocked) throw new Error(budgetBlockMessage(blocked));
 		const background = params.background === true;
 		const task = params.context ? `${params.task}\n\n## Context\n${params.context}` : params.task;
 		const carried = handoff ? lastReport(handoff.from) : undefined;
-		if (handoff && carried === undefined) throw new Error(handoffBlocked(handoff.from, handoff.reason));
+		if (handoff && carried === undefined) throw new Error(handoffBlocked(handoff.from, handoff.reason, tool));
 		const prompt = handoff && carried !== undefined ? handoffPrompt(task, handoff.from, carried, handoff.reason) : task;
 		const continued = params.continue === undefined ? undefined : handoffShare(prior, planPct);
 		const routed = handoff
-			? handoffNote(handoff.from, handle, handoff.reason)
+			? handoffNote(handoff.from, handle, handoff.reason, tool)
 			: continued === undefined
 				? undefined
-				: continueNote(handle, role.name, continued, planPct);
+				: continueNote(handle, role.name, continued, planPct, tool);
 		const note = [routed, route.unrecorded].filter((part) => part !== undefined).join("\n\n") || undefined;
 		const hostSessionId: string = ctx.sessionManager.getSessionId();
 		// The intent is the host's half of continuing a run; which session it becomes is the backend's own to say.
@@ -3382,12 +3387,12 @@ export default function fusion(pi: ExtensionAPI, options: FusionOptions = {}) {
 	 * started it and whichever backend it runs in. The two names are one executor, so no handle is reachable
 	 * through one of them alone.
 	 */
-	const control = async (params: { action: string; run?: string; message?: string }, signal: AbortSignal | undefined, ctx: any) => {
+	const control = async (tool: NonNullable<CardDetails["control"]>, params: { action: string; run?: string; message?: string }, signal: AbortSignal | undefined, ctx: any) => {
 		mask();
 		ui = ctx.ui;
 		ensureHistory(ctx);
 		noteBudget(ctx);
-		const reply = (text: string, details: Record<string, unknown> = {}) => ({ content: [{ type: "text" as const, text }], details });
+		const reply = (text: string, details: Record<string, unknown> = {}) => ({ content: [{ type: "text" as const, text }], details: { ...details, ...(details.question === undefined ? {} : { control: tool }) } });
 		if (!(CONTROL_ACTIONS as readonly string[]).includes(params.action)) {
 			throw new Error(`unknown action ${params.action}; use one of ${CONTROL_ACTIONS.join(", ")}`);
 		}
@@ -3406,16 +3411,16 @@ export default function fusion(pi: ExtensionAPI, options: FusionOptions = {}) {
 			if (!record) {
 				const held = historical.get(handle);
 				if (!held) throw new Error(`unknown run ${handle}`);
-				if (params.action === "status") return reply(heldText(held, undefined, ctx.cwd), { handle, state: held.state, historical: true });
-				return reply(`${handle} (${held.role}) ran in an earlier Pi process and is not active.${unsent} Read it with fusion_control status and run ${handle}, or take no action.`, {
+				if (params.action === "status") return reply(heldText(held, undefined, ctx.cwd, tool), { handle, state: held.state, historical: true });
+				return reply(`${handle} (${held.role}) ran in an earlier Pi process and is not active.${unsent} Read it with ${tool} status and run ${handle}, or take no action.`, {
 					handle,
 					state: held.state,
 					historical: true,
 				});
 			}
 			const held = params.action === "status" ? heldRun(handle, record, ctx) : undefined;
-			if (held) return reply(heldText(held, record, ctx.cwd), { handle, state: held.state, historical: true, ...(record.refusal ? { refused: true } : {}) });
-			const left = record.refusal ? `${record.refusal}.` : `Continue it with ${continueWith(record.backend)} and continue ${handle}, or take no action.`;
+			if (held) return reply(heldText(held, record, ctx.cwd, tool), { handle, state: held.state, historical: true, ...(record.refusal ? { refused: true } : {}) });
+			const left = record.refusal ? `${record.refusal}.` : `Continue it with ${continueWith(record.backend, tool)} and continue ${handle}, or take no action.`;
 			return reply(`${handle} (${record.role}) ran before this Pi session started and is not active.${unsent} ${left}`, { handle, state: "ended", ...(record.refusal ? { refused: true } : {}) });
 		}
 		if (params.action === "status") {
@@ -3432,7 +3437,7 @@ export default function fusion(pi: ExtensionAPI, options: FusionOptions = {}) {
 			const answered = run.userAnswer;
 			if (answered) answered.acknowledged = true;
 			const answerLine = answered ? `\n\nanswered by the user: ${answered.text}` : "";
-			if (run.state === "waiting") return reply(`${askedText(run)}${answerLine}`, { ...runDetails(run), handle, state: run.state });
+			if (run.state === "waiting") return reply(`${askedText(run, tool)}${answerLine}`, { ...runDetails(run), handle, state: run.state });
 			// Taken before the run is awaited: a wait that lands while the run is still finishing carries the report too.
 			run.delivered = true;
 			await run.ended;
@@ -3451,7 +3456,7 @@ export default function fusion(pi: ExtensionAPI, options: FusionOptions = {}) {
 			if (run.state === "running" && answered && !answered.acknowledged) {
 				answered.acknowledged = true;
 				return reply(
-					`The user already answered ${handle}'s question with: ${answered.text}. Your message was not sent; the child goes on with the user's answer. If it still applies, send it again with fusion_control message and it goes to the child as a steer, or as the answer if it has asked another question by then.`,
+					`The user already answered ${handle}'s question with: ${answered.text}. Your message was not sent; the child goes on with the user's answer. If it still applies, send it again with ${tool} message and it goes to the child as a steer, or as the answer if it has asked another question by then.`,
 					{ ...runDetails(run), handle, state: run.state, sent: "none", answeredBy: "user" },
 				);
 			}
@@ -3465,7 +3470,7 @@ export default function fusion(pi: ExtensionAPI, options: FusionOptions = {}) {
 			const recorded = branchRuns(ctx).get(handle);
 			const left = recorded?.refusal
 				? `${recorded.refusal}.`
-				: `If the message still applies, continue the run with ${continueWith(recorded?.backend ?? run.backend)} and continue ${handle}, where you can also set model, effort, context and background. Otherwise take no action.`;
+				: `If the message still applies, continue the run with ${continueWith(recorded?.backend ?? run.backend, tool)} and continue ${handle}, where you can also set model, effort, context and background. Otherwise take no action.`;
 			return reply(`${handle} (${run.role.name}) has ended: ${run.state}. The message was not sent.${text ? `\n\nReport summary:\n${text}` : ""}\n\n${left}`, {
 				...runDetails(run),
 				handle,
@@ -3501,7 +3506,7 @@ export default function fusion(pi: ExtensionAPI, options: FusionOptions = {}) {
 			message: Type.Optional(Type.String({ description: "message only: the answer to a waiting run's question, or a steer for a running child." })),
 		}),
 		async execute(_toolCallId, params, signal, _onUpdate, ctx) {
-			return control(params, signal, ctx);
+			return control(CONTROL_TOOL_NAME, params, signal, ctx);
 		},
 		renderResult(result, options, theme, context) {
 			const action = typeof context.args?.action === "string" ? ` ${context.args.action}` : "";
@@ -3514,15 +3519,15 @@ export default function fusion(pi: ExtensionAPI, options: FusionOptions = {}) {
 		executionMode: "sequential",
 		label: "Claude control",
 		description:
-			"Act on the claude runs of this Pi session by handle. A run is running, waiting (its child asked a question and waits for the answer), or has ended. status: without run, list every run with role, model, state, elapsed time and open question; with run, add its current activity, tool call count and, for a run that can change files, the work tree changes seen so far. wait: block until the run ends and return its report, or until it asks a question and return the question; Esc stops the wait, not the run. message: to a waiting run, the answer to its question; to a running child, a steer it reads when it next takes input; to a run that has ended it sends nothing and returns the run's state and a summary of its report, so you can decide to continue the run with claude or take no action. cancel: stop the run.",
-		promptSnippet: "Check, wait for, answer, steer or cancel a claude run by its handle",
+			"Act on the runs of this Pi session by handle, whichever tool started them and whichever backend runs them. A run is running, waiting (its child asked a question and waits for the answer), or has ended. status: without run, list every run with role, model, state, elapsed time and open question; with run, add its current activity, tool call count and, for a run that can change files, the work tree changes seen so far. wait: block until the run ends and return its report, or until it asks a question and return the question; Esc stops the wait, not the run. message: to a waiting run, the answer to its question; to a running child, a steer it reads when it next takes input; to a run that has ended it sends nothing and returns the run's state and a summary of its report, so you can decide to continue the run with claude (fusion for a Pi run) or take no action. cancel: stop the run.",
+		promptSnippet: "Check, wait for, answer, steer or cancel a run by its handle",
 		parameters: Type.Object({
 			action: stringEnum(CONTROL_ACTIONS, "status, wait, message or cancel."),
 			run: Type.Optional(Type.String({ description: "The run's handle, such as run-3. Required for every action except status." })),
 			message: Type.Optional(Type.String({ description: "message only: the answer to a waiting run's question, or a steer for a running child." })),
 		}),
 		async execute(_toolCallId, params, signal, _onUpdate, ctx) {
-			return control(params, signal, ctx);
+			return control(CLAUDE_CONTROL_NAME, params, signal, ctx);
 		},
 		renderResult(result, options, theme, context) {
 			const action = typeof context.args?.action === "string" ? ` ${context.args.action}` : "";

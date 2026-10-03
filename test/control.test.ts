@@ -223,9 +223,9 @@ test("a second run that can change files fails while one is active, an ask run d
 	const host = makeHost();
 	await withScenario("hang", () => host.claude({ role: "implement", task: "long work", background: true }));
 	await assert.rejects(host.claude({ role: "ultracode", task: "other work" }), {
-		message: "run-1 (implement) is still active; wait for it, message it or cancel it with fusion_control before you start or continue another run that can change files",
+		message: "run-1 (implement) is still active; wait for it, message it or cancel it with claude_control before you start or continue another run that can change files",
 	});
-	await assert.rejects(host.claude({ continue: "run-1", task: "more" }), /^Error: run-1 is still active; send it a message with fusion_control message/);
+	await assert.rejects(host.claude({ continue: "run-1", task: "more" }), /^Error: run-1 is still active; send it a message with claude_control message/);
 	const answer = await host.text(host.claude({ role: "ask", task: "where is x?" }));
 	assert.match(answer, /^done\n\n\[run-2 · ask · opus · /);
 	assert.equal(await host.text(host.control({ action: "cancel", run: "run-1" })), "run-1 cancelled");
@@ -330,8 +330,8 @@ test("session_shutdown stops active runs without a notice", async () => {
 	assert.deepEqual(host.sent, []);
 });
 
-const asks = (handle: string, role: string, question: string) =>
-	`${handle} (${role}) asks:\n\n${question}\n\nThe run waits in the background until you answer with fusion_control message and run ${handle}. Ask the user first if the decision is theirs.`;
+const asks = (handle: string, role: string, question: string, control = "claude_control") =>
+	`${handle} (${role}) asks:\n\n${question}\n\nThe run waits in the background until you answer with ${control} message and run ${handle}. Ask the user first if the decision is theirs.`;
 
 test("a question in a foreground run returns it at once, the run waits in the background, and the answer reaches the child as the tool result", async () => {
 	const host = makeHost();
@@ -351,6 +351,7 @@ test("a question in a foreground run returns it at once, the run waits in the ba
 		background: true,
 		state: "waiting",
 		question: "Which name?",
+		control: "claude_control",
 		sessionUsage: { costUsd: 0, tokensIn: asked.details.sessionUsage.tokensIn, tokensOut: asked.details.sessionUsage.tokensOut, workflowTokens: 0, calls: 1 },
 	});
 	assert.match(await host.text(host.control({ action: "status" })), /^run-1 · implement · opus · waiting · background · \d+s\n  question: Which name\?$/);
@@ -378,7 +379,7 @@ test("a question in a background run sends a notice, and the answered run ends w
 	await until("the question notice", () => host.sent.length > 0);
 	const [message, options] = host.sent[0]!;
 	assert.equal(message.content, `Background run ${asks("run-1", "implement", "Which name?")}`);
-	assert.deepEqual(fixed(message.details), { handle: "run-1", role: "implement", model: "opus", state: "waiting", background: true, question: "Which name?" });
+	assert.deepEqual(fixed(message.details), { handle: "run-1", role: "implement", model: "opus", state: "waiting", background: true, question: "Which name?", control: "claude_control" });
 	assert.deepEqual(options, { triggerTurn: true, deliverAs: "followUp" });
 	await host.control({ action: "message", run: "run-1", message: "bar" });
 	await until("the completion notice", () => host.sent.length > 1);
@@ -802,7 +803,7 @@ test("/fusion answer reaches the child, tells the host once, and turns the host'
 	const late = await host.control({ action: "message", run: "run-1", message: "call it bar" });
 	assert.equal(
 		late.content[0]!.text,
-		"The user already answered run-1's question with: call it foo. Your message was not sent; the child goes on with the user's answer. If it still applies, send it again with fusion_control message and it goes to the child as a steer, or as the answer if it has asked another question by then.",
+		"The user already answered run-1's question with: call it foo. Your message was not sent; the child goes on with the user's answer. If it still applies, send it again with claude_control message and it goes to the child as a steer, or as the answer if it has asked another question by then.",
 	);
 	assert.deepEqual(fixed(late.details), { handle: "run-1", role: "implement", model: "opus", state: "running", background: true, sent: "none", answeredBy: "user" });
 	const report = await host.text(host.control({ action: "wait", run: "run-1" }));
@@ -1595,7 +1596,7 @@ test("a question from a review child names the run it reviews", () =>
 			await host.command("review run-1");
 			await until("the review's question", () => host.sent.length > 1);
 		});
-		assert.equal(host.sent[1]![0].content, `Background run ${asks("run-2", "ask, review of run-1", "Which name?")}`);
+		assert.equal(host.sent[1]![0].content, `Background run ${asks("run-2", "ask, review of run-1", "Which name?", "fusion_control")}`);
 	}));
 
 test("a status render that throws fails neither the run it renders nor a review of another run", () =>
@@ -1789,7 +1790,7 @@ test("a run whose Pi process ended while it was going comes back as aborted, in 
 			const sent = await second.control({ action: "message", run: "run-1", message: "go on" });
 			assert.equal(
 				sent.content[0]!.text,
-				"run-1 (implement) ran in an earlier Pi process and is not active. The message was not sent. Read it with fusion_control status and run run-1, or take no action.",
+				"run-1 (implement) ran in an earlier Pi process and is not active. The message was not sent. Read it with claude_control status and run run-1, or take no action.",
 			);
 			assert.deepEqual(sent.details, { handle: "run-1", state: "aborted", historical: true });
 			second.notices.length = 0;

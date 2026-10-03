@@ -99,6 +99,19 @@ test("a collapsed card of a waiting run shows the question and how to answer it"
 	]);
 });
 
+test("waiting cards keep the invoking control name, in either display mode, and reject unknown names", () => {
+	for (const control of ["fusion_control", "claude_control"] as const) {
+		assert.deepEqual(cardDetails({ control }), { control });
+		for (const expanded of [false, true]) {
+			assert.equal(bodyLines(theme, "", { expanded, question: "Which name?", handle: "run-1", control }).at(-1), `<muted>answer: /fusion answer run-1 <text> or ${control} message</muted>`);
+		}
+	}
+	for (const control of [null, 7, "some_other_tool", "claude_control\u001b[2J"]) {
+		assert.deepEqual(cardDetails({ control }), {});
+		assert.equal(bodyLines(theme, "", { expanded: false, question: "Which name?", handle: "run-1", control: control as any }).at(-1), HINT("run-1"), "even a caller's unchecked control name reaches no terminal line");
+	}
+});
+
 test("an expanded card marks the headings the host must act on and leaves the rest of the report alone", () => {
 	const text = "## Changed\nfoo.ts\n## Escalation\nneeds a decision\n### open questions\nwhat now\n# Review\nfine\n#### Verification\nnpm test";
 	assert.deepEqual(bodyLines(theme, text, { expanded: true }), [

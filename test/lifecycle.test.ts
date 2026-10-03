@@ -584,6 +584,66 @@ test("each backend has its own latest plan run, and a refused one on one backend
 	});
 });
 
+test("question and continuation instructions follow the invoking tool pair, while either control can manage the run", async () => {
+	for (const tool of ["fusion", "claude"]) {
+		const control = tool === "fusion" ? "fusion_control" : "claude_control";
+		const other = tool === "fusion" ? "claude_control" : "fusion_control";
+		const backend = fakeBackend({ name: "claude", scripts: [{ questions: ["Which name?"], pending: true }] });
+		const host = makeHost({ backends: { claude: backend.backend } });
+		try {
+			const waiting = await host.call(tool, { role: "implement", task: "the change" });
+			assert.match(waiting.text ?? "", new RegExp(`answer with ${control} message`));
+			assert.equal(waiting.details.control, control, "background notices and cards keep the run's tool pair");
+			const active = await host.call(tool, { continue: "run-1", task: "more" });
+			assert.match(active.error ?? "", new RegExp(`message with ${control} message, or wait for it with ${control} wait`));
+			const waited = await host.call(other, { action: "wait", run: "run-1" });
+			assert.match(waited.text ?? "", new RegExp(`answer with ${other} message`), "a control reply uses the control that was called");
+			await host.call(other, { action: "message", run: "run-1", message: "use small-name" });
+			const start = await backend.started();
+			await until("the question to be answered", () => start.answers.length === 1);
+			assert.deepEqual(start.answers, ["use small-name"], "the alias changes no question routing");
+			start.release();
+			await ended(host, "run-1");
+			for (const name of [control, other]) {
+				const reply = await host.call(name, { action: "message", run: "run-1", message: "follow up" });
+				const nextTool = name === "claude_control" ? "claude" : "fusion";
+				assert.match(reply.text ?? "", new RegExp(`continue the run with ${nextTool} and continue run-1`));
+			}
+			await host.call(tool, { role: "ask", task: "the question", background: true });
+			await until("the background question notice", () => host.sent.some(([message]) => String(message.content).includes("run-2 (ask) asks:")));
+			const notice = host.sent.find(([message]) => String(message.content).includes("run-2 (ask) asks:"))![0];
+			assert.match(notice.content, new RegExp(`answer with ${control} message`));
+			assert.equal(notice.details.control, control);
+		} finally {
+			await host.shutdown();
+		}
+	}
+});
+
+test("plan handoff, blocked handoff and context-cap instructions name the tool that was called", async () => {
+	for (const tool of ["fusion", "claude"]) {
+		const backend = fakeBackend({ name: "claude", scripts: [{ text: "agreed plan", contextTokens: 900, contextWindow: 1_000 }, {}, {}] });
+		const host = makeHost({ backends: { claude: backend.backend } });
+		try {
+			await host.call(tool, { role: "plan", task: "plan it" });
+			const original = host.branch[0];
+			const handed = await host.call(tool, { role: "plan", task: "next question" });
+			assert.match(handed.text ?? "", new RegExp(`call ${tool} with continue run-1`));
+			const continued = await host.call(tool, { continue: "run-1", task: "use the earlier reasoning" });
+			assert.match(continued.text ?? "", new RegExp(`call ${tool} with role plan and fresh true`));
+			const restarted = makeHost({ branch: [original], backends: { claude: backend.backend } });
+			try {
+				const blocked = await restarted.call(tool, { role: "plan", task: "another question" });
+				assert.match(blocked.error ?? "", new RegExp(`Call ${tool} with role plan and fresh true`));
+			} finally {
+				await restarted.shutdown();
+			}
+		} finally {
+			await host.shutdown();
+		}
+	}
+});
+
 test("a pi plan handoff starts a new handle on the same backend with a fresh session, on the model and level the plan run ran with", async () => {
 	await withEnv(piEnv(), async () => {
 		const pi = fakeBackend({ defaultEffort: "off", scripts: [{ text: "## Plan\n1. do the thing", contextTokens: 900, contextWindow: 1_000 }] });
@@ -871,8 +931,10 @@ test("both control names act on a pi run, and neither offers a claude resume for
 		// The scalar id the child reported is a diagnostic: no record, no resume command, no host detail.
 		assert.equal(host.entries()[0]!.sessionId, undefined);
 		assert.ok(!/pi-scalar/.test(waited.text ?? ""), waited.text);
-		const ended = await host.control({ action: "message", run: "run-1", message: "too late" });
-		assert.match(ended.text ?? "", /continue the run with fusion and continue run-1/);
+		for (const tool of ["fusion_control", "claude_control"]) {
+			const ended = await host.call(tool, { action: "message", run: "run-1", message: "too late" });
+			assert.match(ended.text ?? "", /continue the run with fusion and continue run-1/, tool);
+		}
 	});
 });
 
