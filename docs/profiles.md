@@ -33,7 +33,7 @@ The check runs once before a dialog opens. It runs again just before the setting
 
 `list`, `save` and `default` work while runs are going. They don't change the settings this session runs with.
 
-The host itself does not have to be idle. Applying settings updates the tools' descriptions and guidance at once, so the host's next response reads them. A model request already in progress keeps the guidance it was sent with. A call the host made from older guidance is still checked against the current settings, so a disabled role is refused either way.
+The host itself does not have to be idle. Applying settings updates the tools' descriptions and guidance at once, so the host's next response reads them. If that update fails, the settings are not applied and Fusion attempts to restore the previous guidance and active-tool list. A model request already in progress keeps the guidance it was sent with. A call the host made from older guidance is still checked against the current settings, so a disabled role is refused either way.
 
 ## The built-in configuration and the session's lifetime
 
@@ -51,7 +51,7 @@ A saved profile is a snapshot. Its settings don't follow environment variables t
 
 A fresh run goes to the backend the call names. If the call names none, it goes to the backend the session's settings give the role. When that backend matches the role's setting, the call's own `model` and `effort` win, and the settings fill in whatever the call leaves out. A profile never falls back on an environment variable for a field it leaves out.
 
-A call that names the other backend is a one-off override. It runs on that backend's legacy defaults, taken from the role variables when the instance started, and never on the model or effort set for the role's other backend. The compatibility `claude` tool works this way for a role whose setting is `pi`.
+A call that names the other backend is a one-off override. It runs on that backend's legacy defaults, taken from the role variables when the instance started, and never on the model or effort set for the role's other backend. The compatibility `claude` tool works this way for a role whose setting is `pi`. Both tools' guidance recommends `fusion` for Pi-routed roles; `claude` remains an explicit Claude Code override.
 
 A Pi role with no model is shown as `unconfigured`. A call to it is refused before anything starts, unless the call names a model. Nothing picks a model or a backend for you.
 

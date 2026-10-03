@@ -290,14 +290,15 @@ function claudeRecord(base: RunRecord, data: Record<string, unknown>): RunRecord
 /**
  * The Pi half of an entry. A Pi run is only ever identified by the structured reference it recorded, session file and
  * all: a loose session id, a loose checkpoint or an incomplete reference is refused rather than read as a run with no
- * identity, which would start a new session over a child that exists. A handle alone means no identity was recorded.
+ * identity, which would start a new session over a child that exists. A handle alone keeps the failed run for reading,
+ * never for continuation: retrying requires an explicitly new run.
  */
 function piRecord(base: RunRecord, data: Record<string, unknown>): RunRecord {
 	const record: RunRecord = { ...base, backend: "pi" };
 	const loose = ["sessionId", "checkpoint", "sessionFile"].filter((field) => data[field] !== undefined);
 	if (data.session === undefined) {
 		if (loose.length) return refused(record, `records its pi session in ${loose.join(", ")} rather than in a session reference; it cannot be continued, so start a new run`);
-		return record;
+		return refused(record, "ran on pi and recorded no verified session, so it cannot be continued; start a new run without continue (a plan call takes fresh true)");
 	}
 	const ref = sessionRefOf(data.session, "pi");
 	if (!ref) return refused(record, "has an incomplete or mismatched pi session reference; it cannot be continued, so start a new run");
@@ -692,9 +693,9 @@ export function fusionRoute(params: FusionParams, records: RunRecords, planPct: 
 		const call = { ...params, role: record.role, ...(mode ? { mode } : {}) };
 		checkParams(backend, call);
 		// A Claude run keeps the model and effort it was admitted with unless the call names others. A Pi run's selection
-		// is its record's own, and its binding repeats that rather than reading one off the configuration; a Pi handle that
-		// recorded none falls back on the defaults this instance started with, never on the profile selected now.
-		const kept = backend === "claude" ? claudeKept(record, params, config) : { defaults: { ...config.baseline[record.role].pi } };
+		// is its record's own, and its binding repeats that rather than reading one off the configuration. A Pi record
+		// without a verified session and selection was refused above, so no continuation guesses fallback defaults.
+		const kept = backend === "claude" ? claudeKept(record, params, config) : { defaults: {} };
 		return { backend, role: record.role, handle: record.handle, record, call, ...kept };
 	}
 	if (params.role === undefined) throw new Error("role is required unless continue is set");
@@ -1267,27 +1268,33 @@ function openInBrowser(url: string): void {
 
 /**
  * How the host routes work to a delegation tool, in that tool's own names: the primary tool and its control tool
- * carry the fusion names, and the compatibility pair carries the claude ones, so each tool's guidance names itself.
- * What a role runs on is the session's configuration and is said once, in the description; a disabled role is not
+ * carry the fusion names; compatibility guidance sends Pi-routed roles through fusion rather than silently overriding
+ * the profile. What a role runs on is said in the description; a disabled role is not
  * recommended anywhere here, and one guideline says it is refused.
  */
 const guidelines = (tool: string, control: string, roles: RoleSettings, options: { backend: boolean }): string[] => {
 	const on = (role: KnownRoleName): boolean => roles[role].enabled;
+	const roleTool = (role: KnownRoleName): string => !options.backend && roles[role].backend === "pi" ? TOOL_NAME : tool;
+	const planTool = roleTool("plan");
+	const implementTool = roleTool("implement");
+	const askTool = roleTool("ask");
 	const lines: string[] = [`These ${tool} guidelines apply while Fusion is on, as it is now; once the user has turned Fusion off they no longer apply and you work directly.`];
+	const piRoles = options.backend ? [] : ROLE_NAMES.filter((role) => on(role) && roles[role].backend === "pi");
+	if (piRoles.length) lines.push(`This session routes ${piRoles.map((role) => `role ${role}`).join(", ")} to pi. Use fusion for these roles unless the user explicitly asks for Claude Code: ${tool} forces the claude backend and uses this instance's legacy Claude defaults instead of the configured Pi settings.`);
 	if (on("plan")) {
 		lines.push(
-			`Call ${tool} with role plan, giving the goal, a short plan, constraints and what is already decided, when the design is unresolved: more than one viable approach, unclear requirements, a change to a shared contract or interface, or risk you cannot bound by reading the code. Treat the returned agreed plan as the contract and its Route section as a recommendation. Skip role plan when you can already state what to change, where, the acceptance criteria and how to verify it.`,
-			`Leave ${tool}'s model unset for role plan, which runs it on its configured model. Later plan calls keep the plan run's model; name another model only when the user asks for one, which starts a fresh plan run that carries the plan so far.`,
-			`A ${tool} call with role plan continues the last plan run while that run's context stays under its cap, 35% of the window by default, and while the call names the model that run is on. Past the cap, or when the call names another model, it starts a fresh plan run that carries the last report, the plan agreed so far, instead of the transcript behind it, and the result says which run replaced which. A fresh run past the cap keeps the plan run's model. Keep working with the fresh run: state anything the earlier run knew and its report does not say, and call ${tool} with continue and the older handle only when you need what it dropped.`,
+			`Call ${planTool} with role plan, giving the goal, a short plan, constraints and what is already decided, when the design is unresolved: more than one viable approach, unclear requirements, a change to a shared contract or interface, or risk you cannot bound by reading the code. Treat the returned agreed plan as the contract and its Route section as a recommendation. Skip role plan when you can already state what to change, where, the acceptance criteria and how to verify it.`,
+			`Leave ${planTool}'s model unset for role plan, which runs it on its configured model. Later plan calls keep the plan run's model; name another model only when the user asks for one, which starts a fresh plan run that carries the plan so far.`,
+			`A ${planTool} call with role plan continues the last plan run while that run's context stays under its cap, 35% of the window by default, and while the call names the model that run is on. Past the cap, or when the call names another model, it starts a fresh plan run that carries the last report, the plan agreed so far, instead of the transcript behind it, and the result says which run replaced which. A fresh run past the cap keeps the plan run's model. Keep working with the fresh run: state anything the earlier run knew and its report does not say, and call ${planTool} with continue and the older handle only when you need what it dropped.`,
 		);
 	}
 	lines.push(
 		`A ${tool} call with continue is never handed off, because you named the run. Past the cap its result says so and names what a fresh run would take instead; act on that when the next step can stand on its own, and keep continuing the run while it cannot.`,
-		`You orchestrate ${tool} runs and do not implement: delegate implementation in dependency order, pass earlier results on as context, check each report against the task's acceptance criteria before the next task${on("ask") ? `, and review the change with ${tool} role ask and mode review` : ""}; do not edit files yourself. When a run fails, report its failure message rather than doing the task yourself.`,
+		`You orchestrate ${tool} runs and do not implement: delegate implementation in dependency order, pass earlier results on as context, check each report against the task's acceptance criteria before the next task${on("ask") ? `, and review the change with ${askTool} role ask and mode review` : ""}; do not edit files yourself. When a run fails, report its failure message rather than doing the task yourself.`,
 	);
 	if (on("implement") || on("ultracode")) {
 		const implement = on("implement")
-			? `Send every implementation task to ${tool} with role implement, however complex or risky: one clear, bounded task at a time, straight from the user's request when no design question is open, or task by task from a plan that role plan agreed.`
+			? `Send every implementation task to ${implementTool} with role implement, however complex or risky: one clear, bounded task at a time, straight from the user's request when no design question is open, or task by task from a plan that role plan agreed.`
 			: `Role implement is disabled, so send implementation to ${tool} with role ultracode only when the user asks for it, and otherwise tell the user it needs role implement.`;
 		const ultracode = on("ultracode")
 			? ` Use ${tool} with role ultracode only when the user explicitly asks for ultracode, even when a Route section recommends it; then give it the whole agreed plan in one call, expect it to be slow, and treat its report's Review section as a self-review by agents it briefed. Role ultracode runs its agents one at a time so builds and tests do not overlap, so do not ask it for parallel work.`
@@ -1296,17 +1303,17 @@ const guidelines = (tool: string, control: string, roles: RoleSettings, options:
 	}
 	if (on("implement")) {
 		lines.push(
-			`When a ${tool} role implement report has an Escalation section, do not re-send or widen the task yourself. Keep what it changed and verified, then take the design question to ${tool} with role plan or the broader work to a new ${tool} role implement run, with the report as context.`,
+			`When a ${implementTool} role implement report has an Escalation section, do not re-send or widen the task yourself. Keep what it changed and verified, then ${on("plan") ? `take the design question to ${planTool} with role plan or the broader work to` : "take broader work to"} a new ${implementTool} role implement run, with the report as context.${on("plan") ? "" : " For a design question, tell the user role plan is disabled."}`,
 		);
 	}
 	lines.push(
 		options.backend
 			? `The user's explicit choice wins over these ${tool} guidelines, including asking for or skipping role plan and asking for role ultracode. A backend, model or effort the user names goes in ${tool}'s backend, model or effort parameter; otherwise leave all three unset, which runs each role on this session's configured defaults.`
-			: `The user's explicit choice wins over these ${tool} guidelines, including asking for or skipping role plan and asking for role ultracode. A model or effort the user names goes in ${tool}'s model or effort parameter; otherwise leave both unset, which runs each role on this session's configured defaults.`,
+			: `The user's explicit choice wins over these ${tool} guidelines, including asking for or skipping role plan and asking for role ultracode. For an explicit ${tool} call, put a model or effort the user names in its model or effort parameter; otherwise leave both unset to use the role's configured Claude settings, or this instance's legacy Claude defaults when the role is configured on Pi.`,
 	);
 	if (on("ask")) {
 		lines.push(
-			`Use ${tool} with role ask to answer a question about the code or its dependencies without changing files, instead of reading many files yourself, and with role ask and mode review for an independent review of a change, naming the diff or files and what the change must do. Role ask runs read-only tools and returns an answer or ranked findings with file and line references; it never implements.`,
+			`Use ${askTool} with role ask to answer a question about the code or its dependencies without changing files, instead of reading many files yourself, and with role ask and mode review for an independent review of a change, naming the diff or files and what the change must do. Role ask runs read-only tools and returns an answer or ranked findings with file and line references; it never implements.`,
 		);
 	}
 	lines.push(
@@ -1492,7 +1499,7 @@ export default function fusion(pi: ExtensionAPI, options: FusionOptions = {}) {
 		}
 		const name = document.defaultProfile;
 		if (name === null || chosen) return;
-		const settings = document.profiles[name];
+		const settings = Object.hasOwn(document.profiles, name) ? document.profiles[name] : undefined;
 		if (!settings) {
 			profileWarning = `the default profile ${name} is not in ${await profileStore.where().catch(() => "the profiles file")}; this session uses the ${BUILTIN} configuration`;
 			return;
@@ -1518,6 +1525,7 @@ export default function fusion(pi: ExtensionAPI, options: FusionOptions = {}) {
 	 */
 	const applyConfiguration = (next: Configuration): void => {
 		const previous = configuration;
+		const activeTools = pi.getActiveTools();
 		configuration = next;
 		try {
 			registerGuidance(true);
@@ -1525,6 +1533,10 @@ export default function fusion(pi: ExtensionAPI, options: FusionOptions = {}) {
 			configuration = previous;
 			try {
 				registerGuidance(true);
+			} catch {}
+			// A failed restoration may have changed only part of the list; rollback must use the original snapshot.
+			try {
+				pi.setActiveTools(activeTools);
 			} catch {}
 			throw new Error(`the host's tool guidance did not change: ${error instanceof Error ? error.message : String(error)}`);
 		}
@@ -2610,7 +2622,7 @@ export default function fusion(pi: ExtensionAPI, options: FusionOptions = {}) {
 				notice(`profile ${name} was not loaded: ${error instanceof Error ? error.message : String(error)}`, "error");
 				return;
 			}
-			const settings = document.profiles[name];
+			const settings = Object.hasOwn(document.profiles, name) ? document.profiles[name] : undefined;
 			if (!settings) {
 				notice(`unknown profile ${name}; the profiles are ${[BUILTIN, ...Object.keys(document.profiles).sort()].join(", ")}`, "warning");
 				return;
@@ -2763,7 +2775,7 @@ export default function fusion(pi: ExtensionAPI, options: FusionOptions = {}) {
 			let replaced = false;
 			try {
 				knownProfiles = await profileStore.update((document) => {
-					replaced = command.name in document.profiles;
+					replaced = Object.hasOwn(document.profiles, command.name);
 					return { ...document, profiles: { ...document.profiles, [command.name]: roles } };
 				});
 			} catch (error) {
@@ -2779,7 +2791,7 @@ export default function fusion(pi: ExtensionAPI, options: FusionOptions = {}) {
 			const name = command.name;
 			try {
 				knownProfiles = await profileStore.update((document) => {
-					if (name !== BUILTIN && !(name in document.profiles)) throw new Error(`unknown profile ${name}; the profiles are ${[BUILTIN, ...Object.keys(document.profiles).sort()].join(", ")}`);
+					if (name !== BUILTIN && !Object.hasOwn(document.profiles, name)) throw new Error(`unknown profile ${name}; the profiles are ${[BUILTIN, ...Object.keys(document.profiles).sort()].join(", ")}`);
 					return { ...document, defaultProfile: name === BUILTIN ? null : name };
 				});
 			} catch (error) {
@@ -3334,16 +3346,21 @@ export default function fusion(pi: ExtensionAPI, options: FusionOptions = {}) {
 		for (const definition of [fusionTool(), claudeTool()]) {
 			const key = JSON.stringify([definition.description, definition.promptGuidelines, definition.parameters]);
 			if (registered.get(definition.name) === key) continue;
-			if (!refresh) pi.registerTool(definition as any);
-			else {
+			// The host may install the definition and then throw during its registry refresh; either way rollback must try.
+			registered.delete(definition.name);
+			if (!refresh) {
+				pi.registerTool(definition as any);
+				registered.set(definition.name, key);
+			} else {
 				const activeTools = pi.getActiveTools();
 				try {
 					pi.registerTool(definition as any);
+					// Registration already changed the definition, even if restoring active tools then throws.
+					registered.set(definition.name, key);
 				} finally {
 					pi.setActiveTools(activeTools);
 				}
 			}
-			registered.set(definition.name, key);
 		}
 	};
 

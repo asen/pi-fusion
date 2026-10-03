@@ -143,6 +143,11 @@ test("the latest plan run a call continues is its own backend's, and a refused o
 	// The refused record is still pi's latest plan: the call fails rather than walking back to run-1 or starting fresh.
 	assert.throws(() => fusionRoute({ role: "plan", task: "follow-up", backend: "pi" }, refused), /^Error: run-2 ran on pi and recorded no trusted checkpoint/);
 	assert.equal(fusionRoute({ role: "plan", task: "follow-up", backend: "pi", fresh: true }, refused).handle, "run-3");
+
+	const earlyFailure = records(piEntry({ role: "plan" }), { run: "run-2", role: "plan", backend: "pi", hostSessionId: "host-1" });
+	assert.throws(() => fusionRoute({ role: "plan", task: "follow-up", backend: "pi" }, earlyFailure), /^Error: run-2 ran on pi and recorded no verified session/);
+	assert.throws(() => fusionRoute({ role: "plan", task: "another model", backend: "pi", model: "openai/gpt-5" }, earlyFailure), /^Error: run-2 ran on pi and recorded no verified session/, "changing models does not bypass the refusal or return to run-1");
+	assert.equal(fusionRoute({ role: "plan", task: "retry", backend: "pi", fresh: true }, earlyFailure).handle, "run-3");
 });
 
 test("a plan handoff stays on the backend the plan run is on", () => {

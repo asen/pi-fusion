@@ -30,7 +30,7 @@ export const ROLE_SPECS: Record<KnownRoleName, RoleSpec> = {
 	security: { name: "security", backends: ["pi"], canChangeFiles: true, reviewable: true },
 };
 
-export const isKnownRole = (value: unknown): value is KnownRoleName => typeof value === "string" && value in ROLE_SPECS;
+export const isKnownRole = (value: unknown): value is KnownRoleName => typeof value === "string" && Object.hasOwn(ROLE_SPECS, value);
 
 /** The role's capabilities, or undefined for a name no record and no call may use. */
 export const roleSpec = (role: string): RoleSpec | undefined => (isKnownRole(role) ? ROLE_SPECS[role] : undefined);

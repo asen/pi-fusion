@@ -315,16 +315,50 @@ test("a refused latest pi plan blocks an implicit plan call instead of walking b
 	});
 });
 
-test("a pi run that failed before it verified anything records its handle alone, and the next call starts a new session for it", async () => {
-	await withEnv(piEnv(), async () => {
-		const pi = fakeBackend({ scripts: [{ fail: true, session: null, selection: null }, {}] });
-		const host = makeHost({ backends: both(pi) });
-		assert.match((await host.fusion({ role: "implement", task: "do the thing", backend: "pi" })).error ?? "", /^implement exited 1:/);
-		assert.deepEqual(host.entries(), [{ run: "run-1", role: "implement", backend: "pi", hostSessionId: "host-1" }]);
-		const again = await host.fusion({ continue: "run-1", task: "try again" });
-		assert.equal(again.error, undefined);
-		assert.deepEqual(pi.starts[1]!.intent, { kind: "new" }, "a handle with no identity starts a session rather than resuming one");
-		assert.deepEqual(host.entries().at(-1)!.session, { backend: "pi", sessionId: "pi-2", sessionFile: "/sessions/pi-2.jsonl", checkpoint: "entry-2" });
+test("an early pi failure keeps its report, refuses continuation and requires a fresh handle for every pi role", async (t) => {
+	const roles = ["plan", "implement", "ask", "security"] as const;
+	const env = Object.fromEntries(roles.flatMap((role) => [[`PI_FUSION_PI_${role.toUpperCase()}_MODEL`, undefined], [`PI_FUSION_PI_${role.toUpperCase()}_EFFORT`, undefined]]));
+	await withEnv(env, async () => {
+		for (const role of roles) {
+			const profiles = profileWith({ [role]: { enabled: true, backend: "pi", model: PI_MODEL, effort: "high" } });
+			const pi = fakeBackend({ scripts: [{ fail: true, session: null, selection: null }, {}] });
+			const host = makeHost({ backends: both(pi), profiles });
+			t.after(() => host.shutdown());
+			const first = await host.fusion({ role, task: "do the thing" });
+			assert.match(first.error ?? "", new RegExp(`^${role} exited 1:`));
+			assert.deepEqual(host.entries(), [{ run: "run-1", role, backend: "pi", hostSessionId: "host-1", ...(role === "ask" ? { mode: "answer" } : {}) }]);
+			const refusal = /^run-1 ran on pi and recorded no verified session/;
+			assert.match((await host.fusion({ continue: "run-1", task: "retry" })).error ?? "", refusal, role);
+			assert.match((await host.fusion({ continue: "run-1", task: "retry", model: "openai/gpt-5" })).error ?? "", refusal, "an override cannot make the handle continuable");
+			if (role === "plan") assert.match((await host.fusion({ role, task: "follow up" })).error ?? "", refusal);
+			assert.equal(pi.starts.length, 1, "refused retries start no child");
+			assert.equal(host.branch.length, 1, "the failure record is unchanged");
+			assert.equal((await host.control({ action: "status", run: "run-1" })).details.state, "failed");
+			assert.match((await host.control({ action: "wait", run: "run-1" })).text ?? "", new RegExp(`${role} exited 1:`), "the failure report remains readable");
+			const message = await host.control({ action: "message", run: "run-1", message: "retry" });
+			assert.match(message.text ?? "", /recorded no verified session/);
+			assert.match(message.text ?? "", /start a new run without continue/);
+
+			const next = fakeBackend();
+			const restored = makeHost({ backends: both(next), branch: host.branch, profiles });
+			t.after(() => restored.shutdown());
+			assert.match((await restored.fusion({ continue: "run-1", task: "retry after restart" })).error ?? "", refusal);
+			for (const action of ["status", "message"]) {
+				const status = await restored.control({ action, run: "run-1", ...(action === "message" ? { message: "retry" } : {}) });
+				assert.match(status.text ?? "", /recorded no verified session/);
+				assert.match(status.text ?? "", /start a new run without continue/);
+			}
+			await restored.command("status run-1");
+			assert.match(restored.notices.at(-1) ?? "", /recorded no verified session/);
+			assert.equal(next.starts.length, 0, "a restarted host also refuses before reaching its backend");
+
+			const again = await host.fusion({ role, task: "try again", ...(role === "plan" ? { fresh: true } : {}) });
+			assert.equal(again.error, undefined);
+			assert.deepEqual(pi.starts[1]!.intent, { kind: "new" });
+			assert.deepEqual([pi.starts[1]!.role.model, effortOf(pi.starts[1]!.role)], [PI_MODEL, "high"], "fresh retry uses the profile, not missing role variables");
+			assert.equal(host.entries().at(-1)!.run, "run-2", "the failed handle is never reused");
+			assert.deepEqual(host.entries().at(-1)!.session, { backend: "pi", sessionId: "pi-2", sessionFile: "/sessions/pi-2.jsonl", checkpoint: "entry-2" });
+		}
 	});
 });
 

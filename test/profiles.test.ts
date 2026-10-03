@@ -291,6 +291,19 @@ test("a pi role a profile leaves unconfigured is refused in that profile's words
 	assert.equal(fusionCall({ role: "security", task: "x" }, records(), 35, builtinConfiguration(piBaseline)).bound.model, "deepseek/deepseek-chat");
 });
 
+test("a session-less pi handle fails closed under a profile, and retrying fresh uses that profile", () => {
+	for (const role of ["plan", "implement", "ask", "security"] as const) {
+		const config = configured(settings({ [role]: { enabled: true, backend: "pi", model: "openai/gpt-5", effort: "high" } }));
+		const failed = records({ run: "run-1", role, backend: "pi", hostSessionId: "host-1" });
+		const refusal = /^Error: run-1 ran on pi and recorded no verified session/;
+		assert.throws(() => fusionCall({ continue: "run-1", task: "retry" }, failed, 35, config), refusal, role);
+		assert.throws(() => fusionCall({ continue: "run-1", task: "retry", model: "deepseek/deepseek-chat", effort: "low" }, failed, 35, config), refusal, "naming a model cannot make an unverified run continuable");
+		if (role === "plan") assert.throws(() => fusionCall({ role, task: "retry" }, failed, 35, config), refusal, "an implicit plan call also fails closed");
+		const fresh = fusionCall({ role, task: "retry", ...(role === "plan" ? { fresh: true } : {}) }, failed, 35, config);
+		assert.deepEqual([fresh.handle, fresh.record, fresh.bound.model, fresh.bound.effort], ["run-2", undefined, "openai/gpt-5", "high"]);
+	}
+});
+
 test("a disabled role is refused before anything is bound, whatever the call names, and for a continuation too", () => {
 	const config = configured(settings({ ultracode: { enabled: false, backend: "claude" }, implement: { enabled: false, backend: "claude" } }));
 	const refusal = /^Error: role implement is disabled in profile work; change \/fusion config or select another profile$/;
@@ -361,6 +374,7 @@ interface Tool {
 	description: string;
 	promptGuidelines?: string[];
 	executionMode?: string;
+	parameters?: unknown;
 	execute: (id: string, params: any, signal: AbortSignal | undefined, onUpdate: undefined, ctx: any) => Promise<{ content: Array<{ text: string }>; details?: any }>;
 }
 
@@ -511,6 +525,57 @@ test("the default profile loads as the session starts, and the host's guidance a
 	await host.shutdown();
 });
 
+test("the claude guidance respects pi-routed profiles and leaves explicit Claude overrides available", async (t) => {
+	const piRoles = settings({
+		plan: { enabled: true, backend: "pi", model: "deepseek/deepseek-chat", effort: "low" },
+		implement: { enabled: true, backend: "pi", model: "deepseek/deepseek-chat", effort: "high" },
+		ask: { enabled: true, backend: "pi", model: "deepseek/deepseek-chat", effort: "medium" },
+	});
+	const pi = fakeBackend();
+	const claude = fakeBackend({ name: "claude" });
+	const host = sdkHost({ profiles: memoryProfileStore(document({ work: piRoles }, "work")), backends: { pi: pi.backend, claude: claude.backend } });
+	t.after(() => host.shutdown());
+	await host.start();
+	await host.on();
+	const guidance = host.tools.get("claude")!.promptGuidelines!.join("\n");
+	assert.match(guidance, /Use fusion for these roles unless the user explicitly asks for Claude Code/);
+	assert.match(guidance, /Call fusion with role plan/);
+	assert.match(guidance, /Send every implementation task to fusion with role implement/);
+	assert.match(guidance, /Use fusion with role ask/);
+	assert.doesNotMatch(guidance, /Call claude with role plan|Send every implementation task to claude|Use claude with role ask/);
+	assert.match(guidance, /legacy Claude defaults/);
+	assert.doesNotMatch(guidance, /leave both unset, which runs each role on this session's configured defaults/);
+	assert.doesNotMatch(host.tools.get("fusion")!.promptGuidelines!.join("\n"), /Use fusion for these roles unless/);
+	assert.equal((await host.fusion({ role: "implement", task: "x" })).error, undefined);
+	assert.deepEqual([pi.starts[0]!.role.model, pi.starts[0]!.role.effort], ["deepseek/deepseek-chat", "high"]);
+	assert.equal(claude.starts.length, 0, "the configured route does not start Claude");
+	assert.equal((await host.claude({ role: "implement", task: "explicit Claude work" })).error, undefined);
+	assert.deepEqual([claude.starts[0]!.role.model, claude.starts[0]!.role.effort], ["opus", "high"], "the compatibility tool remains an explicit override on legacy defaults");
+
+	await host.command("profile use builtin");
+	const builtin = host.tools.get("claude")!.promptGuidelines!.join("\n");
+	assert.match(builtin, /Call claude with role plan/);
+	assert.match(builtin, /Send every implementation task to claude with role implement/);
+	assert.match(builtin, /Use claude with role ask/);
+	assert.doesNotMatch(builtin, /Use fusion for these roles unless/);
+});
+
+test("mixed-profile guidance recommends each role's configured backend", async () => {
+	const work = settings({ implement: { enabled: true, backend: "pi", model: "deepseek/deepseek-chat" }, ask: { enabled: false, backend: "pi" } });
+	const noPlan = { ...work, plan: { ...work.plan, enabled: false } };
+	const host = sdkHost({ profiles: memoryProfileStore(document({ work, noPlan }, "work")) });
+	await host.start();
+	const guidance = host.tools.get("claude")!.promptGuidelines!.join("\n");
+	assert.match(guidance, /Call claude with role plan/);
+	assert.match(guidance, /Send every implementation task to fusion with role implement/);
+	assert.doesNotMatch(guidance, /Use (fusion|claude) with role ask/);
+	assert.match(guidance, /disables role ask/);
+	await host.command("profile use noPlan");
+	for (const tool of ["fusion", "claude"]) {
+		assert.doesNotMatch(host.tools.get(tool)!.promptGuidelines!.join("\n"), /Call (fusion|claude) with role plan|to (fusion|claude) with role plan/, "a disabled planner is not recommended, even on escalation");
+	}
+});
+
 test("a broken profiles file or a missing default leaves the built-in configuration and a warning, and rewrites nothing", async () => {
 	const broken = memoryProfileStore("{ nope");
 	const host = sdkHost({ profiles: broken });
@@ -562,6 +627,38 @@ test("profile save, list, use and default each do one thing, and only use change
 		(host.completions("profile default ") as Array<{ value: string }>).map((item) => item.value),
 		["profile default builtin", "profile default work"],
 	);
+});
+
+test("prototype-key profile names are unknown unless explicitly saved, and then work like any profile", async () => {
+	for (const name of ["constructor", "toString", "valueOf", "hasOwnProperty"]) {
+		const store = memoryProfileStore();
+		const host = sdkHost({ profiles: store, ui: false });
+		await host.start();
+		await host.command(`profile use ${name}`);
+		assert.equal(host.last(), `unknown profile ${name}; the profiles are builtin`);
+		await host.command(`profile default ${name}`);
+		assert.equal(host.last(), `the default was not changed: unknown profile ${name}; the profiles are builtin`);
+		assert.equal(store.text(), undefined, "an unknown default writes nothing");
+		await host.command(`profile save ${name}`);
+		assert.match(host.last() ?? "", new RegExp(`^saved profile ${name};`), "an inherited name is not an existing profile");
+		await host.command(`profile save ${name}`);
+		assert.match(host.last() ?? "", new RegExp(`^replaced profile ${name};`));
+		await host.command(`profile use ${name}`);
+		assert.equal(host.last(), `fusion uses profile ${name} in this session`);
+		await host.command(`profile default ${name}`);
+		assert.equal((await store.read()).defaultProfile, name);
+		const restored = sdkHost({ profiles: store, ui: false });
+		await restored.start();
+		assert.deepEqual(restored.notices, [], "a stored prototype-key default loads without a warning");
+		await restored.command("config");
+		assert.match(restored.last() ?? "", new RegExp(`^fusion configuration: ${name} · new sessions start with ${name}`));
+
+		const missingStore = memoryProfileStore(document({}, name));
+		const missing = sdkHost({ profiles: missingStore, ui: false });
+		await missing.start();
+		assert.equal(missing.last(), `fusion: the default profile ${name} is not in (in memory); this session uses the builtin configuration`);
+		assert.equal(missingStore.text(), document({}, name), "startup does not rewrite a missing default");
+	}
 });
 
 test("an edit made to the file elsewhere reaches this session only when a profile is loaded again", async () => {
@@ -749,6 +846,48 @@ test("a guidance refresh that throws puts the previous configuration and its gui
 	assert.equal(tools.get("fusion")!.description, original, "the fusion tool, re-registered first, was put back");
 	await host.command("profile list");
 	assert.match(host.last() ?? "", /^builtin \(current/);
+});
+
+test("a failed guidance refresh rolls back settings, both tool definitions and the complete active list", async () => {
+	const allowed = ["read", "bash", "write", "fusion", "claude", "fusion_control", "claude_control", "fusion_activate", "fusion_deactivate"];
+	for (const enabled of [false, true]) {
+		for (const tool of ["fusion", "claude"]) {
+			for (const failDuringRegistration of [false, true]) {
+				const host = sdkHost({ profiles: memoryProfileStore(document({ work: WORK })), allowed, ui: false });
+				await host.start();
+				if (enabled) await host.on();
+				const originalTools = ["fusion", "claude"].map((name) => {
+					const definition = host.tools.get(name)!;
+					return [definition.description, definition.promptGuidelines, definition.parameters];
+				});
+				const active = [...host.active];
+				const set = host.tools.set.bind(host.tools);
+				let armed = true;
+				host.tools.set = ((name: string, definition: Tool) => {
+					const result = set(name, definition);
+					if (armed && name === tool) {
+						armed = false;
+						if (failDuringRegistration) throw new Error("extension refresh failed after replacing its definition");
+						host.failNextToolChange();
+					}
+					return result;
+				}) as typeof host.tools.set;
+				await host.command("profile use work");
+				const error = failDuringRegistration ? "extension refresh failed after replacing its definition" : "the host refused the tool list";
+				assert.equal(host.last(), `fusion settings stay as they are: the host's tool guidance did not change: ${error}`);
+				assert.deepEqual(host.active, active, `${tool}: a partial restoration loses no active tool and enables no hidden tool`);
+				assert.deepEqual(["fusion", "claude"].map((name) => {
+					const definition = host.tools.get(name)!;
+					return [definition.description, definition.promptGuidelines, definition.parameters];
+				}), originalTools);
+				await host.command("config");
+				assert.match(host.last() ?? "", /^fusion configuration: builtin ·/);
+				await host.command("profile use work");
+				assert.equal(host.last(), "fusion uses profile work in this session; disabled: ultracode", "a one-shot failure does not prevent a later retry");
+				assert.deepEqual(host.active, active);
+			}
+		}
+	}
 });
 
 test("the profile chooser lists every profile with its marks and loads the one picked, and closing it changes nothing", async () => {

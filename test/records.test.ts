@@ -4,6 +4,7 @@ import test from "node:test";
 import { fileURLToPath } from "node:url";
 import type { PiSessionRef, SessionIntent } from "../extensions/backends/types.ts";
 import { intentFor, nextSession, type RecordCall, recordDecision, type RunOutcome, type RunRecord, runRecords } from "../extensions/fusion.ts";
+import { canChangeFiles, isKnownRole, roleSpec } from "../extensions/roles.ts";
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 process.env.PI_FUSION_CLAUDE_BIN = path.join(repoRoot, "test", "fake-claude.mjs");
@@ -107,10 +108,19 @@ test("a pi entry keeps its session reference and the selection it ran with", () 
 	assert.deepEqual(intentFor(record, "host-2"), { kind: "fork", from: PI_REF });
 });
 
-test("a pi entry with a handle and no identity at all starts a new session", () => {
-	const record = only({ run: "run-1", role: "plan", backend: "pi", hostSessionId: "host-1" });
-	assert.deepEqual(record, { handle: "run-1", role: "plan", backend: "pi", hostSessionId: "host-1" });
-	assert.deepEqual(intentFor(record, "host-1"), { kind: "new" });
+test("a pi entry with no verified session keeps its handle and refuses continuation for every pi role", () => {
+	for (const role of ["plan", "implement", "ask", "security"]) {
+		const records = runRecords([entry({ run: "run-1", role, backend: "pi", hostSessionId: "host-1" })]);
+		const record = records.runs.get("run-1")!;
+		assert.equal(record.role, role);
+		assert.equal(record.session, undefined);
+		assert.equal(record.selection, undefined);
+		assert.match(record.refusal ?? "", /^run-1 ran on pi and recorded no verified session/);
+		assert.match(record.refusal ?? "", /start a new run without continue \(a plan call takes fresh true\)/);
+		assert.throws(() => intentFor(record, "host-1"), /recorded no verified session/);
+		assert.equal(records.highest, 1, "the failed handle stays taken");
+		if (role === "plan") assert.equal(records.lastPlan.get("pi"), "run-1", "the refused plan remains the latest plan");
+	}
 });
 
 test("a pi record with no trusted checkpoint is kept for reading and refused for continuing", () => {
@@ -180,8 +190,17 @@ test("an entry naming a backend this host does not know keeps its handle and is 
 	}
 });
 
-test("an entry with an unknown role is dropped, as it always was", () => {
-	assert.deepEqual([...runRecords([entry({ run: "run-1", role: "nobody", backend: "pi" })]).runs], []);
+test("an entry with an unknown or inherited role is dropped", () => {
+	for (const role of ["nobody", "constructor", "toString", "valueOf", "hasOwnProperty", "__proto__"]) {
+		assert.equal(isKnownRole(role), false, role);
+		assert.equal(roleSpec(role), undefined, role);
+		assert.equal(canChangeFiles(role), true, "unknown roles retain the conservative file-changing classification");
+		for (const backend of ["claude", "pi"]) {
+			const records = runRecords([entry({ run: "run-1", role, backend })]);
+			assert.deepEqual([...records.runs], [], `${backend}: ${role}`);
+			assert.equal(records.highest, 0, "an invalid role takes no handle");
+		}
+	}
 	assert.deepEqual([...runRecords([entry({ run: "job-1", role: "plan" })]).runs], []);
 });
 
@@ -206,7 +225,7 @@ test("nextSession still maps a record to the claude session shapes it always had
 	assert.equal(forked.kind, "fork");
 	assert.match(forked.id, UUID);
 	assert.deepEqual({ from: (forked as { from: string }).from, at: (forked as { at?: string }).at }, { from: "s-1", at: "c-1" });
-	assert.match(nextSession(only({ run: "run-1", role: "plan", backend: "pi", hostSessionId: "h-1" }), "h-1").id, UUID);
+	assert.throws(() => nextSession(only({ run: "run-1", role: "plan", backend: "pi", hostSessionId: "h-1" }), "h-1"), /recorded no verified session/);
 	assert.throws(() => nextSession(only(piEntry()), "host-1"), /pi session pi-1 cannot be continued by the claude backend/);
 });
 
