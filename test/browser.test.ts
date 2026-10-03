@@ -185,6 +185,7 @@ interface Page {
 	send(method: string, params?: Record<string, unknown>): Promise<Record<string, unknown>>;
 	evaluate<T>(expression: string): Promise<T>;
 	open(url: string): Promise<void>;
+	refresh(): Promise<void>;
 	until<T>(what: string, expression: string, ok: (value: T) => boolean, ms?: number): Promise<T>;
 }
 
@@ -216,7 +217,9 @@ function makePage(cdp: Cdp, sessionId: string, redact: (text: string) => string)
 		await send("Page.navigate", { url });
 		await until<string>("the page loads", READY, (value) => value === "ready", COMMAND_MS);
 	};
-	return { send, evaluate, open, until };
+	/** Layout checks use the normal refresh path immediately rather than waiting for the next one-second poll. */
+	const refresh = () => evaluate<void>("pollRuns()");
+	return { send, evaluate, open, refresh, until };
 }
 
 function report(): string {
@@ -496,6 +499,7 @@ test("repeated live refreshes keep the log where the reader left it and count ro
 			for (let i = 1; i <= REFRESHES; i++) {
 				const rows = await page.evaluate<number>(LOG_ROWS);
 				store.event("live", { type: "tool_call", name: "Read", brief: `${viewport.name} away ${i}` });
+				await page.refresh();
 				await page.until<number>(`${viewport.name}: refresh ${i} arrives`, LOG_ROWS, (count) => count === rows + 1);
 				assert.equal(await page.evaluate<number>(LOG_SCROLL), 100, `${viewport.name}: refresh ${i} must not move a log scrolled up`);
 				await page.until<string>(`${viewport.name}: refresh ${i} is counted`, JUMP_TEXT, (text) => text === `${i} new ↓`);
@@ -511,6 +515,7 @@ test("repeated live refreshes keep the log where the reader left it and count ro
 			for (let i = 1; i <= REFRESHES; i++) {
 				const rows = await page.evaluate<number>(LOG_ROWS);
 				store.event("live", { type: "tool_call", name: "Read", brief: `${viewport.name} hidden ${i}` });
+				await page.refresh();
 				await page.until<number>(`${viewport.name}: hidden refresh ${i} arrives`, LOG_ROWS, (count) => count === rows + 1);
 				assert.equal(await page.evaluate<number>(PANEL_SCROLL("overview")), middle, `${viewport.name}: hidden refresh ${i} must not move the Overview tab`);
 				await page.until<string>(`${viewport.name}: hidden refresh ${i} is counted on the Log tab`, TAB_BADGE("Log"), (text) => text === `+${i}*`);
@@ -564,6 +569,7 @@ test("the Log tab holds still while tasks, the timeline and thinking grow on the
 				const rows = await page.evaluate<number>(LOG_ROWS);
 				store.event("live", { type: "task_started", taskId, name: `${taskId} ${WORDS(20)}`, taskType: "local_agent", subagentType: "general-purpose" });
 				tasks.push(taskId);
+				await page.refresh();
 				await page.until<number>(`${taskId}: the task's log row arrives`, LOG_ROWS, (count) => count === rows + 1);
 				assert.equal(await page.evaluate<string>(TAB_BADGE("Tasks")), `${tasks.length} running*`, `${taskId}: the Tasks tab counts the running tasks`);
 				await kept(`${taskId} starting`, pinned, pinned ? "" : "1 new ↓");
@@ -582,12 +588,14 @@ test("the Log tab holds still while tasks, the timeline and thinking grow on the
 						{ label: "b", state: "start" },
 					],
 				});
+				await page.refresh();
 				await page.until<string[]>(`${taskId}: the summary arrives`, TASK_SUMMARIES, (summaries) => summaries.some((text) => text.startsWith(marker)));
 				await kept(`${taskId} progress`, pinned, pinned ? "" : "1 new ↓");
 
 				toolCalls++;
 				thoughts.push(`${taskId} thinking ${WORDS(12)}`);
 				store.progress("live", { toolCalls, tokensIn: 5, tokensOut: 1, thinking: [...thoughts] });
+				await page.refresh();
 				await page.until<string>(`${taskId}: the thinking arrives`, TOOL_CALLS_FACT, (value) => value === String(toolCalls));
 				await kept(`${taskId} thinking`, pinned, pinned ? "" : "1 new ↓");
 			};
@@ -1231,6 +1239,7 @@ test("the log stays in place when its entry count gains a digit", { skip }, asyn
 	const fill = async (entries: number, brief: string): Promise<void> => {
 		const shown = Number.parseInt(await page.evaluate<string>(COUNT_TEXT), 10) || 0;
 		for (let i = shown; i < entries; i++) store.event("digits", { type: "tool_call", name: "Read", brief: `${brief} ${++added}` });
+		await page.refresh();
 	};
 	const crossing = async (what: string, from: string, to: string, brief: string): Promise<void> => {
 		await page.until<string>(`${what}: the count reads ${from}`, COUNT_TEXT, (text) => text === from);
@@ -1238,11 +1247,13 @@ test("the log stays in place when its entry count gains a digit", { skip }, asyn
 		assert.ok(slack >= 0, `${what}: the count must end at the edge of the filter row`);
 		const top = await page.evaluate<number>(LOG_TOP);
 		store.event("digits", { type: "tool_call", name: "Read", brief: `${brief} ${++added}` });
+		await page.refresh();
 		await page.until<string>(`${what}: the count reads ${to}`, COUNT_TEXT, (text) => text === to);
 		assert.equal(await page.evaluate<number>(LOG_TOP), top, `${what}: the log moved when the count changed from ${from} to ${to}`);
 	};
 	try {
 		store.event("digits", { type: "tool_call", name: "Read", brief: `row ${++added}` });
+		await page.refresh();
 		await page.until<string>("the digits log is rendered", HAS_LOG, (has) => has === "yes");
 		await fill(9, "row");
 		await crossing("desktop", "9 entries", "10 entries", "row");
@@ -1252,6 +1263,7 @@ test("the log stays in place when its entry count gains a digit", { skip }, asyn
 		await page.send("Emulation.setDeviceMetricsOverride", NARROW);
 		await page.evaluate<string>(SET_QUERY("marker"));
 		for (let i = 0; i < 9; i++) store.event("digits", { type: "tool_call", name: "Read", brief: `marker ${++added}` });
+		await page.refresh();
 		await crossing("mobile filtered", "9 of 100 entries", "10 of 100 entries", "marker");
 	} finally {
 		await page.evaluate<string>("(() => { document.querySelector('.log-filter').style.width = ''; return 'ok'; })()").catch(() => undefined);
