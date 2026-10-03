@@ -345,7 +345,7 @@ export interface PiStderrFailure {
  * Everything this transport keeps of a child's stderr, and all it keeps: last fields and counters, never a history.
  * A stage or an error is read from a recognized diagnostic alone, and recognizing one is a convention — the marker
  * the bootstrap writes — rather than proof of who wrote the line. `tail` is the opposite of that: arbitrary text from
- * the child or anything it started, kept for a person to look at and never put into a failure message on its own.
+ * the child or anything it started. A bounded excerpt is included in startup failures without a useful diagnostic.
  */
 export interface PiStderrRecord {
 	/**
@@ -553,9 +553,8 @@ export type PiFailureKind = "spawn" | "startup" | "exited" | "protocol" | "timeo
 
 /**
  * One failure, as the lifecycle records and reports it. The message is composed here out of fixed text, the stage a
- * diagnostic named, the exit the process had and a recognized bootstrap error cut to the diagnostic cap. Nothing else
- * may reach it: not a command line, not an environment, not the input a call was composed from, not the raw stderr
- * tail and not the text of an error some other library threw.
+ * diagnostic named, the exit the process had and a recognized bootstrap error cut to the diagnostic cap. Startup
+ * failures without a useful diagnostic also carry a labelled, bounded excerpt of the child's stderr.
  */
 export interface PiFailure {
 	kind: PiFailureKind;
@@ -588,6 +587,7 @@ const FAILURE_TEXT: { [kind in PiFailureKind]: string } = {
  * only what is known: that it refused before it served, with the line counts beside it and nothing from the text.
  */
 const SILENT_REFUSAL = "it refused the call before it could serve, and left no diagnostic this host could read";
+const STARTUP_STDERR_MAX_BYTES = 4 * 1024;
 
 /** What may be added to a failure's fixed text, and all that may be. */
 export interface PiFailureDetail {
@@ -658,17 +658,25 @@ export class PiTransportError extends Error {
  * What a child that never served failed with, decided from its own stderr record and its exit alone, and always of
  * kind `startup`: where it stopped is what varies, not what kind of failure it is. A recognized diagnostic names the
  * stage and carries its error; the bootstrap's configuration exit with nothing readable behind it takes the generic
- * refusal wording and the line counts instead, because a stage guessed from text that was discarded is an invention.
- * The lifecycle attaches the exit it observed; nothing here runs a process.
+ * refusal wording and the line counts instead. Without a useful diagnostic error, the message includes the last
+ * 4 KiB of retained stderr, labelled as child output rather than used to guess a stage.
  */
 export function startupFailure(record: PiStderrRecord, exit?: ExitOutcome, bounds: Readonly<PiBounds> = PI_BOUNDS): PiFailure {
 	const at = exit === undefined ? {} : { exit };
+	const error = record.failure?.error === undefined ? undefined : keepFirstBytes(record.failure.error, bounds.maxDiagnosticBytes).text;
+	let failure: PiFailure;
 	if (record.failure) {
-		const error = record.failure.error === undefined ? undefined : keepFirstBytes(record.failure.error, bounds.maxDiagnosticBytes).text;
-		return piFailure("startup", { stage: record.failure.stage, ...at, ...(error === undefined ? {} : { error }) });
+		failure = piFailure("startup", { stage: record.failure.stage, ...at, ...(error === undefined ? {} : { error }) });
+	} else if (exit?.code === STARTUP_EXIT_CODE) {
+		failure = piFailure("startup", { ...at, reason: SILENT_REFUSAL, counts: { lines: record.lines, truncated: record.truncatedLines } });
+	} else {
+		failure = piFailure("startup", at);
 	}
-	if (exit?.code === STARTUP_EXIT_CODE) return piFailure("startup", { ...at, reason: SILENT_REFUSAL, counts: { lines: record.lines, truncated: record.truncatedLines } });
-	return piFailure("startup", at);
+	if (error?.trim() || !record.tail.trim()) return failure;
+	const tail = record.tail.trimEnd();
+	const excerpt = keepLastBytes(tail, STARTUP_STDERR_MAX_BYTES);
+	const truncated = record.dropped > 0 || excerpt.bytes < Buffer.byteLength(tail, "utf8");
+	return { ...failure, message: `${failure.message}\n\nChild stderr${truncated ? " (truncated)" : ""}:\n${excerpt.text}` };
 }
 
 /**

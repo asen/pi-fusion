@@ -575,7 +575,7 @@ test("a child that never served fails by what its own stderr said, and a silent 
 	assert.equal(refusal.stage, undefined);
 	assert.equal(
 		refusal.message,
-		"the pi child did not become ready (exit code 78): it refused the call before it could serve, and left no diagnostic this host could read (2 stderr lines, 1 of them cut)",
+		"the pi child did not become ready (exit code 78): it refused the call before it could serve, and left no diagnostic this host could read (2 stderr lines, 1 of them cut)\n\nChild stderr (truncated):\nplain",
 	);
 	assert.equal(refusal.message.includes("noise"), false, "nothing of the discarded text reaches the message");
 
@@ -584,8 +584,7 @@ test("a child that never served fails by what its own stderr said, and a silent 
 	const other = startupFailure(tailed.record, { code: 1, signal: null });
 	assert.equal(other.kind, "startup");
 	assert.equal(other.stage, undefined);
-	assert.equal(other.message, "the pi child did not become ready (exit code 1)");
-	assert.equal(other.message.includes("the child started"), false, "the raw tail is never a failure message");
+	assert.equal(other.message, "the pi child did not become ready (exit code 1)\n\nChild stderr:\na line from something the child started, which is nobody's diagnostic");
 
 	const signalled = startupFailure(new StderrReader().record, { code: null, signal: "SIGKILL" });
 	assert.equal(signalled.message, "the pi child did not become ready (signal SIGKILL)");

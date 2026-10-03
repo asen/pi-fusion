@@ -2,6 +2,8 @@
 
 How a run is identified, how it survives resumes and forks, when it is handed off, and how the host manages one that runs in the background.
 
+If a Pi child fails to start without a useful bootstrap diagnostic, its error includes a `Child stderr` section with the last 4 KiB of retained output. Truncated output is labelled; empty stderr adds nothing.
+
 ## Runs and handles
 
 Every call to `fusion`, or to `claude` under its older name, belongs to a run, and every run has a handle such as `run-3`: one more than the highest handle on the host's current branch. A run is an ordinary session of the harness that ran it: a Claude Code session, or a Pi session. After each call the extension records a `pi-fusion` custom entry in the host session with the handle, the role, the backend the run went to, the host session id, and how that backend names the child's session again — for a Claude run its session id, a checkpoint, the uuid of the child's last assistant message in that call, and, flat beside them, the model and effort the run was admitted with, defaults included, and for a Pi run the structured reference below, whose selection carries the model and thinking level the child actually ran with. The last entry for a handle on the host's current branch is the run's state.

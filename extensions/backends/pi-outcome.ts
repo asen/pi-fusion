@@ -24,7 +24,8 @@ import type { ChildEvent, ChildRun, HostSession, PiSessionRef, ResolvedSelection
  * extension error's fields, a steer's failure, the child's stderr tail, a path, a session id, the prompt and the
  * contract are all evidence a person may look at where it is kept, and none of them is composed into a diagnostic
  * here. The one exception is a `PiFailure.message`, which the transport already composed out of fixed text, a stage
- * name, an exit and a recognized bootstrap diagnostic, under its own policy.
+ * name, an exit and a recognized bootstrap diagnostic, or a bounded stderr excerpt for startup failures without
+ * a useful diagnostic, under its own policy.
  *
  * **Who decides.** The ending is the only authority. `diagnose` and `finishRun` take a `PiDisposition` because the
  * caller that composes a run holds one — it is that caller's own record of the storage decision it made — and
