@@ -52,7 +52,9 @@ import {
 	PI_BOOTSTRAP_PATH,
 	PI_CHILD_MARKER,
 	PI_CHILD_VARIABLE,
+	PI_SDK_RESOLVE_PATH,
 	piLaunch,
+	SDK_DIR_VARIABLE,
 } from "../extensions/backends/pi-launch.ts";
 import { PI_ROLE_NAMES, type PiRole, piRole } from "../extensions/backends/pi-binding.ts";
 import { type CallStorage, JITI_CACHE_DIR, NODE_CACHE_DIR, prepareCallStorage, writeCallInput } from "../extensions/backends/pi-storage.ts";
@@ -3269,6 +3271,22 @@ test("the launch options run node from PATH on the installed bootstrap, in the c
 	assert.ok(fs.existsSync(PI_BOOTSTRAP_PATH), "the bootstrap is installed beside the module that launches it");
 	assert.throws(() => piLaunch({ input: composed, storage: { ...STORAGE, inputPath: "bootstrap.json" } }), /call input file must be an absolute path/);
 	assert.throws(() => piLaunch({ input: composed, storage: { ...STORAGE, cacheDir: "cache" } }), /call cache directory must be an absolute path/);
+});
+
+test("a launch that names the host's Pi package preloads the resolver and tells it which package, and one that names none does neither", () => {
+	const composed = input();
+	const sdkDir = "/usr/lib/node_modules/@earendil-works/pi-coding-agent";
+	const host: NodeJS.ProcessEnv = { PATH: "/usr/bin", [SDK_DIR_VARIABLE]: "/somewhere/else" };
+	const named = piLaunch({ input: composed, storage: STORAGE, env: host, sdkDir });
+	assert.deepEqual(named.args, ["--import", pathToFileURL(PI_SDK_RESOLVE_PATH).href, PI_BOOTSTRAP_PATH, STORAGE.inputPath], "the preload runs before the bootstrap is loaded, so its static imports are already redirected");
+	assert.equal(named.env[SDK_DIR_VARIABLE], sdkDir);
+	assert.equal(host[SDK_DIR_VARIABLE], "/somewhere/else", "the host's own environment is not changed");
+	assert.equal(PI_SDK_RESOLVE_PATH, path.join(repoRoot, "extensions", "backends", "pi-sdk-resolve.mjs"));
+	assert.ok(fs.existsSync(PI_SDK_RESOLVE_PATH), "the preload is installed beside the module that launches it");
+	const unnamed = piLaunch({ input: composed, storage: STORAGE, env: host });
+	assert.deepEqual(unnamed.args, [PI_BOOTSTRAP_PATH, STORAGE.inputPath]);
+	assert.equal(SDK_DIR_VARIABLE in unnamed.env, false, "an inherited value is not one this launch set, so it does not reach the child");
+	assert.throws(() => piLaunch({ input: composed, storage: STORAGE, sdkDir: "relative/pi" }), /host's Pi package directory must be an absolute path/);
 });
 
 test("the child's environment is a copy with the Fusion-owned agent directory and the child marker, and the host's is untouched", () => {

@@ -1,5 +1,6 @@
+import { existsSync, readFileSync } from "node:fs";
 import * as path from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import type { LaunchOptions } from "../process-tree.ts";
 import type { PiRole } from "./pi-binding.ts";
 import { QUESTION_TOOL_NAME } from "./pi-question-tool.mjs";
@@ -23,6 +24,17 @@ export const BOOTSTRAP_INPUT_VERSION = 1;
 
 /** The bootstrap this host runs, beside this module in the same install: there is no variable that names another. */
 export const PI_BOOTSTRAP_PATH = path.join(path.dirname(fileURLToPath(import.meta.url)), "pi-bootstrap.mjs");
+
+/**
+ * The preload a child resolves the host's own Pi through, beside this module in the same install, and the variable it
+ * reads the host's package directory from. The two strings are restated rather than imported, because importing the
+ * preload would register its hook in this host: `test/backends.test.ts` holds them equal to the preload's own.
+ */
+export const PI_SDK_RESOLVE_PATH = path.join(path.dirname(fileURLToPath(import.meta.url)), "pi-sdk-resolve.mjs");
+export const SDK_DIR_VARIABLE = "PI_FUSION_SDK_DIR";
+
+/** The package a child runs, which is the host's own. */
+const SDK_PACKAGE = "@earendil-works/pi-coding-agent";
 
 /** The environment variable Pi reads its agent directory from, which the child's points at the Fusion-owned one. */
 export const PI_AGENT_DIR_VARIABLE = "PI_CODING_AGENT_DIR";
@@ -243,6 +255,12 @@ export interface LaunchRequest {
 	env?: NodeJS.ProcessEnv;
 	/** The bootstrap to run. Defaults to the one installed beside this module. */
 	bootstrap?: string;
+	/**
+	 * The host's own Pi package directory, which the child resolves the SDK and `typebox` from. A launch without one
+	 * runs the copy beside this install, which is what a test or a harness composing its own launch gets; the backend
+	 * always passes the host's.
+	 */
+	sdkDir?: string;
 }
 
 /**
@@ -340,6 +358,9 @@ export function childEnvironment(request: LaunchRequest, platform: NodeJS.Platfo
 	const env: NodeJS.ProcessEnv = { ...(request.env ?? process.env) };
 	setVariable(env, PI_AGENT_DIR_VARIABLE, absolute("the child agent directory", request.input.agentDir), platform);
 	setVariable(env, PI_CHILD_VARIABLE, PI_CHILD_MARKER, platform);
+	// Set by this launch or by nothing: an inherited value would point a launch that named no package at one anyway.
+	for (const key of spellings(env, SDK_DIR_VARIABLE, platform)) delete env[key];
+	if (request.sdkDir !== undefined) env[SDK_DIR_VARIABLE] = absolute("the host's Pi package directory", request.sdkDir);
 	setVariable(env, JITI_CACHE_VARIABLE, path.join(cacheDir, JITI_CACHE_DIR), platform);
 	// Per spelling, so an inherited empty value keeps the cache off under the name the environment already spells it
 	// with, and a spelling that names a directory is the one pointed at this call's own.
@@ -365,9 +386,10 @@ export function childEnvironment(request: LaunchRequest, platform: NodeJS.Platfo
  */
 export function piLaunch(request: LaunchRequest): LaunchOptions {
 	const env = childEnvironment(request);
+	const preload = request.sdkDir === undefined ? [] : ["--import", pathToFileURL(PI_SDK_RESOLVE_PATH).href];
 	return {
 		command: "node",
-		args: [request.bootstrap ?? PI_BOOTSTRAP_PATH, absolute("the call input file", request.storage.inputPath)],
+		args: [...preload, request.bootstrap ?? PI_BOOTSTRAP_PATH, absolute("the call input file", request.storage.inputPath)],
 		cwd: absolute("the child's working directory", request.input.cwd),
 		env,
 	};
@@ -381,4 +403,34 @@ export function piLaunch(request: LaunchRequest): LaunchOptions {
 export async function hostAgentDir(): Promise<string> {
 	const { getAgentDir } = await import("@earendil-works/pi-coding-agent");
 	return getAgentDir();
+}
+
+/**
+ * The host's own Pi package directory, through the SDK's public accessor and only when a call asks for it, for the same
+ * reason the agent directory is. Inside a Pi host this import is the host's own module, whichever way that host loads
+ * an extension, so the directory is the package the host runs. A child imports that package as plain node does, through
+ * its export map, so a directory that is not one — a compiled binary has no package beside it — is refused here, by a
+ * fixed sentence, rather than handed to a child that would fail to start on it.
+ */
+export async function hostSdkDir(): Promise<string> {
+	let sdk: { getPackageDir?: unknown };
+	try {
+		sdk = await import(SDK_PACKAGE);
+	} catch (error) {
+		throw new Error(`the pi backend could not import this host's own Pi package to find the one a child should run`, { cause: error });
+	}
+	if (typeof sdk.getPackageDir !== "function") throw new Error(`this Pi does not export getPackageDir(), so the pi backend cannot find the Pi package a child should run; use a Pi that does`);
+	const dir = path.resolve(String((sdk.getPackageDir as () => unknown)()));
+	let manifest: { name?: unknown; exports?: unknown } | undefined;
+	try {
+		manifest = JSON.parse(readFileSync(path.join(dir, "package.json"), "utf8"));
+	} catch {
+		manifest = undefined;
+	}
+	const root = (manifest?.exports as Record<string, { import?: unknown } | undefined> | undefined)?.["."];
+	const entry = typeof root?.import === "string" ? path.join(dir, root.import) : undefined;
+	if (manifest?.name !== SDK_PACKAGE || entry === undefined || !existsSync(entry)) {
+		throw new Error(`the pi backend runs a child on this host's own Pi package, and this Pi is not installed as one that node can import (a compiled Pi binary is not); install Pi from npm to use the pi backend`);
+	}
+	return dir;
 }

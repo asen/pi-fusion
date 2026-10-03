@@ -79,13 +79,13 @@ import * as fs from "node:fs";
 import * as http from "node:http";
 import * as os from "node:os";
 import * as path from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 // The production composition the `production` group drives, imported from the extension itself: nothing here
 // reimplements a part of it, and a call that stopped being composable this way fails the group rather than being
 // worked around in it. Node runs this .mjs and these .ts modules under the same type stripping `npm test` uses.
 import { createPiBackend } from "../../extensions/backends/pi-backend.ts";
 import { piRole } from "../../extensions/backends/pi-binding.ts";
-import { PI_BOOTSTRAP_PATH } from "../../extensions/backends/pi-launch.ts";
+import { hostSdkDir, PI_BOOTSTRAP_PATH, PI_SDK_RESOLVE_PATH, SDK_DIR_VARIABLE } from "../../extensions/backends/pi-launch.ts";
 // The one cap a production case has to reproduce rather than restate: how much of a tool's own first argument the
 // progress mapper puts in a `tool_call` event's `brief`. Imported so a pinned event cannot drift from the window the
 // mapper actually cuts to, and so no number here is a second copy of that decision.
@@ -2793,12 +2793,18 @@ async function caseCancellation(root, server, result) {
 		const restarted = server.requests.length - 1;
 		result.say(`provider requests in the ${QUIET_MS}ms after an abort with a steer and a follow-up still queued: ${restarted}`);
 		for (const request of server.requests.slice(1)) result.say(`  restarted request: ${describeRequest(request)}`);
-		result.check(restarted > 0, "abort with queued work produced no further provider request, so this case shows no counterexample and clear_queue may no longer be required");
-		const texts = server.requests.slice(1).flatMap(conversationTexts);
-		result.say(
-			`the restarted turn carried the steer: ${texts.some((text) => text.includes("ROW6-A2-STEER"))}, the follow-up: ${texts.some((text) => text.includes("ROW6-A2-FOLLOWUP"))}`,
-		);
-		result.say("measured Pi behaviour: abort waits for idle and then continues queued messages under a fresh abort controller, so clear_queue must precede abort");
+		// Recorded rather than required: 0.85.1 restarted the run with the queued work, and Pi 1.0.1 measured none. What
+		// the host relies on is clear_queue before abort, which phase (a) measures holds either way; this phase is the
+		// evidence for why, and on a Pi that no longer restarts it is evidence that the order is now merely harmless.
+		if (restarted > 0) {
+			const texts = server.requests.slice(1).flatMap(conversationTexts);
+			result.say(
+				`the restarted turn carried the steer: ${texts.some((text) => text.includes("ROW6-A2-STEER"))}, the follow-up: ${texts.some((text) => text.includes("ROW6-A2-FOLLOWUP"))}`,
+			);
+			result.say("measured Pi behaviour: abort waits for idle and then continues queued messages under a fresh abort controller, so clear_queue must precede abort");
+		} else {
+			result.say("measured Pi behaviour: abort with a steer and a follow-up still queued restarted nothing on this Pi, so clear_queue before abort is a precaution here rather than the fix it was on 0.85.1");
+		}
 		result.check(
 			server.unscripted.length === 0,
 			`the fixture saw ${server.unscripted.length} unscripted request(s) in phase (a2): ${JSON.stringify(server.unscripted.map((request) => request.note))}`,
@@ -3200,6 +3206,10 @@ async function caseRetryCompaction(root, server, result) {
 		textStep("c-t1", "ROW7C-T1-ANSWER"),
 		errorStep("c-overflow", 400, "Your input exceeds the context window of this model"),
 		textStep("c-summary", "ROW7C-SUMMARY-SENTINEL the first turn asked for a fixture answer."),
+		// Pi 1.0.1 also summarises the prefix of the turn it cut, in a second summary request before the retry, which
+		// 0.85.1 did not: the step after the first summary is whichever of the two comes, and a 0.85.1 run leaves the
+		// last step unused rather than reaching an unscripted request.
+		textStep("c-prefix-or-recovered", "ROW7C-RECOVERED"),
 		textStep("c-recovered", "ROW7C-RECOVERED"),
 	]);
 	const childC = startChild(dirs, "c", { session: { mode: "create" }, settings: COMPACTION_SETTINGS });
@@ -3224,13 +3234,30 @@ async function caseRetryCompaction(root, server, result) {
 			eventTypes(childC, settled + 1).length === 0,
 			`agent_settled is not the last event; ${JSON.stringify(eventTypes(childC, settled + 1))} followed it within ${SETTLE_QUIET_MS}ms`,
 		);
-		result.check(server.requests.length === 4, `expected four provider requests (turn, overflow, summary, retry), got ${server.requests.length}`);
+		const summaries = server.requests.filter((request) => request.systemText?.startsWith(SUMMARY_SYSTEM_PREFIX));
+		result.check(
+			(summaries.length === 1 || summaries.length === 2) && server.requests.length === 3 + summaries.length,
+			`expected the turn, the overflow, one or two summaries and the retry, got ${server.requests.length} request(s) of which ${summaries.length} summaries`,
+		);
 		for (const request of server.requests) result.say(`  request ${request.index} (${request.step}): ${describeRequest(request)}`);
-		const retried = server.requests[3];
+		result.say(
+			summaries.length === 2
+				? "measured Pi behaviour: the overflow compaction made two summary requests — the history before the cut, and the prefix of the turn it cut — before the one retry"
+				: "measured Pi behaviour: the overflow compaction made one summary request before the one retry",
+		);
+		const retried = server.requests.at(-1);
 		if (retried) {
 			const texts = conversationTexts(retried);
 			result.check(texts[0]?.startsWith(COMPACTION_SUMMARY_PREFIX), `the retried turn does not start from the summary: ${JSON.stringify(texts[0]?.slice(0, 60))}`);
-			result.check(texts.some((text) => text.includes("ROW7C-T2 second turn")), "the retried turn lost the prompt that overflowed");
+			if (summaries.length === 2) {
+				// 1.0.1's shape: the prompt that overflowed is the prefix it summarised, so the retry carries that summary
+				// in place of the prompt's own text rather than losing it.
+				result.check(conversationTexts(summaries[1]).some((text) => text.includes("ROW7C-T2 second turn")), "the second summary request does not carry the prompt that overflowed");
+				result.check(!texts.some((text) => text.includes("ROW7C-T2 second turn")), "the retried turn carries the prompt that overflowed as well as its summary");
+				result.say("measured Pi behaviour: the prompt that overflowed reaches the retry only as its own summary, not as the text that was sent");
+			} else {
+				result.check(texts.some((text) => text.includes("ROW7C-T2 second turn")), "the retried turn lost the prompt that overflowed");
+			}
 			result.check(!texts.some((text) => text.includes("ROW7C-T1 first turn")), "the retried turn still carries the summarised first turn");
 		}
 		result.say("measured Pi behaviour: an overflow-classified error is not retried by the retry path; compaction runs once and the interrupted turn is continued exactly once");
@@ -3624,6 +3651,12 @@ const holdQuestion = (signal, released) =>
  * named. The subtree's own name is read back from `piPaths` rather than written out here, so it cannot drift from the
  * layout it is meant to describe.
  */
+/**
+ * The Pi package a production child runs, which is this host's own: the same lookup the backend's default takes, read
+ * once here so each case can hold the composed launch to exactly that directory.
+ */
+const HOST_SDK_DIR = await hostSdkDir();
+
 function setupProductionCase(root, server, name) {
 	const dirs = setupCase(root, server, name);
 	const hostAgent = assertInsideRoot(root, "production host agent directory", path.join(dirs.caseRoot, "host-agent"));
@@ -3638,7 +3671,7 @@ function setupProductionCase(root, server, name) {
 	for (const field of ["root", "agentDir", "catalogDir", "modelsStorePath", "sessionDir", "callsDir", "userModelsPath", "userAuthPath", "hostBinDir"]) {
 		assertInsideRoot(root, `piPaths.${field}`, paths[field]);
 	}
-	return { dirs, server, root, hostAgent, paths, env: productionEnv(root) };
+	return { dirs, server, root, hostAgent, paths, env: productionEnv(root), sdkDir: HOST_SDK_DIR };
 }
 
 /**
@@ -3674,12 +3707,15 @@ function setupProductionCase(root, server, name) {
  * the checks over them cannot pass by having nothing to look at.
  */
 function productionStart(prod) {
-	const evidence = { attempts: 0, resolved: 0, commands: [], bootstraps: [], markers: [], offline: [], inputs: [], pids: [] };
+	const evidence = { attempts: 0, resolved: 0, commands: [], preloads: [], bootstraps: [], sdkDirs: [], markers: [], offline: [], inputs: [], pids: [] };
 	const start = async (options) => {
 		evidence.attempts += 1;
 		const launch = options.launch;
 		evidence.commands.push(launch.command);
-		evidence.bootstraps.push(launch.args?.[0]);
+		// The preload goes in front of the bootstrap, so the input is the last argument and the bootstrap the one before.
+		evidence.preloads.push(launch.args?.slice(0, -2));
+		evidence.bootstraps.push(launch.args?.at(-2));
+		evidence.sdkDirs.push(launch.env?.[SDK_DIR_VARIABLE]);
 		evidence.markers.push(launch.env?.PI_FUSION_CHILD);
 		evidence.offline.push(launch.env?.PI_OFFLINE);
 		// Refused before the launch rather than asserted after it: a child this harness could not configure offline is
@@ -3693,10 +3729,13 @@ function productionStart(prod) {
 		// Every path-valued variable of the composed environment, by the same rule `baseChildEnv` checks its own by:
 		// anything holding a separator is a path this child could read or write, and `PATH` is the one exception.
 		for (const [name, value] of Object.entries(launch.env ?? {})) {
-			if (name === "PATH" || typeof value !== "string" || !value.includes(path.sep)) continue;
+			// The host's own Pi package is the one exception beside `PATH`: it is code the child imports, read-only like the
+			// bootstrap itself, which also lies outside the root. `checkComposedStart` holds it to exactly the package the
+			// host's own lookup names, so the exception cannot carry another path.
+			if (name === "PATH" || name === SDK_DIR_VARIABLE || typeof value !== "string" || !value.includes(path.sep)) continue;
 			assertInsideRoot(prod.root, `production launch env ${name}`, value);
 		}
-		const inputPath = assertInsideRoot(prod.root, "production call input file", launch.args?.[1]);
+		const inputPath = assertInsideRoot(prod.root, "production call input file", launch.args?.at(-1));
 		const input = JSON.parse(fs.readFileSync(inputPath, "utf8"));
 		for (const field of CONTAINED_CONFIG_FIELDS) assertInsideRoot(prod.root, `production call input ${field}`, input[field]);
 		// The transcript a continuation reopens is a path the host composed too, and the only one that is not a field
@@ -3884,6 +3923,15 @@ function checkComposedStart(result, prod, call, { questionTool = false } = {}) {
 		`${call.label}: the launch named ${JSON.stringify(evidence.bootstraps)} rather than the installed ${PI_BOOTSTRAP_PATH}`,
 	);
 	result.check(evidence.markers.every((marker) => marker === "pi"), `${call.label}: the child marker was ${JSON.stringify(evidence.markers)} rather than pi`);
+	const preload = ["--import", pathToFileURL(PI_SDK_RESOLVE_PATH).href];
+	result.check(
+		evidence.preloads.every((args) => JSON.stringify(args) === JSON.stringify(preload)),
+		`${call.label}: the launch preloaded ${JSON.stringify(evidence.preloads)} rather than the resolver that runs the host's own Pi`,
+	);
+	result.check(
+		evidence.sdkDirs.every((dir) => dir === prod.sdkDir),
+		`${call.label}: the child was pointed at ${JSON.stringify(evidence.sdkDirs)} rather than the host's own Pi package ${prod.sdkDir}`,
+	);
 	// Non-vacuous by counting first: an empty evidence list would satisfy every() below, so the recorded values have to
 	// be one per start attempt before their contents are worth anything.
 	result.check(

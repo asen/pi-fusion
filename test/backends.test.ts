@@ -124,6 +124,18 @@ test("the program a Pi child runs is the child's alone, and the host reads the t
 	assert.deepEqual(modulesNamedIn(launch).filter((name) => name.endsWith("pi-bootstrap.mjs")), [], "and it names it as that path alone");
 });
 
+test("the preload that resolves the host's own Pi is the child's alone, and the launch names it as a path", () => {
+	// Importing the preload registers its resolve hook in whatever process imported it, which in this host would
+	// redirect the host's own imports: the launch composes its path and restates its one variable instead.
+	for (const file of productionModules()) {
+		const named = modulesNamedIn(fs.readFileSync(file, "utf8"));
+		assert.ok(!named.some((name) => name.endsWith("pi-sdk-resolve.mjs")), `${relative(file)} imports the preload a Pi child is started with`);
+	}
+	assert.deepEqual(dependenciesOf("backends/pi-sdk-resolve.mjs"), ["node:module", "node:path", "node:url"], "the preload stands on node itself, because it runs before anything else in the child");
+	const launch = fs.readFileSync(path.join(repoRoot, "extensions", "backends", "pi-launch.ts"), "utf8");
+	assert.ok(launch.includes('"pi-sdk-resolve.mjs"'), "the launch module no longer names the preload as a path");
+});
+
 /**
  * Every test file the audit below reads, walked rather than listed: a registration written in a file one directory
  * down would be outside `test/*.test.ts`, which is where the runner looks, and still a registration. `test/spikes`

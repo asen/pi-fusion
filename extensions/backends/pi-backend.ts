@@ -3,7 +3,7 @@ import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import type { OwnedCleanup } from "../process-tree.ts";
 import type { PiRole } from "./pi-binding.ts";
-import { hostAgentDir } from "./pi-launch.ts";
+import { hostAgentDir, hostSdkDir } from "./pi-launch.ts";
 import { DISPOSE_FAILED, DISPOSE_WARNING, disposition, finishRun, newRun, type PiDisposal, type PiDisposition, type PiEnded, type PiPreparedIdentity, type PiRun, type PiSession, piSession, progressMapper } from "./pi-outcome.ts";
 import { type PiPrepareRequest, type PiPrepareResult, preparePiChild } from "./pi-prepare.ts";
 import { type PreparedCall, prepareCallStorage, type StorageRequest } from "./pi-storage.ts";
@@ -86,7 +86,7 @@ export const STORAGE_RETAINED = "This call's own storage was retained because cl
  * three in front of the child, the two ways a preparation can end, the task, and the two rejections — a value thrown
  * out of a helper rather than reported by it — that leave this host unable to say what became of a child.
  */
-export type PiCallStage = "aborted-before-start" | "contract" | "agent-dir" | "storage" | "prepare-rejected" | "prepare-refused" | "task" | "task-rejected";
+export type PiCallStage = "aborted-before-start" | "contract" | "agent-dir" | "sdk-dir" | "storage" | "prepare-rejected" | "prepare-refused" | "task" | "task-rejected";
 
 /**
  * What one call did, for a test and for nothing else: it is handed to `onCall` and never to a user, a record or a
@@ -116,6 +116,8 @@ type PiCallStorageReport = NonNullable<PiCallReport["storage"]>;
 export interface PiBackendDeps {
 	/** The host's agent directory. The default reaches the SDK dynamically, and only when a real call asks for it. */
 	agentDir?: () => Promise<string>;
+	/** The host's own Pi package directory, which the child runs. The default reaches the SDK the same way, and as late. */
+	sdkDir?: () => Promise<string>;
 	readContract?: (name: string) => string;
 	storage?: (request: StorageRequest) => PreparedCall;
 	start?: (options: PiChildOptions) => Promise<PiChild>;
@@ -233,6 +235,16 @@ async function runPiCall(request: RunRequest<PiRole, PiSession, PiSteerQueue>, d
 			throw new Error(AGENT_DIR_UNREADABLE, { cause: error });
 		}
 
+		let sdkDir: string;
+		try {
+			sdkDir = await (deps.sdkDir ?? hostSdkDir)();
+		} catch (error) {
+			report.stage = "sdk-dir";
+			report.thrown = { error };
+			// Exactly as it came, for the reason a storage failure is: `hostSdkDir` composes its own actionable sentence.
+			throw error;
+		}
+
 		let storage: PreparedCall;
 		try {
 			// `StorageRequest` calls this field `handle`, and it is the name of a directory rather than the host's own
@@ -284,6 +296,7 @@ async function runPiCall(request: RunRequest<PiRole, PiSession, PiSteerQueue>, d
 			...(deps.bounds === undefined ? {} : { bounds: deps.bounds }),
 			...(deps.bootstrap === undefined ? {} : { bootstrap: deps.bootstrap }),
 			...(deps.env === undefined ? {} : { env: deps.env }),
+			sdkDir,
 		};
 
 		let prepared: PiPrepareResult;

@@ -3,7 +3,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import test, { type TestContext } from "node:test";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import ts from "typescript";
 import { CONTRACTS_DIR } from "../extensions/backends/claude.ts";
 import {
@@ -17,6 +17,7 @@ import {
 	STORAGE_RETAINED,
 } from "../extensions/backends/pi-backend.ts";
 import type { PiRole } from "../extensions/backends/pi-binding.ts";
+import { PI_SDK_RESOLVE_PATH, SDK_DIR_VARIABLE } from "../extensions/backends/pi-launch.ts";
 import { CONTROL_EXTENSION_PATH, FORK_COMMAND, NAVIGATE_COMMAND } from "../extensions/backends/pi-control-extension.mjs";
 import { CLEANUP_ATTENTION, CLEANUP_UNCERTAIN, DISPOSE_FAILED, DISPOSE_WARNING, type PiRun, type PiSession, RUN_CANCELLED, RUN_UNVERIFIED, STORAGE_LEFT } from "../extensions/backends/pi-outcome.ts";
 import { type PreparedCall, prepareCallStorage, type StorageRequest } from "../extensions/backends/pi-storage.ts";
@@ -59,6 +60,9 @@ const CHECKPOINT = "entry-42";
 const LEAF = "entry-77";
 const MODEL = "deepseek/deepseek-chat";
 const PROMPT = "implement the bounded slice";
+
+/** The host's own Pi package directory a call is handed. Nothing reads it: the start seam launches no child. */
+const HOST_SDK_DIR = "/host/lib/node_modules/@earendil-works/pi-coding-agent";
 const ANSWER = "## Changed\nfoo.ts";
 
 /** The reference every continuation below is composed from. */
@@ -298,7 +302,7 @@ function harnessOf(t: TestContext, over: HarnessOptions = {}) {
 	const inputs: Array<Record<string, unknown>> = [];
 	const start = async (given: PiChildOptions): Promise<PiChild> => {
 		options.push(given);
-		const inputPath = given.launch.args[1];
+		const inputPath = given.launch.args.at(-1);
 		if (typeof inputPath === "string") inputs.push(JSON.parse(fs.readFileSync(inputPath, "utf8")) as Record<string, unknown>);
 		seam.onStart?.(given);
 		if (seam.startError !== undefined) throw seam.startError.error;
@@ -310,6 +314,7 @@ function harnessOf(t: TestContext, over: HarnessOptions = {}) {
 	const counts = { progress: 0 };
 	const deps: PiBackendDeps = {
 		agentDir: async () => agentDir,
+		sdkDir: async () => HOST_SDK_DIR,
 		readContract: (name) => `the ${name} contract, as prose the host already read.`,
 		start,
 		env: { PATH: "/usr/bin" },
@@ -393,6 +398,9 @@ test("one new-session call runs the whole composition, stops its child once, and
 	assert.deepEqual(harness.seen.steps, HAPPY_STEPS, "the preparation's readbacks, then the turn's own, in one order");
 	assert.deepEqual(harness.seen.shutdowns, ["host"], "one stop, and it is the task's own: this composition never stops a child itself");
 	assert.deepEqual(harness.seen.turns, [{ text: PROMPT, opts: { completion: "settled" } }], "the prompt exactly as it was composed");
+	const launch = harness.options[0]!.launch;
+	assert.deepEqual(launch.args.slice(0, 2), ["--import", pathToFileURL(PI_SDK_RESOLVE_PATH).href], "the child is started through the preload that resolves the host's own Pi");
+	assert.equal(launch.env?.[SDK_DIR_VARIABLE], HOST_SDK_DIR, "and the preload is told which package that is");
 
 	// What a monitor saw: the session, the tool call bounded to what a monitor may hold, its result, and the end. It
 	// is compared through json because a bounded tool input has a null prototype on purpose, and a strict deep
@@ -715,6 +723,14 @@ test("everything in front of the child throws rather than reporting a run, and a
 		return true;
 	});
 	assert.equal(reportOf(agent.reports).stage, "agent-dir");
+
+	// The host's own Pi package composes its own actionable sentence too, so it travels out exactly as it was.
+	const sdkError = new Error("this Pi is not installed as one that node can import");
+	const sdk = harnessOf(t, { deps: { sdkDir: async () => Promise.reject(sdkError) } });
+	await assert.rejects(sdk.call(), (error: unknown) => error === sdkError);
+	const sdkReport = reportOf(sdk.reports);
+	assert.equal(sdkReport.stage, "sdk-dir");
+	assert.deepEqual([sdkReport.startCalled, sdkReport.storage], [false, undefined], "nothing is stored or started for a call with no package to run");
 
 	// Storage composes its own actionable repair message, so what it threw travels out exactly as it was.
 	const storageError = new Error("inspect this and repair it by hand: it is not a directory");

@@ -166,6 +166,8 @@ export interface PiPrepareRequest {
 	bounds?: Partial<PiBounds>;
 	/** The bootstrap the launch names. Internal, for a harness; the launch's own default is the installed one. */
 	bootstrap?: string;
+	/** The host's own Pi package directory, which the child resolves the SDK from; the backend always passes one. */
+	sdkDir?: string;
 }
 
 /** A refusal as the sequence decides it, before the shutdown a claimed failure performs adds its report to it. */
@@ -477,6 +479,7 @@ export async function preparePiChild(request: PiPrepareRequest): Promise<PiPrepa
 		storage: request.storage,
 		...(request.env === undefined ? {} : { env: request.env }),
 		...(request.bootstrap === undefined ? {} : { bootstrap: request.bootstrap }),
+		...(request.sdkDir === undefined ? {} : { sdkDir: request.sdkDir }),
 	});
 
 	const watched = request.onQuestion === undefined ? undefined : questionWatch(request.onQuestion, request.signal);

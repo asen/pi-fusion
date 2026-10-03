@@ -8,8 +8,9 @@ import { QUESTION_TOOL_NAME, questionTool } from "./pi-question-tool.mjs";
 
 /**
  * The program a Pi child runs. Plain ESM on purpose: a node from `PATH` runs this file with no loader, no bundler and
- * no TypeScript step between them. Two packages reach it, both resolved from its own location and neither installed by
- * it: the public Pi SDK, and `typebox` through `./pi-question-tool.mjs`, which is the schema language a public tool
+ * no TypeScript step between them. Two packages reach it, both resolved from the host's own Pi package through the
+ * preload a launch starts it with (`./pi-sdk-resolve.mjs`), or from beside this file when a launch names none, and
+ * neither installed by it: the public Pi SDK, and `typebox` through `./pi-question-tool.mjs`, which is the schema language a public tool
  * definition is written in and the same package the host's own tools are written against. Whether one copy of it ends
  * up serving both is a package manager's business and is claimed nowhere here. There is no stock CLI, no migration, no
  * private import, no provider client of its own and nothing it installs.
@@ -96,8 +97,21 @@ const codeOf = (error) => {
 };
 const isText = (value) => typeof value === "string" && value.trim() !== "";
 const isRecord = (value) => !!value && typeof value === "object" && !Array.isArray(value);
-/** Where this bootstrap itself lives, which is where its SDK is resolved from. */
+/** Where this bootstrap itself lives. */
 const own = () => path.dirname(fileURLToPath(import.meta.url));
+
+/**
+ * Where the SDK resolves from for this bootstrap: the host's own package when the launch's preload redirected it, and
+ * beside this install otherwise. A name that resolves nowhere is reported as this file's own directory, where it was
+ * looked for.
+ */
+const sdkLocation = () => {
+	try {
+		return fileURLToPath(import.meta.resolve(SDK_PACKAGE));
+	} catch {
+		return own();
+	}
+};
 
 /**
  * The SDK's own surface, checked against what this bootstrap actually calls. `VERSION` is metadata rather than a
@@ -116,18 +130,18 @@ export function checkSdk(pkg) {
 	if (missing.length) {
 		throw new StartupError(
 			"sdk",
-			`${SDK_PACKAGE} ${version} at ${own()} does not provide the public API this bootstrap runs on: ${missing.join(", ")}. Install a version that exports all of them beside the bootstrap; nothing is installed or worked around here`,
+			`${SDK_PACKAGE} ${version} at ${sdkLocation()} does not provide the public API this bootstrap runs on: ${missing.join(", ")}. Run a Pi that exports all of them; nothing is installed or worked around here`,
 		);
 	}
 	return { version, sessionVersion: api.CURRENT_SESSION_VERSION };
 }
 
-/** The installed SDK, resolved from this file's own location rather than from the working directory it runs in. */
+/** The SDK: the host's own package through the launch's preload, or the copy beside this file without one, never the working directory's. */
 export async function loadSdk() {
 	try {
 		return await import(SDK_PACKAGE);
 	} catch (error) {
-		throw new StartupError("sdk", `${SDK_PACKAGE} could not be imported from ${own()}: ${failureText(error)}. Install it beside the bootstrap; nothing is installed automatically here`, { cause: error });
+		throw new StartupError("sdk", `${SDK_PACKAGE} could not be imported from ${sdkLocation()}: ${failureText(error)}. A child runs the host's own Pi package; nothing is installed automatically here`, { cause: error });
 	}
 }
 

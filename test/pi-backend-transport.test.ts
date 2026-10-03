@@ -183,6 +183,8 @@ test("one new-session call runs the whole composition against a child that speak
 
 	const backend = createPiBackend({
 		agentDir: async () => agentDir,
+		// The fake imports node builtins alone, so the preload this names redirects nothing it loads.
+		sdkDir: async () => path.join(root, "host-pi"),
 		readContract: (name) => `# ${name}\nDo the task.`,
 		start,
 		env,
