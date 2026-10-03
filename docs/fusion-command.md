@@ -12,8 +12,9 @@
 - `/fusion answer [run-N] [text]` answers a waiting run's question, and opens an editor for the answer when no text follows the handle (see [Questions](questions.md)).
 - `/fusion review run-N` starts an independent review of a run that has ended (see [Independent reviews](reviews.md)).
 - `/fusion off` stops the host from starting runs, and `/fusion on` lets it start them again (see [Turning fusion off](#turning-fusion-off)).
+- `/fusion config` shows and edits this session's role settings, and `/fusion profile [list | use <name> | save <name> | default <name>]` manages the saved profiles; applying settings is refused while a run is unfinished, as off is (see [Profiles and role settings](profiles.md)).
 
-Argument completion offers the forms, and after a form that takes a handle it offers the handles that form can still act on: every run for `status`, this process's and an earlier one's, the active ones for `cancel` and `wait`, the running ones for `steer`, the waiting ones for `answer`, and the reviewable ones, this process's and an earlier one's that was made in this working directory, for `review`.
+Argument completion offers the forms, and after a form that takes a handle it offers the handles that form can still act on: every run for `status`, this process's and an earlier one's, the active ones for `cancel` and `wait`, the running ones for `steer`, the waiting ones for `answer`, and the reviewable ones, this process's and an earlier one's that was made in this working directory, for `review`. After `profile use`, `profile save` and `profile default` it offers the profile names the profiles file held when it was last read, and `builtin` for `use` and `default`.
 
 Everything the user does through `steer`, `answer` and `review` reaches the host as a message with `triggerTurn: false` and `deliverAs: "followUp"`: it starts no turn, so the user keeps the floor, and the host reads it with its next turn. The message names the run and what the user did, so the host does not repeat work the user has already settled.
 
@@ -25,7 +26,7 @@ Off is refused while any run is unfinished: running, waiting for an answer, or e
 
 While off, nothing starts a run: a `fusion` or `claude` call the host's current turn still makes is refused with `fusion is off; turn it on with /fusion on`, for a fresh run, a continuation and a handoff alike, and so is `/fusion review`. `PI_FUSION_AUTO_REVIEW` starts nothing either, and `/fusion on` starts no review of its own. `/fusion status`, `/fusion dashboard` and the forms that read an ended run keep working.
 
-The switch lives in this extension instance's memory alone: nothing is written to a file, a variable or the transcript. A reload, `/new`, a resume or a fork builds a new instance, which starts on and takes Pi's own tool selection again. Repeating either form changes nothing and says which state fusion is in.
+A profile can be applied while fusion is off: the tools' guidance is updated and they stay hidden, and `/fusion on` gives them back with that guidance. The switch lives in this extension instance's memory alone: nothing is written to a file, a variable or the transcript. A reload, `/new`, a resume or a fork builds a new instance, which starts on and takes Pi's own tool selection again. Repeating either form changes nothing and says which state fusion is in.
 
 ## The status line
 

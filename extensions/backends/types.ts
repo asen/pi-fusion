@@ -266,6 +266,8 @@ export interface Backend<TRole, TSession, TControl extends ChildControl = ChildC
 export interface HostRole {
 	name: string;
 	model: string;
+	/** The effort the role runs at, when it names one: a Pi role that names none leaves the child its own default. */
+	effort?: string;
 	contract: string;
 	mode?: "answer" | "review";
 }

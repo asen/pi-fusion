@@ -8,7 +8,7 @@ A [Pi](https://pi.dev) extension that gives the host model a delegation tool, `f
 
 A **backend** is the harness a child runs in, and this build registers two.
 
-`claude` runs every role but `security` as a headless Claude Code session, and it is what a call that leaves `backend` unset gets for each of those. `pi` runs `plan`, `implement`, `ask` and `security` as a headless Pi session on the user's own Pi provider configuration. `ultracode` is Claude's alone and `security` is Pi's alone, so a call that names `security` goes to `pi` whether or not it names a backend, and naming `claude` for it is refused before anything starts, with `role security does not run on the claude backend; use one of pi`.
+`claude` runs every role but `security` as a headless Claude Code session, and in the built-in configuration it is what a call that leaves `backend` unset gets for each of those; a [profile](docs/profiles.md) can put a role on the other backend, set its model and effort, or disable it. `pi` runs `plan`, `implement`, `ask` and `security` as a headless Pi session on the user's own Pi provider configuration. `ultracode` is Claude's alone and `security` is Pi's alone, so a call that names `security` goes to `pi` whether or not it names a backend, and naming `claude` for it is refused before anything starts, with `role security does not run on the claude backend; use one of pi`.
 
 The `pi` backend has no model of its own and guesses none, so a call that names it needs a provider and a model id:
 
@@ -20,7 +20,7 @@ The same call without `model` runs once `PI_FUSION_PI_IMPLEMENT_MODEL=deepseek/d
 
 ## Roles
 
-The `role` parameter of `fusion` picks the job. The table is the `claude` backend's binding.
+The `role` parameter of `fusion` picks the job. The table is the `claude` backend's binding in the built-in configuration; `/fusion config` shows and changes what each role runs on in a session (see [Profiles and role settings](docs/profiles.md)).
 
 | Role | Model and effort | Tools given to the child | Purpose |
 | --- | --- | --- | --- |
@@ -46,7 +46,7 @@ On the `pi` backend the purposes are the same, because both backends run the sam
 | `mode` | `ask` | `answer` (default) sends `contracts/ask-answer.md`, `review` sends `contracts/ask-review.md`. |
 | `model` | `plan`, `implement`, `ask` on `claude`; every role on `pi` | Replaces the role's model, and the run keeps it for later calls that name no model: a Claude Code alias or id, or a Pi provider and model id split at the first slash. No `pi` role has a model of its own, so there a `model` replaces nothing and is one of the three places the required one comes from. |
 | `effort` | `plan`, `implement`, `ask`, and `security` on `pi` | `low`, `medium`, `high`, `xhigh` or `max`; the `pi` backend adds `off` and `minimal`. Optional on `pi`, where a call that names none leaves the child its own default. |
-| `backend` | all, `fusion` only | The harness the child runs in: `claude`, which an unset `backend` gets, or `pi`. A role the named backend does not run is refused before anything starts. A continued run stays on the backend its record names. |
+| `backend` | all, `fusion` only | The harness the child runs in: `claude` or `pi`. An unset `backend` gets the one the session's settings give the role, `claude` for every role but `security` in the built-in configuration; naming the other one runs the call on that backend's legacy defaults. A role the named backend does not run is refused before anything starts. A continued run stays on the backend its record names. |
 
 `ultracode` takes neither `model` nor `effort`, because any other effort turns its workflows off. A parameter the role does not take fails the call before a child starts, with an error such as `effort is not allowed for role ultracode`. The `claude` tool takes the same parameters apart from `backend`, which it does not have: it is this delegation with the Claude backend forced, so it never infers another one from a call or a record, and it refuses to continue a run recorded on another backend and names the tool that can. All four tools are registered `executionMode: "sequential"`, so their calls run one at a time: Pi runs every tool call in a turn sequentially as soon as one of them is sequential.
 
@@ -68,7 +68,7 @@ While a child runs, the status line shows `<handle> <role> · <seconds> · <n> t
 
 The host model is the orchestrator. Its guidelines ask one question: is the design unresolved. The host sends all implementation to `implement` and uses `ultracode` only when you ask for it. That leaves three routes: straight to `implement`; `plan` first, then `implement` task by task; or `ultracode`, with or without `plan`, on your request.
 
-Your explicit choice wins. Ask for Opus and the host uses `implement`, ask for Fable or ultracode and it uses `ultracode`, and ask for or skip planning as you like. The host names a backend only when you ask for one. For an independent review, the host calls `ask` with `mode: "review"`. Role `security` is yours to ask for: ask for a security investigation, audit or fix and the host uses it, on `pi`, and it picks that role on no judgement of its own. See [Routing](docs/routing.md).
+Your explicit choice wins. Ask for ultracode and the host uses `ultracode`, and ask for or skip planning as you like. The host names a backend, model or effort only when you ask for one, and otherwise runs each role on the session's configured settings. For an independent review, the host calls `ask` with `mode: "review"`. Role `security` is yours to ask for: ask for a security investigation, audit or fix and the host uses it, on `pi`, and it picks that role on no judgement of its own. See [Routing](docs/routing.md).
 
 ## The Pi backend: evidence and limits
 
@@ -113,6 +113,7 @@ The guidelines tell the host to delegate every implementation task and not to ed
 - [Independent reviews](docs/reviews.md) — `/fusion review` and `PI_FUSION_AUTO_REVIEW`.
 - [Monitoring dashboard](docs/dashboard.md) — the local read-only web page.
 - [The ultracode role](docs/ultracode.md) — what the workflow opt-in does and what it costs.
+- [Profiles and role settings](docs/profiles.md) — `/fusion config`, `/fusion profile`, the profiles file, disabled roles and what a call runs on.
 - [Configuration](docs/configuration.md) — every environment variable, and the session cost estimate with its warnings and limit.
 - [The Pi backend plan](docs/pi-backend-plan.md) — the design record the second backend was built from, with the evidence behind each decision. It is a working document whose step 5 status paragraph is its current status.
 - [Development](docs/development.md) — the test suite, the three fakes, and the tripwire that stands in for the registered Pi backend.

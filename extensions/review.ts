@@ -1,4 +1,3 @@
-import type { ResolvedSelection } from "./backends/types.ts";
 import { capBytes } from "./dashboard.ts";
 import { isReviewable } from "./roles.ts";
 
@@ -62,22 +61,4 @@ export function reviewable(run: { state: string; role: string; files?: ReadonlyA
 	if (run.state !== "done" && run.state !== "failed") return `ended ${run.state} without a report to review`;
 	if (!run.files?.length) return "changed no files";
 	return undefined;
-}
-
-/** Which backend reviews a finished run, and what its reviewer inherits of it: a Pi reviewer carries the model alone. */
-export type Reviewer = { backend: "claude" } | { backend: "pi"; model: string };
-
-/**
- * The reviewer a finished run gets, or why it gets none. Every role keeps the Claude ask reviewer it has always had;
- * a security run is reviewed on Pi with the model that run itself ran with, because a review of that work is worth no
- * less than the work. The model is the whole of what is inherited: the reviewer's thinking level is the ask role's own,
- * so a source run's level never sets a reviewer's. Nothing is guessed either, which is why a security run whose record
- * holds no model is refused here rather than reviewed by a model nobody chose. The wording has no handle in it: the
- * caller puts the handle in front, as it does for `reviewable`.
- */
-export function reviewerFor(source: { role: string; selection?: ResolvedSelection }): Reviewer | { refused: string } {
-	if (source.role !== "security") return { backend: "claude" };
-	const model = source.selection?.model?.trim();
-	if (!model) return { refused: "recorded no model it ran with, so no reviewer inherits one; review it yourself with fusion, role ask, mode review, backend pi and a model" };
-	return { backend: "pi", model };
 }

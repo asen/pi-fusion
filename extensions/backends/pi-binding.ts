@@ -112,12 +112,12 @@ export function piParams(call: PiCall): { name: PiRoleName; mode: PiMode } {
 }
 
 /** Where a field of the selection came from, so a value this host will not use says which setting to correct. */
-interface Chosen {
+export interface Chosen {
 	value: string;
 	from: string;
 }
 
-const chosen = (field: "model" | "effort", call: string | undefined, recorded: string | undefined, variable: string, env: NodeJS.ProcessEnv): Chosen | undefined => {
+const chosen = (field: "model" | "effort", call: string | undefined, recorded: string | undefined, configured: Chosen | undefined): Chosen | undefined => {
 	if (call !== undefined) {
 		const named = call.trim();
 		// A call that names the field and leaves it blank is a mistake, not permission to choose something else for it:
@@ -125,29 +125,46 @@ const chosen = (field: "model" | "effort", call: string | undefined, recorded: s
 		if (!named) throw new Error(`the call names an empty ${field} for the pi backend; name one or leave the ${field} parameter out to take the recorded or configured value`);
 		return { value: named, from: "the call" };
 	}
-	// The selection the run actually ran with wins over a variable that has changed since, so a continuation repeats it.
+	// The selection the run actually ran with wins over a configuration that has changed since, so a continuation repeats it.
 	if (recorded) return { value: recorded, from: "the selection the run it continues ran with" };
-	const configured = env[variable]?.trim();
-	return configured ? { value: configured, from: variable } : undefined;
+	return configured;
 };
 
 /**
- * The Pi role a call runs, with the model and thinking level it resolved to: the call's own override first, then the
- * selection the run it continues actually ran with, then the role's configured default. A model is required from one
- * of those three, because Pi has no model of its own to fall back on and this host guesses none. A level is not: a
- * first call that names none leaves the child its own default, and the child reports back what that was.
+ * What a role falls back on when neither the call nor the run it continues names a field: each value with the setting
+ * it came from, so a value this binding refuses says what to correct, and the sentence a call with no model gets.
  */
-export function piRole(call: PiCall, recorded?: ResolvedSelection, env: NodeJS.ProcessEnv = process.env): PiRole {
+export interface PiFallback {
+	model?: Chosen;
+	effort?: Chosen;
+	missing: string;
+}
+
+/** The fallback the role's own variables are, which is what a host that passes no configuration gets. */
+export function variableFallback(role: string, env: NodeJS.ProcessEnv = process.env): PiFallback {
+	const model = env[piModelVariable(role)]?.trim();
+	const effort = env[piEffortVariable(role)]?.trim();
+	return {
+		...(model ? { model: { value: model, from: piModelVariable(role) } } : {}),
+		...(effort ? { effort: { value: effort, from: piEffortVariable(role) } } : {}),
+		missing: `role ${role} has no model for the pi backend: set ${piModelVariable(role)} to a provider and a model id, such as deepseek/deepseek-chat, or name one in the call's model parameter. The pi backend has no default model and resolves none for you`,
+	};
+}
+
+/**
+ * The Pi role a call runs, with the model and thinking level it resolved to: the call's own override first, then the
+ * selection the run it continues actually ran with, then the fallback — the session's configuration, or the role's
+ * own variables when the caller passes none. A model is required from one of those, because Pi has no model of its
+ * own to fall back on and this host guesses none. A level is not: a first call that names none leaves the child its
+ * own default, and the child reports back what that was.
+ */
+export function piRole(call: PiCall, recorded?: ResolvedSelection, env: NodeJS.ProcessEnv = process.env, fallback?: PiFallback): PiRole {
 	const { name, mode } = piParams(call);
-	const variable = piModelVariable(name);
-	const model = chosen("model", call.model, recorded?.model, variable, env);
-	if (!model) {
-		throw new Error(
-			`role ${name} has no model for the pi backend: set ${variable} to a provider and a model id, such as deepseek/deepseek-chat, or name one in the call's model parameter. The pi backend has no default model and resolves none for you`,
-		);
-	}
+	const base = fallback ?? variableFallback(name, env);
+	const model = chosen("model", call.model, recorded?.model, base.model);
+	if (!model) throw new Error(base.missing);
 	if (!isPiModel(model.value)) throw new Error(`${model.from} names model ${JSON.stringify(model.value)}, which is not a pi provider and model id such as deepseek/deepseek-chat`);
-	const effort = chosen("effort", call.effort, recorded?.effort, piEffortVariable(name), env);
+	const effort = chosen("effort", call.effort, recorded?.effort, base.effort);
 	if (effort && !(PI_EFFORTS as readonly string[]).includes(effort.value)) {
 		throw new Error(`${effort.from} names effort ${JSON.stringify(effort.value)}, which is not a pi thinking level; use one of ${PI_EFFORTS.join(", ")}`);
 	}

@@ -21,8 +21,8 @@ import {
 	runChild,
 } from "./backends/claude.ts";
 import { createPiBackend } from "./backends/pi-backend.ts";
-import { PI_CONTRACT_FILES, piParams, piRole } from "./backends/pi-binding.ts";
-import { PI_BOOTSTRAP_PATH } from "./backends/pi-launch.ts";
+import { PI_CONTRACT_FILES, type PiFallback, piEffortVariable, piModelVariable, piParams, piRole, variableFallback } from "./backends/pi-binding.ts";
+import { hostAgentDir, PI_BOOTSTRAP_PATH } from "./backends/pi-launch.ts";
 import {
 	type Ask,
 	BACKEND_NAMES,
@@ -36,6 +36,7 @@ import {
 	type HostRole,
 	type HostSession,
 	isBackendName,
+	isPiModel,
 	keptRef,
 	keptSelection,
 	type ModelCost,
@@ -52,8 +53,27 @@ import { type ChangedFile, changedFiles, type Snapshot, snapshot } from "./chang
 import { type Dashboard, RunStore, startDashboard } from "./dashboard.ts";
 import { contextShare, continueNote, handoffBlocked, handoffNote, handoffPrompt, handoffShare, planContextPct, planProblems, sharePercent, type HandoffReason } from "./handoff.ts";
 import { History, type HistoryRecord, historyDir, historyEnabled } from "./history.ts";
-import { reviewable, reviewerFor, reviewPrompt } from "./review.ts";
-import { canChangeFiles, isKnownRole, KNOWN_ROLE_NAMES, type KnownRoleName, type RoleSpec, roleSpec } from "./roles.ts";
+import { hostProfileStore, type ProfileStore } from "./profile-store.ts";
+import {
+	type Baseline,
+	BUILTIN,
+	builtinSettings,
+	CLAUDE_EFFORTS,
+	captureBaseline,
+	copySettings,
+	effortsFor,
+	nameProblem,
+	type ProfileDocument,
+	parseSettings,
+	type RoleSetting,
+	type RoleSettings,
+	sameSettings,
+	type Selection,
+	settingsTable,
+	ULTRACODE_EFFORT,
+} from "./profiles.ts";
+import { reviewable, reviewPrompt } from "./review.ts";
+import { canChangeFiles, isKnownRole, KNOWN_ROLE_NAMES, type KnownRoleName, ROLE_SPECS, type RoleSpec, roleSpec } from "./roles.ts";
 
 /** A run as the shared lifecycle reads it, whichever backend produced it: the record over the part of a role the host uses. */
 type HostRun = BackendRun<HostRole>;
@@ -67,39 +87,35 @@ const TICK_MS = 1_000;
 /** How often a running run's changed-file count is sampled: a git call per second per run is too many. */
 const FILE_SAMPLE_MS = 10_000;
 
-const env = (key: string, fallback: string): string => process.env[key]?.trim() || fallback;
-
 export const ROLE_NAMES = ["plan", "implement", "ultracode", "ask"] as const;
 export type RoleName = (typeof ROLE_NAMES)[number];
 
-const ROLES: Record<RoleName, Role> = {
+/**
+ * What each Claude role is apart from its model and effort: its tools, permission mode and contract. The model and
+ * effort are a session's configuration, resolved per call, so nothing here pins them when this module is imported.
+ */
+type ClaudeShape = Omit<Role, "model" | "effort">;
+
+const ROLES: Record<RoleName, ClaudeShape> = {
 	plan: {
 		name: "plan",
-		model: env("PI_FUSION_PLAN_MODEL", "fable"),
-		effort: "xhigh",
 		tools: ["Read", "Bash", "Edit", "Write", "Grep", "Glob"],
 		permissionMode: "bypassPermissions",
 		contract: "plan.md",
 	},
 	implement: {
 		name: "implement",
-		model: env("PI_FUSION_IMPLEMENT_MODEL", "opus"),
-		effort: env("PI_FUSION_IMPLEMENT_EFFORT", "high"),
 		tools: ["Read", "Bash", "Edit", "Write", "Grep", "Glob"],
 		permissionMode: "bypassPermissions",
 		contract: "implement.md",
 	},
 	ultracode: {
 		name: "ultracode",
-		model: env("PI_FUSION_ULTRACODE_MODEL", "fable"),
-		effort: "ultracode",
-		permissionMode: env("PI_FUSION_ULTRACODE_PERMISSION_MODE", "bypassPermissions"),
+		permissionMode: process.env.PI_FUSION_ULTRACODE_PERMISSION_MODE?.trim() || "bypassPermissions",
 		contract: "ultracode.md",
 	},
 	ask: {
 		name: "ask",
-		model: env("PI_FUSION_ASK_MODEL", "opus"),
-		effort: env("PI_FUSION_ASK_EFFORT", "high"),
 		tools: ["Read", "Bash", "Grep", "Glob", "WebSearch", "WebFetch"],
 		permissionMode: "bypassPermissions",
 		contract: "ask-answer.md",
@@ -110,7 +126,7 @@ export const ASK_MODES = ["answer", "review"] as const;
 export type AskMode = (typeof ASK_MODES)[number];
 const ASK_CONTRACTS: Record<AskMode, string> = { answer: "ask-answer.md", review: "ask-review.md" };
 
-export const EFFORTS = ["low", "medium", "high", "xhigh", "max"] as const;
+export const EFFORTS = CLAUDE_EFFORTS;
 
 /** The claude parameters only some roles take. `ultracode` takes no effort, because any other level turns its workflows off. */
 const ROLE_PARAMETERS: Record<"fresh" | "mode" | "model" | "effort", readonly RoleName[]> = {
@@ -169,14 +185,22 @@ export function claudeParams(params: ClaudeParams & { role: string }): { name: R
 	return { name, mode: (params.mode ?? "answer") as AskMode };
 }
 
-/** The role a claude call runs, with the call's model and effort. Throws on a role or parameter the call cannot use. */
-export function roleFor(params: ClaudeParams & { role: string }): Role {
+/**
+ * The role a claude call runs: the call's own model and effort, then the defaults its route settled on — the session's
+ * configuration, the run it continues or the legacy defaults — and the legacy defaults of the environment as it is
+ * now when no route gave any. Ultracode's effort is always its own. Throws on a role or parameter the call cannot use.
+ */
+export function roleFor(params: ClaudeParams & { role: string }, defaults?: Selection): Role {
 	const { name, mode } = claudeParams(params);
-	const model = params.model?.trim();
+	const base = defaults ?? captureBaseline()[name].claude ?? {};
+	const model = params.model?.trim() || base.model;
+	const effort = name === "ultracode" ? ULTRACODE_EFFORT : params.effort || base.effort;
+	if (!model) throw new Error(`role ${name} has no model for the claude backend; name one in the call's model parameter or choose one with /fusion config`);
+	if (!effort) throw new Error(`role ${name} has no effort for the claude backend; name one in the call's effort parameter or choose one with /fusion config`);
 	return {
 		...ROLES[name],
-		...(model ? { model } : {}),
-		...(params.effort ? { effort: params.effort } : {}),
+		model,
+		effort,
 		...(name === "ask" ? { mode, contract: ASK_CONTRACTS[mode] } : {}),
 	};
 }
@@ -203,8 +227,13 @@ export interface RunRecord {
 	hostSessionId?: string;
 	/** The last assistant message of the last successful call on this host branch. */
 	checkpoint?: string;
-	/** The model a call chose in place of the role's default, which later calls to the run keep unless they name another. */
+	/**
+	 * The Claude model and effort the run was admitted with, which later calls to the run keep unless they name others.
+	 * Every run this build writes records both, the defaults included; an older entry carries the model only when a
+	 * call chose one over the role's default, and no effort at all.
+	 */
 	model?: string;
+	effort?: string;
 	/** The prompt size of that call's last model turn, and the window it filled, so a plan call can weigh continuing it. */
 	contextTokens?: number;
 	contextWindow?: number;
@@ -239,6 +268,7 @@ function claudeRecord(base: RunRecord, data: Record<string, unknown>): RunRecord
 		...(checkpoint === undefined ? {} : { checkpoint }),
 		// The flat model is this backend's own: a Pi run's model is in the selection it recorded, never in this field.
 		...(typeof data.model === "string" && data.model ? { model: data.model } : {}),
+		...(typeof data.effort === "string" && data.effort ? { effort: data.effort } : {}),
 		...(typeof data.contextTokens === "number" ? { contextTokens: data.contextTokens } : {}),
 		...(typeof data.contextWindow === "number" ? { contextWindow: data.contextWindow } : {}),
 	};
@@ -383,10 +413,11 @@ export interface RecordCall {
 	hostSessionId: string;
 	intent: SessionIntent;
 	/**
-	 * The model this call ran on, when it is one the call chose over the role's own default. Only the Claude half of
-	 * an entry carries it: a Pi run's model is in the selection it records, which its continuation repeats.
+	 * The model and effort this call ran on. Only the Claude half of an entry carries them: a Pi run's are in the
+	 * selection it records, which its continuation repeats.
 	 */
 	model?: string;
+	effort?: string;
 	/** What the branch already records for this handle, which a run that recorded nothing leaves as it is. */
 	prior?: RunRecord;
 }
@@ -405,9 +436,10 @@ const postcondition = (handle: string, why: string): { invalid: string } => ({
  * checked against the flat one: a fork that failed keeps the message it forked at while the flat one is the tip.
  */
 function claudeDecision(call: RecordCall, outcome: RunOutcome, entry: Record<string, unknown>): RecordDecision {
-	// The chosen model is recorded even for a run that reported no session: it is what the handle ran on, and an entry
-	// written for a run with no identity is still the record a later reader of this handle sees.
+	// The model and effort are recorded even for a run that reported no session: they are what the handle ran on, and an
+	// entry written for a run with no identity is still the record a later reader of this handle sees.
 	if (call.model) entry.model = call.model;
+	if (call.effort) entry.effort = call.effort;
 	if (outcome.session !== undefined) {
 		const ref = sessionRefOf(outcome.session, "claude");
 		if (!ref) return postcondition(call.handle, "reported a session reference that is not a claude session");
@@ -504,6 +536,36 @@ export interface Handoff {
 }
 
 /**
+ * What a session runs its roles as: the role settings it applied, where they came from, and the legacy defaults its
+ * extension instance started with, which a call naming the other backend than the configured one runs on.
+ */
+export interface Configuration {
+	/** The profile the settings were loaded from, `builtin` for the legacy defaults. */
+	profile: string;
+	/** True once the settings were edited in this session and no longer match the profile they came from. */
+	modified: boolean;
+	roles: RoleSettings;
+	baseline: Baseline;
+}
+
+/** The built-in configuration over a baseline: the legacy defaults, every role enabled on its legacy backend. */
+export function builtinConfiguration(baseline: Baseline = captureBaseline()): Configuration {
+	return { profile: BUILTIN, modified: false, roles: builtinSettings(baseline), baseline };
+}
+
+/** How a configuration names itself in a message: the profile, and whether this session has edited it since. */
+export const configurationLabel = (config: Configuration): string => `${config.profile}${config.modified ? " (modified)" : ""}`;
+
+/**
+ * The model and effort a route settled on beneath the call's own: the configuration's, a continued or handed-off run's,
+ * or the baseline's. `from` names where they came from for a Pi binding that refuses one, and is absent when they are
+ * the role's own variables, whose names are what such a refusal points at.
+ */
+export interface RouteDefaults extends Selection {
+	from?: string;
+}
+
+/**
  * Where a call goes before any backend has bound a role for it: the backend it runs on, the role it runs, the handle
  * it takes and the record it continues. Everything a call can be refused for that does not depend on a model is
  * settled here, so a route can be refused for its record, its role or its parameters before a binding resolves one.
@@ -516,6 +578,10 @@ export interface FusionRoute {
 	handoff?: Handoff;
 	/** The call as the role's own binding reads it, with the role and, for an ask run, the mode the route settled on. */
 	call: FusionParams & { role: KnownRoleName };
+	/** What the binding falls back on where the call names nothing. Never written into `call`, which stays the call's own. */
+	defaults: RouteDefaults;
+	/** What a continued Claude run never recorded, so the defaults this instance started with stood in for it. */
+	unrecorded?: string;
 }
 
 /** A routed call with the role its backend bound for it. */
@@ -540,13 +606,50 @@ function executableRole(role: string): RoleSpec {
 	throw new Error(`unknown role ${role}; use one of ${KNOWN_ROLE_NAMES.join(", ")}`);
 }
 
-/** The backend a new run goes to: the one the call named, or the sole backend the role runs on, or Claude. */
-function freshBackend(role: string, asked: string | undefined): BackendName {
+/**
+ * Refuses a role the configuration disabled, for a fresh run and a continuation alike, whatever backend, model or
+ * effort the call names: a disabled role starts nothing, takes no handle and is never asked of a backend.
+ */
+function enabledRole(role: KnownRoleName, config: Configuration): void {
+	if (!config.roles[role].enabled) throw new Error(`role ${role} is disabled in profile ${configurationLabel(config)}; change /fusion config or select another profile`);
+}
+
+/** The backend a new run goes to: the one the call named, or the one the configuration names for the role. */
+function freshBackend(role: string, asked: string | undefined, config: Configuration): BackendName {
 	const spec = executableRole(role);
-	if (asked === undefined) return spec.backends.length === 1 ? spec.backends[0]! : claudeBackend.name;
+	if (asked === undefined) return config.roles[spec.name].backend;
 	const backend = namedBackend(asked);
 	if (!spec.backends.includes(backend)) throw new Error(`role ${role} does not run on the ${backend} backend; use one of ${spec.backends.join(", ")}`);
 	return backend;
+}
+
+/**
+ * The defaults a fresh run on a backend takes: the configuration's when that is the backend it names for the role, and
+ * otherwise the legacy defaults this instance started with for that backend. A profile's settings for one backend are
+ * never read as the other's, and a field a profile leaves out is not filled in from a variable.
+ */
+function freshDefaults(role: KnownRoleName, backend: BackendName, config: Configuration): RouteDefaults {
+	const setting = config.roles[role];
+	if (setting.backend !== backend) return { ...config.baseline[role][backend] };
+	const configured: RouteDefaults = { ...(setting.model === undefined ? {} : { model: setting.model }), ...(setting.effort === undefined ? {} : { effort: setting.effort }) };
+	// The built-in configuration as it started is the role's own variables, which is what a refusal should point at.
+	return config.profile === BUILTIN && !config.modified ? configured : { ...configured, from: `profile ${configurationLabel(config)}` };
+}
+
+/**
+ * The defaults a continued Claude run keeps: the model and effort its record names, and for a field an older record
+ * never wrote, the legacy default this instance started with — never the profile selected now — with a sentence that
+ * says so. A field the call names itself needs no stand-in and earns no sentence.
+ */
+function claudeKept(record: RunRecord, params: FusionParams, config: Configuration): { defaults: RouteDefaults; unrecorded?: string } {
+	const base = config.baseline[record.role].claude ?? {};
+	const missing = [
+		...(params.model === undefined && !record.model ? [`model (${base.model ?? "none"})`] : []),
+		...(params.effort === undefined && !record.effort && record.role !== "ultracode" ? [`effort (${base.effort ?? "none"})`] : []),
+	];
+	const defaults: RouteDefaults = { ...(record.model ?? base.model ? { model: record.model ?? base.model } : {}), ...(record.effort ?? base.effort ? { effort: record.effort ?? base.effort } : {}) };
+	if (!missing.length) return { defaults };
+	return { defaults, unrecorded: `${record.handle} was recorded before its ${missing.length === 1 ? "setting was" : "settings were"} kept, so it runs on the default this Pi process started with: ${missing.join(", ")}` };
 }
 
 /**
@@ -567,8 +670,11 @@ function checkParams(backend: BackendName, call: FusionParams & { role: KnownRol
 	else piParams(call);
 }
 
-/** The route a fusion call takes. Throws on a handle, backend, role or parameter the call cannot use. */
-export function fusionRoute(params: FusionParams, records: RunRecords, planPct: number = planContextPct()): FusionRoute {
+/**
+ * The route a fusion call takes. Throws on a handle, backend, role or parameter the call cannot use. A host that passes
+ * no configuration routes on the built-in one over the environment as it is now.
+ */
+export function fusionRoute(params: FusionParams, records: RunRecords, planPct: number = planContextPct(), config: Configuration = builtinConfiguration()): FusionRoute {
 	if (params.continue !== undefined) {
 		if (params.fresh !== undefined) throw new Error("fresh is not allowed with continue");
 		const record = records.runs.get(params.continue);
@@ -580,43 +686,69 @@ export function fusionRoute(params: FusionParams, records: RunRecords, planPct: 
 		// A record this host will not act on stops the call here, before a handoff is weighed or a child is started.
 		if (record.refusal) throw new Error(record.refusal);
 		executableRole(record.role);
+		enabledRole(record.role, config);
 		const backend = continuedBackend(record, params.backend);
 		const mode = params.mode ?? record.mode;
-		// A Claude run keeps the model a call chose for it: a later call inherits it unless it names another. A Pi run's
-		// selection is its record's own, and its binding repeats that rather than reading a model off the call.
-		const kept = backend === "claude" ? params.model?.trim() || record.model : undefined;
-		const call = { ...params, role: record.role, ...(mode ? { mode } : {}), ...(kept ? { model: kept } : {}) };
+		const call = { ...params, role: record.role, ...(mode ? { mode } : {}) };
 		checkParams(backend, call);
-		return { backend, role: record.role, handle: record.handle, record, call };
+		// A Claude run keeps the model and effort it was admitted with unless the call names others. A Pi run's selection
+		// is its record's own, and its binding repeats that rather than reading one off the configuration; a Pi handle that
+		// recorded none falls back on the defaults this instance started with, never on the profile selected now.
+		const kept = backend === "claude" ? claudeKept(record, params, config) : { defaults: { ...config.baseline[record.role].pi } };
+		return { backend, role: record.role, handle: record.handle, record, call, ...kept };
 	}
 	if (params.role === undefined) throw new Error("role is required unless continue is set");
-	const backend = freshBackend(params.role, params.backend);
+	executableRole(params.role);
 	const role = params.role as KnownRoleName;
+	enabledRole(role, config);
+	const backend = freshBackend(role, params.backend, config);
 	const call = { ...params, role };
 	checkParams(backend, call);
+	const fresh = freshDefaults(role, backend, config);
 	// A plan run of one backend is never continued into another, so the latest plan is the one this route's backend ran.
 	const latestPlan = records.lastPlan.get(backend);
 	const last = role === "plan" && params.fresh !== true && latestPlan ? records.runs.get(latestPlan) : undefined;
 	const next = `run-${records.highest + 1}`;
-	if (!last) return { backend, role, handle: next, call };
+	if (!last) return { backend, role, handle: next, call, defaults: fresh };
 	// A latest plan record this host refuses stops the call: an implicit plan call never walks back to an older run.
 	if (last.refusal) throw new Error(last.refusal);
-	// What the last plan run actually ran on, in its own backend's terms: Claude keeps a chosen model flat and falls
-	// back to the role's default, while a Pi run is only ever on the selection it recorded. A backend that can say
-	// neither leaves the model out of the decision rather than guessing one a handoff would then be named after.
-	const lastModel = backend === "claude" ? last.model ?? ROLES.plan.model : last.selection?.model;
+	// What the last plan run actually ran on, in its own backend's terms: Claude keeps its model flat, and an older
+	// record that kept none ran on the legacy default, while a Pi run is only ever on the selection it recorded. A
+	// configured default is not what the run ran on, so it never stands in here and never reads as a change of model.
+	const lastModel = backend === "claude" ? (last.model ?? config.baseline.plan.claude?.model) : last.selection?.model;
 	const named = params.model?.trim();
 	// Another model is not a continuation: the run holds its agreement in a context this call would not be reading.
 	if (named && lastModel && named !== lastModel) {
-		return { backend, role, handle: next, handoff: { from: last.handle, reason: { kind: "model", from: lastModel, to: named } }, call };
+		return { backend, role, handle: next, handoff: { from: last.handle, reason: { kind: "model", from: lastModel, to: named } }, call, defaults: fresh };
 	}
-	// Claude carries the plan run's own model onto the call that continues it and onto the fresh run a cap hands off
-	// to, because that model is the run's and not the call's. Pi binds a fresh run from the call and its variables
-	// again, and repeats the recorded selection on a continuation, which is its binding's own to do.
-	const carried = backend === "claude" && lastModel ? { ...call, model: named || lastModel } : call;
 	const share = handoffShare(last, planPct);
-	if (share === undefined) return { backend, role, handle: last.handle, record: last, call: carried };
-	return { backend, role, handle: next, handoff: { from: last.handle, reason: { kind: "cap", share } }, call: carried };
+	if (share === undefined) {
+		const kept = backend === "claude" ? claudeKept(last, params, config) : { defaults: {} };
+		return { backend, role, handle: last.handle, record: last, call, ...kept };
+	}
+	// A cap hands off to a fresh run that keeps the planner's model, because that model is the run's and not the call's.
+	// On Claude the effort is the call's or the role's default, as it always was. On Pi the model and the level the run
+	// recorded go together, because a level chosen for another model may be one this model does not offer.
+	const carried: RouteDefaults =
+		backend === "claude"
+			? { ...fresh, ...(lastModel ? { model: lastModel } : {}) }
+			: last.selection
+				? { model: last.selection.model, effort: last.selection.effort, from: `the plan run ${last.handle} hands off from` }
+				: fresh;
+	return { backend, role, handle: next, handoff: { from: last.handle, reason: { kind: "cap", share } }, call, defaults: carried };
+}
+
+/** What a Pi binding falls back on for a route: the defaults it settled on, named after where they came from. */
+function piFallback(route: FusionRoute): PiFallback {
+	const { model, effort, from } = route.defaults;
+	const name = route.role;
+	// The role's own variables, as this instance captured them: the binding's own fallback over those values.
+	if (from === undefined) return variableFallback(name, { [piModelVariable(name)]: model, [piEffortVariable(name)]: effort } as NodeJS.ProcessEnv);
+	return {
+		...(model ? { model: { value: model, from } } : {}),
+		...(effort ? { effort: { value: effort, from } } : {}),
+		missing: `role ${name} has no model for the pi backend in ${from}: choose a provider and a model id, such as deepseek/deepseek-chat, with /fusion config, or name one in the call's model parameter. The pi backend has no default model and resolves none for you`,
+	};
 }
 
 /**
@@ -625,27 +757,28 @@ export function fusionRoute(params: FusionParams, records: RunRecords, planPct: 
  * repeats rather than resolving its model again against whatever is configured now.
  */
 export function fusionRole(route: FusionRoute): HostRole {
-	if (route.backend === "claude") return roleFor(route.call);
-	return piRole(route.call, route.record?.selection);
+	if (route.backend === "claude") return roleFor(route.call, route.defaults);
+	return piRole(route.call, route.record?.selection, process.env, piFallback(route));
 }
 
 /** The run a fusion call starts or continues, with the role its backend bound for it. */
-export function fusionCall(params: FusionParams, records: RunRecords, planPct: number = planContextPct()): FusionCall {
-	const route = fusionRoute(params, records, planPct);
+export function fusionCall(params: FusionParams, records: RunRecords, planPct: number = planContextPct(), config?: Configuration): FusionCall {
+	const route = fusionRoute(params, records, planPct, config);
 	return { ...route, bound: fusionRole(route) };
 }
 
 /**
  * The claude tool's own route: the shared one with the backend forced, so nothing infers Pi from a call or a record.
- * A Pi run is continued through fusion, which knows its backend and the selection it has to repeat.
+ * A Pi run is continued through fusion, which knows its backend and the selection it has to repeat. A role the
+ * configuration puts on Pi is run on Claude here as any call naming the other backend is: on the legacy defaults.
  */
-export function claudeRoute(params: ClaudeParams, records: RunRecords, planPct: number = planContextPct()): FusionRoute {
+export function claudeRoute(params: ClaudeParams, records: RunRecords, planPct: number = planContextPct(), config?: Configuration): FusionRoute {
 	const prior = params.continue === undefined ? undefined : records.runs.get(params.continue);
 	if (prior?.backend === "pi") throw new Error(`${prior.handle} ran on the pi backend, which the claude tool does not run; continue it with fusion and continue ${prior.handle}`);
 	// A fresh call's role is checked against the four this tool advertises before the shared route reads a capability:
 	// a role that runs on Pi alone is one this tool does not know, and saying so is what it has always done.
 	if (params.continue === undefined && params.role !== undefined) claudeRoleName(params.role);
-	return fusionRoute({ ...params, backend: claudeBackend.name }, records, planPct);
+	return fusionRoute({ ...params, backend: claudeBackend.name }, records, planPct, config);
 }
 
 /** The run a claude call starts or continues, with the Claude role it binds. Throws on anything the call cannot use. */
@@ -653,10 +786,11 @@ export function claudeCall(
 	params: ClaudeParams,
 	records: RunRecords,
 	planPct: number = planContextPct(),
+	config?: Configuration,
 ): { role: Role; handle: string; record?: RunRecord; handoff?: Handoff } {
-	const route = claudeRoute(params, records, planPct);
+	const route = claudeRoute(params, records, planPct, config);
 	return {
-		role: roleFor(route.call),
+		role: roleFor(route.call, route.defaults),
 		handle: route.handle,
 		...(route.record === undefined ? {} : { record: route.record }),
 		...(route.handoff === undefined ? {} : { handoff: route.handoff }),
@@ -783,8 +917,6 @@ interface ReviewTarget {
 	files?: ReadonlyArray<ChangedFile>;
 	/** The working directory the run was made in, when that is not this one: a review reads the tree the run changed. */
 	madeIn?: string;
-	/** What the run itself ran with, for a role whose reviewer inherits the model: the verified selection and no other. */
-	selection?: ResolvedSelection;
 	/** Links the source to the review that reads it, wherever the source is kept. */
 	markReviewed(handle: string): void;
 }
@@ -1045,9 +1177,12 @@ function handleNumber(handle: string): number {
 	return Number(HANDLE.exec(handle)?.[1] ?? 0);
 }
 
-const FUSION_ARGS = ["dashboard", "dashboard stop", "status", "cancel", "steer", "wait", "answer", "review", "on", "off"];
+const FUSION_ARGS = ["dashboard", "dashboard stop", "status", "cancel", "steer", "wait", "answer", "review", "on", "off", "config", "profile", "profile list", "profile use", "profile save", "profile default"];
 const USAGE =
-	"Usage: /fusion dashboard | /fusion dashboard stop | /fusion status [run-N] | /fusion cancel run-N | /fusion wait run-N | /fusion steer run-N <text> | /fusion answer [run-N] [text] | /fusion review run-N | /fusion on | /fusion off";
+	"Usage: /fusion dashboard | /fusion dashboard stop | /fusion status [run-N] | /fusion cancel run-N | /fusion wait run-N | /fusion steer run-N <text> | /fusion answer [run-N] [text] | /fusion review run-N | /fusion on | /fusion off | /fusion config | /fusion profile [list | use <name> | save <name> | default <name>]";
+const PROFILE_USAGE = "Usage: /fusion profile [list | use <name> | save <name> | default <name>]; builtin names the built-in configuration for use and default";
+/** A /fusion profile argument list that names a profile, as far as it is typed, for completion. */
+const PROFILE_ARG = /^profile\s+(use|save|default)\s+(\S*)$/;
 /** A /fusion argument list that names a run, as far as it is typed, for completion. */
 const RUN_ARG = /^(status|cancel|wait|steer|answer|review)\s+(\S*)$/;
 const BROWSER_OPENER: Record<string, string> = { darwin: "open", linux: "xdg-open" };
@@ -1062,6 +1197,12 @@ export type FusionCommand =
 	| { kind: "cancel" | "wait" | "review"; handle: string }
 	| { kind: "steer"; handle: string; text: string }
 	| { kind: "answer"; handle?: string; text?: string }
+	| { kind: "config" }
+	| { kind: "profile" }
+	| { kind: "profile-list" }
+	| { kind: "profile-use"; name: string }
+	| { kind: "profile-save"; name: string }
+	| { kind: "profile-default"; name: string }
 	| { kind: "usage"; message: string };
 
 /** The command a /fusion argument list names, or the usage when it names none. */
@@ -1073,6 +1214,19 @@ export function parseFusion(args: string): FusionCommand {
 	if (first === "dashboard") {
 		if (tokens.length === 1) return { kind: "dashboard" };
 		return tokens.length === 2 && second === "stop" ? { kind: "dashboard-stop" } : usage;
+	}
+	if (first === "config") return tokens.length === 1 ? { kind: "config" } : usage;
+	if (first === "profile") {
+		if (tokens.length === 1) return { kind: "profile" };
+		if (second === "list") return tokens.length === 2 ? { kind: "profile-list" } : { kind: "usage", message: PROFILE_USAGE };
+		if ((second === "use" || second === "save" || second === "default") && tokens.length === 3) {
+			const name = tokens[2]!;
+			// builtin is a configuration to use or start with, never a name to save under.
+			const problem = second === "save" || name !== BUILTIN ? nameProblem(name) : undefined;
+			if (problem) return { kind: "usage", message: `${problem}. ${PROFILE_USAGE}` };
+			return second === "use" ? { kind: "profile-use", name } : second === "save" ? { kind: "profile-save", name } : { kind: "profile-default", name };
+		}
+		return { kind: "usage", message: PROFILE_USAGE };
 	}
 	if (first === "on") return tokens.length === 1 ? { kind: "on" } : usage;
 	if (first === "off") return tokens.length === 1 ? { kind: "off" } : usage;
@@ -1110,38 +1264,99 @@ function openInBrowser(url: string): void {
 /**
  * How the host routes work to a delegation tool, in that tool's own names: the primary tool and its control tool
  * carry the fusion names, and the compatibility pair carries the claude ones, so each tool's guidance names itself.
+ * What a role runs on is the session's configuration and is said once, in the description; a disabled role is not
+ * recommended anywhere here, and one guideline says it is refused.
  */
-const guidelines = (tool: string, control: string): string[] => [
-	`Call ${tool} with role plan, giving the goal, a short plan, constraints and what is already decided, when the design is unresolved: more than one viable approach, unclear requirements, a change to a shared contract or interface, or risk you cannot bound by reading the code. Treat the returned agreed plan as the contract and its Route section as a recommendation. Skip role plan when you can already state what to change, where, the acceptance criteria and how to verify it.`,
-	`Leave ${tool}'s model unset for role plan, which runs Fable, when the design changes a shared contract or interface, spans modules, or has unclear requirements or risk. Call ${tool} with role plan and model opus when the question is open but bounded, such as two or three approaches inside one module. Later plan calls keep the plan run's model; when an Opus plan turns out harder than it looked, call role plan with model fable, which starts a fresh plan run that carries the plan so far.`,
-	`A ${tool} call with role plan continues the last plan run while that run's context stays under its cap, 35% of the window by default, and while the call names the model that run is on. Past the cap, or when the call names another model, it starts a fresh plan run that carries the last report, the plan agreed so far, instead of the transcript behind it, and the result says which run replaced which. Keep working with the fresh run: state anything the earlier run knew and its report does not say, and call ${tool} with continue and the older handle only when you need what it dropped.`,
-	`A ${tool} call with continue is never handed off, because you named the run. Past the cap its result says so and names what a fresh run would take instead; act on that when the next step can stand on its own, and keep continuing the run while it cannot.`,
-	`You orchestrate ${tool} runs and do not implement: delegate implementation in dependency order, pass earlier results on as context, check each report against the task's acceptance criteria before the next task, and review the change with ${tool} role ask and mode review; do not edit files yourself. When a run fails, report its failure message rather than doing the task yourself.`,
-	`Send every implementation task to ${tool} with role implement, however complex or risky: one clear, bounded task at a time, straight from the user's request when no design question is open, or task by task from a plan that role plan agreed. Use ${tool} with role ultracode only when the user explicitly asks for ultracode or for Fable to implement, even when a Route section recommends it; then give it the whole agreed plan in one call, expect it to be slow, and treat its report's Review section as a self-review by agents it briefed. Role ultracode runs its agents one at a time so builds and tests do not overlap, so do not ask it for parallel work.`,
-	`When a ${tool} role implement report has an Escalation section, do not re-send or widen the task yourself. Keep what it changed and verified, then take the design question to ${tool} with role plan or the broader work to a new ${tool} role implement run, with the report as context.`,
-	`The user's explicit choice wins over these ${tool} guidelines, including asking for or skipping role plan: Opus means role implement, and ultracode or Fable implementing means role ultracode. A model or effort the user names goes in ${tool}'s model or effort parameter; otherwise leave effort unset, and set model only to choose the plan run's model.`,
-	`Use ${tool} with role ask to answer a question about the code or its dependencies without changing files, instead of reading many files yourself, and with role ask and mode review for an independent review of a change, naming the diff or files and what the change must do. Role ask runs read-only tools and returns an answer or ranked findings with file and line references; it never implements.`,
-	`To follow up on an earlier ${tool} run, such as a test that still fails after role implement, call ${tool} with continue set to its handle and the follow-up as task instead of starting a new run; the child keeps its context. Start a new run when the work is unrelated.`,
-	`Call ${tool} with background true when the run will take long and you have other work or the user wants to keep talking, such as role ultracode or a long role implement task; the call returns the handle at once and the report arrives later as a message. Tell the user the handle, so they can follow the run with /fusion. Only one run that can change files is active at a time, but role ask runs can go next to it. Use ${control} status to check a run, wait to block on its report, message to steer it, and cancel to stop it. A message to a run that has ended is not sent; decide from the returned report whether to continue the run with ${tool} continue or leave it.`,
-	`A ${tool} child can ask you a question while it works. The ${tool} call, a ${control} wait or a message then gives you the question, and the run waits in the background, keeping its context, until you answer with ${control} message. Answer it yourself when the conversation already settles it; otherwise ask the user and pass on their answer. Do not start or continue another run that can change files while it waits.`,
-	`A ${tool} child does not commit, whatever it changed. Commit only when the user asks you to.`,
-	`Report to the user which ${tool} roles you used and why, what role plan agreed when it ran, what role implement or role ultracode changed and how it was verified, and what a review found; give the resume command or session file each run's stats line names, so the user can reach the child again, and summarize rather than pasting the child reports verbatim.`,
-];
+const guidelines = (tool: string, control: string, roles: RoleSettings, options: { backend: boolean }): string[] => {
+	const on = (role: KnownRoleName): boolean => roles[role].enabled;
+	const lines: string[] = [];
+	if (on("plan")) {
+		lines.push(
+			`Call ${tool} with role plan, giving the goal, a short plan, constraints and what is already decided, when the design is unresolved: more than one viable approach, unclear requirements, a change to a shared contract or interface, or risk you cannot bound by reading the code. Treat the returned agreed plan as the contract and its Route section as a recommendation. Skip role plan when you can already state what to change, where, the acceptance criteria and how to verify it.`,
+			`Leave ${tool}'s model unset for role plan, which runs it on its configured model. Later plan calls keep the plan run's model; name another model only when the user asks for one, which starts a fresh plan run that carries the plan so far.`,
+			`A ${tool} call with role plan continues the last plan run while that run's context stays under its cap, 35% of the window by default, and while the call names the model that run is on. Past the cap, or when the call names another model, it starts a fresh plan run that carries the last report, the plan agreed so far, instead of the transcript behind it, and the result says which run replaced which. A fresh run past the cap keeps the plan run's model. Keep working with the fresh run: state anything the earlier run knew and its report does not say, and call ${tool} with continue and the older handle only when you need what it dropped.`,
+		);
+	}
+	lines.push(
+		`A ${tool} call with continue is never handed off, because you named the run. Past the cap its result says so and names what a fresh run would take instead; act on that when the next step can stand on its own, and keep continuing the run while it cannot.`,
+		`You orchestrate ${tool} runs and do not implement: delegate implementation in dependency order, pass earlier results on as context, check each report against the task's acceptance criteria before the next task${on("ask") ? `, and review the change with ${tool} role ask and mode review` : ""}; do not edit files yourself. When a run fails, report its failure message rather than doing the task yourself.`,
+	);
+	if (on("implement") || on("ultracode")) {
+		const implement = on("implement")
+			? `Send every implementation task to ${tool} with role implement, however complex or risky: one clear, bounded task at a time, straight from the user's request when no design question is open, or task by task from a plan that role plan agreed.`
+			: `Role implement is disabled, so send implementation to ${tool} with role ultracode only when the user asks for it, and otherwise tell the user it needs role implement.`;
+		const ultracode = on("ultracode")
+			? ` Use ${tool} with role ultracode only when the user explicitly asks for ultracode, even when a Route section recommends it; then give it the whole agreed plan in one call, expect it to be slow, and treat its report's Review section as a self-review by agents it briefed. Role ultracode runs its agents one at a time so builds and tests do not overlap, so do not ask it for parallel work.`
+			: "";
+		lines.push(`${implement}${ultracode}`);
+	}
+	if (on("implement")) {
+		lines.push(
+			`When a ${tool} role implement report has an Escalation section, do not re-send or widen the task yourself. Keep what it changed and verified, then take the design question to ${tool} with role plan or the broader work to a new ${tool} role implement run, with the report as context.`,
+		);
+	}
+	lines.push(
+		options.backend
+			? `The user's explicit choice wins over these ${tool} guidelines, including asking for or skipping role plan and asking for role ultracode. A backend, model or effort the user names goes in ${tool}'s backend, model or effort parameter; otherwise leave all three unset, which runs each role on this session's configured defaults.`
+			: `The user's explicit choice wins over these ${tool} guidelines, including asking for or skipping role plan and asking for role ultracode. A model or effort the user names goes in ${tool}'s model or effort parameter; otherwise leave both unset, which runs each role on this session's configured defaults.`,
+	);
+	if (on("ask")) {
+		lines.push(
+			`Use ${tool} with role ask to answer a question about the code or its dependencies without changing files, instead of reading many files yourself, and with role ask and mode review for an independent review of a change, naming the diff or files and what the change must do. Role ask runs read-only tools and returns an answer or ranked findings with file and line references; it never implements.`,
+		);
+	}
+	lines.push(
+		`To follow up on an earlier ${tool} run, such as a test that still fails after an implementation, call ${tool} with continue set to its handle and the follow-up as task instead of starting a new run; the child keeps its context. Start a new run when the work is unrelated.`,
+		`Call ${tool} with background true when the run will take long and you have other work or the user wants to keep talking, such as a long implementation; the call returns the handle at once and the report arrives later as a message. Tell the user the handle, so they can follow the run with /fusion. Only one run that can change files is active at a time, but role ask runs can go next to it. Use ${control} status to check a run, wait to block on its report, message to steer it, and cancel to stop it. A message to a run that has ended is not sent; decide from the returned report whether to continue the run with ${tool} continue or leave it.`,
+		`A ${tool} child can ask you a question while it works. The ${tool} call, a ${control} wait or a message then gives you the question, and the run waits in the background, keeping its context, until you answer with ${control} message. Answer it yourself when the conversation already settles it; otherwise ask the user and pass on their answer. Do not start or continue another run that can change files while it waits.`,
+		`A ${tool} child does not commit, whatever it changed. Commit only when the user asks you to.`,
+		`Report to the user which ${tool} roles you used and why, what role plan agreed when it ran, what each implementation changed and how it was verified, ${on("ask") ? "and what a review found" : "and that no independent review ran because role ask is disabled"}; give the resume command or session file each run's stats line names, so the user can reach the child again, and summarize rather than pasting the child reports verbatim.`,
+	);
+	const disabled = KNOWN_ROLE_NAMES.filter((role) => !on(role) && (options.backend || role !== "security"));
+	if (disabled.length) {
+		lines.push(
+			`This session's configuration disables ${disabled.map((role) => `role ${role}`).join(", ")}: a ${tool} call to a disabled role is refused, whether it starts a run or continues one. Do not call one; when the work needs it, tell the user, who can enable it with /fusion config or another profile.`,
+		);
+	}
+	return lines;
+};
 
 /**
  * The one guideline the compatibility tool cannot carry, because it advertises no backend parameter at all: which
  * harness a run goes to is the user's to name, so the tool that takes that name is the only one told where it goes.
  */
 const backendGuideline = (tool: string): string =>
-	`When the user names the harness a task is to run on, pass that name in ${tool}'s backend parameter; leave backend unset otherwise, which runs the role on this build's default harness. A harness the role does not run on is refused before anything starts. A run on the pi backend is the other reason to set ${tool}'s model parameter: a pi role has no default model, so a pi call needs a provider and model id there unless PI_FUSION_PI_<ROLE>_MODEL is set for that role.`;
+	`When the user names the harness a task is to run on, pass that name in ${tool}'s backend parameter; leave backend unset otherwise, which runs the role on the backend this session's configuration names for it. A harness the role does not run on is refused before anything starts. A run on the pi backend is the other reason to set ${tool}'s model parameter: a pi role with no model configured needs a provider and model id there.`;
 
 /**
  * The other guideline only the primary tool carries, because it is the only one that advertises the role: `security`
- * is the user's to ask for. Nothing here lets the host decide that work looks security-sensitive and route it there on
- * its own, and the task is where the authorization to change application code comes from.
+ * is the user's to ask for, enabled or not. Nothing here lets the host decide that work looks security-sensitive and
+ * route it there on its own, and the task is where the authorization to change application code comes from.
  */
-const securityGuideline = (tool: string): string =>
-	`Use ${tool} with role security only when the user asks for a security investigation, audit or fix: never on your own judgement that some work looks security-sensitive, where role implement, role ultracode or role ask with mode review is what you use instead. Say in the task whether fixes are authorized, and what is in scope; a security task that does not say reports findings and changes no application code. Role security runs on the pi backend alone, so it needs a provider and model id in ${tool}'s model parameter or in PI_FUSION_PI_SECURITY_MODEL, and like role implement it takes the single active file-changing slot.`;
+const securityGuideline = (tool: string, setting: RoleSetting): string =>
+	`Use ${tool} with role security only when the user asks for a security investigation, audit or fix: never on your own judgement that some work looks security-sensitive, where role implement, role ultracode or role ask with mode review is what you use instead. Say in the task whether fixes are authorized, and what is in scope; a security task that does not say reports findings and changes no application code. Role security runs on the pi backend alone, ${setting.model ? `on ${setting.model} unless the user names another model` : `and this session configures no model for it, so it needs a provider and model id in ${tool}'s model parameter or one chosen with /fusion config`}, and like role implement it takes the single active file-changing slot.`;
+
+/** How a role's setting reads in a description: where a fresh run of it goes and what it runs as there. */
+const settingText = (role: KnownRoleName, setting: RoleSetting): string => {
+	if (!setting.enabled) return `${role} is disabled`;
+	const model = setting.model ? `model ${setting.model}` : "no model configured";
+	const effort = role === "ultracode" || !setting.effort ? "" : ` at effort ${setting.effort}`;
+	return `${role} runs on ${setting.backend} with ${model}${effort}`;
+};
+
+/** The configuration as the fusion tool says it: every role, its backend, model and effort, or that it is disabled. */
+const configurationText = (roles: RoleSettings): string => `In this session's configuration ${KNOWN_ROLE_NAMES.map((role) => settingText(role, roles[role])).join("; ")}.`;
+
+/**
+ * What the claude tool runs each of its roles as: the configured setting for a role this session runs on Claude, and
+ * the legacy Claude defaults for one it runs on Pi, which is what a call naming the other backend gets.
+ */
+const claudeConfigurationText = (config: Configuration): string =>
+	`In this session's configuration ${ROLE_NAMES.map((role) => {
+		const setting = config.roles[role];
+		const claude: RoleSetting = setting.backend === "claude" ? setting : { enabled: setting.enabled, backend: "claude", ...config.baseline[role].claude };
+		return settingText(role, claude);
+	}).join("; ")}.`;
 
 /** A plain string enum: some providers reject the anyOf of consts that a union of literals becomes. */
 const stringEnum = <T extends readonly string[]>(values: T, description: string) =>
@@ -1151,6 +1366,11 @@ const stringEnum = <T extends readonly string[]>(values: T, description: string)
 export interface FusionOptions {
 	/** The backends this runtime runs a child in, merged over this build's own. Nothing reads this from the user. */
 	backends?: Partial<Record<BackendName, HostBackend>>;
+	/**
+	 * Where profiles are read and saved. Left out, it is the user's own `profiles.json` under the host agent directory,
+	 * resolved on first use; every test host passes a store of its own so no case reads or writes that file.
+	 */
+	profiles?: ProfileStore;
 }
 
 export default function fusion(pi: ExtensionAPI, options: FusionOptions = {}) {
@@ -1214,6 +1434,112 @@ export default function fusion(pi: ExtensionAPI, options: FusionOptions = {}) {
 		const available = names.join(", ");
 		const instead = continued ? `Read what that run reported and start a new run on ${available}` : `Take the work to ${available} with a role it runs, or do it yourself`;
 		return `${why}and this pi-fusion runs ${available} only. Nothing was started and nothing was recorded. ${instead}; no configuration makes ${backend} available here.`;
+	};
+
+	/**
+	 * The legacy defaults this instance started with, from a copy of the environment taken now: the built-in
+	 * configuration, and what a call naming the other backend than the configured one runs on, for the instance's life.
+	 */
+	const baseline = captureBaseline({ ...process.env });
+	/**
+	 * What this session runs its roles as. It lives in this instance alone, like on and off: a reload or another host
+	 * session loads the default profile again. A run reads it once, when it is admitted, and keeps what it bound.
+	 */
+	let configuration: Configuration = builtinConfiguration(baseline);
+	const profileStore = options.profiles ?? hostProfileStore(hostAgentDir);
+	/** The profiles file as the last read found it, for completion, which cannot wait for a read. */
+	let knownProfiles: ProfileDocument | undefined;
+	/** Why the default profile was not loaded at startup, said once where a notice can be shown. */
+	let profileWarning: string | undefined;
+	let initializing: Promise<void> | undefined;
+	/** True once the startup load has settled, so a call after it registers its run without yielding to anything first. */
+	let initialized = false;
+	/** True once this session chose its settings itself, which a late startup load must not overwrite. */
+	let chosen = false;
+
+	/** Reads the profiles file, remembering what it held for completion. */
+	const readProfiles = async (): Promise<ProfileDocument> => {
+		const document = await profileStore.read();
+		knownProfiles = document;
+		return document;
+	};
+
+	/**
+	 * Loads the default profile once per instance, before any run starts or any setting is applied: a call or a command
+	 * that arrives first waits for it. A file that cannot be read, or a default it does not hold, leaves the built-in
+	 * configuration and a warning; nothing is rewritten and nothing claims the broken profile was applied.
+	 */
+	const initialize = (): Promise<void> =>
+		(initializing ??= (async () => {
+			try {
+				await loadDefault();
+			} finally {
+				initialized = true;
+			}
+		})());
+
+	const loadDefault = async (): Promise<void> => {
+		let document: ProfileDocument;
+		try {
+			document = await readProfiles();
+		} catch (error) {
+			profileWarning = `${error instanceof Error ? error.message : String(error)}; this session uses the ${BUILTIN} configuration`;
+			return;
+		}
+		const name = document.defaultProfile;
+		if (name === null || chosen) return;
+		const settings = document.profiles[name];
+		if (!settings) {
+			profileWarning = `the default profile ${name} is not in ${await profileStore.where().catch(() => "the profiles file")}; this session uses the ${BUILTIN} configuration`;
+			return;
+		}
+		try {
+			applyConfiguration({ profile: name, modified: false, roles: copySettings(settings), baseline });
+		} catch (error) {
+			profileWarning = `the default profile ${name} was not applied: ${error instanceof Error ? error.message : String(error)}; this session uses the ${BUILTIN} configuration`;
+		}
+	};
+
+	/** Says once, where a notice can be shown, that the default profile was not what this session started with. */
+	const noteProfiles = (ctx: any): void => {
+		if (profileWarning === undefined) return;
+		const warning = profileWarning;
+		profileWarning = undefined;
+		record(() => ctx.ui.notify(`fusion: ${warning}`, "warning"));
+	};
+
+	/**
+	 * Makes a configuration this session's, with the host's tool guidance in the same synchronous step, so the host is
+	 * never told one configuration while calls run on another. A guidance refresh that throws puts both back.
+	 */
+	const applyConfiguration = (next: Configuration): void => {
+		const previous = configuration;
+		configuration = next;
+		try {
+			registerGuidance(true);
+		} catch (error) {
+			configuration = previous;
+			try {
+				registerGuidance(true);
+			} catch {}
+			throw new Error(`the host's tool guidance did not change: ${error instanceof Error ? error.message : String(error)}`);
+		}
+	};
+
+	/**
+	 * Applies settings to this session, or says why not. The unfinished-run check and the assignment share one synchronous
+	 * block, the same rule /fusion off keeps, so a run admitted while a dialog was open or a file was read refuses it.
+	 */
+	const switchTo = (next: Configuration): string | undefined => {
+		const names = unfinishedNames();
+		if (names) return `fusion settings stay as they are while runs are unfinished: ${names}. Wait for each run or cancel it with /fusion cancel run-N, then retry.`;
+		try {
+			applyConfiguration(next);
+		} catch (error) {
+			return `fusion settings stay as they are: ${error instanceof Error ? error.message : String(error)}`;
+		}
+		chosen = true;
+		return undefined;
 	};
 
 	const store = new RunStore();
@@ -1600,9 +1926,9 @@ export default function fusion(pi: ExtensionAPI, options: FusionOptions = {}) {
 					backend: call.backend,
 					hostSessionId: call.hostSessionId,
 					intent: call.intent,
-					// Only a model the call chose over the role's own default is worth keeping: it is what a later call to
-					// this run inherits, and recording the default would pin a run to whatever that default was that day.
-					...(call.backend === "claude" && call.role.model !== ROLES[call.role.name as RoleName]?.model ? { model: call.role.model } : {}),
+					// The model and effort the run was admitted with, defaults included: they are what a later call to this run
+					// keeps, so switching profiles or changing a variable afterwards does not move a run it never chose.
+					...(call.backend === "claude" ? { model: call.role.model, ...(call.role.effort ? { effort: call.role.effort } : {}) } : {}),
 					...(call.prior === undefined ? {} : { prior: call.prior }),
 				},
 				{
@@ -1891,9 +2217,6 @@ export default function fusion(pi: ExtensionAPI, options: FusionOptions = {}) {
 		...(run.report === undefined ? {} : { report: run.report }),
 		...(run.failure === undefined ? {} : { failure: run.failure }),
 		...(run.files === undefined ? {} : { files: run.files }),
-		// The selection this host verified, which is the only one a reviewer may inherit: what the child claimed in
-		// progress and what a refused outcome carried are both on the snapshot, and neither says what the run ran with.
-		...(run.verified?.selection === undefined ? {} : { selection: run.verified.selection }),
 		markReviewed: (handle) => {
 			run.reviewedBy = handle;
 			record(() => store.reviewed(run.id, handle));
@@ -1910,7 +2233,6 @@ export default function fusion(pi: ExtensionAPI, options: FusionOptions = {}) {
 		...(held.report === undefined ? {} : { report: held.report }),
 		...(held.failure === undefined ? {} : { failure: held.failure }),
 		...(held.files === undefined ? {} : { files: held.files }),
-		...(held.selection === undefined ? {} : { selection: held.selection }),
 		markReviewed: (handle) => {
 			held.reviewedBy = handle;
 			saveHistory(ctx, held.hostSessionId, held);
@@ -1928,22 +2250,27 @@ export default function fusion(pi: ExtensionAPI, options: FusionOptions = {}) {
 		// Refused before the budget is read, a handle is taken, the source is linked to a review or any child starts.
 		const reason = reviewable({ state: source.state, role: source.role, ...(source.files ? { files: source.files } : {}) });
 		if (reason) return { refused: `${source.handle} ${reason}` };
+		// A review is a fresh ask run, so the ask role's own setting decides whether there is one at all: the role of the
+		// run it reads does not, and neither does anything that run recorded.
+		if (!configuration.roles.ask.enabled) return { refused: `role ask is disabled in profile ${configurationLabel(configuration)}, so nothing reviews ${source.handle}; change /fusion config or select another profile` };
 		const blocked = ledger.blocked();
 		if (blocked) return { refused: budgetBlockMessage(blocked) };
-		// Which backend reviews the run, and what its reviewer inherits of it, is review policy, and a run it refuses is
-		// refused here: before a handle is taken, before the source is linked to a review and before any child starts.
-		const reviewer = reviewerFor({ role: source.role, ...(source.selection === undefined ? {} : { selection: source.selection }) });
-		if ("refused" in reviewer) return { refused: `${source.handle} ${reviewer.refused}` };
 		const handle = `run-${coverLiveHandles(runRecords(ctx.sessionManager.getBranch())).highest + 1}`;
 		const hostSessionId: string = ctx.sessionManager.getSessionId();
-		const backend = backends[reviewer.backend];
-		if (!backend) return { refused: unavailable(reviewer.backend, `${handle} would review ${source.handle}`, false) };
-		// Each backend binds its own ask review role: the Claude reviewer the Claude roles have always had, and a Pi
-		// reviewer on the model the source run ran with, at whatever level this host configures a Pi ask run at. A
-		// binding that refuses the reviewer is this review's refusal and not the run's: nothing has started yet.
+		// Every review runs where this session runs role ask, on its configured model and effort, whatever the source was.
+		const route: FusionRoute = {
+			backend: configuration.roles.ask.backend,
+			role: "ask",
+			handle,
+			call: { role: "ask", task: "", mode: "review" },
+			defaults: freshDefaults("ask", configuration.roles.ask.backend, configuration),
+		};
+		const backend = backends[route.backend];
+		if (!backend) return { refused: unavailable(route.backend, `${handle} would review ${source.handle}`, false) };
+		// A binding that refuses the reviewer is this review's refusal and not the run's: nothing has started yet.
 		let role: HostRole;
 		try {
-			role = reviewer.backend === "claude" ? roleFor({ role: "ask", task: "", mode: "review" }) : piRole({ role: "ask", mode: "review", model: reviewer.model });
+			role = fusionRole(route);
 		} catch (error) {
 			const why = error instanceof Error ? error.message : String(error);
 			return { refused: `${handle} would review ${source.handle}, and its reviewer could not be bound: ${why.length > SUMMARY_CHARS ? `${why.slice(0, SUMMARY_CHARS)}…` : why}` };
@@ -1984,9 +2311,9 @@ export default function fusion(pi: ExtensionAPI, options: FusionOptions = {}) {
 		return { run: started };
 	};
 
-	/** The review a run that changed files gets on its own, when the user turned automatic reviews on. */
+	/** The review a run that changed files gets on its own, when the user turned automatic reviews on and role ask is enabled. */
 	const startAutoReview = (run: LiveRun, ctx: any): void => {
-		if (!enabled || !autoReview || run.origin !== "tool" || run.state !== "done" || run.reviewedBy || shuttingDown) return;
+		if (!enabled || !autoReview || !configuration.roles.ask.enabled || run.origin !== "tool" || run.state !== "done" || run.reviewedBy || shuttingDown) return;
 		if (notReviewable(run)) return;
 		const started = startReview(liveSource(run, ctx), "auto-review", ctx);
 		if ("refused" in started) ctx.ui.notify(`fusion: auto-review of ${run.handle} did not start: ${started.refused}`, "warning");
@@ -2135,9 +2462,268 @@ export default function fusion(pi: ExtensionAPI, options: FusionOptions = {}) {
 		return handles(active());
 	};
 
+	/** The profiles a list shows, built-in first, each marked as this session's selection and as the future default. */
+	const profileLines = (document: ProfileDocument): string[] => {
+		const startup = document.defaultProfile ?? BUILTIN;
+		return [BUILTIN, ...Object.keys(document.profiles).sort()].map((name) => {
+			const marks = [
+				...(configuration.profile === name ? [configuration.modified ? "current, modified" : "current"] : []),
+				...(startup === name ? ["default for new sessions"] : []),
+			];
+			return `${name}${marks.length ? ` (${marks.join("; ")})` : ""}`;
+		});
+	};
+
+	/** The configuration as /fusion config shows it: where it came from, what future sessions start with, and every role. */
+	const configurationLines = async (): Promise<string[]> => {
+		let startup: string;
+		try {
+			startup = (await readProfiles()).defaultProfile ?? BUILTIN;
+		} catch (error) {
+			startup = `unknown (${error instanceof Error ? error.message : String(error)})`;
+		}
+		const where = await profileStore.where().catch(() => "unknown");
+		return [`fusion configuration: ${configurationLabel(configuration)} · new sessions start with ${startup}`, ...settingsTable(configuration.roles), `profiles file: ${where}`];
+	};
+
+	/** The roles a configuration disables, as a notice ends with them, so a switch says what it turned off. */
+	const disabledText = (roles: RoleSettings): string => {
+		const off = KNOWN_ROLE_NAMES.filter((role) => !roles[role].enabled);
+		return off.length ? `; disabled: ${off.join(", ")}` : "";
+	};
+
+	/** Loads a saved profile, or the built-in configuration, into this session; the file is read again for it. */
+	const useProfile = async (name: string, notice: (text: string, level: "info" | "warning" | "error") => void): Promise<void> => {
+		const early = unfinishedNames();
+		if (early) {
+			notice(`fusion settings stay as they are while runs are unfinished: ${early}. Wait for each run or cancel it with /fusion cancel run-N, then retry.`, "warning");
+			return;
+		}
+		let next: Configuration;
+		if (name === BUILTIN) next = builtinConfiguration(baseline);
+		else {
+			let document: ProfileDocument;
+			try {
+				document = await readProfiles();
+			} catch (error) {
+				notice(`profile ${name} was not loaded: ${error instanceof Error ? error.message : String(error)}`, "error");
+				return;
+			}
+			const settings = document.profiles[name];
+			if (!settings) {
+				notice(`unknown profile ${name}; the profiles are ${[BUILTIN, ...Object.keys(document.profiles).sort()].join(", ")}`, "warning");
+				return;
+			}
+			next = { profile: name, modified: false, roles: copySettings(settings), baseline };
+		}
+		const refused = switchTo(next);
+		if (refused) {
+			notice(refused, "warning");
+			return;
+		}
+		notice(`fusion uses profile ${name} in this session${disabledText(next.roles)}`, "info");
+	};
+
+	/** The model a role's setting takes in the editor: one of the host's available models or one typed, or none for Pi. */
+	const pickModel = async (ctx: any, role: KnownRoleName, setting: RoleSetting): Promise<string | null | undefined> => {
+		if (setting.backend === "claude") {
+			const typed = await ctx.ui.input(`Claude model for ${role}: an alias or id`, setting.model ?? "");
+			return typed?.trim() || undefined;
+		}
+		// The host's own list of models it has credentials for, read and never fetched. A child resolves its model against
+		// Fusion's own catalog, so a model offered here can still be one a child refuses when it starts.
+		let available: string[] = [];
+		try {
+			available = (ctx.modelRegistry?.getAvailable?.() ?? []).map((model: { provider: string; id: string }) => `${model.provider}/${model.id}`).filter((model: string) => isPiModel(model));
+		} catch {}
+		const TYPE = "Type a provider/model id…";
+		const NONE = "Unconfigured";
+		const choice = await ctx.ui.select(`Pi model for ${role}`, [...available, TYPE, NONE]);
+		if (choice === undefined) return undefined;
+		if (choice === NONE) return null;
+		if (choice !== TYPE) return choice;
+		const typed = (await ctx.ui.input(`Pi model for ${role}: a provider and model id`, "deepseek/deepseek-chat"))?.trim();
+		if (!typed) return undefined;
+		if (!isPiModel(typed)) {
+			ctx.ui.notify(`${typed} is not a provider and model id such as deepseek/deepseek-chat; the model is unchanged`, "warning");
+			return undefined;
+		}
+		return typed;
+	};
+
+	/** Edits one role of a draft in place, field by field, until the user goes back to the table. */
+	const editRole = async (ctx: any, role: KnownRoleName, draft: RoleSettings): Promise<void> => {
+		for (;;) {
+			const setting = draft[role];
+			const options = [
+				`enabled: ${setting.enabled ? "yes" : "no"}`,
+				`backend: ${setting.backend}`,
+				`model: ${setting.model ?? "unconfigured"}`,
+				role === "ultracode" ? `effort: ${ULTRACODE_EFFORT} (fixed)` : `effort: ${setting.effort ?? (setting.backend === "pi" ? "child default" : "none")}`,
+				"Back",
+			];
+			const choice = await ctx.ui.select(`fusion config · ${role}`, options);
+			if (choice === undefined || choice === "Back") return;
+			const field = options.indexOf(choice);
+			if (field === 0) draft[role] = { ...setting, enabled: !setting.enabled };
+			else if (field === 1) {
+				const backends = ROLE_SPECS[role].backends;
+				if (backends.length === 1) {
+					ctx.ui.notify(`role ${role} runs on ${backends[0]} alone`, "info");
+					continue;
+				}
+				const backend = await ctx.ui.select(`Backend for ${role}`, [...backends]);
+				// A model and an effort are one backend's own, so a new backend starts from its own defaults, not the old one's.
+				if (isBackendName(backend) && backend !== setting.backend) draft[role] = { enabled: setting.enabled, backend, ...baseline[role][backend] };
+			} else if (field === 2) {
+				const model = await pickModel(ctx, role, setting);
+				if (model === null) {
+					const { model: _, ...rest } = setting;
+					draft[role] = rest;
+				} else if (model !== undefined) draft[role] = { ...setting, model };
+			} else if (field === 3 && role !== "ultracode") {
+				const DEFAULT = "child default";
+				const efforts = [...effortsFor(role, setting.backend), ...(setting.backend === "pi" ? [DEFAULT] : [])];
+				const effort = await ctx.ui.select(`Effort for ${role} on ${setting.backend}`, efforts);
+				if (effort === DEFAULT) {
+					const { effort: _, ...rest } = setting;
+					draft[role] = rest;
+				} else if (effort !== undefined) draft[role] = { ...setting, effort };
+			}
+		}
+	};
+
+	/**
+	 * The editor: a table of roles over select and input dialogs. Every edit goes into a draft, and nothing reaches the
+	 * session until Apply, which checks the whole draft and then the unfinished runs again; Cancel leaves it as it was.
+	 */
+	const editConfiguration = async (ctx: any, notice: (text: string, level: "info" | "warning" | "error") => void): Promise<void> => {
+		const early = unfinishedNames();
+		if (early) {
+			notice(`fusion settings stay as they are while runs are unfinished: ${early}. Wait for each run or cancel it with /fusion cancel run-N, then retry.`, "warning");
+			return;
+		}
+		const draft = copySettings(configuration.roles);
+		for (;;) {
+			const rows = settingsTable(draft);
+			const APPLY = "Apply";
+			const CANCEL = "Cancel";
+			const choice = await ctx.ui.select(`fusion config · ${configurationLabel(configuration)}\n${rows[0]}`, [...rows.slice(1), APPLY, CANCEL]);
+			if (choice === undefined || choice === CANCEL) {
+				notice("fusion config cancelled; nothing changed", "info");
+				return;
+			}
+			if (choice === APPLY) {
+				let roles: RoleSettings;
+				try {
+					roles = parseSettings(draft);
+				} catch (error) {
+					notice(`these settings cannot be applied: ${error instanceof Error ? error.message : String(error)}`, "warning");
+					continue;
+				}
+				if (sameSettings(roles, configuration.roles)) {
+					notice("fusion config: nothing changed", "info");
+					return;
+				}
+				const refused = switchTo({ profile: configuration.profile, modified: true, roles, baseline });
+				if (refused) {
+					notice(refused, "warning");
+					return;
+				}
+				notice(`fusion settings applied to this session${disabledText(roles)}; save them with /fusion profile save <name>`, "info");
+				return;
+			}
+			const role = KNOWN_ROLE_NAMES[rows.slice(1).indexOf(choice)];
+			if (role) await editRole(ctx, role, draft);
+		}
+	};
+
+	/** What /fusion config and /fusion profile do. Each reads the profiles file again rather than trusting a copy. */
+	const configure = async (
+		command: Extract<FusionCommand, { kind: "config" | "profile" | "profile-list" | "profile-use" | "profile-save" | "profile-default" }>,
+		ctx: any,
+		notice: (text: string, level: "info" | "warning" | "error") => void,
+	): Promise<void> => {
+		const dialogs = ctx.hasUI !== false && typeof ctx.ui?.select === "function";
+		if (command.kind === "config") {
+			if (dialogs) await editConfiguration(ctx, notice);
+			else notice((await configurationLines()).join("\n"), "info");
+			return;
+		}
+		if (command.kind === "profile-use") return useProfile(command.name, notice);
+		if (command.kind === "profile-save") {
+			let roles: RoleSettings;
+			try {
+				roles = parseSettings(copySettings(configuration.roles));
+			} catch (error) {
+				notice(`this session's settings cannot be saved: ${error instanceof Error ? error.message : String(error)}`, "warning");
+				return;
+			}
+			let replaced = false;
+			try {
+				knownProfiles = await profileStore.update((document) => {
+					replaced = command.name in document.profiles;
+					return { ...document, profiles: { ...document.profiles, [command.name]: roles } };
+				});
+			} catch (error) {
+				notice(`profile ${command.name} was not saved: ${error instanceof Error ? error.message : String(error)}`, "error");
+				return;
+			}
+			// The session now matches the saved snapshot, unless something applied other settings while the file was written.
+			if (sameSettings(roles, configuration.roles)) configuration = { ...configuration, profile: command.name, modified: false };
+			notice(`${replaced ? "replaced" : "saved"} profile ${command.name}; it is not the default for new sessions unless /fusion profile default ${command.name} makes it one`, "info");
+			return;
+		}
+		if (command.kind === "profile-default") {
+			const name = command.name;
+			try {
+				knownProfiles = await profileStore.update((document) => {
+					if (name !== BUILTIN && !(name in document.profiles)) throw new Error(`unknown profile ${name}; the profiles are ${[BUILTIN, ...Object.keys(document.profiles).sort()].join(", ")}`);
+					return { ...document, defaultProfile: name === BUILTIN ? null : name };
+				});
+			} catch (error) {
+				notice(`the default was not changed: ${error instanceof Error ? error.message : String(error)}`, "warning");
+				return;
+			}
+			notice(`new sessions start with ${name}; this session keeps ${configurationLabel(configuration)}`, "info");
+			return;
+		}
+		let document: ProfileDocument;
+		try {
+			document = await readProfiles();
+		} catch (error) {
+			notice(`the profiles could not be read: ${error instanceof Error ? error.message : String(error)}`, "error");
+			return;
+		}
+		if (command.kind === "profile-list" || !dialogs) {
+			notice([...profileLines(document), ...(command.kind === "profile" ? [PROFILE_USAGE] : [])].join("\n"), "info");
+			return;
+		}
+		const early = unfinishedNames();
+		if (early) {
+			notice(`fusion settings stay as they are while runs are unfinished: ${early}. Wait for each run or cancel it with /fusion cancel run-N, then retry.`, "warning");
+			return;
+		}
+		const lines = profileLines(document);
+		const choice = await ctx.ui.select("fusion profile: load one into this session", lines);
+		if (choice === undefined) {
+			notice("fusion profile: nothing changed", "info");
+			return;
+		}
+		const name = [BUILTIN, ...Object.keys(document.profiles).sort()][lines.indexOf(choice)];
+		if (name !== undefined) await useProfile(name, notice);
+	};
+
 	pi.registerCommand("fusion", {
-		description: "Open or close the pi-fusion dashboard, check, cancel, steer, answer, review and wait for this session's runs, or turn fusion on or off",
+		description: "Open or close the pi-fusion dashboard, check, cancel, steer, answer, review and wait for this session's runs, turn fusion on or off, or configure roles and profiles",
 		getArgumentCompletions: (prefix: string) => {
+			const profile = PROFILE_ARG.exec(prefix);
+			if (profile) {
+				const kind = profile[1];
+				const names = [...(kind === "save" ? [] : [BUILTIN]), ...Object.keys(knownProfiles?.profiles ?? {}).sort()];
+				const matches = names.filter((name) => name.startsWith(profile[2]!));
+				return matches.length ? matches.map((name) => ({ value: `profile ${kind} ${name}`, label: `profile ${kind} ${name}` })) : null;
+			}
 			const named = RUN_ARG.exec(prefix);
 			if (named) {
 				const kind = named[1];
@@ -2156,6 +2742,21 @@ export default function fusion(pi: ExtensionAPI, options: FusionOptions = {}) {
 			const command = parseFusion(args);
 			if (command.kind === "usage") {
 				notice(command.message, "warning");
+				return;
+			}
+			// A command that starts a review or applies settings reads the configuration, so it waits for the default
+			// profile as a call does; once that has loaded, nothing here yields.
+			if (!initialized) await initialize();
+			noteProfiles(ctx);
+			if (
+				command.kind === "config" ||
+				command.kind === "profile" ||
+				command.kind === "profile-list" ||
+				command.kind === "profile-use" ||
+				command.kind === "profile-save" ||
+				command.kind === "profile-default"
+			) {
+				await configure(command, ctx, notice);
 				return;
 			}
 			if (command.kind === "off") {
@@ -2401,6 +3002,12 @@ export default function fusion(pi: ExtensionAPI, options: FusionOptions = {}) {
 		},
 	});
 
+	// The default profile loads as the session starts, so the first prompt already carries its guidance.
+	pi.on("session_start", async (_event, ctx) => {
+		await initialize();
+		noteProfiles(ctx);
+	});
+
 	pi.on("session_shutdown", async () => {
 		shuttingDown = true;
 		record(() => ui?.setWidget?.("fusion", undefined));
@@ -2440,6 +3047,10 @@ export default function fusion(pi: ExtensionAPI, options: FusionOptions = {}) {
 		// A hidden tool leaves the host's tool list on its next turn, so a call already in this one still lands here.
 		if (!enabled) throw new Error(FUSION_OFF);
 		ui = ctx.ui;
+		// No call runs on the built-in defaults while the default profile is still loading. Once it has loaded, nothing
+		// here yields before the run registers, which is what lets a cancel issued right after the call find it.
+		if (!initialized) await initialize();
+		noteProfiles(ctx);
 		ensureHistory(ctx);
 		noteBudget(ctx);
 		// A run whose state has just turned terminal records its branch entry when its end path lands; a continue reads it.
@@ -2452,7 +3063,9 @@ export default function fusion(pi: ExtensionAPI, options: FusionOptions = {}) {
 			}
 		};
 		refuseActive(params.continue);
-		const route = tool === CLAUDE_TOOL_NAME ? claudeRoute(params, records, planPct) : fusionRoute(params, records, planPct);
+		// The configuration is read here, after the last await before the run registers, so a switch that landed while
+		// this call waited is the one it runs on; from here to the registration nothing yields, and the bound role is final.
+		const route = tool === CLAUDE_TOOL_NAME ? claudeRoute(params, records, planPct, configuration) : fusionRoute(params, records, planPct, configuration);
 		const { handle, record: prior, handoff } = route;
 		/*
 		 * A backend this build does not run is refused here: after the route, the record and the call's parameters have
@@ -2475,11 +3088,12 @@ export default function fusion(pi: ExtensionAPI, options: FusionOptions = {}) {
 		if (handoff && carried === undefined) throw new Error(handoffBlocked(handoff.from, handoff.reason));
 		const prompt = handoff && carried !== undefined ? handoffPrompt(task, handoff.from, carried, handoff.reason) : task;
 		const continued = params.continue === undefined ? undefined : handoffShare(prior, planPct);
-		const note = handoff
+		const routed = handoff
 			? handoffNote(handoff.from, handle, handoff.reason)
 			: continued === undefined
 				? undefined
 				: continueNote(handle, role.name, continued, planPct);
+		const note = [routed, route.unrecorded].filter((part) => part !== undefined).join("\n\n") || undefined;
 		const hostSessionId: string = ctx.sessionManager.getSessionId();
 		// The intent is the host's half of continuing a run; which session it becomes is the backend's own to say.
 		const intent = intentFor(prior, hostSessionId);
@@ -2533,15 +3147,19 @@ export default function fusion(pi: ExtensionAPI, options: FusionOptions = {}) {
 		return outcome(run);
 	};
 
-	pi.registerTool({
+	/** The fusion tool as this session's configuration describes it; its executor and renderers never change. */
+	const fusionTool = () => ({
 		name: TOOL_NAME,
-		executionMode: "sequential",
+		executionMode: "sequential" as const,
 		label: "Fusion",
-		description:
-			"Delegate work to a child: a headless coding session in this working directory, run through one of this build's backends. The role picks the job. plan: Claude Fable, or the model you name, which can read the code, run commands and write scratch files, challenges a goal and your proposed plan and consolidates it into an agreed, numbered task list with acceptance criteria. A plan call continues the last plan run of the backend it routes to, so follow-ups can refer to the earlier agreement, until that run's context passes its cap or the call names another model, when the call starts a fresh plan run carrying the agreed plan and says so; fresh starts a new plan run. implement: Claude Opus implements one clear, bounded task with full tools and reports what changed and how it was verified. If the task needs a broader scope or a design decision, it stops and reports under Escalation instead of widening the task. ultracode: Claude Fable in Claude Code with ultracode on orchestrates Claude Opus 5 agents at xhigh effort, one agent at a time, to implement, verify and review a task, several tasks in dependency order, or a whole agreed plan. It is slower and costlier than implement; use it only when the user asks for it. ask: Claude Opus with read-only tools (Read, Bash, Grep, Glob, WebSearch, WebFetch) answers a question about the code with file and line references, or with mode review gives an independent review of a change, findings ranked by severity. It has no Edit or Write, and its contract forbids changing files through Bash. security: investigates one scoped security concern, area or change on the user's own Pi provider configuration, with the same tools as role implement. It confirms a finding where it can, reports each with a severity and with whether it is confirmed or inferred, and never puts a secret in its report by value. Its task says whether fixes are authorized: with none it reports findings and changes no application code, and with one it writes the smallest fix that closes a finding and verifies it. Ask for it only when the user asks for a security investigation, audit or fix. backend picks the harness a child runs in, and the claude models above are what every role but security runs as when a call names no backend: leave backend unset unless the user asks for pi. backend pi runs plan, implement, ask and security on the user's own Pi provider configuration, under the same contracts as the claude roles, security's own contract included; role ultracode runs on the claude backend alone, and role security on the pi backend alone, so a call that names it goes to pi whether or not it names a backend and naming claude for it is refused before anything starts. On pi the tools are Pi's own and are not the claude lists above: roles plan, implement and security run with read, bash, edit, write, grep, find and ls, role ask runs with read, bash, grep, find and ls and has no web search or web fetch tool at all, and every pi role also gets ask_orchestrator, which is how a pi child asks you a question. A pi call's model is a provider and a model id, such as deepseek/deepseek-chat, taken from the call's model parameter, then the selection the run it continues actually ran with, then PI_FUSION_PI_<ROLE>_MODEL for that role; a pi call with none of those is refused before anything starts, because nothing here resolves a pi model for you. Every run gets a handle such as run-3, shown in the stats line. continue with a handle sends the task as a follow-up to that run: the child keeps its context from the run's last successful call, across a resume of this session, /tree and forks, stays on the backend it ran on, and keeps the model that run chose unless the call names another. Calls run one at a time: Pi serializes any turn that contains one. Returns the child's report, or with background true the handle at once and the report later as a message; manage a background run with fusion_control. If the child asks a question, the call returns the question at once and the run waits in the background until you answer it with fusion_control message. Only one run that can change files is active at a time, waiting included; ask runs can go next to it. The claude tool is this same delegation forced to the claude backend, kept for compatibility, and fusion_control and claude_control both act on every run.",
+		description: `Delegate work to a child: a headless coding session in this working directory, run through one of this build's backends. The role picks the job. plan: a planner on the configured model, or the model you name, which can read the code, run commands and write scratch files, challenges a goal and your proposed plan and consolidates it into an agreed, numbered task list with acceptance criteria. A plan call continues the last plan run of the backend it routes to, so follow-ups can refer to the earlier agreement, until that run's context passes its cap or the call names another model, when the call starts a fresh plan run carrying the agreed plan and says so; fresh starts a new plan run. implement: implements one clear, bounded task with full tools and reports what changed and how it was verified. If the task needs a broader scope or a design decision, it stops and reports under Escalation instead of widening the task. ultracode: Claude Code with ultracode on orchestrates Claude Opus 5 agents at xhigh effort, one agent at a time, to implement, verify and review a task, several tasks in dependency order, or a whole agreed plan. It is slower and costlier than implement; use it only when the user asks for it. ask: read-only tools (on claude: Read, Bash, Grep, Glob, WebSearch, WebFetch) answer a question about the code with file and line references, or with mode review give an independent review of a change, findings ranked by severity. It has no edit or write tool, and its contract forbids changing files through a shell. security: investigates one scoped security concern, area or change on the user's own Pi provider configuration, with the same tools as role implement. It confirms a finding where it can, reports each with a severity and with whether it is confirmed or inferred, and never puts a secret in its report by value. Its task says whether fixes are authorized: with none it reports findings and changes no application code, and with one it writes the smallest fix that closes a finding and verifies it. Ask for it only when the user asks for a security investigation, audit or fix. ${configurationText(configuration.roles)} A disabled role is refused whether a call starts or continues it. backend picks the harness a child runs in: leave backend unset unless the user names one, and a fresh run goes to the backend the configuration above names for its role, on that role's configured model and effort. A call that names the other backend runs there on that backend's own defaults, never on the settings configured for the role's other backend. backend pi runs plan, implement, ask and security on the user's own Pi provider configuration, under the same contracts as the claude roles, security's own contract included; role ultracode runs on the claude backend alone, and role security on the pi backend alone, so a call that names it goes to pi whether or not it names a backend and naming claude for it is refused before anything starts. On pi the tools are Pi's own and are not the claude lists above: roles plan, implement and security run with read, bash, edit, write, grep, find and ls, role ask runs with read, bash, grep, find and ls and has no web search or web fetch tool at all, and every pi role also gets ask_orchestrator, which is how a pi child asks you a question. A pi call's model is a provider and a model id, such as deepseek/deepseek-chat, taken from the call's model parameter, then the selection the run it continues actually ran with, then this session's configuration for that role, which by default comes from PI_FUSION_PI_<ROLE>_MODEL; a pi call with none of those is refused before anything starts, because nothing here resolves a pi model for you. Every run gets a handle such as run-3, shown in the stats line. continue with a handle sends the task as a follow-up to that run: the child keeps its context from the run's last successful call, across a resume of this session, /tree and forks, stays on the backend it ran on, and keeps the model and effort that run was started with unless the call names others, whatever profile is selected since. Calls run one at a time: Pi serializes any turn that contains one. Returns the child's report, or with background true the handle at once and the report later as a message; manage a background run with fusion_control. If the child asks a question, the call returns the question at once and the run waits in the background until you answer it with fusion_control message. Only one run that can change files is active at a time, waiting included; ask runs can go next to it. The claude tool is this same delegation forced to the claude backend, kept for compatibility, and fusion_control and claude_control both act on every run.`,
 		promptSnippet:
 			"Delegate planning (plan), bounded implementation (implement), implementation the user asks ultracode for (ultracode), read-only questions and reviews (ask) or a scoped security investigation or fix the user asked for (security) to a coding child",
-		promptGuidelines: [...guidelines(TOOL_NAME, CONTROL_TOOL_NAME), securityGuideline(TOOL_NAME), backendGuideline(TOOL_NAME)],
+		promptGuidelines: [
+			...guidelines(TOOL_NAME, CONTROL_TOOL_NAME, configuration.roles, { backend: true }),
+			...(configuration.roles.security.enabled ? [securityGuideline(TOOL_NAME, configuration.roles.security)] : []),
+			backendGuideline(TOOL_NAME),
+		],
 		parameters: Type.Object({
 			role: Type.Optional(stringEnum(KNOWN_ROLE_NAMES, "plan, implement, ultracode, ask or security. Required unless continue is set.")),
 			task: Type.String({
@@ -2553,19 +3171,24 @@ export default function fusion(pi: ExtensionAPI, options: FusionOptions = {}) {
 			background: Type.Optional(Type.Boolean({ description: "Return at once with the run's handle and let the run go on; you get its report as a message when it ends. Default false." })),
 			fresh: Type.Optional(Type.Boolean({ description: "plan only, not with continue: start a new plan run instead of continuing the last one." })),
 			mode: Type.Optional(stringEnum(ASK_MODES, "ask only: answer (default) for a question, review for an independent review of a change. A continued ask run keeps its mode unless this names another.")),
-			backend: Type.Optional(stringEnum(BACKEND_NAMES, "The harness the child runs in: claude, which runs every role but security and is what a call that leaves this unset gets for all of them, or pi, which runs plan, implement, ask and security on the user's own Pi provider configuration and needs a provider and model id from the call's model parameter or PI_FUSION_PI_<ROLE>_MODEL. Name pi only when the user asks for it; role security goes to pi whether or not this names it, because no other harness runs it, and naming claude for it is refused. With continue it must name the backend that run is on, if it names one at all.")),
+			backend: Type.Optional(
+				stringEnum(
+					BACKEND_NAMES,
+					"The harness the child runs in: claude, which runs every role but security, or pi, which runs plan, implement, ask and security on the user's own Pi provider configuration and needs a provider and model id from the call's model parameter or this session's configuration. Leave it unset to run the role on the backend this session's configuration names for it, and name one only when the user asks for it; role security goes to pi whether or not this names it, because no other harness runs it, and naming claude for it is refused. With continue it must name the backend that run is on, if it names one at all.",
+				),
+			),
 			model: Type.Optional(
 				Type.String({
 					description:
-						"A model instead of the role's default: on the claude backend a Claude Code alias or id, for plan, implement and ask only, which the run keeps for later calls that name no model; on the pi backend a provider and model id such as deepseek/deepseek-chat, which every pi role takes and no pi role has a default for. A plan call that names another model than the plan run is on starts a fresh plan run carrying the agreed plan.",
+						"A model instead of the role's configured one: on the claude backend a Claude Code alias or id, for plan, implement and ask only; on the pi backend a provider and model id such as deepseek/deepseek-chat, which every pi role takes. A run keeps its model for later calls that name no model. A plan call that names another model than the plan run is on starts a fresh plan run carrying the agreed plan.",
 				}),
 			),
-			effort: Type.Optional(stringEnum(FUSION_EFFORTS, "The child's effort instead of the role's default, for plan, implement, ask and security: low, medium, high, xhigh or max on the claude backend, and any of these pi thinking levels on the pi backend, which is the only one role security runs on.")),
+			effort: Type.Optional(stringEnum(FUSION_EFFORTS, "The child's effort instead of the role's configured one, for plan, implement, ask and security: low, medium, high, xhigh or max on the claude backend, and any of these pi thinking levels on the pi backend, which is the only one role security runs on.")),
 		}),
-		async execute(toolCallId, params, signal, onUpdate, ctx) {
+		async execute(toolCallId: string, params: FusionParams, signal: AbortSignal | undefined, onUpdate: LiveRun["onUpdate"], ctx: any) {
 			return delegate(TOOL_NAME, toolCallId, params, signal, onUpdate, ctx);
 		},
-		renderCall(args, theme, context) {
+		renderCall(args: unknown, theme: any, context: any) {
 			const call = (args ?? {}) as Partial<Record<"continue" | "role" | "task", unknown>>;
 			const continued = argText(call.continue);
 			const target = continued ? `continue ${continued}` : argText(call.role);
@@ -2573,19 +3196,19 @@ export default function fusion(pi: ExtensionAPI, options: FusionOptions = {}) {
 			const task = firstLine(argText(call.task));
 			return reuse(context, task ? `${label} ${theme.fg("muted", task)}` : label, [], "truncate");
 		},
-		renderResult(result, options, theme, context) {
+		renderResult(result: any, options: any, theme: any, context: any) {
 			return resultCard(TOOL_NAME, result, options, theme, context);
 		},
 	});
 
-	pi.registerTool({
+	/** The claude tool as this session's configuration describes it; its executor and renderers never change. */
+	const claudeTool = () => ({
 		name: CLAUDE_TOOL_NAME,
-		executionMode: "sequential",
+		executionMode: "sequential" as const,
 		label: "Claude",
-		description:
-			"Delegate work to a child: a headless Claude Code session in this working directory. The role picks the job. plan: Claude Fable, or the model you name, which can read the code, run commands and write scratch files, challenges a goal and your proposed plan and consolidates it into an agreed, numbered task list with acceptance criteria. A plan call continues the last plan run, so follow-ups can refer to the earlier agreement, until that run's context passes its cap or the call names another model, when the call starts a fresh plan run carrying the agreed plan and says so; fresh starts a new plan run. implement: Claude Opus implements one clear, bounded task with full tools and reports what changed and how it was verified. If the task needs a broader scope or a design decision, it stops and reports under Escalation instead of widening the task. ultracode: Claude Fable in Claude Code with ultracode on orchestrates Claude Opus 5 agents at xhigh effort, one agent at a time, to implement, verify and review a task, several tasks in dependency order, or a whole agreed plan. It is slower and costlier than implement; use it only when the user asks for it. ask: Claude Opus with read-only tools (Read, Bash, Grep, Glob, WebSearch, WebFetch) answers a question about the code with file and line references, or with mode review gives an independent review of a change, findings ranked by severity. It has no Edit or Write, and its contract forbids changing files through Bash. Every run gets a handle such as run-3, shown in the stats line. continue with a handle sends the task as a follow-up to that run: the child keeps its context from the run's last successful call, across a resume of this session, /tree and forks, and keeps the model that run chose unless the call names another. Calls run one at a time: Pi serializes any turn that contains one. Returns the child's report, or with background true the handle at once and the report later as a message; manage a background run with claude_control. If the child asks a question, the call returns the question at once and the run waits in the background until you answer it with claude_control message. Only one run that can change files is active at a time, waiting included; ask runs can go next to it.",
+		description: `Delegate work to a child: a headless Claude Code session in this working directory. The role picks the job. plan: a planner on its configured model, or the model you name, which can read the code, run commands and write scratch files, challenges a goal and your proposed plan and consolidates it into an agreed, numbered task list with acceptance criteria. A plan call continues the last plan run, so follow-ups can refer to the earlier agreement, until that run's context passes its cap or the call names another model, when the call starts a fresh plan run carrying the agreed plan and says so; fresh starts a new plan run. implement: implements one clear, bounded task with full tools and reports what changed and how it was verified. If the task needs a broader scope or a design decision, it stops and reports under Escalation instead of widening the task. ultracode: Claude Code with ultracode on orchestrates Claude Opus 5 agents at xhigh effort, one agent at a time, to implement, verify and review a task, several tasks in dependency order, or a whole agreed plan. It is slower and costlier than implement; use it only when the user asks for it. ask: read-only tools (Read, Bash, Grep, Glob, WebSearch, WebFetch) answer a question about the code with file and line references, or with mode review give an independent review of a change, findings ranked by severity. It has no Edit or Write, and its contract forbids changing files through Bash. ${claudeConfigurationText(configuration)} A disabled role is refused whether a call starts or continues it. Every run gets a handle such as run-3, shown in the stats line. continue with a handle sends the task as a follow-up to that run: the child keeps its context from the run's last successful call, across a resume of this session, /tree and forks, and keeps the model and effort that run was started with unless the call names others. Calls run one at a time: Pi serializes any turn that contains one. Returns the child's report, or with background true the handle at once and the report later as a message; manage a background run with claude_control. If the child asks a question, the call returns the question at once and the run waits in the background until you answer it with claude_control message. Only one run that can change files is active at a time, waiting included; ask runs can go next to it.`,
 		promptSnippet: "Delegate planning (plan), bounded implementation (implement), implementation the user asks ultracode for (ultracode) or read-only questions and reviews (ask) to a Claude Code child",
-		promptGuidelines: guidelines(CLAUDE_TOOL_NAME, CLAUDE_CONTROL_NAME),
+		promptGuidelines: guidelines(CLAUDE_TOOL_NAME, CLAUDE_CONTROL_NAME, configuration.roles, { backend: false }),
 		parameters: Type.Object({
 			role: Type.Optional(stringEnum(ROLE_NAMES, "plan, implement, ultracode or ask. Required unless continue is set.")),
 			task: Type.String({
@@ -2597,13 +3220,13 @@ export default function fusion(pi: ExtensionAPI, options: FusionOptions = {}) {
 			background: Type.Optional(Type.Boolean({ description: "Return at once with the run's handle and let the run go on; you get its report as a message when it ends. Default false." })),
 			fresh: Type.Optional(Type.Boolean({ description: "plan only, not with continue: start a new plan run instead of continuing the last one." })),
 			mode: Type.Optional(stringEnum(ASK_MODES, "ask only: answer (default) for a question, review for an independent review of a change. A continued ask run keeps its mode unless this names another.")),
-			model: Type.Optional(Type.String({ description: "plan, implement and ask only: a Claude Code model alias or id instead of the role's default. The run keeps it for later calls that name no model, and a plan call that names another model starts a fresh plan run." })),
-			effort: Type.Optional(stringEnum(EFFORTS, "plan, implement and ask only: the child's effort instead of the role's default.")),
+			model: Type.Optional(Type.String({ description: "plan, implement and ask only: a Claude Code model alias or id instead of the role's configured one. The run keeps it for later calls that name no model, and a plan call that names another model starts a fresh plan run." })),
+			effort: Type.Optional(stringEnum(EFFORTS, "plan, implement and ask only: the child's effort instead of the role's configured one.")),
 		}),
-		async execute(toolCallId, params, signal, onUpdate, ctx) {
+		async execute(toolCallId: string, params: ClaudeParams, signal: AbortSignal | undefined, onUpdate: LiveRun["onUpdate"], ctx: any) {
 			return delegate(CLAUDE_TOOL_NAME, toolCallId, params, signal, onUpdate, ctx);
 		},
-		renderCall(args, theme, context) {
+		renderCall(args: unknown, theme: any, context: any) {
 			const call = (args ?? {}) as Partial<Record<"continue" | "role" | "task", unknown>>;
 			const continued = argText(call.continue);
 			const target = continued ? `continue ${continued}` : argText(call.role);
@@ -2611,10 +3234,38 @@ export default function fusion(pi: ExtensionAPI, options: FusionOptions = {}) {
 			const task = firstLine(argText(call.task));
 			return reuse(context, task ? `${label} ${theme.fg("muted", task)}` : label, [], "truncate");
 		},
-		renderResult(result, options, theme, context) {
+		renderResult(result: any, options: any, theme: any, context: any) {
 			return resultCard(CLAUDE_TOOL_NAME, result, options, theme, context);
 		},
 	});
+
+	/** What each delegation tool was last registered with, so a refresh re-registers only a tool whose guidance changed. */
+	const registered = new Map<string, string>();
+
+	/**
+	 * Registers the delegation tools from the current configuration. The first registration is the extension's load; a
+	 * refresh re-registers a tool under its own name, which this SDK applies at once and which rebuilds the host's
+	 * prompt. That refresh also puts back every tool a host allow list names, so the active list is taken just before
+	 * each re-registration and set back just after it: a tool /fusion off hid, or one the user turned off, stays off.
+	 */
+	const registerGuidance = (refresh: boolean): void => {
+		for (const definition of [fusionTool(), claudeTool()]) {
+			const key = JSON.stringify([definition.description, definition.promptGuidelines, definition.parameters]);
+			if (registered.get(definition.name) === key) continue;
+			if (!refresh) pi.registerTool(definition as any);
+			else {
+				const activeTools = pi.getActiveTools();
+				try {
+					pi.registerTool(definition as any);
+				} finally {
+					pi.setActiveTools(activeTools);
+				}
+			}
+			registered.set(definition.name, key);
+		}
+	};
+
+	registerGuidance(false);
 
 
 	/**

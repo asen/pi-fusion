@@ -185,10 +185,11 @@ const REGISTRATIONS: Record<string, number> = {
 	"test/control.test.ts": 1,
 	"test/extension.test.ts": 4,
 	"test/lifecycle.test.ts": 1,
+	"test/profiles.test.ts": 1,
 	"test/routing.test.ts": 2,
 	"test/session.test.ts": 1,
 };
-const REGISTRATIONS_TOTAL = 9;
+const REGISTRATIONS_TOTAL = 10;
 
 test("every Fusion registration in the suite names the backends it takes, and the registrations are the ones pinned here", () => {
 	// A registration that names neither marker would run with the pi backend this build registers, which is a real

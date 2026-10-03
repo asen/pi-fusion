@@ -3,6 +3,7 @@ import { after } from "node:test";
 import { PI_ROLE_NAMES, piEffortVariable, piModelVariable } from "../extensions/backends/pi-binding.ts";
 import type { HostBackend, SessionIntent } from "../extensions/backends/types.ts";
 import type { FusionOptions } from "../extensions/fusion.ts";
+import { memoryProfileStore } from "../extensions/profile-store.ts";
 
 /**
  * The pi backend the test hosts register in place of the one this build registers by default — all of them but the
@@ -65,7 +66,8 @@ export const PI_SELECTION_VARIABLES = PI_ROLE_NAMES.flatMap((role) => [piModelVa
 export function productionDefaults(): FusionOptions {
 	const set = PI_SELECTION_VARIABLES.filter((name) => process.env[name] !== undefined);
 	if (set.length) throw new Error(`a production-default registration must leave a pi role no model to resolve, and ${set.join(", ")} is still set`);
-	return {};
+	// The production backends, and never the user's own profiles file: no registration of the suite reads or writes it.
+	return { profiles: memoryProfileStore() };
 }
 
 /**

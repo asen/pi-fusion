@@ -11,6 +11,7 @@ import { CARD_REPORT_LINES } from "../extensions/cards.ts";
 import { PI_CONTRACT_FILES, PI_ROLE_NAMES, piRole } from "../extensions/backends/pi-binding.ts";
 import { PI_CHILD_MARKER, PI_CHILD_VARIABLE } from "../extensions/backends/pi-launch.ts";
 import fusion from "../extensions/fusion.ts";
+import { memoryProfileStore } from "../extensions/profile-store.ts";
 import { fakeBackend } from "./fake-pi-backend.ts";
 import { PI_SELECTION_VARIABLES, piTripwire, productionDefaults } from "./tripwire.ts";
 
@@ -60,8 +61,11 @@ const renderers = new Map<string, Renderer>();
 const handlers = new Map<string, (event: any, ctx: any) => Promise<void> | void>();
 let appendedEntries = 0;
 const api = {
+	// A tool registered again under its own name replaces the one before it, as the SDK does.
 	registerTool: (tool: RegisteredTool) => {
-		tools.push(tool);
+		const at = tools.findIndex((candidate) => candidate.name === tool.name);
+		if (at === -1) tools.push(tool);
+		else tools[at] = tool;
 	},
 	registerCommand: (name: string, options: RegisteredCommand) => {
 		commands.set(name, options);
@@ -79,7 +83,7 @@ const api = {
 
 // The tripwire in place of the pi backend this build registers: nothing in this file runs a pi child, and the one case
 // that reads the production registration makes its own below.
-fusion(api, { backends: { ...piTripwire() } });
+fusion(api, { backends: { ...piTripwire() }, profiles: memoryProfileStore() });
 
 const ctx = {
 	cwd: repoRoot,
@@ -150,7 +154,7 @@ test("registers the sequential fusion and claude tool pairs, the fusion command,
 		["fusion", "claude", "fusion_control", "claude_control"],
 	);
 	for (const name of ["fusion", "claude", "fusion_control", "claude_control"]) assert.equal(byName(name).executionMode, "sequential", name);
-	assert.deepEqual([...handlers.keys()], ["session_shutdown", "session_before_tree"]);
+	assert.deepEqual([...handlers.keys()], ["session_start", "session_shutdown", "session_before_tree"]);
 	const command = commands.get("fusion");
 	assert.ok(command, "the fusion command is not registered");
 	assert.ok(command.description, "the command needs a description for the command list");
@@ -165,6 +169,12 @@ test("registers the sequential fusion and claude tool pairs, the fusion command,
 		{ value: "review", label: "review" },
 		{ value: "on", label: "on" },
 		{ value: "off", label: "off" },
+		{ value: "config", label: "config" },
+		{ value: "profile", label: "profile" },
+		{ value: "profile list", label: "profile list" },
+		{ value: "profile use", label: "profile use" },
+		{ value: "profile save", label: "profile save" },
+		{ value: "profile default", label: "profile default" },
 	]);
 	assert.deepEqual(command.getArgumentCompletions?.("dashboard s"), [{ value: "dashboard stop", label: "dashboard stop" }]);
 	assert.deepEqual(command.getArgumentCompletions?.("s"), [
@@ -359,7 +369,10 @@ test("the fusion tool says which harness runs what, and the pi backend it regist
 	assert.match(fusionTool.description, /role ultracode runs on the claude backend alone/);
 	assert.match(fusionTool.description, /role security on the pi backend alone/);
 	assert.match(fusionTool.description, /naming claude for it is refused before anything starts/);
-	assert.match(fusionTool.description, /leave backend unset unless the user asks for pi/);
+	assert.match(fusionTool.description, /leave backend unset unless the user names one, and a fresh run goes to the backend the configuration above names for its role/);
+	// What the configuration is, said in the description rather than as fixed model names a profile would make false.
+	assert.match(fusionTool.description, /In this session's configuration plan runs on claude with model fable at effort xhigh; implement runs on claude with model opus at effort high; ultracode runs on claude with model fable; ask runs on claude with model opus at effort high; security runs on pi with no model configured\./);
+	assert.doesNotMatch(fusionTool.description, /Claude Fable|Claude Opus with/);
 	// The one role whose work the user has to have asked for, said in the description as well as in the guideline.
 	assert.match(fusionTool.description, /only when the user asks for a security investigation, audit or fix/);
 	assert.match(fusionTool.description, /never puts a secret in its report by value/);
@@ -388,7 +401,8 @@ test("the fusion tool says which harness runs what, and the pi backend it regist
 	assert.match(fusionTool.description, /every pi role also gets ask_orchestrator/);
 	assert.doesNotMatch(byName("claude").description, /find and ls/, "the compatibility tool advertises claude's own tools and no pi list");
 	const backendParameter = fusionTool.parameters.properties.backend.description as string;
-	assert.match(backendParameter, /claude, which runs every role but security and is what a call that leaves this unset gets for all of them/);
+	assert.match(backendParameter, /claude, which runs every role but security/);
+	assert.match(backendParameter, /Leave it unset to run the role on the backend this session's configuration names for it/);
 	assert.match(backendParameter, /pi, which runs plan, implement, ask and security/);
 	assert.match(backendParameter, /role security goes to pi whether or not this names it/);
 	assert.ok(
@@ -428,7 +442,7 @@ test("the fusion tool says which harness runs what, and the pi backend it regist
 	// lifecycle. The fake is in-memory and starts nothing: no pi child, process, protocol or provider is behind it.
 	const fake = fakeBackend();
 	const injected = recordedHost();
-	fusion(injected.api, { backends: { ...piTripwire(), pi: fake.backend } });
+	fusion(injected.api, { backends: { ...piTripwire(), pi: fake.backend }, profiles: memoryProfileStore() });
 	const injectedFusion = injected.into.tools.get("fusion");
 	assert.ok(injectedFusion, "the registration that injected a pi backend advertises no fusion tool");
 	const ran = await injectedFusion.execute("call-1", { role: "implement", task: "do the pi thing", backend: "pi", model: "deepseek/deepseek-chat" }, undefined, undefined, ctx);
@@ -524,7 +538,7 @@ test("a marked pi child registers nothing at all, and any other value registers 
 		try {
 			// What is registered is what this case reads, so the tripwire stands in for the pi backend here too: nothing
 			// below runs a call, and a registration that took the production one would still be one more of them.
-			fusion(recorder, { backends: { ...piTripwire() } });
+			fusion(recorder, { backends: { ...piTripwire() }, profiles: memoryProfileStore() });
 		} finally {
 			if (before === undefined) delete process.env[PI_CHILD_VARIABLE];
 			else process.env[PI_CHILD_VARIABLE] = before;
@@ -1002,8 +1016,9 @@ test("a later /fusion dashboard gets a fresh url and session_shutdown closes it,
 });
 
 test("any other argument warns about the usage and starts nothing", async () => {
-	const usage = "Usage: /fusion dashboard | /fusion dashboard stop | /fusion status [run-N] | /fusion cancel run-N | /fusion wait run-N | /fusion steer run-N <text> | /fusion answer [run-N] [text] | /fusion review run-N | /fusion on | /fusion off";
-	for (const args of ["", "   ", "dashboard start", "status foo", "cancel", "steer run-1"]) {
+	const usage =
+		"Usage: /fusion dashboard | /fusion dashboard stop | /fusion status [run-N] | /fusion cancel run-N | /fusion wait run-N | /fusion steer run-N <text> | /fusion answer [run-N] [text] | /fusion review run-N | /fusion on | /fusion off | /fusion config | /fusion profile [list | use <name> | save <name> | default <name>]";
+	for (const args of ["", "   ", "dashboard start", "status foo", "cancel", "steer run-1", "config now"]) {
 		const notices = await runCommand(args);
 		assert.deepEqual(notices, [{ message: usage, type: "warning" }], `for ${JSON.stringify(args)}`);
 	}

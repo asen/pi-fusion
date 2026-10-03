@@ -11,6 +11,7 @@ import { hostBackend } from "../extensions/backends/types.ts";
 import fusion, { claudeCall, claudeRoute, type FusionParams, fusionCall, fusionRoute, ROLE_NAMES, roleFor, type RunRecords, runRecords } from "../extensions/fusion.ts";
 import { KNOWN_ROLE_NAMES, roleSpec } from "../extensions/roles.ts";
 import { History } from "../extensions/history.ts";
+import { memoryProfileStore } from "../extensions/profile-store.ts";
 import { PI_SELECTION_VARIABLES, piTripwire, productionDefaults } from "./tripwire.ts";
 
 const tempDirs: string[] = [];
@@ -181,9 +182,10 @@ test("a plan call that names the model the plan run is on continues it, on eithe
 	const chosen = records(claudeEntry({ run: "run-1", role: "plan", model: "opus" }));
 	const same = fusionRoute({ role: "plan", task: "and the next step?", model: "opus" }, chosen);
 	assert.deepEqual([same.handle, same.handoff, same.call.model], ["run-1", undefined, "opus"]);
-	// The run keeps its own model when the call names none: a plan call never silently drops back to the default.
+	// The run keeps its own model when the call names none: a plan call never silently drops back to the default, and
+	// the model it keeps is the route's default beneath the call rather than something written into the call.
 	const unnamed = fusionRoute({ role: "plan", task: "and the next step?" }, chosen);
-	assert.deepEqual([unnamed.handle, unnamed.handoff, unnamed.call.model], ["run-1", undefined, "opus"]);
+	assert.deepEqual([unnamed.handle, unnamed.handoff, unnamed.call.model, unnamed.defaults.model], ["run-1", undefined, undefined, "opus"]);
 	assert.equal(fusionCall({ role: "plan", task: "and the next step?" }, chosen).bound.model, "opus");
 	// A plan run on the role's own default is continued by a call that names that same default.
 	const byDefault = records(claudeEntry({ run: "run-1", role: "plan" }));
@@ -195,26 +197,33 @@ test("a plan call that names the model the plan run is on continues it, on eithe
 });
 
 /**
- * The deliberate split between the backends at a cap handoff: a Claude plan run's model is the run's own and is
- * carried to the fresh run that replaces it, while a Pi call is bound from the call and its variables again, which
- * is the same rule a first pi call runs under. A pi continuation still repeats the selection its record holds.
+ * A cap handoff keeps the planner's model on both backends, because that model is the run's and not the call's. Its
+ * effort is the call's or the role's default on Claude, as it always was; on Pi the recorded level goes with the
+ * recorded model, because a level chosen for another model may be one this model does not offer.
  */
-test("a cap handoff carries the claude plan run's model, and leaves a pi call to bind its own", () => {
+test("a cap handoff carries the plan run's model on either backend, and on pi the level it ran at too", () => {
 	const full = { contextTokens: 400_000, contextWindow: 1_000_000 };
-	const claude = fusionRoute({ role: "plan", task: "next" }, records(claudeEntry({ run: "run-1", role: "plan", model: "opus", ...full })), 35);
+	const sonnet = records(claudeEntry({ run: "run-1", role: "plan", model: "sonnet", effort: "low", ...full }));
+	const claude = fusionRoute({ role: "plan", task: "next" }, sonnet, 35);
 	assert.deepEqual(claude.handoff, { from: "run-1", reason: { kind: "cap", share: 0.4 } });
-	assert.deepEqual([claude.handle, claude.call.model], ["run-2", "opus"]);
-	assert.equal(fusionCall({ role: "plan", task: "next" }, records(claudeEntry({ run: "run-1", role: "plan", model: "opus", ...full })), 35).bound.model, "opus");
+	assert.deepEqual([claude.handle, claude.call.model], ["run-2", undefined], "nothing is written into the call");
+	const bound = fusionCall({ role: "plan", task: "next" }, sonnet, 35).bound as { model: string; effort?: string };
+	assert.deepEqual([bound.model, bound.effort], ["sonnet", "xhigh"], "the planner's model, at the role's own effort rather than the old run's");
+	assert.equal((fusionCall({ role: "plan", task: "next", effort: "max" }, sonnet, 35).bound as { effort?: string }).effort, "max", "an effort the call names wins");
+	// A deliberately fresh plan takes the defaults, not the planner's model.
+	assert.equal(fusionCall({ role: "plan", task: "next", fresh: true }, sonnet, 35).bound.model, "fable");
 
-	const pi = fusionRoute({ role: "plan", task: "next", backend: "pi" }, records(piEntry({ run: "run-1", role: "plan", ...full })), 35);
+	const pi = fusionCall({ role: "plan", task: "next", backend: "pi" }, records(piEntry({ run: "run-1", role: "plan", ...full })), 35);
 	assert.deepEqual(pi.handoff, { from: "run-1", reason: { kind: "cap", share: 0.4 } });
-	assert.equal(pi.call.model, undefined, "a fresh pi run is bound from the call and its variables, not from the run it replaces");
-	assert.equal(pi.record, undefined, "and carries no record, so nothing repeats the replaced run's selection");
+	assert.equal(pi.record, undefined, "a cap handoff carries no record: it is a fresh run");
+	assert.deepEqual({ model: pi.bound.model, effort: (pi.bound as PiRole).effort }, PI_SELECTION, "the model and the level the plan run recorded, together");
+	const level = fusionCall({ role: "plan", task: "next", backend: "pi", effort: "low" }, records(piEntry({ run: "run-1", role: "plan", ...full })), 35);
+	assert.deepEqual({ model: level.bound.model, effort: (level.bound as PiRole).effort }, { model: PI_SELECTION.model, effort: "low" }, "an effort the call names wins on pi too");
 });
 
 test("a continued claude run keeps the model it recorded, and a continued pi run keeps its recorded selection", () => {
 	const kept = fusionRoute({ continue: "run-1", task: "and the tests?" }, records(claudeEntry({ model: "sonnet" })));
-	assert.deepEqual([kept.backend, kept.call.model], ["claude", "sonnet"]);
+	assert.deepEqual([kept.backend, kept.call.model, kept.defaults.model], ["claude", undefined, "sonnet"]);
 	assert.equal(fusionCall({ continue: "run-1", task: "and the tests?" }, records(claudeEntry({ model: "sonnet" }))).bound.model, "sonnet");
 	// The call's own model wins over the recorded one, and a run that recorded none keeps the role's default.
 	assert.equal(fusionRoute({ continue: "run-1", task: "more", model: "opus" }, records(claudeEntry({ model: "sonnet" }))).call.model, "opus");
@@ -433,7 +442,7 @@ function recorder(): { ext: Extension; api: ExtensionAPI } {
  */
 const makeExtension = (backends: Partial<Record<"claude" | "pi", HostBackend>> = {}): Extension => {
 	const { ext, api } = recorder();
-	fusion(api, { backends: { ...piTripwire(), ...backends } });
+	fusion(api, { backends: { ...piTripwire(), ...backends }, profiles: memoryProfileStore() });
 	return ext;
 };
 

@@ -9,6 +9,7 @@ import { fileURLToPath } from "node:url";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import type { BackendName, HostBackend, SessionIntent } from "../extensions/backends/types.ts";
 import fusion from "../extensions/fusion.ts";
+import { memoryProfileStore, type ProfileStore } from "../extensions/profile-store.ts";
 import { History, type HistoryRecord } from "../extensions/history.ts";
 import { type FakeBackend, fakeBackend, type FakeScript } from "./fake-pi-backend.ts";
 import { piTripwire } from "./tripwire.ts";
@@ -73,6 +74,8 @@ interface HostOptions {
 	/** Only a host session Pi keeps a file for keeps a history. */
 	sessionFile?: string;
 	cwd?: string;
+	/** Where the host's profiles are kept: a store of the case's own, or an empty one in memory. */
+	profiles?: ProfileStore;
 }
 
 /** A Pi host with the extension registered on it: the tools, the command, the branch it appends to and the messages it got. */
@@ -99,7 +102,7 @@ function makeHost(options: HostOptions = {}) {
 	} as unknown as ExtensionAPI;
 	// The tripwire under whatever the case registered: a host here that named only claude still gets no pi backend it
 	// could run, and a case that injects one of its own puts it over this.
-	fusion(api, { backends: { ...piTripwire(), ...options.backends } });
+	fusion(api, { backends: { ...piTripwire(), ...options.backends }, profiles: options.profiles ?? memoryProfileStore() });
 	const sessionManager: Record<string, unknown> = { getSessionId: () => options.sessionId ?? "host-1", getBranch: () => branch };
 	if (options.sessionFile !== undefined) sessionManager.getSessionFile = () => options.sessionFile;
 	const editors: Array<{ title: string; prefill?: string }> = [];
@@ -545,30 +548,33 @@ test("each backend has its own latest plan run, and a refused one on one backend
 	});
 });
 
-test("a pi plan handoff starts a new handle on the same backend with a fresh session and a fresh binding", async () => {
+test("a pi plan handoff starts a new handle on the same backend with a fresh session, on the model and level the plan run ran with", async () => {
 	await withEnv(piEnv(), async () => {
 		const pi = fakeBackend({ defaultEffort: "off", scripts: [{ text: "## Plan\n1. do the thing", contextTokens: 900, contextWindow: 1_000 }] });
 		const host = makeHost({ backends: both(pi) });
 		assert.equal((await host.fusion({ role: "plan", task: "agree a plan", backend: "pi" })).error, undefined);
 		assert.deepEqual(host.entries()[0]!.selection, { model: PI_MODEL, effort: "off" });
 
-		// The variables have moved on, and a fresh run is bound by them rather than by what the replaced run ran with.
-		await withEnv({ PI_FUSION_PI_PLAN_MODEL: "openai/gpt-5", PI_FUSION_PI_PLAN_EFFORT: "high" }, async () => {
-			pi.script({ contextTokens: 10, contextWindow: 1_000 });
-			const handed = await host.fusion({ role: "plan", task: "and the next step?", backend: "pi" });
-			assert.equal(handed.error, undefined);
-			assert.match(handed.text ?? "", /^run-2 is a fresh plan run: run-1's context had reached 90% of its window/);
-			const fresh = pi.starts[1]!;
-			assert.deepEqual(fresh.intent, { kind: "new" }, "a handoff starts a new run rather than continuing the old session");
-			assert.deepEqual(fresh.session, { kind: "new", intent: { kind: "new" } });
-			assert.deepEqual([fresh.role.model, effortOf(fresh.role)], ["openai/gpt-5", "high"]);
-			assert.match(fresh.prompt, /## Plan\n1\. do the thing/, "the fresh run carries the replaced run's report as the plan so far");
-			assert.match(fresh.prompt, /and the next step\?/);
-			const entry = host.entries().at(-1)!;
-			assert.equal(entry.run, "run-2");
-			assert.deepEqual(entry.selection, { model: "openai/gpt-5", effort: "high" });
-			assert.deepEqual(entry.session, { backend: "pi", sessionId: "pi-2", sessionFile: "/sessions/pi-2.jsonl", checkpoint: "entry-2" });
-		});
+		// The planner's model and the level it ran at go to the fresh run together, whatever is configured by then: a level
+		// chosen for another model may be one this model does not offer.
+		pi.script({ contextTokens: 10, contextWindow: 1_000 });
+		const handed = await host.fusion({ role: "plan", task: "and the next step?", backend: "pi" });
+		assert.equal(handed.error, undefined);
+		assert.match(handed.text ?? "", /^run-2 is a fresh plan run: run-1's context had reached 90% of its window/);
+		const fresh = pi.starts[1]!;
+		assert.deepEqual(fresh.intent, { kind: "new" }, "a handoff starts a new run rather than continuing the old session");
+		assert.deepEqual(fresh.session, { kind: "new", intent: { kind: "new" } });
+		assert.deepEqual([fresh.role.model, effortOf(fresh.role)], [PI_MODEL, "off"]);
+		assert.match(fresh.prompt, /## Plan\n1\. do the thing/, "the fresh run carries the replaced run's report as the plan so far");
+		assert.match(fresh.prompt, /and the next step\?/);
+		const entry = host.entries().at(-1)!;
+		assert.equal(entry.run, "run-2");
+		assert.deepEqual(entry.selection, { model: PI_MODEL, effort: "off" });
+		assert.deepEqual(entry.session, { backend: "pi", sessionId: "pi-2", sessionFile: "/sessions/pi-2.jsonl", checkpoint: "entry-2" });
+		// A deliberately fresh plan is the one that takes the configured defaults rather than the planner's.
+		pi.script({});
+		assert.equal((await host.fusion({ role: "plan", task: "start over", backend: "pi", fresh: true, effort: "high" })).error, undefined);
+		assert.deepEqual([pi.starts[2]!.role.model, effortOf(pi.starts[2]!.role)], [PI_MODEL, "high"]);
 	});
 });
 
@@ -1685,12 +1691,23 @@ test("a security continuation stays on pi with the selection that run ran with, 
 	});
 });
 
-test("a finished security run is reviewed by a fresh pi ask child on the model it ran with, at this host's own ask level", async () => {
+/** Every role as a saved profile states it, with the legacy defaults, for a case that changes one or two of them. */
+const PROFILE_ROLES: Record<string, Record<string, unknown>> = {
+	plan: { enabled: true, backend: "claude", model: "fable", effort: "xhigh" },
+	implement: { enabled: true, backend: "claude", model: "opus", effort: "high" },
+	ultracode: { enabled: true, backend: "claude", model: "fable" },
+	ask: { enabled: true, backend: "claude", model: "opus", effort: "high" },
+	security: { enabled: true, backend: "pi", model: SECURITY_MODEL },
+};
+
+/** A profiles file in memory whose default profile, `work`, is the legacy defaults with the roles a case names over them. */
+const profileWith = (roles: Record<string, Record<string, unknown>>): ProfileStore =>
+	memoryProfileStore(JSON.stringify({ version: 1, defaultProfile: "work", profiles: { work: { roles: { ...PROFILE_ROLES, ...roles } } } }));
+
+test("a finished security run is reviewed by this session's ask run, a claude one by default, and nothing of the source run's selection reaches it", async () => {
 	const dir = gitRepo("security-review");
-	// The source ran at a high level on its own model, and this host configures pi ask runs with another model and a
-	// low level: the reviewer carries the source's model and this host's level, and nothing else of either.
 	await withEnv(securityEnv({ PI_FUSION_PI_SECURITY_EFFORT: "high", PI_FUSION_PI_ASK_MODEL: PI_MODEL, PI_FUSION_PI_ASK_EFFORT: "low" }), async () => {
-		const pi = fakeBackend({ scripts: [{ pending: true, text: "## Findings\n1. high, confirmed: the token check accepts an expired token" }, {}] });
+		const pi = fakeBackend({ scripts: [{ pending: true, text: "## Findings\n1. high, confirmed: the token check accepts an expired token" }] });
 		const claude = fakeBackend({ name: "claude" });
 		const host = makeHost({ backends: both(pi, claude), cwd: dir });
 		const done = await runThatChanged(host, pi, dir, { role: "security", task: "audit the token check; fixes are authorized" });
@@ -1701,169 +1718,133 @@ test("a finished security run is reviewed by a fresh pi ask child on the model i
 		host.notices.length = 0;
 		await host.command("review run-1");
 		assert.deepEqual(host.notices, ["run-2 reviews run-1 in the background; its report arrives as a message"]);
-		const reviewer = pi.starts[1]!;
+		assert.equal(pi.starts.length, 1, "no pi child reviews it: role ask runs on claude in this configuration");
+		const reviewer = claude.starts[0]!;
 		assert.deepEqual(
 			[reviewer.role.name, reviewer.role.mode, reviewer.role.contract, reviewer.role.model, effortOf(reviewer.role)],
-			["ask", "review", "ask-review.md", SECURITY_MODEL, "low"],
-			"the reviewer inherits the model alone: the level is this host's own ask level, never the source run's",
+			["ask", "review", "ask-review.md", "opus", "high"],
+			"the reviewer is the ask role as configured, whatever the source ran with",
 		);
-		assert.deepEqual(toolsOf(reviewer.role), READING_TOOLS, "a review reads and reports, so it has no edit or write tool at all");
 		assert.deepEqual(reviewer.session, { kind: "new", intent: { kind: "new" } }, "nobody briefed the reviewer: it is a session of its own");
 		assert.match(reviewer.prompt, /^Review run-1, a security run that ended done\./);
 		assert.ok(reviewer.prompt.includes("A fixed.ts"), reviewer.prompt);
-		assert.deepEqual(claude.starts, [], "no claude child stands in for the reviewer of a pi run");
-
 		await ended(host, "run-2");
-		assert.deepEqual(host.entries().at(-1), {
-			run: "run-2",
-			role: "ask",
-			mode: "review",
-			backend: "pi",
-			hostSessionId: "host-1",
-			session: { backend: "pi", sessionId: "pi-2", sessionFile: "/sessions/pi-2.jsonl", checkpoint: "entry-2" },
-			selection: { model: SECURITY_MODEL, effort: "low" },
-		});
-		const status = await host.control({ action: "status" });
-		assert.match(status.text ?? "", new RegExp(`\\nrun-2 · ask · ${SECURITY_MODEL.replace("/", "\\/")} · done · background · \\d+s · review of run-1$`));
 		assert.equal((await host.control({ action: "status", run: "run-1" })).details.reviewedBy, "run-2");
-		noClaudeResume("a pi review of a pi security run", status.text, host.sent.map(([message]) => message.content).join("\n"));
 	});
 });
 
-test("the reviewer's level is this host's ask configuration, so a host that configures none leaves the reviewer the child's own default", async () => {
-	const dir = gitRepo("security-review-no-effort");
-	await withEnv(securityEnv({ PI_FUSION_PI_SECURITY_EFFORT: "high", PI_FUSION_PI_ASK_MODEL: PI_MODEL, PI_FUSION_PI_ASK_EFFORT: undefined }), async () => {
-		const pi = fakeBackend({ scripts: [{ pending: true }, {}] });
-		const host = makeHost({ backends: both(pi, fakeBackend({ name: "claude" })), cwd: dir });
+test("a profile that runs ask on pi reviews every role there, on the ask role's own model and effort", async () => {
+	const dir = gitRepo("profile-pi-review");
+	await withEnv(securityEnv({ PI_FUSION_PI_SECURITY_EFFORT: "high" }), async () => {
+		const pi = fakeBackend({ scripts: [{ pending: true }, {}, {}] });
+		const claude = fakeBackend({ name: "claude", scripts: [{ pending: true }] });
+		const host = makeHost({ backends: both(pi, claude), cwd: dir, profiles: profileWith({ ask: { enabled: true, backend: "pi", model: PI_MODEL, effort: "low" } }) });
 		const done = await runThatChanged(host, pi, dir, { role: "security", task: "audit the token check" });
 		assert.equal(done.error, undefined);
-		assert.deepEqual(host.entries()[0]!.selection, { model: SECURITY_MODEL, effort: "high" });
 		await host.command("review run-1");
 		const reviewer = pi.starts[1]!;
-		assert.equal(reviewer.role.model, SECURITY_MODEL);
-		assert.equal(effortOf(reviewer.role), undefined, "the source run's level is inherited under no name: nothing configures the reviewer's, so it has none");
+		assert.deepEqual(
+			[reviewer.role.name, reviewer.role.mode, reviewer.role.contract, reviewer.role.model, effortOf(reviewer.role)],
+			["ask", "review", "ask-review.md", PI_MODEL, "low"],
+			"the profile's ask model and effort, and not the security run's model or level",
+		);
+		assert.deepEqual(toolsOf(reviewer.role), READING_TOOLS, "a review reads and reports, so it has no edit or write tool at all");
 		await ended(host, "run-2");
+		assert.deepEqual(host.entries().at(-1)!.selection, { model: PI_MODEL, effort: "low" });
+
+		// A claude implement run is reviewed by that same pi ask run: the source's backend does not pick the reviewer.
+		const other = await runThatChanged(host, claude, dir, { role: "implement", task: "add the retry" }, "retried.ts");
+		assert.equal(other.error, undefined);
+		await host.command("review run-3");
+		assert.deepEqual([pi.starts[2]!.role.name, pi.starts[2]!.role.model, effortOf(pi.starts[2]!.role)], ["ask", PI_MODEL, "low"]);
+		assert.equal(claude.starts.length, 1, "no claude child reviewed it");
+		await ended(host, "run-4");
 	});
 });
 
-test("PI_FUSION_AUTO_REVIEW gives a security run one pi reviewer and an ordinary claude run its claude one, in the same host", async () => {
+test("PI_FUSION_AUTO_REVIEW gives a security run and a claude run the same configured ask reviewer, and none at all while ask is disabled", async () => {
 	const dir = gitRepo("security-auto-review");
-	await withEnv({ ...securityEnv({ PI_FUSION_PI_ASK_MODEL: PI_MODEL, PI_FUSION_PI_ASK_EFFORT: "low" }), PI_FUSION_AUTO_REVIEW: "1" }, async () => {
-		const pi = fakeBackend({ scripts: [{ pending: true }, {}] });
-		const claude = fakeBackend({ name: "claude", scripts: [{ pending: true }, {}] });
+	await withEnv({ ...securityEnv(), PI_FUSION_AUTO_REVIEW: "1" }, async () => {
+		const pi = fakeBackend({ scripts: [{ pending: true }] });
+		const claude = fakeBackend({ name: "claude", scripts: [{}, { pending: true }, {}] });
 		const host = makeHost({ backends: both(pi, claude), cwd: dir });
 		const done = await runThatChanged(host, pi, dir, { role: "security", task: "audit the token check" });
 		assert.ok((done.text ?? "").endsWith("\n\nrun-2 reviews this run in the background; its report arrives as a message."), done.text);
-		assert.equal(done.details.reviewedBy, "run-2");
 		await ended(host, "run-2");
-		assert.equal(pi.starts.length, 2, "exactly one reviewer was started for it");
-		assert.deepEqual([pi.starts[1]!.role.name, pi.starts[1]!.role.mode, pi.starts[1]!.role.model], ["ask", "review", SECURITY_MODEL]);
-		assert.equal(claude.starts.length, 0, "and no claude child reviewed a pi security run");
-		const after = await host.control({ action: "status" });
-		assert.ok(!(after.text ?? "").includes("run-3"), `a review never starts a review: ${after.text}`);
-
-		// The same host, and an ordinary claude implement run still gets the claude ask reviewer it always had.
-		const other = await runThatChanged(host, claude, dir, { role: "implement", task: "add the retry", backend: "claude" }, "retried.ts");
-		assert.equal(other.error, undefined);
+		assert.equal(pi.starts.length, 1, "no pi child reviewed the security run");
+		assert.deepEqual([claude.starts[0]!.role.name, claude.starts[0]!.role.mode, claude.starts[0]!.role.model], ["ask", "review", "opus"]);
+		const other = await runThatChanged(host, claude, dir, { role: "implement", task: "add the retry" }, "retried.ts");
 		assert.equal(other.details.reviewedBy, "run-4");
 		await ended(host, "run-4");
-		assert.equal(claude.starts.length, 2);
-		assert.deepEqual([claude.starts[1]!.role.name, claude.starts[1]!.role.mode, claude.starts[1]!.role.contract], ["ask", "review", "ask-review.md"]);
-		assert.equal(pi.starts.length, 2, "and no pi child reviewed a claude run");
+		assert.deepEqual([claude.starts[2]!.role.name, claude.starts[2]!.role.mode], ["ask", "review"]);
+	});
+	const quiet = gitRepo("auto-review-ask-disabled");
+	await withEnv({ ...piEnv(), PI_FUSION_AUTO_REVIEW: "1" }, async () => {
+		const claude = fakeBackend({ name: "claude", scripts: [{ pending: true }] });
+		const host = makeHost({ backends: both(fakeBackend(), claude), cwd: quiet, profiles: profileWith({ ask: { enabled: false, backend: "claude" } }) });
+		const done = await runThatChanged(host, claude, quiet, { role: "implement", task: "add the retry" });
+		assert.equal(done.error, undefined);
+		assert.equal(done.details.reviewedBy, undefined, "a disabled ask role starts no review");
+		assert.ok(!(done.text ?? "").includes("reviews this run"), done.text);
+		assert.equal(claude.starts.length, 1, "and no reviewer");
+		assert.deepEqual(host.notices, [], "skipping it is not a warning");
+		host.notices.length = 0;
+		await host.command("review run-1");
+		assert.deepEqual(host.notices, ["role ask is disabled in profile work, so nothing reviews run-1; change /fusion config or select another profile"]);
+		assert.equal(claude.starts.length, 1);
 	});
 });
 
-test("a security run an earlier Pi process left is reviewed on the model that run recorded, whatever this one is configured with", async () => {
+test("a security run an earlier Pi process left is reviewed by this session's ask run, whatever model it recorded", async () => {
 	const dir = gitRepo("security-restored-review");
 	const historyDir = tempDir("security-restored-history");
 	const sessionFile = path.join(historyDir, "host-1.jsonl");
 	const branch: unknown[] = [];
-	const ran = "openrouter/deepseek/deepseek-chat";
 	await withEnv({ ...securityEnv(), PI_FUSION_HISTORY: "1", PI_FUSION_HISTORY_DIR: historyDir }, async () => {
 		const first = fakeBackend({ scripts: [{ pending: true }] });
 		const host = makeHost({ backends: both(first), branch, sessionFile, cwd: dir });
-		const done = await runThatChanged(host, first, dir, { role: "security", task: "audit the token check", model: ran, effort: "max" });
+		const done = await runThatChanged(host, first, dir, { role: "security", task: "audit the token check", model: "openrouter/deepseek/deepseek-chat", effort: "max" });
 		assert.equal(done.error, undefined);
-		assert.deepEqual(done.details.files, ["fixed.ts"]);
-		assert.deepEqual(host.entries()[0]!.selection, { model: ran, effort: "max" });
 	});
-
-	// A later Pi process, on the same branch and the same history, configured with other models for both roles.
-	await withEnv(
-		{ ...securityEnv({ PI_FUSION_PI_SECURITY_MODEL: "openai/gpt-5-codex", PI_FUSION_PI_ASK_MODEL: PI_MODEL, PI_FUSION_PI_ASK_EFFORT: "medium" }), PI_FUSION_HISTORY: "1", PI_FUSION_HISTORY_DIR: historyDir },
-		async () => {
-			const later = fakeBackend();
-			const claude = fakeBackend({ name: "claude" });
-			const host = makeHost({ backends: both(later, claude), branch, sessionFile, cwd: dir });
-			const status = await statusOf(host, "run-1");
-			assert.match(status, /^run-1 \(security\) ran in an earlier Pi process: done, /);
-			assert.match(status, /\nreview it with \/fusion review run-1$/);
-			noClaudeResume("a restored security run", status);
-
-			host.notices.length = 0;
-			await host.command("review run-1");
-			assert.deepEqual(host.notices, ["run-2 reviews run-1 in the background; its report arrives as a message"]);
-			const reviewer = later.starts[0]!;
-			assert.deepEqual(
-				[reviewer.role.name, reviewer.role.mode, reviewer.role.contract, reviewer.role.model, effortOf(reviewer.role)],
-				["ask", "review", "ask-review.md", ran, "medium"],
-				"the reviewer carries the model the restored run recorded, and this host's own ask level",
-			);
-			assert.deepEqual(toolsOf(reviewer.role), READING_TOOLS);
-			assert.ok(reviewer.prompt.includes("A fixed.ts"), "the reviewer is given the paths the restored run changed");
-			assert.deepEqual(claude.starts, [], "no claude child reviewed it");
-			await ended(host, "run-2");
-			const entry = host.entries().at(-1)!;
-			assert.deepEqual([entry.run, entry.role, entry.mode, entry.backend], ["run-2", "ask", "review", "pi"]);
-			assert.deepEqual(entry.selection, { model: ran, effort: "medium" });
-			noClaudeResume("the review of a restored security run", await statusOf(host, "run-2"), host.sent.map(([message]) => message.content).join("\n"));
-			assert.equal(new History(historyDir).load("host-1").records.find((record) => record.handle === "run-1")!.reviewedBy, "run-2", "and the restored run is linked to the review that read it");
-		},
-	);
-});
-
-test("a reviewer this host cannot bind refuses the review in the binding's own words, and starts, records and links nothing", async () => {
-	const dir = gitRepo("security-review-unbindable");
-	await withEnv(securityEnv({ PI_FUSION_PI_ASK_MODEL: PI_MODEL }), async () => {
-		const pi = fakeBackend({ scripts: [{ pending: true }, {}] });
-		const claude = fakeBackend({ name: "claude" });
-		const host = makeHost({ backends: both(pi, claude), cwd: dir });
-		const done = await runThatChanged(host, pi, dir, { role: "security", task: "audit the token check" });
-		assert.equal(done.error, undefined);
-		assert.deepEqual(done.details.files, ["fixed.ts"], "the source is reviewable, so the reviewer's own binding is the only thing left that can refuse the review");
-
-		// The level configured for pi ask runs is not a level Pi has, and the reviewer's level is the ask role's own:
-		// the binding that would build the reviewer throws, and the review is refused by it before anything starts.
-		await withEnv({ PI_FUSION_PI_ASK_EFFORT: "ultracode" }, async () => {
-			host.notices.length = 0;
-			await host.command("review run-1");
-			assert.deepEqual(host.notices, [
-				'run-2 would review run-1, and its reviewer could not be bound: PI_FUSION_PI_ASK_EFFORT names effort "ultracode", which is not a pi thinking level; use one of off, minimal, low, medium, high, xhigh, max',
-			]);
-			assert.ok(!host.notices[0]!.includes("…"), `the reason is under the cap, so none of it was cut: ${host.notices[0]}`);
-			assert.equal(pi.starts.length, 1, "no reviewer was started");
-			assert.deepEqual(claude.starts, [], "and no claude child stood in for the reviewer this host could not bind");
-			assert.deepEqual(host.sent, [], "the host hears of no review");
-			assert.equal(host.entries().length, 1, "nothing was recorded for a handle nothing took");
-			assert.equal((await host.control({ action: "status", run: "run-1" })).details.reviewedBy, undefined, "and the source is linked to no review");
-			assert.ok(!((await host.control({ action: "status" })).text ?? "").includes("run-2"), "no run of that handle exists");
-		});
-
-		// The handle that refusal named was never taken: with a level this host can bind, the review is that same run-2.
+	await withEnv({ ...securityEnv(), PI_FUSION_HISTORY: "1", PI_FUSION_HISTORY_DIR: historyDir }, async () => {
+		const later = fakeBackend();
+		const host = makeHost({ backends: both(later), branch, sessionFile, cwd: dir, profiles: profileWith({ ask: { enabled: true, backend: "pi", model: PI_MODEL, effort: "medium" } }) });
+		const status = await statusOf(host, "run-1");
+		assert.match(status, /\nreview it with \/fusion review run-1$/);
 		host.notices.length = 0;
 		await host.command("review run-1");
 		assert.deepEqual(host.notices, ["run-2 reviews run-1 in the background; its report arrives as a message"]);
-		assert.equal(effortOf(pi.starts[1]!.role), undefined, "and the level the refused binding read is gone with the variable");
+		const reviewer = later.starts[0]!;
+		assert.deepEqual([reviewer.role.name, reviewer.role.mode, reviewer.role.model, effortOf(reviewer.role)], ["ask", "review", PI_MODEL, "medium"]);
+		assert.ok(reviewer.prompt.includes("A fixed.ts"), "the reviewer is given the paths the restored run changed");
 		await ended(host, "run-2");
-		assert.equal(host.entries().at(-1)!.run, "run-2");
+		assert.equal(new History(historyDir).load("host-1").records.find((record) => record.handle === "run-1")!.reviewedBy, "run-2", "and the restored run is linked to the review that read it");
 	});
 });
 
-test("a security record in a host that registered no pi backend is refused before a reviewer is started, recorded or linked", async () => {
+test("an ask reviewer this host cannot bind refuses the review in the binding's own words, and starts, records and links nothing", async () => {
+	const dir = gitRepo("security-review-unbindable");
+	await withEnv(securityEnv(), async () => {
+		const pi = fakeBackend({ scripts: [{ pending: true }, {}] });
+		const claude = fakeBackend({ name: "claude" });
+		const host = makeHost({ backends: both(pi, claude), cwd: dir, profiles: profileWith({ ask: { enabled: true, backend: "pi" } }) });
+		const done = await runThatChanged(host, pi, dir, { role: "security", task: "audit the token check" });
+		assert.equal(done.error, undefined);
+		host.notices.length = 0;
+		await host.command("review run-1");
+		assert.deepEqual(host.notices, [
+			"run-2 would review run-1, and its reviewer could not be bound: role ask has no model for the pi backend in profile work: choose a provider and a model id, such as deepseek/deepseek-chat, with /fusion config, or name one in the call's model parameter. The pi backend has no default model and resolves none for you",
+		]);
+		assert.equal(pi.starts.length, 1, "no reviewer was started");
+		assert.deepEqual(claude.starts, [], "and no claude child stood in for the reviewer this host could not bind");
+		assert.equal(host.entries().length, 1, "nothing was recorded for a handle nothing took");
+		assert.equal((await host.control({ action: "status", run: "run-1" })).details.reviewedBy, undefined, "and the source is linked to no review");
+	});
+});
+
+test("an ask reviewer configured on a backend this host did not register is refused before anything is started, recorded or linked", async () => {
 	const dir = tempDir("security-review-no-pi");
 	const sessionFile = path.join(dir, "host-1.jsonl");
-	// One restored security run that nothing else about could refuse a review: it ended done, it changed files, it was
-	// made in this working directory, and it recorded the model it ran with.
 	new History(dir).saveAll("host-1", repoRoot, [
 		heldRecord({
 			role: "security",
@@ -1871,26 +1852,16 @@ test("a security record in a host that registered no pi backend is refused befor
 			ref: { backend: "pi", sessionId: "pi-1", sessionFile: "/sessions/pi-1.jsonl", checkpoint: "entry-1" },
 		}),
 	]);
-	await withEnv({ ...securityEnv({ PI_FUSION_PI_ASK_MODEL: PI_MODEL }), PI_FUSION_HISTORY: "1", PI_FUSION_HISTORY_DIR: dir }, async () => {
+	await withEnv({ ...securityEnv(), PI_FUSION_HISTORY: "1", PI_FUSION_HISTORY_DIR: dir }, async () => {
 		const claude = fakeBackend({ name: "claude" });
-		// The one backend that reviews this role is left out of this host, which is what a key overridden with nothing
-		// is: a backend the host did not register, the tripwire that would otherwise stand in for it included.
-		const host = makeHost({ backends: { pi: undefined, claude: claude.backend }, sessionFile });
+		const host = makeHost({ backends: { pi: undefined, claude: claude.backend }, sessionFile, profiles: profileWith({ ask: { enabled: true, backend: "pi", model: PI_MODEL } }) });
 		await host.command("review run-1");
 		assert.deepEqual(host.notices, [
 			"the pi backend is not available in this build: run-2 would review run-1, and this pi-fusion runs claude only. Nothing was started and nothing was recorded. Take the work to claude with a role it runs, or do it yourself; no configuration makes pi available here.",
 		]);
-		assert.deepEqual(claude.starts, [], "no claude child stands in for the backend that reviews this role");
-		assert.deepEqual(host.sent, [], "the host hears of no review");
+		assert.deepEqual(claude.starts, [], "no claude child stands in for the backend the ask role is configured on");
 		assert.equal(host.branch.length, 0, "nothing was recorded for a handle nothing took");
-		assert.equal((await host.control({ action: "status" })).text, "no runs in this Pi session yet", "and no run of this Pi process was started");
-		const after = new History(dir).load("host-1").records;
-		assert.deepEqual(
-			after.map((record) => record.handle),
-			["run-1"],
-			"the history keeps no review run either",
-		);
-		assert.equal(after[0]!.reviewedBy, undefined, "and the restored run is linked to no review");
+		assert.equal(new History(dir).load("host-1").records[0]!.reviewedBy, undefined, "and the restored run is linked to no review");
 	});
 });
 

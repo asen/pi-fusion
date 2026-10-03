@@ -163,8 +163,13 @@ export interface PublishHooks {
 
 const inspect = (target: string, what: string): string => `inspect ${target} and repair it by hand: ${what}`;
 
-/** A directory Fusion owns, created where it is absent and checked where it is not. An existing one is never replaced. */
-function ownedDir(dir: string): void {
+/**
+ * A directory Fusion owns, created where it is absent and checked where it is not. An existing one is never replaced.
+ * The profile store creates the shared `pi-fusion` root through this too, so the two agree on what that root may be:
+ * a directory this user can read, write and search, created private. It follows a symbolic link and checks neither
+ * the owner nor the mode of a directory that already exists.
+ */
+export function ownedDir(dir: string): void {
 	try {
 		fs.mkdirSync(dir, { recursive: true, mode: OWNED_DIR_MODE });
 	} catch (error) {

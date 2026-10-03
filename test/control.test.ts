@@ -8,6 +8,7 @@ import test, { afterEach } from "node:test";
 import { fileURLToPath } from "node:url";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import fusion, { parseFusion } from "../extensions/fusion.ts";
+import { memoryProfileStore } from "../extensions/profile-store.ts";
 import { HISTORY_VERSION } from "../extensions/history.ts";
 import { piTripwire } from "./tripwire.ts";
 
@@ -47,7 +48,8 @@ type WaitFactory = (tui: { requestRender: () => void }, theme: any, keybindings:
 type Renderer = (message: any, options: { expanded: boolean; outputPad: number }, theme: any) => { render: (width: number) => string[] } | undefined;
 
 const USAGE =
-	"Usage: /fusion dashboard | /fusion dashboard stop | /fusion status [run-N] | /fusion cancel run-N | /fusion wait run-N | /fusion steer run-N <text> | /fusion answer [run-N] [text] | /fusion review run-N | /fusion on | /fusion off";
+	"Usage: /fusion dashboard | /fusion dashboard stop | /fusion status [run-N] | /fusion cancel run-N | /fusion wait run-N | /fusion steer run-N <text> | /fusion answer [run-N] [text] | /fusion review run-N | /fusion on | /fusion off | /fusion config | /fusion profile [list | use <name> | save <name> | default <name>]";
+const PROFILE_USAGE = "Usage: /fusion profile [list | use <name> | save <name> | default <name>]; builtin names the built-in configuration for use and default";
 const ESC = "\u001b";
 const BEL = "\u0007";
 
@@ -101,7 +103,7 @@ function makeHost(cwd = repoRoot, mode: "tui" | "print" = "print", session: { id
 	} as unknown as ExtensionAPI;
 	// Every run of this file is a claude one, and the tripwire is what keeps the pi backend this build registers out of
 	// reach of a case that routed to it by accident.
-	fusion(api, { backends: { ...piTripwire() } });
+	fusion(api, { backends: { ...piTripwire() }, profiles: memoryProfileStore() });
 	const theme = { fg: (_color: string, text: string) => text, bold: (text: string) => text, dim: (text: string) => text };
 	const ui = {
 		setStatus(_key: string, _text: string | undefined) {},
@@ -140,13 +142,15 @@ function makeHost(cwd = repoRoot, mode: "tui" | "print" = "print", session: { id
 		};
 	};
 	const completions = (prefix: string) => commands.get("fusion")!.getArgumentCompletions(prefix);
+	/** Starts the session as Pi does before any tool call, which loads the default profile. */
+	const begin = async () => handlers.get("session_start")!({ type: "session_start", reason: "startup" }, ctx);
 	/** Closes the editor the command opened, as the user does by saving or cancelling it. */
 	const closeEditor = (typed: string | undefined) => {
 		const resolve = openEditor!;
 		openEditor = undefined;
 		resolve(typed);
 	};
-	return { activeTools, branch, sent, handlers, notices, waits, renders, finished, ctx, ui, editors, widgets, renderers, claude, control, text, tree, command, completions, closeEditor, failSends };
+	return { activeTools, branch, sent, handlers, notices, waits, renders, finished, ctx, ui, editors, widgets, renderers, claude, control, text, tree, command, completions, closeEditor, failSends, begin };
 }
 
 /** A run's details without the three a test cannot pin down: how long it ran and what it had changed by then. */
@@ -594,6 +598,7 @@ test("session_shutdown waits for a run that has ended but not yet recorded its e
 
 test("parseFusion reads every /fusion form and answers anything else with the usage", () => {
 	const usage = { kind: "usage", message: USAGE };
+	const profileUsage = { kind: "usage", message: PROFILE_USAGE };
 	for (const [args, expected] of [
 		["dashboard", { kind: "dashboard" }],
 		["  dashboard  ", { kind: "dashboard" }],
@@ -634,6 +639,21 @@ test("parseFusion reads every /fusion form and answers anything else with the us
 		["off run-1", usage],
 		["of", usage],
 		["onn", usage],
+		["config", { kind: "config" }],
+		["config now", usage],
+		["profile", { kind: "profile" }],
+		["profile list", { kind: "profile-list" }],
+		["profile use work", { kind: "profile-use", name: "work" }],
+		["profile use builtin", { kind: "profile-use", name: "builtin" }],
+		["profile save Work.2_x-y", { kind: "profile-save", name: "Work.2_x-y" }],
+		["profile default builtin", { kind: "profile-default", name: "builtin" }],
+		["profile default work", { kind: "profile-default", name: "work" }],
+		["profile list now", profileUsage],
+		["profile use", profileUsage],
+		["profile use a b", profileUsage],
+		["profile rename a", profileUsage],
+		["profile save builtin", { kind: "usage", message: `builtin is the built-in configuration and cannot be saved over. ${PROFILE_USAGE}` }],
+		["profile use -x", { kind: "usage", message: `profile name "-x" must start with a letter or digit and use only letters, digits, dots, dashes and underscores, at most 64 characters. ${PROFILE_USAGE}` }],
 	] as const) {
 		assert.deepEqual(parseFusion(args), expected, JSON.stringify(args));
 	}
@@ -693,6 +713,8 @@ test("/fusion cancel stops a background run and lets the host learn that the use
 test("/fusion cancel on a run that is still taking its first snapshot waits for the run to end", () =>
 	withGitHold(async (host, hold) => {
 		fs.writeFileSync(hold, "");
+		// The session has started, as it always has in Pi before a tool call, so the call registers its run at once.
+		await host.begin();
 		const starting = withScenario("hang", () => host.claude({ role: "implement", task: "long work", background: true }));
 		let told = false;
 		const cancelling = host.command("cancel run-1").then(() => {
@@ -711,6 +733,7 @@ test("/fusion cancel on a run that is still taking its first snapshot waits for 
 
 test("/fusion cancel fails a foreground claude call with the user's cancel", async () => {
 	const host = makeHost();
+	await host.begin();
 	const running = withScenario("hang", () => host.claude({ role: "implement", task: "long work" }));
 	await started(host, "run-1");
 	await host.command("cancel run-1");
@@ -1097,6 +1120,12 @@ test("/fusion completes the first word, and then the runs each command can still
 		{ value: "review", label: "review" },
 		{ value: "on", label: "on" },
 		{ value: "off", label: "off" },
+		{ value: "config", label: "config" },
+		{ value: "profile", label: "profile" },
+		{ value: "profile list", label: "profile list" },
+		{ value: "profile use", label: "profile use" },
+		{ value: "profile save", label: "profile save" },
+		{ value: "profile default", label: "profile default" },
 	]);
 	assert.deepEqual(host.completions("o"), [
 		{ value: "on", label: "on" },
@@ -1879,10 +1908,8 @@ test("a restored security run that recorded what it ran with is offered for revi
 				assert.match(second.notices[0]![0], /^run-1 \(security\) ran in an earlier Pi process/);
 				assert.ok(second.notices[0]![0].includes("review it with /fusion review run-1"), second.notices[0]![0]);
 				assert.deepEqual(second.completions("review "), [{ value: "review run-1", label: "review run-1" }], "the restored security run is offered for review");
-				// The review itself is not run here: its reviewer is a pi child, and the pi backend of this host is the
-				// tripwire. The policy that picks that reviewer is `test/review.test.ts`'s, pure and on its own; the
-				// reviewer it is actually bound to — the model, the level, the contract and the tools — is
-				// `test/lifecycle.test.ts`'s, against an injected pi backend.
+				// The review itself is not run here; the reviewer it gets, which is this session's ask run wherever role
+				// ask is configured, is `test/lifecycle.test.ts`'s, against an injected pi backend.
 				assert.deepEqual(second.sent, [], "reading the status starts nothing");
 				assert.equal(second.branch.length, 1, "and appends no entry");
 			},
@@ -1890,32 +1917,21 @@ test("a restored security run that recorded what it ran with is offered for revi
 		),
 	));
 
-test("a restored security run that recorded no model it ran with is reviewed by nothing, and nothing starts, links or records", () =>
+test("a restored security run that recorded no model it ran with is still reviewed: the reviewer is this session's ask run", () =>
 	withHistory((dir) =>
 		withRepo(
 			async (first, cwd) => {
 				await withScenario("edit", () => first.claude({ role: "implement", task: "add the retry" }));
-				// A model configured for pi ask runs is exactly what must not stand in for the one the run did not
-				// record: the reviewer inherits the source run's model or there is no reviewer.
-				process.env.PI_FUSION_PI_ASK_MODEL = "deepseek/deepseek-chat";
-				try {
-					const second = restoredSecurity(dir, cwd);
-					await second.command("review run-1");
-					assert.deepEqual(second.notices, [
-						[
-							"run-1 recorded no model it ran with, so no reviewer inherits one; review it yourself with fusion, role ask, mode review, backend pi and a model",
-							"warning",
-						],
-					]);
-					assert.deepEqual(second.sent, [], "no review run starts and the host hears nothing of one");
-					assert.equal(await second.text(second.control({ action: "status" })), "no runs in this Pi session yet", "no run of this Pi process was started");
-					assert.equal(second.branch.length, 1, "and no entry was appended for one");
-					const after = heldFile(dir, "host-1");
-					assert.deepEqual(after.records.map((record) => record.handle), ["run-1"], "the history keeps no review run either");
-					assert.equal(after.records[0].reviewedBy, undefined, "and the source is linked to no review");
-				} finally {
-					delete process.env.PI_FUSION_PI_ASK_MODEL;
-				}
+				// A review is a fresh ask run on this session's ask settings, claude ones here, so nothing it needs comes from
+				// the run it reads: a source that recorded no model is reviewed like any other.
+				const second = restoredSecurity(dir, cwd);
+				await second.command("review run-1");
+				assert.deepEqual(second.notices, [["run-2 reviews run-1 in the background; its report arrives as a message", "info"]]);
+				const report = await second.text(second.control({ action: "wait", run: "run-2" }));
+				assert.match(report, /^run-2 \(ask, review of run-1\) done\./);
+				assert.match(report, /\[run-2 · ask · opus · /, "the reviewer runs on the ask role's own model");
+				const after = heldFile(dir, "host-1");
+				assert.equal(after.records.find((record) => record.handle === "run-1")?.reviewedBy, "run-2", "and the source is linked to it");
 			},
 			{ id: "host-1", file: path.join(os.tmpdir(), "host-1.jsonl") },
 		),
