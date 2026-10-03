@@ -50,7 +50,7 @@ import { budgetConfig, budgetProblems, type CallUsage, Ledger } from "./budget.t
 import { bodyLines, Card, CARD_FILES, CARD_QUESTION_CHARS, type CardDetails, cardDetails, type CardMode, type CardTheme, headerLine, plainText, resultText, type WidgetRun, widgetLines } from "./cards.ts";
 import { type ChangedFile, changedFiles, type Snapshot, snapshot } from "./changes.ts";
 import { type Dashboard, RunStore, startDashboard } from "./dashboard.ts";
-import { contextShare, continueNote, handoffBlocked, handoffNote, handoffPrompt, handoffShare, planContextPct, planProblems, sharePercent } from "./handoff.ts";
+import { contextShare, continueNote, handoffBlocked, handoffNote, handoffPrompt, handoffShare, planContextPct, planProblems, sharePercent, type HandoffReason } from "./handoff.ts";
 import { History, type HistoryRecord, historyDir, historyEnabled } from "./history.ts";
 import { reviewable, reviewerFor, reviewPrompt } from "./review.ts";
 import { canChangeFiles, isKnownRole, KNOWN_ROLE_NAMES, type KnownRoleName, type RoleSpec, roleSpec } from "./roles.ts";
@@ -116,7 +116,7 @@ export const EFFORTS = ["low", "medium", "high", "xhigh", "max"] as const;
 const ROLE_PARAMETERS: Record<"fresh" | "mode" | "model" | "effort", readonly RoleName[]> = {
 	fresh: ["plan"],
 	mode: ["ask"],
-	model: ["implement", "ask"],
+	model: ["plan", "implement", "ask"],
 	effort: ["plan", "implement", "ask"],
 };
 
@@ -203,6 +203,8 @@ export interface RunRecord {
 	hostSessionId?: string;
 	/** The last assistant message of the last successful call on this host branch. */
 	checkpoint?: string;
+	/** The model a call chose in place of the role's default, which later calls to the run keep unless they name another. */
+	model?: string;
 	/** The prompt size of that call's last model turn, and the window it filled, so a plan call can weigh continuing it. */
 	contextTokens?: number;
 	contextWindow?: number;
@@ -235,6 +237,8 @@ function claudeRecord(base: RunRecord, data: Record<string, unknown>): RunRecord
 		backend: "claude",
 		...(sessionId === undefined ? {} : { sessionId }),
 		...(checkpoint === undefined ? {} : { checkpoint }),
+		// The flat model is this backend's own: a Pi run's model is in the selection it recorded, never in this field.
+		...(typeof data.model === "string" && data.model ? { model: data.model } : {}),
 		...(typeof data.contextTokens === "number" ? { contextTokens: data.contextTokens } : {}),
 		...(typeof data.contextWindow === "number" ? { contextWindow: data.contextWindow } : {}),
 	};
@@ -378,6 +382,11 @@ export interface RecordCall {
 	backend: BackendName;
 	hostSessionId: string;
 	intent: SessionIntent;
+	/**
+	 * The model this call ran on, when it is one the call chose over the role's own default. Only the Claude half of
+	 * an entry carries it: a Pi run's model is in the selection it records, which its continuation repeats.
+	 */
+	model?: string;
 	/** What the branch already records for this handle, which a run that recorded nothing leaves as it is. */
 	prior?: RunRecord;
 }
@@ -396,6 +405,9 @@ const postcondition = (handle: string, why: string): { invalid: string } => ({
  * checked against the flat one: a fork that failed keeps the message it forked at while the flat one is the tip.
  */
 function claudeDecision(call: RecordCall, outcome: RunOutcome, entry: Record<string, unknown>): RecordDecision {
+	// The chosen model is recorded even for a run that reported no session: it is what the handle ran on, and an entry
+	// written for a run with no identity is still the record a later reader of this handle sees.
+	if (call.model) entry.model = call.model;
 	if (outcome.session !== undefined) {
 		const ref = sessionRefOf(outcome.session, "claude");
 		if (!ref) return postcondition(call.handle, "reported a session reference that is not a claude session");
@@ -485,10 +497,10 @@ export function recordDecision(call: RecordCall, outcome: RunOutcome): RecordDec
 	return call.backend === "pi" ? piDecision(call, outcome, entry) : claudeDecision(call, outcome, entry);
 }
 
-/** A plan call that started a fresh run rather than continue one whose context had grown past the cap. */
+/** A plan call that started a fresh run rather than continue the last one. */
 export interface Handoff {
 	from: string;
-	share: number;
+	reason: HandoffReason;
 }
 
 /**
@@ -570,7 +582,10 @@ export function fusionRoute(params: FusionParams, records: RunRecords, planPct: 
 		executableRole(record.role);
 		const backend = continuedBackend(record, params.backend);
 		const mode = params.mode ?? record.mode;
-		const call = { ...params, role: record.role, ...(mode ? { mode } : {}) };
+		// A Claude run keeps the model a call chose for it: a later call inherits it unless it names another. A Pi run's
+		// selection is its record's own, and its binding repeats that rather than reading a model off the call.
+		const kept = backend === "claude" ? params.model?.trim() || record.model : undefined;
+		const call = { ...params, role: record.role, ...(mode ? { mode } : {}), ...(kept ? { model: kept } : {}) };
 		checkParams(backend, call);
 		return { backend, role: record.role, handle: record.handle, record, call };
 	}
@@ -586,9 +601,22 @@ export function fusionRoute(params: FusionParams, records: RunRecords, planPct: 
 	if (!last) return { backend, role, handle: next, call };
 	// A latest plan record this host refuses stops the call: an implicit plan call never walks back to an older run.
 	if (last.refusal) throw new Error(last.refusal);
+	// What the last plan run actually ran on, in its own backend's terms: Claude keeps a chosen model flat and falls
+	// back to the role's default, while a Pi run is only ever on the selection it recorded. A backend that can say
+	// neither leaves the model out of the decision rather than guessing one a handoff would then be named after.
+	const lastModel = backend === "claude" ? last.model ?? ROLES.plan.model : last.selection?.model;
+	const named = params.model?.trim();
+	// Another model is not a continuation: the run holds its agreement in a context this call would not be reading.
+	if (named && lastModel && named !== lastModel) {
+		return { backend, role, handle: next, handoff: { from: last.handle, reason: { kind: "model", from: lastModel, to: named } }, call };
+	}
+	// Claude carries the plan run's own model onto the call that continues it and onto the fresh run a cap hands off
+	// to, because that model is the run's and not the call's. Pi binds a fresh run from the call and its variables
+	// again, and repeats the recorded selection on a continuation, which is its binding's own to do.
+	const carried = backend === "claude" && lastModel ? { ...call, model: named || lastModel } : call;
 	const share = handoffShare(last, planPct);
-	if (share === undefined) return { backend, role, handle: last.handle, record: last, call };
-	return { backend, role, handle: next, handoff: { from: last.handle, share }, call };
+	if (share === undefined) return { backend, role, handle: last.handle, record: last, call: carried };
+	return { backend, role, handle: next, handoff: { from: last.handle, reason: { kind: "cap", share } }, call: carried };
 }
 
 /**
@@ -1076,19 +1104,20 @@ function openInBrowser(url: string): void {
  * carry the fusion names, and the compatibility pair carries the claude ones, so each tool's guidance names itself.
  */
 const guidelines = (tool: string, control: string): string[] => [
-	`Route ${tool} calls by complexity and risk, not by file count. Call ${tool} with role plan, giving the goal, a short plan, constraints and what is already decided, when the design is unresolved: more than one viable approach, unclear requirements, a change to a shared contract or interface, or risk you cannot bound by reading the code. Treat the returned agreed plan as the contract and its Route section as a recommendation. Skip role plan when you can already state what to change, where, the acceptance criteria and how to verify it.`,
-	`A ${tool} call with role plan continues the last plan run only while that run's context stays under its cap, 35% of the window by default. Past the cap the call starts a fresh plan run that carries the last report, the plan agreed so far, instead of the transcript behind it, and the result says which run replaced which. Keep working with the fresh run: state anything the earlier run knew and its report does not say, and call ${tool} with continue and the older handle only when you need what it dropped.`,
+	`Call ${tool} with role plan, giving the goal, a short plan, constraints and what is already decided, when the design is unresolved: more than one viable approach, unclear requirements, a change to a shared contract or interface, or risk you cannot bound by reading the code. Treat the returned agreed plan as the contract and its Route section as a recommendation. Skip role plan when you can already state what to change, where, the acceptance criteria and how to verify it.`,
+	`Leave ${tool}'s model unset for role plan, which runs Fable, when the design changes a shared contract or interface, spans modules, or has unclear requirements or risk. Call ${tool} with role plan and model opus when the question is open but bounded, such as two or three approaches inside one module. Later plan calls keep the plan run's model; when an Opus plan turns out harder than it looked, call role plan with model fable, which starts a fresh plan run that carries the plan so far.`,
+	`A ${tool} call with role plan continues the last plan run while that run's context stays under its cap, 35% of the window by default, and while the call names the model that run is on. Past the cap, or when the call names another model, it starts a fresh plan run that carries the last report, the plan agreed so far, instead of the transcript behind it, and the result says which run replaced which. Keep working with the fresh run: state anything the earlier run knew and its report does not say, and call ${tool} with continue and the older handle only when you need what it dropped.`,
 	`A ${tool} call with continue is never handed off, because you named the run. Past the cap its result says so and names what a fresh run would take instead; act on that when the next step can stand on its own, and keep continuing the run while it cannot.`,
-	`Delegate every implementation task to ${tool} with role implement or role ultracode, in dependency order; do not edit files yourself.`,
-	`Use ${tool} with role implement for a clear, bounded task, however many files it touches: straight from the user's request when no design question is open, or one task at a time from a plan that role plan agreed.`,
-	`Use ${tool} with role ultracode for complex, uncertain or high-risk work that gains from separate specialist agents and independent verification, or when the user asks for ultracode or for Fable to implement. Role ultracode runs its agents one at a time so builds and tests do not overlap; do not ask it for parallel work, and expect it to be slow. Give it a whole agreed plan in one call unless tasks must be verified separately. Its report's Review section is a self-review by agents it briefed.`,
-	`When a ${tool} role implement report has an Escalation section, do not re-send or widen the task yourself. Keep what it changed and verified, then take the design question to ${tool} role plan or the broader work to ${tool} role ultracode, with the report as context.`,
-	`The user's explicit choice wins over these ${tool} routing guidelines: Opus means role implement, Fable or ultracode means role ultracode, and the user can ask for or skip role plan. A model or effort the user names goes in ${tool}'s model or effort parameter; leave both unset otherwise.`,
+	`You orchestrate ${tool} runs and do not implement: delegate implementation in dependency order, pass earlier results on as context, check each report against the task's acceptance criteria before the next task, and review the change with ${tool} role ask and mode review; do not edit files yourself. When a run fails, report its failure message rather than doing the task yourself.`,
+	`Send every implementation task to ${tool} with role implement, however complex or risky: one clear, bounded task at a time, straight from the user's request when no design question is open, or task by task from a plan that role plan agreed. Use ${tool} with role ultracode only when the user explicitly asks for ultracode or for Fable to implement, even when a Route section recommends it; then give it the whole agreed plan in one call, expect it to be slow, and treat its report's Review section as a self-review by agents it briefed. Role ultracode runs its agents one at a time so builds and tests do not overlap, so do not ask it for parallel work.`,
+	`When a ${tool} role implement report has an Escalation section, do not re-send or widen the task yourself. Keep what it changed and verified, then take the design question to ${tool} with role plan or the broader work to a new ${tool} role implement run, with the report as context.`,
+	`The user's explicit choice wins over these ${tool} guidelines, including asking for or skipping role plan: Opus means role implement, and ultracode or Fable implementing means role ultracode. A model or effort the user names goes in ${tool}'s model or effort parameter; otherwise leave effort unset, and set model only to choose the plan run's model.`,
 	`Use ${tool} with role ask to answer a question about the code or its dependencies without changing files, instead of reading many files yourself, and with role ask and mode review for an independent review of a change, naming the diff or files and what the change must do. Role ask runs read-only tools and returns an answer or ranked findings with file and line references; it never implements.`,
 	`To follow up on an earlier ${tool} run, such as a test that still fails after role implement, call ${tool} with continue set to its handle and the follow-up as task instead of starting a new run; the child keeps its context. Start a new run when the work is unrelated.`,
-	`Call ${tool} with background true when the run will take long and you have other work or the user wants to keep talking, such as role ultracode or a long role implement task; the call returns the handle at once and the report arrives later as a message. Only one run that can change files is active at a time, but role ask runs can go next to it. Use ${control} status to check a run, wait to block on its report, message to steer it, and cancel to stop it. A message to a run that has ended is not sent; decide from the returned report whether to continue the run with ${tool} continue or leave it.`,
+	`Call ${tool} with background true when the run will take long and you have other work or the user wants to keep talking, such as role ultracode or a long role implement task; the call returns the handle at once and the report arrives later as a message. Tell the user the handle, so they can follow the run with /fusion. Only one run that can change files is active at a time, but role ask runs can go next to it. Use ${control} status to check a run, wait to block on its report, message to steer it, and cancel to stop it. A message to a run that has ended is not sent; decide from the returned report whether to continue the run with ${tool} continue or leave it.`,
 	`A ${tool} child can ask you a question while it works. The ${tool} call, a ${control} wait or a message then gives you the question, and the run waits in the background, keeping its context, until you answer with ${control} message. Answer it yourself when the conversation already settles it; otherwise ask the user and pass on their answer. Do not start or continue another run that can change files while it waits.`,
-	`Report to the user which ${tool} roles you used and why, what role plan agreed when it ran, what role implement or role ultracode changed and how it was verified, and what role ultracode's review found; summarize rather than pasting the child reports verbatim.`,
+	`A ${tool} child does not commit, whatever it changed. Commit only when the user asks you to.`,
+	`Report to the user which ${tool} roles you used and why, what role plan agreed when it ran, what role implement or role ultracode changed and how it was verified, and what a review found; give the resume command or session file each run's stats line names, so the user can reach the child again, and summarize rather than pasting the child reports verbatim.`,
 ];
 
 /**
@@ -1096,7 +1125,7 @@ const guidelines = (tool: string, control: string): string[] => [
  * harness a run goes to is the user's to name, so the tool that takes that name is the only one told where it goes.
  */
 const backendGuideline = (tool: string): string =>
-	`When the user names the harness a task is to run on, pass that name in ${tool}'s backend parameter; leave backend unset otherwise, which runs the role on this build's default harness. A harness the role does not run on is refused before anything starts.`;
+	`When the user names the harness a task is to run on, pass that name in ${tool}'s backend parameter; leave backend unset otherwise, which runs the role on this build's default harness. A harness the role does not run on is refused before anything starts. A run on the pi backend is the other reason to set ${tool}'s model parameter: a pi role has no default model, so a pi call needs a provider and model id there unless PI_FUSION_PI_<ROLE>_MODEL is set for that role.`;
 
 /**
  * The other guideline only the primary tool carries, because it is the only one that advertises the role: `security`
@@ -1550,6 +1579,9 @@ export default function fusion(pi: ExtensionAPI, options: FusionOptions = {}) {
 					backend: call.backend,
 					hostSessionId: call.hostSessionId,
 					intent: call.intent,
+					// Only a model the call chose over the role's own default is worth keeping: it is what a later call to
+					// this run inherits, and recording the default would pin a run to whatever that default was that day.
+					...(call.backend === "claude" && call.role.model !== ROLES[call.role.name as RoleName]?.model ? { model: call.role.model } : {}),
 					...(call.prior === undefined ? {} : { prior: call.prior }),
 				},
 				{
@@ -2377,11 +2409,11 @@ export default function fusion(pi: ExtensionAPI, options: FusionOptions = {}) {
 		const background = params.background === true;
 		const task = params.context ? `${params.task}\n\n## Context\n${params.context}` : params.task;
 		const carried = handoff ? lastReport(handoff.from) : undefined;
-		if (handoff && carried === undefined) throw new Error(handoffBlocked(handoff.from, handoff.share));
-		const prompt = handoff && carried !== undefined ? handoffPrompt(task, handoff.from, carried) : task;
+		if (handoff && carried === undefined) throw new Error(handoffBlocked(handoff.from, handoff.reason));
+		const prompt = handoff && carried !== undefined ? handoffPrompt(task, handoff.from, carried, handoff.reason) : task;
 		const continued = params.continue === undefined ? undefined : handoffShare(prior, planPct);
 		const note = handoff
-			? handoffNote(handoff.from, handle, handoff.share)
+			? handoffNote(handoff.from, handle, handoff.reason)
 			: continued === undefined
 				? undefined
 				: continueNote(handle, role.name, continued, planPct);
@@ -2441,23 +2473,28 @@ export default function fusion(pi: ExtensionAPI, options: FusionOptions = {}) {
 		executionMode: "sequential",
 		label: "Fusion",
 		description:
-			"Delegate work to a child: a headless coding session in this working directory, run through one of this build's backends. The role picks the job. plan: Claude Fable, which can read the code, run commands and write scratch files, challenges a goal and your proposed plan and consolidates it into an agreed, numbered task list with acceptance criteria. A plan call continues the last plan run of the backend it routes to, so follow-ups can refer to the earlier agreement, until that run's context passes its cap, when the call starts a fresh plan run carrying the agreed plan and says so; fresh starts a new plan run. implement: Claude Opus implements one clear, bounded task with full tools and reports what changed and how it was verified. If the task needs a broader scope or a design decision, it stops and reports under Escalation instead of widening the task. ultracode: Claude Fable in Claude Code with ultracode on orchestrates Claude Opus 5 agents at xhigh effort, one agent at a time, to implement, verify and review a task, several tasks in dependency order, or a whole agreed plan. It is slower and costlier than implement. ask: Claude Opus with read-only tools (Read, Bash, Grep, Glob, WebSearch, WebFetch) answers a question about the code with file and line references, or with mode review gives an independent review of a change, findings ranked by severity. It has no Edit or Write, and its contract forbids changing files through Bash. security: investigates one scoped security concern, area or change on the user's own Pi provider configuration, with the same tools as role implement. It confirms a finding where it can, reports each with a severity and with whether it is confirmed or inferred, and never puts a secret in its report by value. Its task says whether fixes are authorized: with none it reports findings and changes no application code, and with one it writes the smallest fix that closes a finding and verifies it. Ask for it only when the user asks for a security investigation, audit or fix. backend picks the harness a child runs in, and the claude models above are what every role but security runs as when a call names no backend: leave backend unset unless the user asks for pi. backend pi runs plan, implement, ask and security on the user's own Pi provider configuration, under the same contracts as the claude roles, security's own contract included; role ultracode runs on the claude backend alone, and role security on the pi backend alone, so a call that names it goes to pi whether or not it names a backend and naming claude for it is refused before anything starts. On pi the tools are Pi's own and are not the claude lists above: roles plan, implement and security run with read, bash, edit, write, grep, find and ls, role ask runs with read, bash, grep, find and ls and has no web search or web fetch tool at all, and every pi role also gets ask_orchestrator, which is how a pi child asks you a question. A pi call's model is a provider and a model id, such as deepseek/deepseek-chat, taken from the call's model parameter, then the selection the run it continues actually ran with, then PI_FUSION_PI_<ROLE>_MODEL for that role; a pi call with none of those is refused before anything starts, because nothing here resolves a pi model for you. Every run gets a handle such as run-3, shown in the stats line. continue with a handle sends the task as a follow-up to that run: the child keeps its context from the run's last successful call, across a resume of this session, /tree and forks, and stays on the backend it ran on. A new run has not seen this conversation, so its task must be self-contained. Calls run one at a time: Pi serializes any turn that contains one. Returns the child's report, or with background true the handle at once and the report later as a message; manage a background run with fusion_control. If the child asks a question, the call returns the question at once and the run waits in the background until you answer it with fusion_control message. Only one run that can change files is active at a time, waiting included; ask runs can go next to it. The claude tool is this same delegation forced to the claude backend, kept for compatibility, and fusion_control and claude_control both act on every run.",
+			"Delegate work to a child: a headless coding session in this working directory, run through one of this build's backends. The role picks the job. plan: Claude Fable, or the model you name, which can read the code, run commands and write scratch files, challenges a goal and your proposed plan and consolidates it into an agreed, numbered task list with acceptance criteria. A plan call continues the last plan run of the backend it routes to, so follow-ups can refer to the earlier agreement, until that run's context passes its cap or the call names another model, when the call starts a fresh plan run carrying the agreed plan and says so; fresh starts a new plan run. implement: Claude Opus implements one clear, bounded task with full tools and reports what changed and how it was verified. If the task needs a broader scope or a design decision, it stops and reports under Escalation instead of widening the task. ultracode: Claude Fable in Claude Code with ultracode on orchestrates Claude Opus 5 agents at xhigh effort, one agent at a time, to implement, verify and review a task, several tasks in dependency order, or a whole agreed plan. It is slower and costlier than implement; use it only when the user asks for it. ask: Claude Opus with read-only tools (Read, Bash, Grep, Glob, WebSearch, WebFetch) answers a question about the code with file and line references, or with mode review gives an independent review of a change, findings ranked by severity. It has no Edit or Write, and its contract forbids changing files through Bash. security: investigates one scoped security concern, area or change on the user's own Pi provider configuration, with the same tools as role implement. It confirms a finding where it can, reports each with a severity and with whether it is confirmed or inferred, and never puts a secret in its report by value. Its task says whether fixes are authorized: with none it reports findings and changes no application code, and with one it writes the smallest fix that closes a finding and verifies it. Ask for it only when the user asks for a security investigation, audit or fix. backend picks the harness a child runs in, and the claude models above are what every role but security runs as when a call names no backend: leave backend unset unless the user asks for pi. backend pi runs plan, implement, ask and security on the user's own Pi provider configuration, under the same contracts as the claude roles, security's own contract included; role ultracode runs on the claude backend alone, and role security on the pi backend alone, so a call that names it goes to pi whether or not it names a backend and naming claude for it is refused before anything starts. On pi the tools are Pi's own and are not the claude lists above: roles plan, implement and security run with read, bash, edit, write, grep, find and ls, role ask runs with read, bash, grep, find and ls and has no web search or web fetch tool at all, and every pi role also gets ask_orchestrator, which is how a pi child asks you a question. A pi call's model is a provider and a model id, such as deepseek/deepseek-chat, taken from the call's model parameter, then the selection the run it continues actually ran with, then PI_FUSION_PI_<ROLE>_MODEL for that role; a pi call with none of those is refused before anything starts, because nothing here resolves a pi model for you. Every run gets a handle such as run-3, shown in the stats line. continue with a handle sends the task as a follow-up to that run: the child keeps its context from the run's last successful call, across a resume of this session, /tree and forks, stays on the backend it ran on, and keeps the model that run chose unless the call names another. Calls run one at a time: Pi serializes any turn that contains one. Returns the child's report, or with background true the handle at once and the report later as a message; manage a background run with fusion_control. If the child asks a question, the call returns the question at once and the run waits in the background until you answer it with fusion_control message. Only one run that can change files is active at a time, waiting included; ask runs can go next to it. The claude tool is this same delegation forced to the claude backend, kept for compatibility, and fusion_control and claude_control both act on every run.",
 		promptSnippet:
-			"Delegate planning (plan), bounded implementation (implement), complex, high-risk implementation (ultracode), read-only questions and reviews (ask) or a scoped security investigation or fix the user asked for (security) to a coding child",
+			"Delegate planning (plan), bounded implementation (implement), implementation the user asks ultracode for (ultracode), read-only questions and reviews (ask) or a scoped security investigation or fix the user asked for (security) to a coding child",
 		promptGuidelines: [...guidelines(TOOL_NAME, CONTROL_TOOL_NAME), securityGuideline(TOOL_NAME), backendGuideline(TOOL_NAME)],
 		parameters: Type.Object({
 			role: Type.Optional(stringEnum(KNOWN_ROLE_NAMES, "plan, implement, ultracode, ask or security. Required unless continue is set.")),
 			task: Type.String({
 				description:
-					"For plan: the goal, your proposed plan, constraints and decisions already made; the child reads the code itself, so do not paste file contents. For implement and ultracode: the task or tasks, agreed or direct: what to change, where, acceptance criteria, and how to verify each one. For ask: the question, or for mode review the change to review (a diff, a commit range or files) and what it must do. For security: the concern, area or change to investigate, what the code is meant to guarantee, and whether fixes are authorized; without that it reports findings and changes no application code. With continue: the follow-up message.",
+					"Plain, readable prose, with the spaces between words kept. A new run has not seen this conversation, so make the task self-contained, and name files instead of pasting their contents. For plan: the goal, your proposed plan, constraints and decisions already made; the child reads the code itself. For implement and ultracode: the task or tasks, agreed or direct: what to change, where, acceptance criteria, and how to verify each one. For ask: the question, or for mode review the change to review (a diff, a commit range or files) and what it must do. For security: the concern, area or change to investigate, what the code is meant to guarantee, and whether fixes are authorized; without that it reports findings and changes no application code. With continue: the follow-up message.",
 			}),
 			continue: Type.Optional(Type.String({ description: "A run's handle, such as run-3: continue that run instead of starting a new one, on the backend it ran on." })),
-			context: Type.Optional(Type.String({ description: "Extra context the child needs: decisions, related files, results of earlier tasks." })),
+			context: Type.Optional(Type.String({ description: "Extra context the child needs, in plain, readable prose: decisions, related files, results of earlier tasks." })),
 			background: Type.Optional(Type.Boolean({ description: "Return at once with the run's handle and let the run go on; you get its report as a message when it ends. Default false." })),
 			fresh: Type.Optional(Type.Boolean({ description: "plan only, not with continue: start a new plan run instead of continuing the last one." })),
 			mode: Type.Optional(stringEnum(ASK_MODES, "ask only: answer (default) for a question, review for an independent review of a change. A continued ask run keeps its mode unless this names another.")),
 			backend: Type.Optional(stringEnum(BACKEND_NAMES, "The harness the child runs in: claude, which runs every role but security and is what a call that leaves this unset gets for all of them, or pi, which runs plan, implement, ask and security on the user's own Pi provider configuration and needs a provider and model id from the call's model parameter or PI_FUSION_PI_<ROLE>_MODEL. Name pi only when the user asks for it; role security goes to pi whether or not this names it, because no other harness runs it, and naming claude for it is refused. With continue it must name the backend that run is on, if it names one at all.")),
-			model: Type.Optional(Type.String({ description: "A model instead of the role's default: on the claude backend a Claude Code alias or id, for implement and ask only; on the pi backend a provider and model id such as deepseek/deepseek-chat, which every pi role takes and no pi role has a default for." })),
+			model: Type.Optional(
+				Type.String({
+					description:
+						"A model instead of the role's default: on the claude backend a Claude Code alias or id, for plan, implement and ask only, which the run keeps for later calls that name no model; on the pi backend a provider and model id such as deepseek/deepseek-chat, which every pi role takes and no pi role has a default for. A plan call that names another model than the plan run is on starts a fresh plan run carrying the agreed plan.",
+				}),
+			),
 			effort: Type.Optional(stringEnum(FUSION_EFFORTS, "The child's effort instead of the role's default, for plan, implement, ask and security: low, medium, high, xhigh or max on the claude backend, and any of these pi thinking levels on the pi backend, which is the only one role security runs on.")),
 		}),
 		async execute(toolCallId, params, signal, onUpdate, ctx) {
@@ -2481,21 +2518,21 @@ export default function fusion(pi: ExtensionAPI, options: FusionOptions = {}) {
 		executionMode: "sequential",
 		label: "Claude",
 		description:
-			"Delegate work to a child: a headless Claude Code session in this working directory. The role picks the job. plan: Claude Fable, which can read the code, run commands and write scratch files, challenges a goal and your proposed plan and consolidates it into an agreed, numbered task list with acceptance criteria. A plan call continues the last plan run, so follow-ups can refer to the earlier agreement, until that run's context passes its cap, when the call starts a fresh plan run carrying the agreed plan and says so; fresh starts a new plan run. implement: Claude Opus implements one clear, bounded task with full tools and reports what changed and how it was verified. If the task needs a broader scope or a design decision, it stops and reports under Escalation instead of widening the task. ultracode: Claude Fable in Claude Code with ultracode on orchestrates Claude Opus 5 agents at xhigh effort, one agent at a time, to implement, verify and review a task, several tasks in dependency order, or a whole agreed plan. It is slower and costlier than implement. ask: Claude Opus with read-only tools (Read, Bash, Grep, Glob, WebSearch, WebFetch) answers a question about the code with file and line references, or with mode review gives an independent review of a change, findings ranked by severity. It has no Edit or Write, and its contract forbids changing files through Bash. Every run gets a handle such as run-3, shown in the stats line. continue with a handle sends the task as a follow-up to that run: the child keeps its context from the run's last successful call, across a resume of this session, /tree and forks. A new run has not seen this conversation, so its task must be self-contained. Calls run one at a time: Pi serializes any turn that contains one. Returns the child's report, or with background true the handle at once and the report later as a message; manage a background run with claude_control. If the child asks a question, the call returns the question at once and the run waits in the background until you answer it with claude_control message. Only one run that can change files is active at a time, waiting included; ask runs can go next to it.",
-		promptSnippet: "Delegate planning (plan), bounded implementation (implement), complex, high-risk implementation (ultracode) or read-only questions and reviews (ask) to a Claude Code child",
+			"Delegate work to a child: a headless Claude Code session in this working directory. The role picks the job. plan: Claude Fable, or the model you name, which can read the code, run commands and write scratch files, challenges a goal and your proposed plan and consolidates it into an agreed, numbered task list with acceptance criteria. A plan call continues the last plan run, so follow-ups can refer to the earlier agreement, until that run's context passes its cap or the call names another model, when the call starts a fresh plan run carrying the agreed plan and says so; fresh starts a new plan run. implement: Claude Opus implements one clear, bounded task with full tools and reports what changed and how it was verified. If the task needs a broader scope or a design decision, it stops and reports under Escalation instead of widening the task. ultracode: Claude Fable in Claude Code with ultracode on orchestrates Claude Opus 5 agents at xhigh effort, one agent at a time, to implement, verify and review a task, several tasks in dependency order, or a whole agreed plan. It is slower and costlier than implement; use it only when the user asks for it. ask: Claude Opus with read-only tools (Read, Bash, Grep, Glob, WebSearch, WebFetch) answers a question about the code with file and line references, or with mode review gives an independent review of a change, findings ranked by severity. It has no Edit or Write, and its contract forbids changing files through Bash. Every run gets a handle such as run-3, shown in the stats line. continue with a handle sends the task as a follow-up to that run: the child keeps its context from the run's last successful call, across a resume of this session, /tree and forks, and keeps the model that run chose unless the call names another. Calls run one at a time: Pi serializes any turn that contains one. Returns the child's report, or with background true the handle at once and the report later as a message; manage a background run with claude_control. If the child asks a question, the call returns the question at once and the run waits in the background until you answer it with claude_control message. Only one run that can change files is active at a time, waiting included; ask runs can go next to it.",
+		promptSnippet: "Delegate planning (plan), bounded implementation (implement), implementation the user asks ultracode for (ultracode) or read-only questions and reviews (ask) to a Claude Code child",
 		promptGuidelines: guidelines(CLAUDE_TOOL_NAME, CLAUDE_CONTROL_NAME),
 		parameters: Type.Object({
 			role: Type.Optional(stringEnum(ROLE_NAMES, "plan, implement, ultracode or ask. Required unless continue is set.")),
 			task: Type.String({
 				description:
-					"For plan: the goal, your proposed plan, constraints and decisions already made; the child reads the code itself, so do not paste file contents. For implement and ultracode: the task or tasks, agreed or direct: what to change, where, acceptance criteria, and how to verify each one. For ask: the question, or for mode review the change to review (a diff, a commit range or files) and what it must do. With continue: the follow-up message.",
+					"Plain, readable prose, with the spaces between words kept. A new run has not seen this conversation, so make the task self-contained, and name files instead of pasting their contents. For plan: the goal, your proposed plan, constraints and decisions already made; the child reads the code itself. For implement and ultracode: the task or tasks, agreed or direct: what to change, where, acceptance criteria, and how to verify each one. For ask: the question, or for mode review the change to review (a diff, a commit range or files) and what it must do. With continue: the follow-up message.",
 			}),
 			continue: Type.Optional(Type.String({ description: "A run's handle, such as run-3: continue that run instead of starting a new one." })),
-			context: Type.Optional(Type.String({ description: "Extra context the child needs: decisions, related files, results of earlier tasks." })),
+			context: Type.Optional(Type.String({ description: "Extra context the child needs, in plain, readable prose: decisions, related files, results of earlier tasks." })),
 			background: Type.Optional(Type.Boolean({ description: "Return at once with the run's handle and let the run go on; you get its report as a message when it ends. Default false." })),
 			fresh: Type.Optional(Type.Boolean({ description: "plan only, not with continue: start a new plan run instead of continuing the last one." })),
 			mode: Type.Optional(stringEnum(ASK_MODES, "ask only: answer (default) for a question, review for an independent review of a change. A continued ask run keeps its mode unless this names another.")),
-			model: Type.Optional(Type.String({ description: "implement and ask only: a Claude Code model alias or id instead of the role's default." })),
+			model: Type.Optional(Type.String({ description: "plan, implement and ask only: a Claude Code model alias or id instead of the role's default. The run keeps it for later calls that name no model, and a plan call that names another model starts a fresh plan run." })),
 			effort: Type.Optional(stringEnum(EFFORTS, "plan, implement and ask only: the child's effort instead of the role's default.")),
 		}),
 		async execute(toolCallId, params, signal, onUpdate, ctx) {

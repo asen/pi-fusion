@@ -452,6 +452,57 @@ test("continue goes back to a plan run the cap would hand off, because the host 
 	assert.equal(prompt, "follow-up");
 });
 
+test("a plan call's model is recorded, and a later plan call that names none continues the run on it", async () => {
+	const ext = makeExtension();
+	const { argv } = await invoke(ext, { role: "plan", task: "the goal", model: "opus" }, makeCtx({}));
+	assert.equal(valueOf(argv, "--model"), "opus");
+	const [, data] = ext.appended[0] as [string, Record<string, unknown>];
+	assert.equal(data.model, "opus");
+
+	const again = await invoke(makeExtension(), { role: "plan", task: "follow-up" }, makeCtx({ branch: [entry(data)] }));
+	assert.equal(valueOf(again.argv, "--resume"), data.sessionId);
+	assert.equal(valueOf(again.argv, "--model"), "opus");
+	const same = await invoke(makeExtension(), { role: "plan", task: "follow-up", model: "opus" }, makeCtx({ branch: [entry(data)] }));
+	assert.equal(valueOf(same.argv, "--resume"), data.sessionId);
+});
+
+test("a run on the role's default model records no model", async () => {
+	const ext = makeExtension();
+	await invoke(ext, { role: "plan", task: "the goal" }, makeCtx({}));
+	assert.equal((ext.appended[0] as [string, Record<string, unknown>])[1].model, undefined);
+});
+
+test("a plan call that names another model starts a fresh run that carries the last report", async () => {
+	const ext = makeExtension();
+	await invoke(ext, { role: "plan", task: "the goal", model: "opus" }, makeCtx({}));
+	const [, data] = ext.appended[0] as [string, Record<string, unknown>];
+
+	const { argv, prompt, text } = await invoke(ext, { role: "plan", task: "harder than it looked", model: "fable" }, makeCtx({ branch: [entry(data)] }));
+	assert.equal(valueOf(argv, "--resume"), undefined, "the fresh run does not resume the run it replaces");
+	assert.equal(valueOf(argv, "--model"), "fable");
+	assert.match(prompt ?? "", /^harder than it looked\n\n## The plan so far\nThis is a fresh plan run\. run-1 agreed the plan so far, and it ran on another model,/);
+	assert.match(text ?? "", /^run-2 is a fresh plan run: run-1 ran on opus and the call names fable, so it was not continued\./);
+	assert.equal((ext.appended[1] as [string, Record<string, unknown>])[1].run, "run-2");
+});
+
+test("a plan call that names another model and has no report to carry says what the host can do instead", async () => {
+	const ext = makeExtension();
+	const branch = [entry(recorded("run-1", "plan", S1, "host-1", "ckpt-1"))];
+	const { argv, error } = await invoke(ext, { role: "plan", task: "follow-up", model: "opus" }, makeCtx({ branch }));
+	assert.match(error ?? "", /^run-1 runs on fable and the call names opus, so a plan call does not continue it/);
+	assert.match(error ?? "", /fresh true/);
+	assert.deepEqual(argv, []);
+	assert.deepEqual(ext.appended, []);
+});
+
+test("continue keeps the model the run recorded unless the call names another", async () => {
+	const branch = [entry({ ...recorded("run-1", "implement", S1, "host-1", "ckpt-1"), model: "sonnet" })];
+	const kept = await invoke(makeExtension(), { continue: "run-1", task: "and the tests?" }, makeCtx({ branch }));
+	assert.equal(valueOf(kept.argv, "--model"), "sonnet");
+	const changed = await invoke(makeExtension(), { continue: "run-1", task: "and the tests?", model: "opus" }, makeCtx({ branch }));
+	assert.equal(valueOf(changed.argv, "--model"), "opus");
+});
+
 test("PI_FUSION_PLAN_CONTEXT_PCT sets the cap, and 0 turns the handoff off", async () => {
 	assert.equal(planContextPct({ PI_FUSION_PLAN_CONTEXT_PCT: "20" } as NodeJS.ProcessEnv), 20);
 	assert.equal(planContextPct({} as NodeJS.ProcessEnv), 35);

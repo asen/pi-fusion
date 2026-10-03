@@ -45,7 +45,7 @@ The reply a question gets, from the host through `fusion_control message` or fro
 _Avoid_: reply, response, decision
 
 **Handoff**:
-A `plan` call that starts a fresh run on the same backend, carrying the replaced run's last report, rather than continue a plan run whose context has passed its cap. The fresh run is a new run in every other way: its own handle, its own session and its own binding. A `continue` call names its run and is warned instead, never handed off.
+A `plan` call that starts a fresh run on the same backend, carrying the replaced run's last report, rather than continue the last plan run, for one of two reasons: that run's context has passed its cap, or the call names a model other than the one it runs on. The fresh run is a new run in every other way: its own handle, its own session and its own binding — a Claude run carries its own chosen model onto the fresh run a cap hands off to, while a Pi run's fresh binding reads the call and its variables again. A `continue` call names its run and is warned instead, never handed off.
 _Avoid_: rollover, compaction, reset
 
 **Escalation**:

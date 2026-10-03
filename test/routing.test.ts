@@ -148,10 +148,80 @@ test("a plan handoff stays on the backend the plan run is on", () => {
 	const route = fusionRoute({ role: "plan", task: "next", backend: "pi" }, over, 35);
 	assert.equal(route.backend, "pi");
 	assert.equal(route.handle, "run-2");
-	assert.deepEqual(route.handoff, { from: "run-1", share: 0.4 });
+	assert.deepEqual(route.handoff, { from: "run-1", reason: { kind: "cap", share: 0.4 } });
 	// The claude route sees no plan run of its own, so it starts one rather than handing off the pi run.
 	const onClaude = fusionRoute({ role: "plan", task: "next" }, over, 35);
 	assert.deepEqual([onClaude.handle, onClaude.handoff], ["run-2", undefined]);
+});
+
+/**
+ * What each backend can say the last plan run is on, which is what a model handoff is decided against: Claude keeps
+ * the chosen model flat on the entry and falls back to the role's own default, while a Pi run is only ever on the
+ * selection it recorded. Neither backend resolves the other's model, so each one's answer is read here.
+ */
+test("a plan call that names another model hands the plan off on the backend the plan run is on", () => {
+	const chosen = records(claudeEntry({ run: "run-1", role: "plan", model: "opus" }));
+	const handed = fusionRoute({ role: "plan", task: "harder than it looked", model: "fable" }, chosen);
+	assert.deepEqual([handed.backend, handed.handle, handed.record], ["claude", "run-2", undefined]);
+	assert.deepEqual(handed.handoff, { from: "run-1", reason: { kind: "model", from: "opus", to: "fable" } });
+	assert.equal(handed.call.model, "fable", "the fresh run runs the model the call named");
+	// A plan run that chose nothing ran the role's own default, which is the model a handoff is named after.
+	const byDefault = fusionRoute({ role: "plan", task: "a bounded question", model: "opus" }, records(claudeEntry({ run: "run-1", role: "plan" })));
+	assert.deepEqual(byDefault.handoff, { from: "run-1", reason: { kind: "model", from: "fable", to: "opus" } });
+
+	// A pi plan run's model is the selection it recorded, and nothing falls back to a default this backend has none of.
+	const pi = records(piEntry({ run: "run-1", role: "plan" }));
+	const onPi = fusionRoute({ role: "plan", task: "harder than it looked", backend: "pi", model: "openai/gpt-5" }, pi);
+	assert.deepEqual([onPi.backend, onPi.handle], ["pi", "run-2"]);
+	assert.deepEqual(onPi.handoff, { from: "run-1", reason: { kind: "model", from: "deepseek/deepseek-chat", to: "openai/gpt-5" } });
+	assert.equal(onPi.call.model, "openai/gpt-5");
+});
+
+test("a plan call that names the model the plan run is on continues it, on either backend", () => {
+	const chosen = records(claudeEntry({ run: "run-1", role: "plan", model: "opus" }));
+	const same = fusionRoute({ role: "plan", task: "and the next step?", model: "opus" }, chosen);
+	assert.deepEqual([same.handle, same.handoff, same.call.model], ["run-1", undefined, "opus"]);
+	// The run keeps its own model when the call names none: a plan call never silently drops back to the default.
+	const unnamed = fusionRoute({ role: "plan", task: "and the next step?" }, chosen);
+	assert.deepEqual([unnamed.handle, unnamed.handoff, unnamed.call.model], ["run-1", undefined, "opus"]);
+	assert.equal(fusionCall({ role: "plan", task: "and the next step?" }, chosen).bound.model, "opus");
+	// A plan run on the role's own default is continued by a call that names that same default.
+	const byDefault = records(claudeEntry({ run: "run-1", role: "plan" }));
+	assert.deepEqual([fusionRoute({ role: "plan", task: "more", model: "fable" }, byDefault).handle, fusionRoute({ role: "plan", task: "more" }, byDefault).handle], ["run-1", "run-1"]);
+
+	const pi = records(piEntry({ run: "run-1", role: "plan" }));
+	const onPi = fusionRoute({ role: "plan", task: "and the next step?", backend: "pi", model: "deepseek/deepseek-chat" }, pi);
+	assert.deepEqual([onPi.handle, onPi.handoff], ["run-1", undefined]);
+});
+
+/**
+ * The deliberate split between the backends at a cap handoff: a Claude plan run's model is the run's own and is
+ * carried to the fresh run that replaces it, while a Pi call is bound from the call and its variables again, which
+ * is the same rule a first pi call runs under. A pi continuation still repeats the selection its record holds.
+ */
+test("a cap handoff carries the claude plan run's model, and leaves a pi call to bind its own", () => {
+	const full = { contextTokens: 400_000, contextWindow: 1_000_000 };
+	const claude = fusionRoute({ role: "plan", task: "next" }, records(claudeEntry({ run: "run-1", role: "plan", model: "opus", ...full })), 35);
+	assert.deepEqual(claude.handoff, { from: "run-1", reason: { kind: "cap", share: 0.4 } });
+	assert.deepEqual([claude.handle, claude.call.model], ["run-2", "opus"]);
+	assert.equal(fusionCall({ role: "plan", task: "next" }, records(claudeEntry({ run: "run-1", role: "plan", model: "opus", ...full })), 35).bound.model, "opus");
+
+	const pi = fusionRoute({ role: "plan", task: "next", backend: "pi" }, records(piEntry({ run: "run-1", role: "plan", ...full })), 35);
+	assert.deepEqual(pi.handoff, { from: "run-1", reason: { kind: "cap", share: 0.4 } });
+	assert.equal(pi.call.model, undefined, "a fresh pi run is bound from the call and its variables, not from the run it replaces");
+	assert.equal(pi.record, undefined, "and carries no record, so nothing repeats the replaced run's selection");
+});
+
+test("a continued claude run keeps the model it recorded, and a continued pi run keeps its recorded selection", () => {
+	const kept = fusionRoute({ continue: "run-1", task: "and the tests?" }, records(claudeEntry({ model: "sonnet" })));
+	assert.deepEqual([kept.backend, kept.call.model], ["claude", "sonnet"]);
+	assert.equal(fusionCall({ continue: "run-1", task: "and the tests?" }, records(claudeEntry({ model: "sonnet" }))).bound.model, "sonnet");
+	// The call's own model wins over the recorded one, and a run that recorded none keeps the role's default.
+	assert.equal(fusionRoute({ continue: "run-1", task: "more", model: "opus" }, records(claudeEntry({ model: "sonnet" }))).call.model, "opus");
+	assert.equal(fusionCall({ continue: "run-1", task: "more" }, records(claudeEntry())).bound.model, "opus");
+	// Nothing puts a model on a pi continuation's call: the recorded selection is the binding's to repeat.
+	const onPi = fusionRoute({ continue: "run-1", task: "and the tests?" }, records(piEntry()));
+	assert.deepEqual([onPi.backend, onPi.call.model, onPi.record?.selection], ["pi", undefined, PI_SELECTION]);
 });
 
 test("the claude route forces its backend and never continues or reuses a pi run", () => {
@@ -181,7 +251,9 @@ test("the legacy claude call still returns the Claude role it always did", () =>
 test("each backend checks the parameters its role takes, and rejects an effort the other one offers", () => {
 	assert.throws(() => fusionRoute({ role: "implement", task: "x", effort: "off" }, records()), /^Error: unknown effort off; use one of low, medium, high, xhigh, max$/);
 	assert.throws(() => fusionRoute({ role: "implement", task: "x", effort: "minimal", backend: "claude" }, records()), /^Error: unknown effort minimal; use one of low, medium, high, xhigh, max$/);
-	assert.throws(() => fusionRoute({ role: "plan", task: "x", model: "opus" }, records()), /^Error: model is not allowed for role plan$/);
+	// Role plan takes a model on both backends now; role ultracode still takes none, on the one backend that runs it.
+	assert.equal(fusionRoute({ role: "plan", task: "x", model: "opus" }, records()).call.model, "opus");
+	assert.throws(() => fusionRoute({ role: "ultracode", task: "x", model: "fable" }, records()), /^Error: model is not allowed for role ultracode$/);
 	assert.throws(() => fusionRoute({ role: "implement", task: "x", fresh: true, backend: "pi" }, records()), /^Error: fresh is not allowed for role implement$/);
 	assert.throws(() => fusionRoute({ role: "implement", task: "x", mode: "review", backend: "pi" }, records()), /^Error: mode is not allowed for role implement$/);
 	// Pi takes a model for every role it runs, and Pi's own thinking levels for each of them.

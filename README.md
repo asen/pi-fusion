@@ -24,9 +24,9 @@ The `role` parameter of `fusion` picks the job. The table is the `claude` backen
 
 | Role | Model and effort | Tools given to the child | Purpose |
 | --- | --- | --- | --- |
-| `plan` | `fable`, xhigh | Read, Bash, Edit, Write, Grep, Glob | Challenge a plan and return an agreed, numbered task list. |
+| `plan` | `fable` (the host picks `opus` for bounded design), xhigh | Read, Bash, Edit, Write, Grep, Glob | Challenge a plan and return an agreed, numbered task list. |
 | `implement` | `opus`, high | Read, Bash, Edit, Write, Grep, Glob | Implement one clear, bounded task. |
-| `ultracode` | `fable`, ultracode | Claude Code's own, plus Workflow, Agent and the user's MCP servers | Complex, uncertain or high-risk work, or a whole agreed plan. |
+| `ultracode` | `fable`, ultracode | Claude Code's own, plus Workflow, Agent and the user's MCP servers | Complex, uncertain or high-risk work, or a whole agreed plan. The host uses it only when you ask for it. |
 | `ask` | `opus`, high | Read, Bash, Grep, Glob, WebSearch, WebFetch | Answer a question about the code, or review a change with `mode: "review"`. Changes no files. |
 
 On the `pi` backend the purposes are the same, because both backends run the same contracts under `contracts/`, and the tools are Pi's own: `plan`, `implement` and `security` get read, bash, edit, write, grep, find and ls, and `ask` gets read, bash, grep, find and ls, with no web tool. Every child of either backend also gets `ask_orchestrator`. A Pi role has no model default, so a `pi` call needs one; its effort is optional, and a call that names none leaves the child its own. See [Backends](#backends).
@@ -44,7 +44,7 @@ On the `pi` backend the purposes are the same, because both backends run the sam
 | `background` | all | `true` returns the handle at once and lets the run go on. |
 | `fresh` | `plan` | Start a new plan run. Not allowed with `continue`. |
 | `mode` | `ask` | `answer` (default) sends `contracts/ask-answer.md`, `review` sends `contracts/ask-review.md`. |
-| `model` | `implement`, `ask` on `claude`; every role on `pi` | Replaces the role's model for one call: a Claude Code alias or id, or a Pi provider and model id split at the first slash. No `pi` role has a model of its own, so there a `model` replaces nothing and is one of the three places the required one comes from. |
+| `model` | `plan`, `implement`, `ask` on `claude`; every role on `pi` | Replaces the role's model, and the run keeps it for later calls that name no model: a Claude Code alias or id, or a Pi provider and model id split at the first slash. No `pi` role has a model of its own, so there a `model` replaces nothing and is one of the three places the required one comes from. |
 | `effort` | `plan`, `implement`, `ask`, and `security` on `pi` | `low`, `medium`, `high`, `xhigh` or `max`; the `pi` backend adds `off` and `minimal`. Optional on `pi`, where a call that names none leaves the child its own default. |
 | `backend` | all, `fusion` only | The harness the child runs in: `claude`, which an unset `backend` gets, or `pi`. A role the named backend does not run is refused before anything starts. A continued run stays on the backend its record names. |
 
@@ -66,7 +66,7 @@ While a child runs, the status line shows `<handle> <role> · <seconds> · <n> t
 
 ## Routing
 
-The host model is the orchestrator. Its guidelines ask two questions: is the design unresolved, and which implementer role fits the complexity and risk. That leaves three routes: straight to `implement`; `plan` first, then `implement` task by task; or `ultracode`, with or without `plan`.
+The host model is the orchestrator. Its guidelines ask one question: is the design unresolved. The host sends all implementation to `implement` and uses `ultracode` only when you ask for it. That leaves three routes: straight to `implement`; `plan` first, then `implement` task by task; or `ultracode`, with or without `plan`, on your request.
 
 Your explicit choice wins. Ask for Opus and the host uses `implement`, ask for Fable or ultracode and it uses `ultracode`, and ask for or skip planning as you like. The host names a backend only when you ask for one. For an independent review, the host calls `ask` with `mode: "review"`. Role `security` is yours to ask for: ask for a security investigation, audit or fix and the host uses it, on `pi`, and it picks that role on no judgement of its own. See [Routing](docs/routing.md).
 

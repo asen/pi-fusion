@@ -23,7 +23,7 @@
 | `PI_FUSION_HISTORY` | unset; `1` keeps the runs of each Pi session that has a session file on disk, prompts and reports included, so a later Pi process on the same session can show them |
 | `PI_FUSION_HISTORY_DIR` | unset; the directory those files go in. The default is `pi-fusion/history` under `PI_CODING_AGENT_DIR`, which is `~/.pi/agent` |
 
-Each variable applies to the role in its name. A call's `model` or `effort` parameter wins over the variable for that call.
+Each variable applies to the role in its name. A call's `model` or `effort` parameter wins over the variable for that call, and a run keeps the `model` for later calls that name none.
 
 ## The pi backend's variables
 

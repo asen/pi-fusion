@@ -172,7 +172,8 @@ const runItem = (run, step) => {
 		for (const flag of flags) row.appendChild(flagBadge(flag));
 		item.appendChild(row);
 	}
-	item.appendChild(el("span", "run-model", run.background === true ? str(run.model) + " · background" : str(run.model)));
+	const model = str(run.modelId) || str(run.model);
+	item.appendChild(el("span", "run-model", run.background === true ? model + " · background" : model));
 	if (str(run.question)) item.appendChild(el("span", "run-question", str(run.question)));
 	const meta = el("span", "run-meta");
 	const clock = el("span", "run-clock");

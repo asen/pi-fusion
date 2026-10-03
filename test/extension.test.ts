@@ -703,7 +703,6 @@ test("a parameter the role does not take fails the call before any child starts"
 	for (const [params, message] of [
 		[{ role: "ultracode", task: "x", effort: "high" }, "effort is not allowed for role ultracode"],
 		[{ role: "ultracode", task: "x", model: "opus" }, "model is not allowed for role ultracode"],
-		[{ role: "plan", task: "x", model: "opus" }, "model is not allowed for role plan"],
 		[{ role: "implement", task: "x", mode: "review" }, "mode is not allowed for role implement"],
 		[{ role: "ultracode", task: "x", mode: "answer" }, "mode is not allowed for role ultracode"],
 		[{ role: "plan", task: "x", mode: "review" }, "mode is not allowed for role plan"],
