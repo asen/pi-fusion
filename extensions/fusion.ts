@@ -737,6 +737,10 @@ const TOOL_NAME = "fusion";
 const CONTROL_TOOL_NAME = "fusion_control";
 const CLAUDE_TOOL_NAME = "claude";
 const CLAUDE_CONTROL_NAME = "claude_control";
+/** Every tool /fusion off hides from the host, so no route to a run is left beside the guards. */
+const FUSION_TOOLS: readonly string[] = [TOOL_NAME, CONTROL_TOOL_NAME, CLAUDE_TOOL_NAME, CLAUDE_CONTROL_NAME];
+/** What a call or review that would start a run is told while fusion is off. */
+const FUSION_OFF = "fusion is off; turn it on with /fusion on";
 const NOTICE_TYPE = "pi-fusion-run";
 /** What a run notice is about: the run itself, or what the user did to it. */
 const NOTICE_LABELS = new Map([
@@ -1041,9 +1045,9 @@ function handleNumber(handle: string): number {
 	return Number(HANDLE.exec(handle)?.[1] ?? 0);
 }
 
-const FUSION_ARGS = ["dashboard", "dashboard stop", "status", "cancel", "steer", "wait", "answer", "review"];
+const FUSION_ARGS = ["dashboard", "dashboard stop", "status", "cancel", "steer", "wait", "answer", "review", "on", "off"];
 const USAGE =
-	"Usage: /fusion dashboard | /fusion dashboard stop | /fusion status [run-N] | /fusion cancel run-N | /fusion wait run-N | /fusion steer run-N <text> | /fusion answer [run-N] [text] | /fusion review run-N";
+	"Usage: /fusion dashboard | /fusion dashboard stop | /fusion status [run-N] | /fusion cancel run-N | /fusion wait run-N | /fusion steer run-N <text> | /fusion answer [run-N] [text] | /fusion review run-N | /fusion on | /fusion off";
 /** A /fusion argument list that names a run, as far as it is typed, for completion. */
 const RUN_ARG = /^(status|cancel|wait|steer|answer|review)\s+(\S*)$/;
 const BROWSER_OPENER: Record<string, string> = { darwin: "open", linux: "xdg-open" };
@@ -1052,6 +1056,8 @@ const BROWSER_OPENER: Record<string, string> = { darwin: "open", linux: "xdg-ope
 export type FusionCommand =
 	| { kind: "dashboard" }
 	| { kind: "dashboard-stop" }
+	| { kind: "on" }
+	| { kind: "off" }
 	| { kind: "status"; handle?: string }
 	| { kind: "cancel" | "wait" | "review"; handle: string }
 	| { kind: "steer"; handle: string; text: string }
@@ -1068,6 +1074,8 @@ export function parseFusion(args: string): FusionCommand {
 		if (tokens.length === 1) return { kind: "dashboard" };
 		return tokens.length === 2 && second === "stop" ? { kind: "dashboard-stop" } : usage;
 	}
+	if (first === "on") return tokens.length === 1 ? { kind: "on" } : usage;
+	if (first === "off") return tokens.length === 1 ? { kind: "off" } : usage;
 	if (first === "status") {
 		if (tokens.length === 1) return { kind: "status" };
 		return tokens.length === 2 && HANDLE.test(second) ? { kind: "status", handle: second } : usage;
@@ -1442,10 +1450,23 @@ export default function fusion(pi: ExtensionAPI, options: FusionOptions = {}) {
 	let ui: { setStatus(key: string, text: string | undefined): void; setWidget?(key: string, lines: string[] | undefined): void } | undefined;
 	let ticker: NodeJS.Timeout | undefined;
 	let shuttingDown = false;
+	/**
+	 * Whether the host may start runs. It lives in this extension instance alone, so a reload or another host session
+	 * starts on again, and it turns off only while no run is unfinished, so off never strands a run the host cannot reach.
+	 */
+	let enabled = true;
+	/** The Fusion tools that were active when off was accepted: on gives back these and no other. */
+	let hidden: string[] = [];
 	/** Whether the active runs also show over the editor; the footer status line stays either way. */
 	const widgetOn = process.env.PI_FUSION_WIDGET?.trim() !== "0";
 
 	const active = (): LiveRun[] => [...runs.values()].filter(isActive);
+
+	/** The runs that have not finished, the ones still in their end path named as finishing, or undefined when none is. */
+	const unfinishedNames = (): string | undefined => {
+		const unfinished = [...runs.values()].filter((run) => !run.finished);
+		return unfinished.length ? unfinished.map((run) => `${run.handle} (${run.role.name}${isActive(run) ? "" : ", finishing"})`).join(", ") : undefined;
+	};
 
 	/** Monitoring only: a host that cannot take the status or an update must not fail the run that renders. */
 	const render = () => {
@@ -1902,6 +1923,7 @@ export default function fusion(pi: ExtensionAPI, options: FusionOptions = {}) {
 	 * `runs` and no other run can take the same handle in between.
 	 */
 	const startReview = (source: ReviewTarget, origin: "review" | "auto-review", ctx: any): { run: LiveRun } | { refused: string } => {
+		if (!enabled) return { refused: FUSION_OFF };
 		if (source.madeIn) return { refused: `${source.handle} was made in ${source.madeIn}, not in this working directory; review it from there` };
 		// Refused before the budget is read, a handle is taken, the source is linked to a review or any child starts.
 		const reason = reviewable({ state: source.state, role: source.role, ...(source.files ? { files: source.files } : {}) });
@@ -1964,7 +1986,7 @@ export default function fusion(pi: ExtensionAPI, options: FusionOptions = {}) {
 
 	/** The review a run that changed files gets on its own, when the user turned automatic reviews on. */
 	const startAutoReview = (run: LiveRun, ctx: any): void => {
-		if (!autoReview || run.origin !== "tool" || run.state !== "done" || run.reviewedBy || shuttingDown) return;
+		if (!enabled || !autoReview || run.origin !== "tool" || run.state !== "done" || run.reviewedBy || shuttingDown) return;
 		if (notReviewable(run)) return;
 		const started = startReview(liveSource(run, ctx), "auto-review", ctx);
 		if ("refused" in started) ctx.ui.notify(`fusion: auto-review of ${run.handle} did not start: ${started.refused}`, "warning");
@@ -2114,7 +2136,7 @@ export default function fusion(pi: ExtensionAPI, options: FusionOptions = {}) {
 	};
 
 	pi.registerCommand("fusion", {
-		description: "Open or close the pi-fusion dashboard, or check, cancel, steer, answer, review and wait for this session's runs",
+		description: "Open or close the pi-fusion dashboard, check, cancel, steer, answer, review and wait for this session's runs, or turn fusion on or off",
 		getArgumentCompletions: (prefix: string) => {
 			const named = RUN_ARG.exec(prefix);
 			if (named) {
@@ -2134,6 +2156,46 @@ export default function fusion(pi: ExtensionAPI, options: FusionOptions = {}) {
 			const command = parseFusion(args);
 			if (command.kind === "usage") {
 				notice(command.message, "warning");
+				return;
+			}
+			if (command.kind === "off") {
+				if (!enabled) {
+					notice("fusion is already off; turn it on with /fusion on", "info");
+					return;
+				}
+				// The check and the switch share one synchronous block, so no run can register between them.
+				const names = unfinishedNames();
+				if (names) {
+					notice(`fusion stays on while runs are unfinished: ${names}. Wait for each run or cancel it with /fusion cancel run-N, then retry /fusion off.`, "warning");
+					return;
+				}
+				try {
+					const activeTools = pi.getActiveTools();
+					pi.setActiveTools(activeTools.filter((name) => !FUSION_TOOLS.includes(name)));
+					hidden = activeTools.filter((name) => FUSION_TOOLS.includes(name));
+				} catch (error) {
+					notice(`fusion stays on: the host's tool list did not change: ${error instanceof Error ? error.message : String(error)}`, "error");
+					return;
+				}
+				enabled = false;
+				notice("fusion is off; no run can start until /fusion on", "info");
+				return;
+			}
+			if (command.kind === "on") {
+				if (enabled) {
+					notice("fusion is already on", "info");
+					return;
+				}
+				try {
+					const activeTools = pi.getActiveTools();
+					pi.setActiveTools([...activeTools, ...hidden.filter((name) => !activeTools.includes(name))]);
+				} catch (error) {
+					notice(`fusion stays off: the host's tool list did not change: ${error instanceof Error ? error.message : String(error)}`, "error");
+					return;
+				}
+				enabled = true;
+				hidden = [];
+				notice("fusion is on", "info");
 				return;
 			}
 			if (command.kind === "dashboard") {
@@ -2168,7 +2230,7 @@ export default function fusion(pi: ExtensionAPI, options: FusionOptions = {}) {
 				if (command.handle === undefined) {
 					const all = [...runs.values()];
 					const earlier = heldRuns(ctx).map((held) => `${held.handle} · ${held.role} · ${held.model} · ${held.state} · earlier Pi process`);
-					notice([...(all.length ? all.map(statusLine) : ["no runs in this Pi session yet"]), ...earlier, usageLine()].join("\n"), "info");
+					notice([`fusion: ${enabled ? "on" : "off"}`, ...(all.length ? all.map(statusLine) : ["no runs in this Pi session yet"]), ...earlier, usageLine()].join("\n"), "info");
 					return;
 				}
 				const run = live(command.handle);
@@ -2353,9 +2415,8 @@ export default function fusion(pi: ExtensionAPI, options: FusionOptions = {}) {
 	});
 
 	pi.on("session_before_tree", async (_event, ctx) => {
-		const unfinished = [...runs.values()].filter((run) => !run.finished);
-		if (!unfinished.length) return undefined;
-		const names = unfinished.map((run) => `${run.handle} (${run.role.name}${isActive(run) ? "" : ", finishing"})`).join(", ");
+		const names = unfinishedNames();
+		if (!names) return undefined;
 		ctx.ui.notify(
 			`/tree is blocked while fusion runs are active: ${names}. A report or run record that arrives after /tree would land on the destination branch. Wait for each run or cancel it with fusion_control, then retry /tree.`,
 			"warning",
@@ -2376,6 +2437,8 @@ export default function fusion(pi: ExtensionAPI, options: FusionOptions = {}) {
 	 * in what a run then is: one lifecycle, one set of handles, one question arbitration, one ledger.
 	 */
 	const delegate = async (tool: string, toolCallId: string, params: FusionParams, signal: AbortSignal | undefined, onUpdate: LiveRun["onUpdate"], ctx: any) => {
+		// A hidden tool leaves the host's tool list on its next turn, so a call already in this one still lands here.
+		if (!enabled) throw new Error(FUSION_OFF);
 		ui = ctx.ui;
 		ensureHistory(ctx);
 		noteBudget(ctx);
@@ -2424,6 +2487,8 @@ export default function fusion(pi: ExtensionAPI, options: FusionOptions = {}) {
 		const title = `pi-fusion ${handle} ${role.name} · host ${hostSessionId}`;
 		/** Only the live run a continued call replaces knows the run it reviews, and the new one keeps naming it. */
 		const reviews = params.continue === undefined ? undefined : runs.get(params.continue)?.reviews;
+		// Off can be accepted while this call waited for the run it continues; startRun registers before its first await.
+		if (!enabled) throw new Error(FUSION_OFF);
 		const run = await startRun({
 			tool,
 			toolCallId,

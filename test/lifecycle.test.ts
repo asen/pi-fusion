@@ -85,7 +85,11 @@ function makeHost(options: HostOptions = {}) {
 	/** The same notices with the level each was shown at, for a test that reads how loud one was. */
 	const notified: Array<{ text: string; level?: string }> = [];
 	const sent: Array<[any, any]> = [];
+	/** The host's active tool list, which /fusion off and on are the only things here that change. */
+	const activeTools: string[] = ["read", "bash", "fusion", "fusion_control", "claude", "claude_control"];
 	const api = {
+		getActiveTools: () => [...activeTools],
+		setActiveTools: (names: string[]) => activeTools.splice(0, activeTools.length, ...names),
 		registerTool: (tool: any) => tools.set(tool.name, tool),
 		registerCommand: (name: string, command: any) => commands.set(name, command),
 		on: (event: string, handler: any) => handlers.set(event, handler),
@@ -125,6 +129,7 @@ function makeHost(options: HostOptions = {}) {
 		}
 	};
 	return {
+		activeTools,
 		branch,
 		notices,
 		notified,
@@ -1886,5 +1891,99 @@ test("a security record in a host that registered no pi backend is refused befor
 			"the history keeps no review run either",
 		);
 		assert.equal(after[0]!.reviewedBy, undefined, "and the restored run is linked to no review");
+	});
+});
+
+const OFF_REFUSAL = "fusion is off; turn it on with /fusion on";
+
+test("/fusion off hides the fusion tools and starts nothing, and /fusion on gives back the ones it hid", async () => {
+	await withEnv(piEnv(), async () => {
+		const pi = fakeBackend();
+		const claude = fakeBackend({ name: "claude" });
+		const host = makeHost({ backends: both(pi, claude) });
+		assert.equal((await host.fusion({ role: "implement", task: "first", backend: "pi" })).error, undefined);
+		// A tool the user had turned off before stays off after on.
+		host.activeTools.splice(host.activeTools.indexOf("claude_control"), 1);
+
+		await host.command("off");
+		assert.deepEqual(host.notices.at(-1), "fusion is off; no run can start until /fusion on");
+		assert.deepEqual(host.activeTools, ["read", "bash"]);
+		await host.command("off");
+		assert.equal(host.notices.at(-1), "fusion is already off; turn it on with /fusion on");
+		assert.deepEqual(host.activeTools, ["read", "bash"], "a second off changes nothing");
+		await host.command("status");
+		assert.match(host.notices.at(-1) ?? "", /^fusion: off\nrun-1 · implement · /);
+
+		// A call already in the host's turn when off was accepted still reaches the tools, and every one of them is refused.
+		assert.equal((await host.fusion({ role: "implement", task: "second", backend: "pi" })).error, OFF_REFUSAL);
+		assert.equal((await host.fusion({ role: "implement", task: "more", continue: "run-1" })).error, OFF_REFUSAL);
+		assert.equal((await host.claude({ role: "ask", task: "a question" })).error, OFF_REFUSAL);
+		assert.equal((await host.fusion({ role: "plan", task: "a plan", backend: "claude" })).error, OFF_REFUSAL);
+		await host.command("review run-1");
+		assert.equal(host.notices.at(-1), OFF_REFUSAL);
+		assert.equal(pi.starts.length + claude.starts.length, 1, "nothing started while off");
+		assert.equal(host.entries().length, 1, "and nothing was recorded");
+
+		// A tool the user turned on while fusion was off survives on, and on puts back only what off took.
+		host.activeTools.push("grep");
+		await host.command("on");
+		assert.equal(host.notices.at(-1), "fusion is on");
+		assert.deepEqual(host.activeTools, ["read", "bash", "grep", "fusion", "fusion_control", "claude"]);
+		await host.command("on");
+		assert.equal(host.notices.at(-1), "fusion is already on");
+		assert.deepEqual(host.activeTools, ["read", "bash", "grep", "fusion", "fusion_control", "claude"], "a second on changes nothing");
+		await host.command("status");
+		assert.match(host.notices.at(-1) ?? "", /^fusion: on\n/);
+		const again = await host.fusion({ role: "implement", task: "more", continue: "run-1" });
+		assert.equal(again.error, undefined);
+		assert.equal(pi.starts.length, 2, "a call after on starts its run");
+	});
+});
+
+test("/fusion off is refused while a run is running or waiting for an answer, and changes nothing", async () => {
+	await withEnv(piEnv(), async () => {
+		const pi = fakeBackend({ scripts: [{ pending: true }, { questions: ["Which name?"] }, {}] });
+		const host = makeHost({ backends: both(pi) });
+		const tools = [...host.activeTools];
+		await host.fusion({ role: "implement", task: "long work", backend: "pi", background: true });
+		const running = await pi.started();
+		await host.command("off");
+		assert.equal(
+			host.notices.at(-1),
+			"fusion stays on while runs are unfinished: run-1 (implement). Wait for each run or cancel it with /fusion cancel run-N, then retry /fusion off.",
+		);
+		assert.deepEqual(host.activeTools, tools);
+		running.release();
+		await ended(host, "run-1");
+
+		const asked = await host.fusion({ role: "ask", task: "a question", backend: "pi" });
+		assert.equal(asked.details.state, "waiting");
+		await host.command("off");
+		assert.match(host.notices.at(-1) ?? "", /^fusion stays on while runs are unfinished: run-2 \(ask\)\./);
+		assert.deepEqual(host.activeTools, tools, "the host can still answer the run it is waiting on");
+		await host.control({ action: "message", run: "run-2", message: "call it foo" });
+		await ended(host, "run-2");
+		await host.command("off");
+		assert.equal(host.notices.at(-1), "fusion is off; no run can start until /fusion on");
+		assert.deepEqual(host.activeTools, ["read", "bash"]);
+	});
+});
+
+test("/fusion off is refused while an automatic review is unfinished, and on starts no review of its own", async () => {
+	const dir = gitRepo("off-auto-review");
+	await withEnv({ ...piEnv(), PI_FUSION_AUTO_REVIEW: "1" }, async () => {
+		const claude = fakeBackend({ name: "claude", scripts: [{ pending: true }, { pending: true }, {}] });
+		const host = makeHost({ backends: both(fakeBackend(), claude), cwd: dir });
+		const done = await runThatChanged(host, claude, dir, { role: "implement", task: "add the retry", backend: "claude" });
+		assert.equal(done.details.reviewedBy, "run-2");
+		const review = await claude.started(2);
+		await host.command("off");
+		assert.match(host.notices.at(-1) ?? "", /^fusion stays on while runs are unfinished: run-2 \(ask\)\./);
+		review.release();
+		await ended(host, "run-2");
+		await host.command("off");
+		assert.equal(host.notices.at(-1), "fusion is off; no run can start until /fusion on");
+		await host.command("on");
+		assert.equal(claude.starts.length, 2, "on starts no review of its own");
 	});
 });

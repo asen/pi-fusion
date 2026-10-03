@@ -9,6 +9,8 @@ The user sees `run-2 reviews run-1 in the background; its report arrives as a me
 
 With `PI_FUSION_AUTO_REVIEW=1` the extension starts the same review on its own when an `implement`, `ultracode` or `security` run a delegation tool started ends `done` with changed files. It starts once per run, before the run's own report reaches the host, so the report and the tool result carry the review line. Only a run a delegation tool started gets one, so a review never reviews a review, and a failed, aborted or cancelled run never gets one. If the review cannot start, because the budget limit blocks it or for any other reason, the user is told why and the run reports as usual.
 
+While fusion is off, neither `/fusion review` nor `PI_FUSION_AUTO_REVIEW` starts a review, and `/fusion on` starts none of its own (see [Turning fusion off](fusion-command.md#turning-fusion-off)).
+
 ## Which backend reviews a run
 
 The reviewed run's role decides which backend reviews it, and a `security` run is the only one that is not reviewed by Claude.

@@ -101,6 +101,8 @@ pi --model openai-codex/gpt-6-astra --thinking high
 
 Pi activates every extension tool at startup, so `fusion`, `fusion_control`, `claude` and `claude_control` sit next to Pi's built-ins. To pin the list down, pass `--tools read,grep,find,ls,bash,fusion,fusion_control`. `--tools` is a strict allowlist: leaving `fusion` out leaves the host with no delegation, and leaving `fusion_control` out leaves background runs unmanaged. Keep `claude` and `claude_control` in the list as well if you want the compatibility names; the extension's own messages name the primary pair.
 
+To stop the host from starting runs for a while without unloading the extension, type `/fusion off`; `/fusion on` turns it back on. Off hides all four tools and is refused while any run is unfinished; see [the /fusion command](docs/fusion-command.md#turning-fusion-off).
+
 The guidelines tell the host to delegate every implementation task and not to edit files itself. That is an instruction, not enforcement: the host still has bash. To enforce it, drop bash from the tool list. The cost is that the host can no longer run git itself.
 
 ## Documentation

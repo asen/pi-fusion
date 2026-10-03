@@ -163,6 +163,8 @@ test("registers the sequential fusion and claude tool pairs, the fusion command,
 		{ value: "wait", label: "wait" },
 		{ value: "answer", label: "answer" },
 		{ value: "review", label: "review" },
+		{ value: "on", label: "on" },
+		{ value: "off", label: "off" },
 	]);
 	assert.deepEqual(command.getArgumentCompletions?.("dashboard s"), [{ value: "dashboard stop", label: "dashboard stop" }]);
 	assert.deepEqual(command.getArgumentCompletions?.("s"), [
@@ -1000,7 +1002,7 @@ test("a later /fusion dashboard gets a fresh url and session_shutdown closes it,
 });
 
 test("any other argument warns about the usage and starts nothing", async () => {
-	const usage = "Usage: /fusion dashboard | /fusion dashboard stop | /fusion status [run-N] | /fusion cancel run-N | /fusion wait run-N | /fusion steer run-N <text> | /fusion answer [run-N] [text] | /fusion review run-N";
+	const usage = "Usage: /fusion dashboard | /fusion dashboard stop | /fusion status [run-N] | /fusion cancel run-N | /fusion wait run-N | /fusion steer run-N <text> | /fusion answer [run-N] [text] | /fusion review run-N | /fusion on | /fusion off";
 	for (const args of ["", "   ", "dashboard start", "status foo", "cancel", "steer run-1"]) {
 		const notices = await runCommand(args);
 		assert.deepEqual(notices, [{ message: usage, type: "warning" }], `for ${JSON.stringify(args)}`);
