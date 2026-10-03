@@ -395,10 +395,11 @@ test("the fusion tool says which harness runs what, and the pi backend it regist
 	assert.match(fusionTool.description, /naming claude for it is refused before anything starts/);
 	assert.match(fusionTool.description, /leave backend unset unless the user names one, and a fresh run goes to the backend the configuration above names for its role/);
 	// What the configuration is, said in the description rather than as fixed model names a profile would make false.
-	assert.match(fusionTool.description, /In this session's configuration plan runs on claude with model fable at effort xhigh; implement runs on claude with model opus at effort high; ultracode runs on claude with model fable; ask runs on claude with model opus at effort high; security runs on pi with no model configured\./);
+	assert.match(fusionTool.description, /In this session's configuration plan runs on claude with model fable at effort xhigh; implement runs on claude with model opus at effort high; ultracode runs on claude with model fable; ask runs on claude with model opus at effort high; security is disabled\./);
 	assert.doesNotMatch(fusionTool.description, /Claude Fable|Claude Opus with/);
 	// The one role whose work the user has to have asked for, said in the description as well as in the guideline.
 	assert.match(fusionTool.description, /only when the user asks for a security investigation, audit or fix/);
+	assert.doesNotMatch(fusionTool.promptGuidelines?.join("\n") ?? "", /security investigation, audit or fix/, "a disabled role is not recommended in routing guidance");
 	assert.match(fusionTool.description, /never puts a secret in its report by value/);
 	assert.match(fusionTool.description, /with none it reports findings and changes no application code/);
 	assert.doesNotMatch(byName("claude").description, /\bsecurity\b/, "the compatibility tool advertises a role it cannot run nowhere");
@@ -453,10 +454,10 @@ test("the fusion tool says which harness runs what, and the pi backend it regist
 			message:
 				"role implement has no model for the pi backend: set PI_FUSION_PI_IMPLEMENT_MODEL to a provider and a model id, such as deepseek/deepseek-chat, or name one in the call's model parameter. The pi backend has no default model and resolves none for you",
 		});
-		// And the role pi alone runs, which needs no backend named to go there: the binding refuses it the same way.
+		// Security is disabled by default and is refused before model binding.
 		await assert.rejects(defaultFusion.execute("call-2", { role: "security", task: "audit the token check" }, undefined, undefined, ctx), {
 			message:
-				"role security has no model for the pi backend: set PI_FUSION_PI_SECURITY_MODEL to a provider and a model id, such as deepseek/deepseek-chat, or name one in the call's model parameter. The pi backend has no default model and resolves none for you",
+				"role security is disabled in profile builtin; change /fusion config or select another profile",
 		});
 		assert.equal(defaults.into.entries, 0, "a call the binding refused records nothing");
 	} finally {
@@ -527,10 +528,9 @@ test("a fusion call with no backend runs the role's claude defaults and records 
 	await assert.rejects(byName("fusion").execute("call-1", { role: "ultracode", task: "x", backend: "pi" }, undefined, undefined, ctx), {
 		message: "role ultracode does not run on the pi backend; use one of claude",
 	});
-	// security runs on pi alone, so naming claude for it is refused by capability, and the compatibility tool, which
-	// advertises four roles and no backend at all, refuses the name itself.
+	// Security's disabled flag wins over a backend override; the compatibility tool still refuses the role by name.
 	await assert.rejects(byName("fusion").execute("call-1", { role: "security", task: "x", backend: "claude" }, undefined, undefined, ctx), {
-		message: "role security does not run on the claude backend; use one of pi",
+		message: "role security is disabled in profile builtin; change /fusion config or select another profile",
 	});
 	await assert.rejects(byName("claude").execute("call-1", { role: "security", task: "x" }, undefined, undefined, ctx), {
 		message: "unknown role security; use one of plan, implement, ultracode, ask",

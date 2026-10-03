@@ -12,7 +12,7 @@ import fusion from "../extensions/fusion.ts";
 import { memoryProfileStore, type ProfileStore } from "../extensions/profile-store.ts";
 import { History, type HistoryRecord } from "../extensions/history.ts";
 import { type FakeBackend, fakeBackend, type FakeScript } from "./fake-pi-backend.ts";
-import { toolList, turnOn } from "./host-tools.ts";
+import { securityProfiles, toolList, turnOn } from "./host-tools.ts";
 import { piTripwire } from "./tripwire.ts";
 
 /**
@@ -1654,6 +1654,9 @@ const SECURITY_MODEL = "openai/gpt-5";
 /** The variables a security run needs beside the other roles': the role has no default model and no default level. */
 const securityEnv = (over: Record<string, string | undefined> = {}) => piEnv({ PI_FUSION_PI_SECURITY_MODEL: SECURITY_MODEL, PI_FUSION_PI_SECURITY_EFFORT: undefined, ...over });
 
+/** Security is opt-in, so these lifecycle cases load an enabled profile instead of changing the built-in defaults. */
+const makeSecurityHost = (options: HostOptions = {}) => makeHost({ ...options, profiles: options.profiles ?? securityProfiles() });
+
 /** The Pi tool lists a role is made of: the coding set a role that changes files runs with, and the read-only set a review runs with. */
 const CODING_TOOLS = ["read", "bash", "edit", "write", "grep", "find", "ls"];
 const READING_TOOLS = ["read", "bash", "grep", "find", "ls"];
@@ -1690,7 +1693,7 @@ test("a security call names no backend and runs on pi, and while it runs nothing
 	await withEnv(securityEnv(), async () => {
 		const pi = fakeBackend({ scripts: [{ pending: true }, {}] });
 		const claude = fakeBackend({ name: "claude" });
-		const host = makeHost({ backends: both(pi, claude) });
+		const host = makeSecurityHost({ backends: both(pi, claude) });
 		const started = await host.fusion({ role: "security", task: "audit the token check", background: true });
 		assert.equal(started.text, "run-1 started in the background; you get the report when it ends");
 		const writing = await pi.started();
@@ -1738,7 +1741,7 @@ test("a security run waiting for an answer keeps the writer slot, and takes one 
 	await withEnv(securityEnv(), async () => {
 		const pi = fakeBackend({ scripts: [{ questions: ["May I patch the token check, or do you want findings only?"] }] });
 		const claude = fakeBackend({ name: "claude" });
-		const host = makeHost({ backends: both(pi, claude) });
+		const host = makeSecurityHost({ backends: both(pi, claude) });
 		const asked = await host.fusion({ role: "security", task: "audit the token check" });
 		assert.match(asked.text ?? "", /^run-1 \(security\) asks:\n\nMay I patch the token check/);
 		assert.equal(asked.details.state, "waiting");
@@ -1759,14 +1762,14 @@ test("a security continuation stays on pi with the selection that run ran with, 
 	await withEnv(securityEnv({ PI_FUSION_PI_SECURITY_EFFORT: "high" }), async () => {
 		const branch: unknown[] = [];
 		const first = fakeBackend();
-		assert.equal((await makeHost({ backends: both(first), branch }).fusion({ role: "security", task: "audit the token check" })).error, undefined);
+		assert.equal((await makeSecurityHost({ backends: both(first), branch }).fusion({ role: "security", task: "audit the token check" })).error, undefined);
 		assert.deepEqual([first.starts[0]!.role.model, effortOf(first.starts[0]!.role)], [SECURITY_MODEL, "high"]);
 
 		// A fresh extension on the same branch is what a Pi restart leaves, and the variables have moved on since.
 		await withEnv({ PI_FUSION_PI_SECURITY_MODEL: "deepseek/deepseek-chat", PI_FUSION_PI_SECURITY_EFFORT: "off" }, async () => {
 			const next = fakeBackend();
 			const claude = fakeBackend({ name: "claude" });
-			const host = makeHost({ backends: both(next, claude), branch });
+			const host = makeSecurityHost({ backends: both(next, claude), branch });
 			const ran = await host.fusion({ continue: "run-1", task: "and the refresh path?" });
 			assert.equal(ran.error, undefined);
 			const start = next.starts[0]!;
@@ -1807,7 +1810,7 @@ test("a finished security run is reviewed by this session's ask run, a claude on
 	await withEnv(securityEnv({ PI_FUSION_PI_SECURITY_EFFORT: "high", PI_FUSION_PI_ASK_MODEL: PI_MODEL, PI_FUSION_PI_ASK_EFFORT: "low" }), async () => {
 		const pi = fakeBackend({ scripts: [{ pending: true, text: "## Findings\n1. high, confirmed: the token check accepts an expired token" }] });
 		const claude = fakeBackend({ name: "claude" });
-		const host = makeHost({ backends: both(pi, claude), cwd: dir });
+		const host = makeSecurityHost({ backends: both(pi, claude), cwd: dir });
 		const done = await runThatChanged(host, pi, dir, { role: "security", task: "audit the token check; fixes are authorized" });
 		assert.equal(done.error, undefined);
 		assert.deepEqual(done.details.files, ["fixed.ts"], "the run under test has to have changed files, so the reviewer it gets is the only thing left to judge");
@@ -1836,7 +1839,7 @@ test("a profile that runs ask on pi reviews every role there, on the ask role's 
 	await withEnv(securityEnv({ PI_FUSION_PI_SECURITY_EFFORT: "high" }), async () => {
 		const pi = fakeBackend({ scripts: [{ pending: true }, {}, {}] });
 		const claude = fakeBackend({ name: "claude", scripts: [{ pending: true }] });
-		const host = makeHost({ backends: both(pi, claude), cwd: dir, profiles: profileWith({ ask: { enabled: true, backend: "pi", model: PI_MODEL, effort: "low" } }) });
+		const host = makeSecurityHost({ backends: both(pi, claude), cwd: dir, profiles: profileWith({ ask: { enabled: true, backend: "pi", model: PI_MODEL, effort: "low" } }) });
 		const done = await runThatChanged(host, pi, dir, { role: "security", task: "audit the token check" });
 		assert.equal(done.error, undefined);
 		await host.command("review run-1");
@@ -1865,7 +1868,7 @@ test("PI_FUSION_AUTO_REVIEW gives a security run and a claude run the same confi
 	await withEnv({ ...securityEnv(), PI_FUSION_AUTO_REVIEW: "1" }, async () => {
 		const pi = fakeBackend({ scripts: [{ pending: true }] });
 		const claude = fakeBackend({ name: "claude", scripts: [{}, { pending: true }, {}] });
-		const host = makeHost({ backends: both(pi, claude), cwd: dir });
+		const host = makeSecurityHost({ backends: both(pi, claude), cwd: dir });
 		const done = await runThatChanged(host, pi, dir, { role: "security", task: "audit the token check" });
 		assert.ok((done.text ?? "").endsWith("\n\nrun-2 reviews this run in the background; its report arrives as a message."), done.text);
 		await ended(host, "run-2");
@@ -1879,7 +1882,7 @@ test("PI_FUSION_AUTO_REVIEW gives a security run and a claude run the same confi
 	const quiet = gitRepo("auto-review-ask-disabled");
 	await withEnv({ ...piEnv(), PI_FUSION_AUTO_REVIEW: "1" }, async () => {
 		const claude = fakeBackend({ name: "claude", scripts: [{ pending: true }] });
-		const host = makeHost({ backends: both(fakeBackend(), claude), cwd: quiet, profiles: profileWith({ ask: { enabled: false, backend: "claude" } }) });
+		const host = makeSecurityHost({ backends: both(fakeBackend(), claude), cwd: quiet, profiles: profileWith({ ask: { enabled: false, backend: "claude" } }) });
 		const done = await runThatChanged(host, claude, quiet, { role: "implement", task: "add the retry" });
 		assert.equal(done.error, undefined);
 		assert.equal(done.details.reviewedBy, undefined, "a disabled ask role starts no review");
@@ -1900,13 +1903,13 @@ test("a security run an earlier Pi process left is reviewed by this session's as
 	const branch: unknown[] = [];
 	await withEnv({ ...securityEnv(), PI_FUSION_HISTORY: "1", PI_FUSION_HISTORY_DIR: historyDir }, async () => {
 		const first = fakeBackend({ scripts: [{ pending: true }] });
-		const host = makeHost({ backends: both(first), branch, sessionFile, cwd: dir });
+		const host = makeSecurityHost({ backends: both(first), branch, sessionFile, cwd: dir });
 		const done = await runThatChanged(host, first, dir, { role: "security", task: "audit the token check", model: "openrouter/deepseek/deepseek-chat", effort: "max" });
 		assert.equal(done.error, undefined);
 	});
 	await withEnv({ ...securityEnv(), PI_FUSION_HISTORY: "1", PI_FUSION_HISTORY_DIR: historyDir }, async () => {
 		const later = fakeBackend();
-		const host = makeHost({ backends: both(later), branch, sessionFile, cwd: dir, profiles: profileWith({ ask: { enabled: true, backend: "pi", model: PI_MODEL, effort: "medium" } }) });
+		const host = makeSecurityHost({ backends: both(later), branch, sessionFile, cwd: dir, profiles: profileWith({ ask: { enabled: true, backend: "pi", model: PI_MODEL, effort: "medium" } }) });
 		const status = await statusOf(host, "run-1");
 		assert.match(status, /\nreview it with \/fusion review run-1$/);
 		host.notices.length = 0;
@@ -1925,7 +1928,7 @@ test("an ask reviewer this host cannot bind refuses the review in the binding's 
 	await withEnv(securityEnv(), async () => {
 		const pi = fakeBackend({ scripts: [{ pending: true }, {}] });
 		const claude = fakeBackend({ name: "claude" });
-		const host = makeHost({ backends: both(pi, claude), cwd: dir, profiles: profileWith({ ask: { enabled: true, backend: "pi" } }) });
+		const host = makeSecurityHost({ backends: both(pi, claude), cwd: dir, profiles: profileWith({ ask: { enabled: true, backend: "pi" } }) });
 		const done = await runThatChanged(host, pi, dir, { role: "security", task: "audit the token check" });
 		assert.equal(done.error, undefined);
 		host.notices.length = 0;
@@ -1952,7 +1955,7 @@ test("an ask reviewer configured on a backend this host did not register is refu
 	]);
 	await withEnv({ ...securityEnv(), PI_FUSION_HISTORY: "1", PI_FUSION_HISTORY_DIR: dir }, async () => {
 		const claude = fakeBackend({ name: "claude" });
-		const host = makeHost({ backends: { pi: undefined, claude: claude.backend }, sessionFile, profiles: profileWith({ ask: { enabled: true, backend: "pi", model: PI_MODEL } }) });
+		const host = makeSecurityHost({ backends: { pi: undefined, claude: claude.backend }, sessionFile, profiles: profileWith({ ask: { enabled: true, backend: "pi", model: PI_MODEL } }) });
 		await host.command("review run-1");
 		assert.deepEqual(host.notices, [
 			"the pi backend is not available in this build: run-2 would review run-1, and this pi-fusion runs claude only. Nothing was started and nothing was recorded. Take the work to claude with a role it runs, or do it yourself; no configuration makes pi available here.",

@@ -1,3 +1,6 @@
+import { memoryProfileStore } from "../extensions/profile-store.ts";
+import { builtinSettings, captureBaseline, serializeDocument } from "../extensions/profiles.ts";
+
 /**
  * The host's tool list as a fake ExtensionAPI models it, and the one way a test host turns Fusion on. Fusion starts off
  * in every extension instance, so a host whose case delegates turns it on the way a user's request does, through the
@@ -6,6 +9,13 @@
 
 /** What Pi activates for an extension loaded with no allow list: its own builtins beside every tool registered. */
 export const STARTING_TOOLS = ["read", "bash", "fusion", "fusion_control", "claude", "claude_control", "fusion_activate", "fusion_deactivate"];
+
+/** Security lifecycle cases explicitly opt in through a saved profile, retaining the model and effort they configured. */
+export function securityProfiles() {
+	const roles = builtinSettings(captureBaseline());
+	roles.security.enabled = true;
+	return memoryProfileStore(serializeDocument({ version: 1, defaultProfile: "security", profiles: { security: roles } }));
+}
 
 /**
  * The three accessors Fusion reads the host's tool list through, over a list the case can read and change. `offered` is

@@ -37,7 +37,7 @@ The host itself does not have to be idle. Applying settings updates the tools' d
 
 ## The built-in configuration and the session's lifetime
 
-The built-in configuration is the legacy behavior. Every role is enabled. `security` runs on `pi`, and every other role runs on `claude`. Models and efforts come from the [role variables](configuration.md), read once when the extension instance starts. `security` stays unconfigured until `PI_FUSION_PI_SECURITY_MODEL` names a model.
+The built-in configuration enables every role except `security`. Enable security through `/fusion config` or a saved profile when you need it. Its backend is `pi`; every other role defaults to `claude`. Models and efforts come from the [role variables](configuration.md), read once when the extension instance starts. `PI_FUSION_PI_SECURITY_MODEL` configures security's model but does not enable the role. Saved profiles keep their own enabled settings.
 
 When an extension instance starts, it loads the default profile from the file. Starting Pi, `/new`, a reload, a resume and a fork each start a new instance. If there is no default profile, the session starts on `builtin`. If the file can't be read, isn't valid, or names a default it doesn't hold, the session also starts on `builtin`, and you get a warning once a notice can be shown. Nothing rewrites the file in that case.
 
@@ -77,7 +77,7 @@ plan       yes      claude   fable                   xhigh
 implement  yes      pi       deepseek/deepseek-chat  high
 ultracode  no       claude   fable                   ultracode (fixed)
 ask        yes      claude   opus                    high
-security   yes      pi       unconfigured            child default
+security   no       pi       unconfigured            child default
 ```
 
 Pick a role to change these settings:

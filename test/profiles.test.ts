@@ -60,18 +60,18 @@ const records = (...entries: Array<Record<string, unknown>>): RunRecords => runR
 // ---------------------------------------------------------------------------------------------------------------------
 // The configuration itself: pure, with no file and no host.
 
-test("the built-in configuration is the legacy defaults: every role enabled on its legacy backend, captured from the environment it is given", () => {
+test("the built-in configuration disables security even with a configured model, and captures each role's defaults from the environment", () => {
 	assert.deepEqual(LEGACY, {
 		plan: { enabled: true, backend: "claude", model: "fable", effort: "xhigh" },
 		implement: { enabled: true, backend: "claude", model: "opus", effort: "high" },
 		ultracode: { enabled: true, backend: "claude", model: "fable", effort: "ultracode" },
 		ask: { enabled: true, backend: "claude", model: "opus", effort: "high" },
-		security: { enabled: true, backend: "pi" },
+		security: { enabled: false, backend: "pi" },
 	});
 	const env = { PI_FUSION_IMPLEMENT_MODEL: "sonnet", PI_FUSION_ASK_EFFORT: "low", PI_FUSION_PI_SECURITY_MODEL: "deepseek/deepseek-chat", PI_FUSION_PI_PLAN_EFFORT: "high" } as NodeJS.ProcessEnv;
 	const captured = captureBaseline(env);
 	assert.deepEqual(builtinSettings(captured).implement, { enabled: true, backend: "claude", model: "sonnet", effort: "high" });
-	assert.deepEqual(builtinSettings(captured).security, { enabled: true, backend: "pi", model: "deepseek/deepseek-chat" });
+	assert.deepEqual(builtinSettings(captured).security, { enabled: false, backend: "pi", model: "deepseek/deepseek-chat" });
 	assert.deepEqual(captured.plan.pi, { effort: "high" }, "the other backend's legacy defaults are captured too, for a call that names it");
 	env.PI_FUSION_IMPLEMENT_MODEL = "haiku";
 	assert.equal(captured.implement.claude?.model, "sonnet", "a baseline is a copy: a variable changed later does not reach it");
@@ -111,6 +111,20 @@ test("a configuration is validated whole: every role, its backend, its model and
 	assert.equal(loose.plan.model, "openrouter/deepseek/deepseek-chat", "a provider's own slashes survive");
 	// A disabled role's supplied fields are still checked.
 	assert.throws(() => parseSettings({ ...LEGACY, ask: { enabled: false, backend: "pi", model: "nope" } }), /roles\.ask\.model "nope"/);
+});
+
+test("built-in security refuses explicit models and continuations, while a saved profile can enable it", () => {
+	const config = builtinConfiguration(captureBaseline({ PI_FUSION_PI_SECURITY_MODEL: "openai/gpt-5" }));
+	const branch = records({ run: "run-1", role: "security", backend: "pi", hostSessionId: "host-1", session: { backend: "pi", sessionId: "pi-1", sessionFile: "/sessions/pi-1.jsonl", checkpoint: "entry-1" }, selection: { model: "openai/gpt-5", effort: "medium" } });
+	for (const call of [{ role: "security", task: "audit" }, { role: "security", task: "audit", backend: "pi", model: "openai/gpt-5" }, { continue: "run-1", task: "audit more" }]) {
+		assert.throws(() => fusionCall(call, branch, 35, config), /role security is disabled in profile builtin/);
+	}
+	const roles = copySettings(config.roles);
+	roles.security.enabled = true;
+	const saved = parseDocument(JSON.parse(document({ security: roles }, "security")));
+	const enabled: Configuration = { ...config, profile: "security", roles: saved.profiles.security! };
+	assert.equal(fusionCall({ role: "security", task: "audit" }, records(), 35, enabled).bound.model, "openai/gpt-5");
+	assert.equal(fusionCall({ continue: "run-1", task: "audit more" }, branch, 35, enabled).handle, "run-1");
 });
 
 test("a copy of a configuration shares nothing with it", () => {
@@ -154,7 +168,7 @@ test("the configuration table names every role with its backend, model and effor
 		"implement  no       claude   unconfigured            none",
 		"ultracode  yes      claude   fable                   ultracode (fixed)",
 		"ask        yes      pi       deepseek/deepseek-chat  child default",
-		"security   yes      pi       unconfigured            child default",
+		"security   no       pi       unconfigured            child default",
 	]);
 });
 
@@ -287,8 +301,9 @@ test("a pi role a profile leaves unconfigured is refused in that profile's words
 		/^Error: role security has no model for the pi backend in profile work \(modified\): choose a provider and a model id, such as deepseek\/deepseek-chat, with \/fusion config, or name one in the call's model parameter/,
 	);
 	assert.equal(fusionCall({ role: "security", task: "x", model: "openai/gpt-5" }, records(), 35, config).bound.model, "openai/gpt-5");
-	// The built-in configuration as it started is the variables, and says so.
-	assert.equal(fusionCall({ role: "security", task: "x" }, records(), 35, builtinConfiguration(piBaseline)).bound.model, "deepseek/deepseek-chat");
+	// The built-in configuration keeps the configured model without enabling the role.
+	assert.equal(builtinConfiguration(piBaseline).roles.security.model, "deepseek/deepseek-chat");
+	assert.throws(() => fusionCall({ role: "security", task: "x" }, records(), 35, builtinConfiguration(piBaseline)), /role security is disabled in profile builtin/);
 });
 
 test("a session-less pi handle fails closed under a profile, and retrying fresh uses that profile", () => {
@@ -513,7 +528,7 @@ test("the default profile loads as the session starts, and the host's guidance a
 	const description = host.tools.get("fusion")!.description;
 	assert.match(description, /In this session's configuration plan runs on claude with model fable at effort xhigh; implement runs on claude with model sonnet at effort low; ultracode is disabled; ask runs on claude with model haiku at effort medium;/);
 	const guidelines = host.tools.get("fusion")!.promptGuidelines ?? [];
-	assert.ok(guidelines.some((line) => /disables role ultracode: a fusion call to a disabled role is refused/.test(line)), guidelines.join("\n"));
+	assert.ok(guidelines.some((line) => /disables role ultracode, role security: a fusion call to a disabled role is refused/.test(line)), guidelines.join("\n"));
 	assert.ok(!guidelines.some((line) => /Use fusion with role ultracode/.test(line)), "a disabled role is recommended nowhere");
 	assert.match(host.tools.get("claude")!.description, /ultracode is disabled/);
 	assert.deepEqual(host.active, ["read", "bash", "fusion_activate"], "and fusion starts off, with only its way in offered");
@@ -610,7 +625,7 @@ test("profile save, list, use and default each do one thing, and only use change
 	assert.equal(host.last(), "the default was not changed: unknown profile nope; the profiles are builtin, work");
 	assert.equal(parseDocument(JSON.parse(store.text()!)).defaultProfile, "work");
 	await host.command("profile use builtin");
-	assert.equal(host.last(), "fusion uses profile builtin in this session");
+	assert.equal(host.last(), "fusion uses profile builtin in this session; disabled: security");
 	await host.command("profile list");
 	assert.equal(host.last(), "builtin (current)\nwork (default for new sessions)");
 	await host.command("profile use nope");
@@ -645,7 +660,7 @@ test("prototype-key profile names are unknown unless explicitly saved, and then 
 		await host.command(`profile save ${name}`);
 		assert.match(host.last() ?? "", new RegExp(`^replaced profile ${name};`));
 		await host.command(`profile use ${name}`);
-		assert.equal(host.last(), `fusion uses profile ${name} in this session`);
+		assert.equal(host.last(), `fusion uses profile ${name} in this session; disabled: security`);
 		await host.command(`profile default ${name}`);
 		assert.equal((await store.read()).defaultProfile, name);
 		const restored = sdkHost({ profiles: store, ui: false });
@@ -706,7 +721,7 @@ test("applying settings is refused while any run is unfinished, and saving or ch
 	run.release();
 	await run.call;
 	await host.command("profile use work");
-	assert.equal(host.last(), "fusion uses profile work in this session; disabled: ultracode");
+	assert.equal(host.last(), "fusion uses profile work in this session; disabled: ultracode, security");
 	assert.equal((await host.fusion({ role: "implement", task: "x" })).error, undefined);
 	assert.equal(claude.starts[1]!.role.model, "sonnet");
 });
@@ -746,7 +761,7 @@ test("the editor stages every change and applies them together, and a run that s
 	});
 	await host.start();
 	await host.command("config");
-	assert.equal(host.last(), "fusion settings applied to this session; disabled: ultracode; save them with /fusion profile save <name>");
+	assert.equal(host.last(), "fusion settings applied to this session; disabled: ultracode, security; save them with /fusion profile save <name>");
 	assert.match(host.tools.get("fusion")!.description, /implement runs on pi with model openrouter\/deepseek\/deepseek-r1 at effort high; ultracode is disabled/);
 	await host.command("profile list");
 	assert.match(host.last() ?? "", /^builtin \(current, modified; default for new sessions\)$/m);
@@ -815,7 +830,7 @@ test("a re-registration keeps the host's active tools exactly as they were, unde
 	await host.command("off");
 	assert.deepEqual(host.active, ["read", "fusion_activate"]);
 	await host.command("profile use work");
-	assert.equal(host.last(), "fusion uses profile work in this session; disabled: ultracode");
+	assert.equal(host.last(), "fusion uses profile work in this session; disabled: ultracode, security");
 	assert.deepEqual(host.active, ["read", "fusion_activate"], "nothing the allow list names came back while fusion is off");
 	assert.match(host.tools.get("fusion")!.description, /implement runs on claude with model sonnet/, "and the hidden tools carry the new guidance");
 	await host.command("on");
@@ -884,7 +899,7 @@ test("a failed guidance refresh rolls back settings, both tool definitions and t
 				await host.command("config");
 				assert.match(host.last() ?? "", /^fusion configuration: builtin ·/);
 				await host.command("profile use work");
-				assert.equal(host.last(), "fusion uses profile work in this session; disabled: ultracode", "a one-shot failure does not prevent a later retry");
+				assert.equal(host.last(), "fusion uses profile work in this session; disabled: ultracode, security", "a one-shot failure does not prevent a later retry");
 				assert.deepEqual(host.active, active);
 			}
 		}
@@ -906,7 +921,7 @@ test("the profile chooser lists every profile with its marks and loads the one p
 	await host.start();
 	await host.command("profile");
 	assert.equal(host.titles.at(-1), "fusion profile: load one into this session");
-	assert.equal(host.last(), "fusion uses profile builtin in this session");
+	assert.equal(host.last(), "fusion uses profile builtin in this session; disabled: security");
 	await host.command("profile");
 	assert.equal(host.last(), "fusion profile: nothing changed");
 	assert.match(host.tools.get("fusion")!.description, /ultracode runs on claude with model fable/);

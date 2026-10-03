@@ -549,7 +549,7 @@ export interface Configuration {
 	baseline: Baseline;
 }
 
-/** The built-in configuration over a baseline: the legacy defaults, every role enabled on its legacy backend. */
+/** The built-in configuration over a baseline, with security disabled until the user enables it. */
 export function builtinConfiguration(baseline: Baseline = captureBaseline()): Configuration {
 	return { profile: BUILTIN, modified: false, roles: builtinSettings(baseline), baseline };
 }

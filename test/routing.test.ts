@@ -8,12 +8,12 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { type PiRole, piModelVariable, piRole } from "../extensions/backends/pi-binding.ts";
 import type { Backend, ChildControl, ChildRun, HostBackend, PiSessionRef, ResolvedSelection, SessionIntent } from "../extensions/backends/types.ts";
 import { hostBackend } from "../extensions/backends/types.ts";
-import fusion, { claudeCall, claudeRoute, type FusionParams, fusionCall, fusionRoute, ROLE_NAMES, roleFor, type RunRecords, runRecords } from "../extensions/fusion.ts";
+import fusion, { builtinConfiguration, claudeCall, claudeRoute, type FusionParams, fusionCall, fusionRoute, ROLE_NAMES, roleFor, type RunRecords, runRecords } from "../extensions/fusion.ts";
 import { KNOWN_ROLE_NAMES, roleSpec } from "../extensions/roles.ts";
 import { History } from "../extensions/history.ts";
-import { memoryProfileStore } from "../extensions/profile-store.ts";
+import { memoryProfileStore, type ProfileStore } from "../extensions/profile-store.ts";
 import { PI_SELECTION_VARIABLES, piTripwire, productionDefaults } from "./tripwire.ts";
-import { toolList, turnOn } from "./host-tools.ts";
+import { securityProfiles, toolList, turnOn } from "./host-tools.ts";
 
 const tempDirs: string[] = [];
 after(() => {
@@ -64,26 +64,29 @@ test("an explicit backend must run the role, and an unknown one names the backen
 });
 
 test("the security role runs on pi alone: a call with no backend goes there, claude is refused and a record continues there", () => {
+	const config = builtinConfiguration();
+	config.roles.security.enabled = true;
+	config.modified = true;
 	// Pi is the sole backend the role runs on, so a call that names no backend goes there rather than to the default one.
-	const fresh = fusionRoute({ role: "security", task: "audit the token check" }, records());
+	const fresh = fusionRoute({ role: "security", task: "audit the token check" }, records(), 35, config);
 	assert.deepEqual([fresh.backend, fresh.role, fresh.handle], ["pi", "security", "run-1"]);
-	assert.equal(fusionRoute({ role: "security", task: "x", backend: "pi" }, records()).backend, "pi");
-	assert.throws(() => fusionRoute({ role: "security", task: "x", backend: "claude" }, records()), /^Error: role security does not run on the claude backend; use one of pi$/);
+	assert.equal(fusionRoute({ role: "security", task: "x", backend: "pi" }, records(), 35, config).backend, "pi");
+	assert.throws(() => fusionRoute({ role: "security", task: "x", backend: "claude" }, records(), 35, config), /^Error: role security does not run on the claude backend; use one of pi$/);
 	// The compatibility tool advertises four roles and this is not one of them, so its own list refuses it by name
 	// rather than by a capability that tool never advertised.
-	assert.throws(() => claudeRoute({ role: "security", task: "x" }, records()), /^Error: unknown role security; use one of plan, implement, ultracode, ask$/);
-	assert.throws(() => claudeCall({ role: "security", task: "x" }, records()), /^Error: unknown role security; use one of plan, implement, ultracode, ask$/);
+	assert.throws(() => claudeRoute({ role: "security", task: "x" }, records(), 35, config), /^Error: unknown role security; use one of plan, implement, ultracode, ask$/);
+	assert.throws(() => claudeCall({ role: "security", task: "x" }, records(), 35, config), /^Error: unknown role security; use one of plan, implement, ultracode, ask$/);
 	// A security record on the branch is continued on the backend it ran on, with the selection that run ran with.
 	const branch = records({ run: "run-1", role: "security", backend: "pi", hostSessionId: "host-1", session: { ...PI_REF }, selection: { ...PI_SELECTION } });
-	const continued = fusionCall({ continue: "run-1", task: "and the refresh path?" }, branch);
+	const continued = fusionCall({ continue: "run-1", task: "and the refresh path?" }, branch, 35, config);
 	assert.deepEqual(
 		[continued.backend, continued.handle, continued.bound.name, continued.bound.model, continued.bound.contract],
 		["pi", "run-1", "security", "deepseek/deepseek-chat", "security.md"],
 	);
 	// The whole selection the run ran with is what its binding repeats, the thinking level included.
 	assert.deepEqual(piRole(continued.call, continued.record?.selection, piEnv()), { name: "security", model: "deepseek/deepseek-chat", effort: "medium", contract: "security.md", ...PI_CODING_METADATA });
-	assert.equal(fusionRoute({ continue: "run-1", task: "x", backend: "pi" }, branch).backend, "pi");
-	assert.throws(() => fusionRoute({ continue: "run-1", task: "x", backend: "claude" }, branch), /^Error: run-1 ran on the pi backend; omit backend or use pi$/);
+	assert.equal(fusionRoute({ continue: "run-1", task: "x", backend: "pi" }, branch, 35, config).backend, "pi");
+	assert.throws(() => fusionRoute({ continue: "run-1", task: "x", backend: "claude" }, branch, 35, config), /^Error: run-1 ran on the pi backend; omit backend or use pi$/);
 	// A role nothing knows is refused by the roles there are, which is every role a record may name.
 	assert.throws(() => fusionRoute({ role: "audit", task: "x" } as FusionParams, records()), /^Error: unknown role audit; use one of plan, implement, ultracode, ask, security$/);
 });
@@ -448,9 +451,9 @@ function recorder(): { ext: Extension; api: ExtensionAPI } {
  * default, with the backends the case named over it. A case that wants the defaults themselves says so with
  * `defaultExtension`, and there is exactly one of those in this file.
  */
-const makeExtension = (backends: Partial<Record<"claude" | "pi", HostBackend>> = {}): Extension => {
+const makeExtension = (backends: Partial<Record<"claude" | "pi", HostBackend>> = {}, profiles: ProfileStore = memoryProfileStore()): Extension => {
 	const { ext, api } = recorder();
-	fusion(api, { backends: { ...piTripwire(), ...backends }, profiles: memoryProfileStore() });
+	fusion(api, { backends: { ...piTripwire(), ...backends }, profiles });
 	void turnOn(ext.tools.get("fusion_activate"));
 	return ext;
 };
@@ -550,7 +553,7 @@ test("a security call goes to the injected pi backend with no backend named, and
 	process.env.PI_FUSION_PI_SECURITY_EFFORT = "xhigh";
 	try {
 		const { backend, started } = stubBackend();
-		const ext = makeExtension({ pi: backend });
+		const ext = makeExtension({ pi: backend }, securityProfiles());
 		const ran = await call(ext, "fusion", { role: "security", task: "audit the token check" }, makeCtx());
 		assert.equal(ran.error, undefined);
 		assert.match(ran.text ?? "", /^## Changed\nfoo\.ts\n\n\[run-1 · security · deepseek\/deepseek-chat · /);
@@ -676,12 +679,11 @@ test("the pi backend this build registers is reached through its binding, which 
 			"role implement has no model for the pi backend: set PI_FUSION_PI_IMPLEMENT_MODEL to a provider and a model id, such as deepseek/deepseek-chat, or name one in the call's model parameter. The pi backend has no default model and resolves none for you",
 		);
 		assert.doesNotMatch(refused.error ?? "", /not available in this build/, "the backend is registered now, so an unconfigured call is refused by the binding rather than by availability");
-		// The role pi alone runs takes the same path with no backend named at all: routed to pi, then refused by the
-		// binding for having no model, before that backend is asked for a session, a control or a run.
+		// Security is disabled by default, so its role guard refuses it before model binding.
 		const security = await call(ext, "fusion", { role: "security", task: "audit the token check" }, makeCtx());
 		assert.equal(
 			security.error,
-			"role security has no model for the pi backend: set PI_FUSION_PI_SECURITY_MODEL to a provider and a model id, such as deepseek/deepseek-chat, or name one in the call's model parameter. The pi backend has no default model and resolves none for you",
+			"role security is disabled in profile builtin; change /fusion config or select another profile",
 		);
 		assert.deepEqual(ext.appended, [], "a refused call records nothing");
 		// The handle was not taken either: the next call is still run-1.

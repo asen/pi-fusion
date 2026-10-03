@@ -14,7 +14,7 @@ export const CLAUDE_EFFORTS = ["low", "medium", "high", "xhigh", "max"] as const
 /** The one effort ultracode runs at: xhigh plus the standing workflow opt-in, so no other level is a choice for it. */
 export const ULTRACODE_EFFORT = "ultracode";
 
-/** The name the legacy defaults go by. It is never a stored profile, so it can be neither saved over nor deleted. */
+/** The name the built-in defaults go by. It is never a stored profile, so it can be neither saved over nor deleted. */
 export const BUILTIN = "builtin";
 
 /** What a profile may be called: plain, case-sensitive and short enough to type. */
@@ -71,12 +71,12 @@ export const defaultBackend = (role: KnownRoleName): BackendName => {
 	return backends.length === 1 ? backends[0]! : "claude";
 };
 
-/** The settings the legacy behavior amounts to: every role enabled on its default backend, with that backend's defaults. */
+/** The built-in role defaults: security is opt-in; model and effort defaults come from the captured baseline. */
 export function builtinSettings(baseline: Baseline): RoleSettings {
 	const settings = {} as RoleSettings;
 	for (const role of KNOWN_ROLE_NAMES) {
 		const backend = defaultBackend(role);
-		settings[role] = { enabled: true, backend, ...copySelection(baseline[role][backend]) };
+		settings[role] = { enabled: role !== "security", backend, ...copySelection(baseline[role][backend]) };
 	}
 	return settings;
 }
