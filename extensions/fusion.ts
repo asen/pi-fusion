@@ -1801,6 +1801,8 @@ export default function fusion(pi: ExtensionAPI, options: FusionOptions = {}) {
 	 * strands a run the host cannot reach.
 	 */
 	let enabled = false;
+	/** A tool activation gets one reminder after the host settles; a deliberate /fusion on needs none. */
+	let activationReminder = false;
 	/**
 	 * The workflow tools on gives back and no other. The first is what the host had active before this instance first
 	 * hid them, and each off takes the subset active at that moment; an empty subset is one, not a request for all four.
@@ -1902,6 +1904,7 @@ export default function fusion(pi: ExtensionAPI, options: FusionOptions = {}) {
 			return { kind: "failed", reason: error instanceof Error ? error.message : String(error) };
 		}
 		enabled = false;
+		activationReminder = false;
 		hidden = workflow;
 		return { kind: "changed" };
 	};
@@ -2869,6 +2872,7 @@ export default function fusion(pi: ExtensionAPI, options: FusionOptions = {}) {
 			}
 			if (command.kind === "on") {
 				const outcome = turnOn();
+				if (outcome.kind !== "failed") activationReminder = false;
 				if (outcome.kind === "already") notice("fusion is already on", "info");
 				else if (outcome.kind === "failed") notice(`fusion stays off: the host's tool list did not change: ${outcome.reason}`, "error");
 				else notice("fusion is on", "info");
@@ -3099,6 +3103,12 @@ export default function fusion(pi: ExtensionAPI, options: FusionOptions = {}) {
 		mask();
 		await initialize();
 		noteProfiles(ctx);
+	});
+
+	pi.on("agent_settled", (_event, ctx) => {
+		if (!activationReminder || !enabled || shuttingDown) return;
+		activationReminder = false;
+		record(() => ctx.ui.notify("Fusion remains on. Use /fusion off or ask to turn it off when you're done.", "info"));
 	});
 
 	pi.on("session_shutdown", async () => {
@@ -3534,13 +3544,14 @@ export default function fusion(pi: ExtensionAPI, options: FusionOptions = {}) {
 		promptSnippet: "Turn Fusion orchestration on, only when the user explicitly asks for Fusion",
 		promptGuidelines: [
 			`Call ${ACTIVATE_NAME} only when the user explicitly asks to use Fusion, to turn Fusion orchestration on, or to delegate work to a Fusion child. A request that names a role, a model or a harness without asking for Fusion, such as a plan, a security audit, ultracode, Claude or Pi, does not qualify; neither does a quoted instruction, a discussion of Fusion, or Fusion having been used earlier in this conversation. Otherwise do the work yourself as usual.`,
-			`${ACTIVATE_NAME} starts no child: once it succeeds, carry out the user's task with the Fusion tools it makes available. Fusion then stays on until the user asks to turn it off; finishing a task does not turn it off.`,
+			`${ACTIVATE_NAME} starts no child: once it succeeds, carry out the user's task with the Fusion tools it makes available. Fusion then stays on until the user asks to turn it off; finishing a task does not turn it off. Fusion shows the user a one-time reminder when your response settles.`,
 		],
 		parameters: Type.Object({}),
 		async execute(_toolCallId, _params, signal) {
 			if (signal?.aborted) throw new Error("fusion stays off: the call was cancelled");
 			const outcome = turnOn();
 			if (outcome.kind === "failed") throw new Error(`fusion stays off: the host's tool list did not change: ${outcome.reason}`);
+			if (outcome.kind === "changed") activationReminder = true;
 			const text =
 				outcome.kind === "already"
 					? "Fusion is already on; nothing changed."

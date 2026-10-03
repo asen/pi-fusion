@@ -482,6 +482,7 @@ function sdkHost(options: SdkHostOptions = {}) {
 		branch,
 		dialogs,
 		start: async () => handlers.get("session_start")!({ type: "session_start", reason: "startup" }, ctx),
+		settled: async () => handlers.get("agent_settled")!({ type: "agent_settled" }, ctx),
 		/** Turns Fusion on as a user's request for it does, through the activation tool. */
 		on: () => turnOn(tools.get("fusion_activate"), ctx),
 		command: async (args: string) => commands.get("fusion")!.handler(args, ctx),
@@ -961,6 +962,55 @@ test("the mode tools and the commands make the same change, each idempotent, kee
 	assert.deepEqual(host.active, ["read", "bash", "grep", "fusion_activate"]);
 	await host.call("fusion_activate", {});
 	assert.deepEqual(host.active, ["read", "bash", "grep", "fusion", "claude", "fusion_control", "fusion_deactivate"], "the tool gives back what the command took");
+});
+
+test("tool activation reminds once at the next host settlement, without turning Fusion off", async () => {
+	const host = sdkHost();
+	await host.start();
+	await host.settled();
+	assert.deepEqual(host.notices, [], "starting off has no reminder");
+	await host.call("fusion_activate", {});
+	assert.deepEqual(host.notices, [], "activation waits for the host to settle");
+	await host.settled();
+	assert.deepEqual(host.notices, [["Fusion remains on. Use /fusion off or ask to turn it off when you're done.", "info"]]);
+	assert.deepEqual(host.active, ON_TOOLS, "the reminder keeps Fusion available");
+	await host.call("fusion_activate", {});
+	await host.settled();
+	assert.equal(host.notices.length, 1, "a stale activation does not rearm the reminder");
+	await host.call("fusion_deactivate", {});
+	await host.call("fusion_activate", {});
+	await host.settled();
+	assert.equal(host.notices.length, 2, "a new activation gets its own reminder");
+	await host.shutdown();
+});
+
+test("manual activation and successful deactivation clear a pending activation reminder", async () => {
+	const host = sdkHost();
+	await host.start();
+	await host.command("on");
+	host.notices.length = 0;
+	await host.settled();
+	assert.deepEqual(host.notices, [], "manual activation needs no reminder");
+	await host.command("off");
+	await host.call("fusion_activate", {});
+	await host.command("on");
+	host.notices.length = 0;
+	await host.settled();
+	assert.deepEqual(host.notices, [], "manual on suppresses a pending reminder even when already on");
+	assert.deepEqual(host.active, ON_TOOLS);
+	for (const off of [() => host.command("off"), () => host.call("fusion_deactivate", {})]) {
+		await host.command("off");
+		await host.call("fusion_activate", {});
+		await off();
+		host.notices.length = 0;
+		await host.settled();
+		assert.deepEqual(host.notices, [], "turning off clears the pending reminder");
+		await host.command("on");
+		host.notices.length = 0;
+		await host.settled();
+		assert.deepEqual(host.notices, [], "an old reminder stays cleared after manual reactivation");
+	}
+	await host.shutdown();
 });
 
 test("deactivation is refused while a run is running, waiting or finishing, by the tool and the command alike, and cancels nothing", async () => {

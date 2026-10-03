@@ -153,13 +153,13 @@ function assertCommon(run: Invocation, contract: string) {
 	assert.match(run.text, /\n\n\[.+ · \d+ tool calls · in \d+ out \d+ · context [\d.]+k\/[\d.]+M \(<1%\) · workflow agents 250 tokens · claude --resume [^\]]+\]$/);
 }
 
-test("registers the sequential fusion and claude tool pairs and the two mode tools, the fusion command, one session_shutdown handler and one session_before_tree handler", () => {
+test("registers the sequential fusion and claude tool pairs and the two mode tools, the fusion command and the session and settlement handlers", () => {
 	assert.deepEqual(
 		tools.map((tool) => tool.name),
 		["fusion", "claude", "fusion_control", "claude_control", "fusion_activate", "fusion_deactivate"],
 	);
 	for (const name of ["fusion", "claude", "fusion_control", "claude_control", "fusion_activate", "fusion_deactivate"]) assert.equal(byName(name).executionMode, "sequential", name);
-	assert.deepEqual([...handlers.keys()], ["session_start", "session_shutdown", "session_before_tree"]);
+	assert.deepEqual([...handlers.keys()], ["session_start", "agent_settled", "session_shutdown", "session_before_tree"]);
 	const command = commands.get("fusion");
 	assert.ok(command, "the fusion command is not registered");
 	assert.ok(command.description, "the command needs a description for the command list");
