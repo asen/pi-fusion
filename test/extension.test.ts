@@ -14,6 +14,7 @@ import fusion from "../extensions/fusion.ts";
 import { memoryProfileStore } from "../extensions/profile-store.ts";
 import { fakeBackend } from "./fake-pi-backend.ts";
 import { PI_SELECTION_VARIABLES, piTripwire, productionDefaults } from "./tripwire.ts";
+import { toolList, turnOn } from "./host-tools.ts";
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 process.env.PI_FUSION_CLAUDE_BIN = path.join(repoRoot, "test", "fake-claude.mjs");
@@ -60,7 +61,9 @@ const commands = new Map<string, RegisteredCommand>();
 const renderers = new Map<string, Renderer>();
 const handlers = new Map<string, (event: any, ctx: any) => Promise<void> | void>();
 let appendedEntries = 0;
+const { activeTools: _active, ...toolAccess } = toolList(() => tools.map((tool) => tool.name));
 const api = {
+	...toolAccess,
 	// A tool registered again under its own name replaces the one before it, as the SDK does.
 	registerTool: (tool: RegisteredTool) => {
 		const at = tools.findIndex((candidate) => candidate.name === tool.name);
@@ -84,6 +87,8 @@ const api = {
 // The tripwire in place of the pi backend this build registers: nothing in this file runs a pi child, and the one case
 // that reads the production registration makes its own below.
 fusion(api, { backends: { ...piTripwire() }, profiles: memoryProfileStore() });
+// Fusion starts off; the cases here delegate, so the host turns it on as a user's request for Fusion does.
+void turnOn(tools.find((tool) => tool.name === "fusion_activate"));
 
 const ctx = {
 	cwd: repoRoot,
@@ -148,12 +153,12 @@ function assertCommon(run: Invocation, contract: string) {
 	assert.match(run.text, /\n\n\[.+ · \d+ tool calls · in \d+ out \d+ · context [\d.]+k\/[\d.]+M \(<1%\) · workflow agents 250 tokens · claude --resume [^\]]+\]$/);
 }
 
-test("registers the sequential fusion and claude tool pairs, the fusion command, one session_shutdown handler and one session_before_tree handler", () => {
+test("registers the sequential fusion and claude tool pairs and the two mode tools, the fusion command, one session_shutdown handler and one session_before_tree handler", () => {
 	assert.deepEqual(
 		tools.map((tool) => tool.name),
-		["fusion", "claude", "fusion_control", "claude_control"],
+		["fusion", "claude", "fusion_control", "claude_control", "fusion_activate", "fusion_deactivate"],
 	);
-	for (const name of ["fusion", "claude", "fusion_control", "claude_control"]) assert.equal(byName(name).executionMode, "sequential", name);
+	for (const name of ["fusion", "claude", "fusion_control", "claude_control", "fusion_activate", "fusion_deactivate"]) assert.equal(byName(name).executionMode, "sequential", name);
 	assert.deepEqual([...handlers.keys()], ["session_start", "session_shutdown", "session_before_tree"]);
 	const command = commands.get("fusion");
 	assert.ok(command, "the fusion command is not registered");
@@ -344,7 +349,9 @@ interface RecordedHost {
 
 const recordedHost = (): { into: RecordedHost; api: ExtensionAPI } => {
 	const into: RecordedHost = { tools: new Map(), entries: 0 };
+	const { activeTools: _active, ...toolAccess } = toolList(() => into.tools.keys());
 	const api = {
+		...toolAccess,
 		registerTool: (tool: RegisteredTool) => into.tools.set(tool.name, tool),
 		registerCommand: () => {},
 		on: () => {},
@@ -422,6 +429,7 @@ test("the fusion tool says which harness runs what, and the pi backend it regist
 	try {
 		const defaults = recordedHost();
 		fusion(defaults.api, productionDefaults());
+		void turnOn(defaults.into.tools.get("fusion_activate"));
 		const defaultFusion = defaults.into.tools.get("fusion");
 		assert.ok(defaultFusion, "the production-default registration advertises no fusion tool");
 		await assert.rejects(defaultFusion.execute("call-1", { role: "implement", task: "x", backend: "pi" }, undefined, undefined, ctx), {
@@ -443,6 +451,7 @@ test("the fusion tool says which harness runs what, and the pi backend it regist
 	const fake = fakeBackend();
 	const injected = recordedHost();
 	fusion(injected.api, { backends: { ...piTripwire(), pi: fake.backend }, profiles: memoryProfileStore() });
+	void turnOn(injected.into.tools.get("fusion_activate"));
 	const injectedFusion = injected.into.tools.get("fusion");
 	assert.ok(injectedFusion, "the registration that injected a pi backend advertises no fusion tool");
 	const ran = await injectedFusion.execute("call-1", { role: "implement", task: "do the pi thing", backend: "pi", model: "deepseek/deepseek-chat" }, undefined, undefined, ctx);

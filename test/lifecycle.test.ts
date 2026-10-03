@@ -12,6 +12,7 @@ import fusion from "../extensions/fusion.ts";
 import { memoryProfileStore, type ProfileStore } from "../extensions/profile-store.ts";
 import { History, type HistoryRecord } from "../extensions/history.ts";
 import { type FakeBackend, fakeBackend, type FakeScript } from "./fake-pi-backend.ts";
+import { toolList, turnOn } from "./host-tools.ts";
 import { piTripwire } from "./tripwire.ts";
 
 /**
@@ -88,11 +89,10 @@ function makeHost(options: HostOptions = {}) {
 	/** The same notices with the level each was shown at, for a test that reads how loud one was. */
 	const notified: Array<{ text: string; level?: string }> = [];
 	const sent: Array<[any, any]> = [];
-	/** The host's active tool list, which /fusion off and on are the only things here that change. */
-	const activeTools: string[] = ["read", "bash", "fusion", "fusion_control", "claude", "claude_control"];
+	/** The host's active tool list, which Fusion's own mode changes are the only things here that change. */
+	const { activeTools, ...toolAccess } = toolList(() => tools.keys());
 	const api = {
-		getActiveTools: () => [...activeTools],
-		setActiveTools: (names: string[]) => activeTools.splice(0, activeTools.length, ...names),
+		...toolAccess,
 		registerTool: (tool: any) => tools.set(tool.name, tool),
 		registerCommand: (name: string, command: any) => commands.set(name, command),
 		on: (event: string, handler: any) => handlers.set(event, handler),
@@ -121,6 +121,8 @@ function makeHost(options: HostOptions = {}) {
 			}),
 	};
 	const ctx = { cwd: options.cwd ?? repoRoot, mode: "print", hasUI: true, ui, sessionManager };
+	// Fusion starts off; a case that delegates needs it on, as a user's request for Fusion turns it on.
+	void turnOn(tools.get("fusion_activate"), ctx);
 	const call = async (tool: string, params: Record<string, unknown>, signal?: AbortSignal): Promise<Called> => {
 		const registered = tools.get(tool);
 		assert.ok(registered, `tool ${tool} is not registered`);
@@ -1865,7 +1867,7 @@ test("an ask reviewer configured on a backend this host did not register is refu
 	});
 });
 
-const OFF_REFUSAL = "fusion is off; turn it on with /fusion on";
+const OFF_REFUSAL = "fusion is off; turn it on with /fusion on, or ask for Fusion by name";
 
 test("/fusion off hides the fusion tools and starts nothing, and /fusion on gives back the ones it hid", async () => {
 	await withEnv(piEnv(), async () => {
@@ -1878,10 +1880,10 @@ test("/fusion off hides the fusion tools and starts nothing, and /fusion on give
 
 		await host.command("off");
 		assert.deepEqual(host.notices.at(-1), "fusion is off; no run can start until /fusion on");
-		assert.deepEqual(host.activeTools, ["read", "bash"]);
+		assert.deepEqual(host.activeTools, ["read", "bash", "fusion_activate"]);
 		await host.command("off");
 		assert.equal(host.notices.at(-1), "fusion is already off; turn it on with /fusion on");
-		assert.deepEqual(host.activeTools, ["read", "bash"], "a second off changes nothing");
+		assert.deepEqual(host.activeTools, ["read", "bash", "fusion_activate"], "a second off changes nothing");
 		await host.command("status");
 		assert.match(host.notices.at(-1) ?? "", /^fusion: off\nrun-1 · implement · /);
 
@@ -1895,14 +1897,14 @@ test("/fusion off hides the fusion tools and starts nothing, and /fusion on give
 		assert.equal(pi.starts.length + claude.starts.length, 1, "nothing started while off");
 		assert.equal(host.entries().length, 1, "and nothing was recorded");
 
-		// A tool the user turned on while fusion was off survives on, and on puts back only what off took.
+		// A tool the user turned on while fusion was off survives on, and on puts back only what off took, with its own way out.
 		host.activeTools.push("grep");
 		await host.command("on");
 		assert.equal(host.notices.at(-1), "fusion is on");
-		assert.deepEqual(host.activeTools, ["read", "bash", "grep", "fusion", "fusion_control", "claude"]);
+		assert.deepEqual(host.activeTools, ["read", "bash", "grep", "fusion", "fusion_control", "claude", "fusion_deactivate"]);
 		await host.command("on");
 		assert.equal(host.notices.at(-1), "fusion is already on");
-		assert.deepEqual(host.activeTools, ["read", "bash", "grep", "fusion", "fusion_control", "claude"], "a second on changes nothing");
+		assert.deepEqual(host.activeTools, ["read", "bash", "grep", "fusion", "fusion_control", "claude", "fusion_deactivate"], "a second on changes nothing");
 		await host.command("status");
 		assert.match(host.notices.at(-1) ?? "", /^fusion: on\n/);
 		const again = await host.fusion({ role: "implement", task: "more", continue: "run-1" });
@@ -1936,7 +1938,7 @@ test("/fusion off is refused while a run is running or waiting for an answer, an
 		await ended(host, "run-2");
 		await host.command("off");
 		assert.equal(host.notices.at(-1), "fusion is off; no run can start until /fusion on");
-		assert.deepEqual(host.activeTools, ["read", "bash"]);
+		assert.deepEqual(host.activeTools, ["read", "bash", "fusion_activate"]);
 	});
 });
 

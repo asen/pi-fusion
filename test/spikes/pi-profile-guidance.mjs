@@ -3,8 +3,13 @@
  * Manual, no-inference check of what Fusion profiles rely on in the installed Pi SDK: that registering a tool again
  * under its own name replaces its definition and rebuilds the host's system prompt, that a registry refresh under a
  * `--tools` allow list puts every allowed tool back on the active list, and that Fusion's own restore of the active
- * list keeps /fusion off's hidden tools hidden through a profile change. It is outside `test/*.test.ts` and `npm test`,
- * and is run by hand: `node test/spikes/pi-profile-guidance.mjs`.
+ * list keeps /fusion off's hidden tools hidden through a profile change. It also checks that Fusion starts off in a real
+ * session — only `fusion_activate` active and no orchestration guidance in the prompt — that `/fusion on` and the mode
+ * tools themselves switch the active list and the prompt, and that the SDK's own next-turn refresh, the hook an agent
+ * loop calls before each assistant response, hands the switched tools and prompt to the next response. The mode tools
+ * are run through their registered definitions' `execute`, outside the agent loop, so this is evidence of the state a
+ * tool call leaves and of what the next response would be given, not of a model choosing to call one. It is outside
+ * `test/*.test.ts` and `npm test`, and is run by hand: `node test/spikes/pi-profile-guidance.mjs`.
  *
  * What it builds: one throwaway agent directory and home under a temporary root, an in-memory settings manager and
  * session manager, and a real `AgentSession` with this extension passed in as an inline factory over an in-memory
@@ -85,8 +90,49 @@ const command = async (held, text) => {
 	return held.notices.at(-1)?.[0];
 };
 
+const ORCHESTRATE = /You orchestrate fusion runs and do not implement/;
+const ACTIVATE = /Call fusion_activate only when the user explicitly asks to use Fusion/;
+const DEACTIVATE = /Call fusion_deactivate only when the user explicitly asks to stop using Fusion/;
+
+await check("fusion starts off: only the activation tool is active, and the prompt carries its guidance and no orchestration", async () => {
+	const held = await session();
+	const names = held.session.getActiveToolNames();
+	assert.ok(names.includes("fusion_activate"), names.join(", "));
+	for (const name of ["fusion", "fusion_control", "claude", "claude_control", "fusion_deactivate"]) assert.ok(!names.includes(name), `${name} is active at startup`);
+	assert.match(held.session.systemPrompt, ACTIVATE);
+	assert.doesNotMatch(held.session.systemPrompt, ORCHESTRATE);
+	assert.doesNotMatch(held.session.systemPrompt, DEACTIVATE);
+	assert.equal(await command(held, "/fusion on"), "fusion is on");
+	assert.match(held.session.systemPrompt, ORCHESTRATE);
+	assert.match(held.session.systemPrompt, DEACTIVATE);
+	assert.doesNotMatch(held.session.systemPrompt, ACTIVATE);
+	assert.equal(await command(held, "/fusion off"), "fusion is off; no run can start until /fusion on");
+	assert.match(held.session.systemPrompt, ACTIVATE);
+	assert.doesNotMatch(held.session.systemPrompt, ORCHESTRATE);
+});
+
+await check("the mode tools switch the active list and the prompt, and the next-turn refresh hands the switch to the next response", async () => {
+	const held = await session();
+	const run = async (name) => held.session.getToolDefinition(name).execute(`spike-${name}`, {}, undefined, undefined, undefined);
+	const nextTurn = async () => held.session.agent.prepareNextTurnWithContext({ context: { systemPrompt: "stale", messages: [], tools: [] } }, undefined);
+	const on = await run("fusion_activate");
+	assert.deepEqual(on.details, { enabled: true, changed: true });
+	let next = await nextTurn();
+	assert.ok(next.context.tools.some((tool) => tool.name === "fusion"), "the next response is given the fusion tool");
+	assert.ok(!next.context.tools.some((tool) => tool.name === "fusion_activate"), "and not the activation tool");
+	assert.match(next.context.systemPrompt, ORCHESTRATE);
+	const off = await run("fusion_deactivate");
+	assert.deepEqual(off.details, { enabled: false, changed: true });
+	next = await nextTurn();
+	assert.ok(!next.context.tools.some((tool) => tool.name === "fusion"), "the next response is not given the fusion tool");
+	assert.doesNotMatch(next.context.systemPrompt, ORCHESTRATE);
+	assert.match(next.context.systemPrompt, ACTIVATE);
+	assert.deepEqual(held.session.messages.filter((message) => message.role === "assistant"), [], "no assistant turn ran");
+});
+
 await check("a profile applied by command rebuilds the host's system prompt with the new guidance, with no model turn", async () => {
 	const held = await session();
+	await command(held, "/fusion on");
 	const before = held.session.systemPrompt;
 	assert.match(before, /Use fusion with role ultracode only when the user explicitly asks/, "the built-in guidance recommends ultracode");
 	assert.equal(await command(held, "/fusion profile use work"), "fusion uses profile work in this session; disabled: ultracode");
@@ -100,8 +146,9 @@ await check("a profile applied by command rebuilds the host's system prompt with
 });
 
 await check("under a --tools allow list, a re-registration keeps the active list exactly as it was", async () => {
-	const allowed = ["read", "bash", "write", "fusion", "fusion_control", "claude", "claude_control"];
+	const allowed = ["read", "bash", "write", "fusion", "fusion_control", "claude", "claude_control", "fusion_activate", "fusion_deactivate"];
 	const held = await session(allowed);
+	await command(held, "/fusion on");
 	held.session.setActiveToolsByName(held.session.getActiveToolNames().filter((name) => name !== "write"));
 	const before = held.session.getActiveToolNames();
 	assert.ok(!before.includes("write"));
@@ -119,13 +166,14 @@ await check("the SDK itself re-adds allowed tools on a refresh, which is why Fus
 });
 
 await check("while fusion is off, a profile change leaves the fusion tools hidden under an allow list, and on gives them back", async () => {
-	const held = await session(["read", "bash", "fusion", "fusion_control", "claude", "claude_control"]);
+	const held = await session(["read", "bash", "fusion", "fusion_control", "claude", "claude_control", "fusion_activate", "fusion_deactivate"]);
+	await command(held, "/fusion on");
 	const on = held.session.getActiveToolNames();
 	assert.equal(await command(held, "/fusion off"), "fusion is off; no run can start until /fusion on");
-	assert.deepEqual(held.session.getActiveToolNames(), ["read", "bash"]);
+	assert.deepEqual([...held.session.getActiveToolNames()].sort(), ["bash", "fusion_activate", "read"]);
 	await command(held, "/fusion profile use other");
-	assert.deepEqual(held.session.getActiveToolNames(), ["read", "bash"], "no fusion tool came back");
-	assert.doesNotMatch(held.session.systemPrompt, /\bfusion_control\b/, "and the prompt names none of them");
+	assert.deepEqual([...held.session.getActiveToolNames()].sort(), ["bash", "fusion_activate", "read"], "no fusion tool came back");
+	assert.doesNotMatch(held.session.systemPrompt, ORCHESTRATE, "and the prompt carries none of their guidance");
 	await command(held, "/fusion on");
 	assert.deepEqual([...held.session.getActiveToolNames()].sort(), [...on].sort());
 	assert.match(held.session.systemPrompt, /disables role ask/, "and the prompt carries the profile applied while off");

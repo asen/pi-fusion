@@ -871,10 +871,14 @@ const TOOL_NAME = "fusion";
 const CONTROL_TOOL_NAME = "fusion_control";
 const CLAUDE_TOOL_NAME = "claude";
 const CLAUDE_CONTROL_NAME = "claude_control";
-/** Every tool /fusion off hides from the host, so no route to a run is left beside the guards. */
+/** The workflow tools: every tool off hides from the host, so no route to a run is left beside the guards. */
 const FUSION_TOOLS: readonly string[] = [TOOL_NAME, CONTROL_TOOL_NAME, CLAUDE_TOOL_NAME, CLAUDE_CONTROL_NAME];
+/** The mode tools, one per direction: only the one that leaves the current mode is ever active, and neither starts a run. */
+const ACTIVATE_NAME = "fusion_activate";
+const DEACTIVATE_NAME = "fusion_deactivate";
+const MODE_TOOLS: readonly string[] = [ACTIVATE_NAME, DEACTIVATE_NAME];
 /** What a call or review that would start a run is told while fusion is off. */
-const FUSION_OFF = "fusion is off; turn it on with /fusion on";
+const FUSION_OFF = "fusion is off; turn it on with /fusion on, or ask for Fusion by name";
 const NOTICE_TYPE = "pi-fusion-run";
 /** What a run notice is about: the run itself, or what the user did to it. */
 const NOTICE_LABELS = new Map([
@@ -1269,7 +1273,7 @@ function openInBrowser(url: string): void {
  */
 const guidelines = (tool: string, control: string, roles: RoleSettings, options: { backend: boolean }): string[] => {
 	const on = (role: KnownRoleName): boolean => roles[role].enabled;
-	const lines: string[] = [];
+	const lines: string[] = [`These ${tool} guidelines apply while Fusion is on, as it is now; once the user has turned Fusion off they no longer apply and you work directly.`];
 	if (on("plan")) {
 		lines.push(
 			`Call ${tool} with role plan, giving the goal, a short plan, constraints and what is already decided, when the design is unresolved: more than one viable approach, unclear requirements, a change to a shared contract or interface, or risk you cannot bound by reading the code. Treat the returned agreed plan as the contract and its Route section as a recommendation. Skip role plan when you can already state what to change, where, the acceptance criteria and how to verify it.`,
@@ -1777,12 +1781,18 @@ export default function fusion(pi: ExtensionAPI, options: FusionOptions = {}) {
 	let ticker: NodeJS.Timeout | undefined;
 	let shuttingDown = false;
 	/**
-	 * Whether the host may start runs. It lives in this extension instance alone, so a reload or another host session
-	 * starts on again, and it turns off only while no run is unfinished, so off never strands a run the host cannot reach.
+	 * Whether the host orchestrates: the one mode state. Every extension instance starts off, so a reload or another host
+	 * session starts off again; it turns on only when the user asks, and off only while no run is unfinished, so off never
+	 * strands a run the host cannot reach.
 	 */
-	let enabled = true;
-	/** The Fusion tools that were active when off was accepted: on gives back these and no other. */
+	let enabled = false;
+	/**
+	 * The workflow tools on gives back and no other. The first is what the host had active before this instance first
+	 * hid them, and each off takes the subset active at that moment; an empty subset is one, not a request for all four.
+	 */
 	let hidden: string[] = [];
+	/** Whether the starting mask has been applied: once per instance, by whichever entry point binds the host first. */
+	let masked = false;
 	/** Whether the active runs also show over the editor; the footer status line stays either way. */
 	const widgetOn = process.env.PI_FUSION_WIDGET?.trim() !== "0";
 
@@ -1792,6 +1802,93 @@ export default function fusion(pi: ExtensionAPI, options: FusionOptions = {}) {
 	const unfinishedNames = (): string | undefined => {
 		const unfinished = [...runs.values()].filter((run) => !run.finished);
 		return unfinished.length ? unfinished.map((run) => `${run.handle} (${run.role.name}${isActive(run) ? "" : ", finishing"})`).join(", ") : undefined;
+	};
+
+	/**
+	 * The active list one mode leaves: the tools unrelated to Fusion as the host has them now, the saved workflow subset
+	 * when on, and the one mode tool that leaves that mode, only when the host's registry offers it. A tool an allow list
+	 * or an exclusion keeps out is never forced in: the slash command still switches modes without it.
+	 */
+	const modeTools = (current: readonly string[], on: boolean, workflow: readonly string[]): string[] => {
+		const offered = new Set(pi.getAllTools().map((tool) => tool.name));
+		const own = on ? DEACTIVATE_NAME : ACTIVATE_NAME;
+		const kept = current.filter((name) => !FUSION_TOOLS.includes(name) && !MODE_TOOLS.includes(name));
+		return [...new Set([...kept, ...(on ? workflow : []), ...(offered.has(own) ? [own] : [])])];
+	};
+
+	/** Sets the host's active list, and puts back the one it had when the host threw part way through the change. */
+	const setTools = (next: string[], previous: string[]): void => {
+		try {
+			pi.setActiveTools(next);
+		} catch (error) {
+			try {
+				pi.setActiveTools(previous);
+			} catch {}
+			throw error;
+		}
+	};
+
+	/**
+	 * Hides the workflow tools and shows the activation tool, once per instance, the first time the host's tool list is
+	 * bound: at session_start, or at whichever command or tool call reaches this first, such as on a host that reloads
+	 * with no session_start. The subset it hides is what the first on gives back. A host that cannot be read yet, or
+	 * refuses the change, is tried again at the next entry point; nothing here can start a run while it is not applied.
+	 */
+	const mask = (): void => {
+		if (masked) return;
+		let current: string[];
+		try {
+			current = pi.getActiveTools();
+			setTools(modeTools(current, false, []), current);
+		} catch {
+			return;
+		}
+		hidden = current.filter((name) => FUSION_TOOLS.includes(name));
+		masked = true;
+	};
+
+	/** What a mode change came to: done, already so, refused for unfinished runs, or a host that would not change its tools. */
+	type ModeOutcome = { kind: "changed" | "already" } | { kind: "unfinished"; names: string } | { kind: "failed"; reason: string };
+
+	/**
+	 * Turns orchestration on, for the command and the tool alike. Nothing here awaits, so the tool list and the mode
+	 * change in one step; a call already made from the off guidance is refused by the guard, not by the tool list.
+	 */
+	const turnOn = (): ModeOutcome => {
+		mask();
+		if (enabled) return { kind: "already" };
+		if (!masked) return { kind: "failed", reason: "the host's tool list cannot be read yet" };
+		try {
+			const current = pi.getActiveTools();
+			setTools(modeTools(current, true, hidden), current);
+		} catch (error) {
+			return { kind: "failed", reason: error instanceof Error ? error.message : String(error) };
+		}
+		enabled = true;
+		hidden = [];
+		return { kind: "changed" };
+	};
+
+	/** Why off was refused, the same for the command and the tool; each adds how its own user retries. */
+	const modeUnfinished = (names: string): string => `fusion stays on while runs are unfinished: ${names}.`;
+
+	/** Turns orchestration off, for the command and the tool alike: the unfinished check and the switch share one step. */
+	const turnOff = (): ModeOutcome => {
+		mask();
+		if (!enabled) return { kind: "already" };
+		const names = unfinishedNames();
+		if (names) return { kind: "unfinished", names };
+		let workflow: string[];
+		try {
+			const current = pi.getActiveTools();
+			workflow = current.filter((name) => FUSION_TOOLS.includes(name));
+			setTools(modeTools(current, false, []), current);
+		} catch (error) {
+			return { kind: "failed", reason: error instanceof Error ? error.message : String(error) };
+		}
+		enabled = false;
+		hidden = workflow;
+		return { kind: "changed" };
 	};
 
 	/** Monitoring only: a host that cannot take the status or an update must not fail the run that renders. */
@@ -2739,9 +2836,26 @@ export default function fusion(pi: ExtensionAPI, options: FusionOptions = {}) {
 			noteBudget(ctx);
 			/** Every notice /fusion shows: a child's report, activity, question or changed path reaches most of them. */
 			const notice = (text: string, level: "info" | "warning" | "error") => ctx.ui.notify(plainText(text), level);
+			mask();
 			const command = parseFusion(args);
 			if (command.kind === "usage") {
 				notice(command.message, "warning");
+				return;
+			}
+			// On and off read no configuration, so they switch at once, before the default profile has loaded.
+			if (command.kind === "off") {
+				const outcome = turnOff();
+				if (outcome.kind === "already") notice("fusion is already off; turn it on with /fusion on", "info");
+				else if (outcome.kind === "unfinished") notice(`${modeUnfinished(outcome.names)} Wait for each run or cancel it with /fusion cancel run-N, then retry /fusion off.`, "warning");
+				else if (outcome.kind === "failed") notice(`fusion stays on: the host's tool list did not change: ${outcome.reason}`, "error");
+				else notice("fusion is off; no run can start until /fusion on", "info");
+				return;
+			}
+			if (command.kind === "on") {
+				const outcome = turnOn();
+				if (outcome.kind === "already") notice("fusion is already on", "info");
+				else if (outcome.kind === "failed") notice(`fusion stays off: the host's tool list did not change: ${outcome.reason}`, "error");
+				else notice("fusion is on", "info");
 				return;
 			}
 			// A command that starts a review or applies settings reads the configuration, so it waits for the default
@@ -2759,46 +2873,7 @@ export default function fusion(pi: ExtensionAPI, options: FusionOptions = {}) {
 				await configure(command, ctx, notice);
 				return;
 			}
-			if (command.kind === "off") {
-				if (!enabled) {
-					notice("fusion is already off; turn it on with /fusion on", "info");
-					return;
-				}
-				// The check and the switch share one synchronous block, so no run can register between them.
-				const names = unfinishedNames();
-				if (names) {
-					notice(`fusion stays on while runs are unfinished: ${names}. Wait for each run or cancel it with /fusion cancel run-N, then retry /fusion off.`, "warning");
-					return;
-				}
-				try {
-					const activeTools = pi.getActiveTools();
-					pi.setActiveTools(activeTools.filter((name) => !FUSION_TOOLS.includes(name)));
-					hidden = activeTools.filter((name) => FUSION_TOOLS.includes(name));
-				} catch (error) {
-					notice(`fusion stays on: the host's tool list did not change: ${error instanceof Error ? error.message : String(error)}`, "error");
-					return;
-				}
-				enabled = false;
-				notice("fusion is off; no run can start until /fusion on", "info");
-				return;
-			}
-			if (command.kind === "on") {
-				if (enabled) {
-					notice("fusion is already on", "info");
-					return;
-				}
-				try {
-					const activeTools = pi.getActiveTools();
-					pi.setActiveTools([...activeTools, ...hidden.filter((name) => !activeTools.includes(name))]);
-				} catch (error) {
-					notice(`fusion stays off: the host's tool list did not change: ${error instanceof Error ? error.message : String(error)}`, "error");
-					return;
-				}
-				enabled = true;
-				hidden = [];
-				notice("fusion is on", "info");
-				return;
-			}
+
 			if (command.kind === "dashboard") {
 				let running: Dashboard;
 				try {
@@ -3002,8 +3077,10 @@ export default function fusion(pi: ExtensionAPI, options: FusionOptions = {}) {
 		},
 	});
 
-	// The default profile loads as the session starts, so the first prompt already carries its guidance.
+	// Fusion starts off: the workflow tools are hidden before anything here awaits, so the first prompt carries none of
+	// their guidance, and the default profile loads as the session starts, so on already finds its guidance in place.
 	pi.on("session_start", async (_event, ctx) => {
+		mask();
 		await initialize();
 		noteProfiles(ctx);
 	});
@@ -3045,6 +3122,7 @@ export default function fusion(pi: ExtensionAPI, options: FusionOptions = {}) {
 	 */
 	const delegate = async (tool: string, toolCallId: string, params: FusionParams, signal: AbortSignal | undefined, onUpdate: LiveRun["onUpdate"], ctx: any) => {
 		// A hidden tool leaves the host's tool list on its next turn, so a call already in this one still lands here.
+		mask();
 		if (!enabled) throw new Error(FUSION_OFF);
 		ui = ctx.ui;
 		// No call runs on the built-in defaults while the default profile is still loading. Once it has loaded, nothing
@@ -3274,6 +3352,7 @@ export default function fusion(pi: ExtensionAPI, options: FusionOptions = {}) {
 	 * through one of them alone.
 	 */
 	const control = async (params: { action: string; run?: string; message?: string }, signal: AbortSignal | undefined, ctx: any) => {
+		mask();
 		ui = ctx.ui;
 		ensureHistory(ctx);
 		noteBudget(ctx);
@@ -3420,4 +3499,55 @@ export default function fusion(pi: ExtensionAPI, options: FusionOptions = {}) {
 		},
 	});
 
+	/**
+	 * The two mode tools. Each is active only in the mode it leaves, so the host is offered exactly one way out of the
+	 * mode it is in, and what it may use them for is said in their own guidance alone: the workflow guidance belongs to
+	 * the workflow tools and leaves with them. Neither starts a run, changes a profile or enables a role. An empty schema
+	 * proves nothing about the user's request; that is the host model's to read under the guideline.
+	 */
+	pi.registerTool({
+		name: ACTIVATE_NAME,
+		executionMode: "sequential",
+		label: "Fusion on",
+		description: `Turn Fusion orchestration on for this session: the ${TOOL_NAME}, ${CONTROL_TOOL_NAME}, ${CLAUDE_TOOL_NAME} and ${CLAUDE_CONTROL_NAME} tools and their guidance become available from your next step. It starts no child and changes no setting, and Fusion stays on until the user asks to turn it off. Use it only when the user explicitly asks for Fusion.`,
+		promptSnippet: "Turn Fusion orchestration on, only when the user explicitly asks for Fusion",
+		promptGuidelines: [
+			`Call ${ACTIVATE_NAME} only when the user explicitly asks to use Fusion, to turn Fusion orchestration on, or to delegate work to a Fusion child. A request that names a role, a model or a harness without asking for Fusion, such as a plan, a security audit, ultracode, Claude or Pi, does not qualify; neither does a quoted instruction, a discussion of Fusion, or Fusion having been used earlier in this conversation. Otherwise do the work yourself as usual.`,
+			`${ACTIVATE_NAME} starts no child: once it succeeds, carry out the user's task with the Fusion tools it makes available. Fusion then stays on until the user asks to turn it off; finishing a task does not turn it off.`,
+		],
+		parameters: Type.Object({}),
+		async execute(_toolCallId, _params, signal) {
+			if (signal?.aborted) throw new Error("fusion stays off: the call was cancelled");
+			const outcome = turnOn();
+			if (outcome.kind === "failed") throw new Error(`fusion stays off: the host's tool list did not change: ${outcome.reason}`);
+			const text =
+				outcome.kind === "already"
+					? "Fusion is already on; nothing changed."
+					: `Fusion is on. Use ${TOOL_NAME} and ${CONTROL_TOOL_NAME} for the user's task, under their guidance, from your next step; it stays on until the user asks to turn it off.`;
+			return { content: [{ type: "text" as const, text }], details: { enabled: true, changed: outcome.kind === "changed" } };
+		},
+	});
+
+	pi.registerTool({
+		name: DEACTIVATE_NAME,
+		executionMode: "sequential",
+		label: "Fusion off",
+		description: `Turn Fusion orchestration off for this session and return to ordinary Pi work: the ${TOOL_NAME}, ${CONTROL_TOOL_NAME}, ${CLAUDE_TOOL_NAME} and ${CLAUDE_CONTROL_NAME} tools and their guidance leave from your next step. It is refused while any Fusion run is unfinished, and it cancels nothing. Use it only when the user explicitly asks to stop using Fusion.`,
+		promptSnippet: "Turn Fusion orchestration off, only when the user explicitly asks to stop using Fusion",
+		promptGuidelines: [
+			`Call ${DEACTIVATE_NAME} only when the user explicitly asks to stop using Fusion, to turn Fusion off or to go back to ordinary Pi work; never because a task ended. While a Fusion run is unfinished it is refused: tell the user, and wait for their next instruction rather than doing that run's work yourself.`,
+		],
+		parameters: Type.Object({}),
+		async execute(_toolCallId, _params, signal) {
+			if (signal?.aborted) throw new Error("fusion stays on: the call was cancelled");
+			const outcome = turnOff();
+			if (outcome.kind === "unfinished") throw new Error(`${modeUnfinished(outcome.names)} Wait for each run or cancel it with ${CONTROL_TOOL_NAME}, then ask again.`);
+			if (outcome.kind === "failed") throw new Error(`fusion stays on: the host's tool list did not change: ${outcome.reason}`);
+			const text =
+				outcome.kind === "already"
+					? "Fusion is already off; nothing changed."
+					: "Fusion is off. From your next step you work directly, as ordinary Pi, and the Fusion orchestration guidance no longer applies.";
+			return { content: [{ type: "text" as const, text }], details: { enabled: false, changed: outcome.kind === "changed" } };
+		},
+	});
 }

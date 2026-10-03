@@ -1,5 +1,6 @@
 # Routing
 
+All of this applies only while Fusion is on. It starts off, and until you turn it on — with `/fusion on`, or by asking for Fusion in plain words — the host has none of the workflow tools and none of the guidance below, and handles your requests as ordinary Pi. Asking for a role without Fusion, such as "plan this first" or "do a security audit", doesn't turn it on. Once on, the guidance applies until you turn Fusion off; see [Turning Fusion on and off](fusion-command.md#turning-fusion-on-and-off).
 
 The host model (GPT-6 Astra via the `openai-codex` provider) is the orchestrator. The tool guidelines injected into its system prompt ask it for two decisions. First, is the design unresolved: more than one viable approach, unclear requirements, a change to a shared contract or interface, or risk the host cannot bound by reading the code. If it is, the host calls `fusion` with role `plan` first; if the host can already say what to change, where, the acceptance criteria and how to verify it, it skips planning. The planner runs on the plan role's configured model; the host names another model only when you ask for one, which starts a fresh plan run that carries the plan so far. Second, the host sends all implementation to role `implement`, one bounded task at a time however complex or risky, and uses role `ultracode` only when you ask for it.
 

@@ -13,6 +13,7 @@ import { KNOWN_ROLE_NAMES, roleSpec } from "../extensions/roles.ts";
 import { History } from "../extensions/history.ts";
 import { memoryProfileStore } from "../extensions/profile-store.ts";
 import { PI_SELECTION_VARIABLES, piTripwire, productionDefaults } from "./tripwire.ts";
+import { toolList, turnOn } from "./host-tools.ts";
 
 const tempDirs: string[] = [];
 after(() => {
@@ -425,7 +426,9 @@ interface Extension {
 /** The recording host one registration is made on, built apart so each of the two registrations below is one line. */
 function recorder(): { ext: Extension; api: ExtensionAPI } {
 	const ext: Extension = { tools: new Map(), commands: new Map(), appended: [] };
+	const { activeTools: _active, ...toolAccess } = toolList(() => ext.tools.keys());
 	const api = {
+		...toolAccess,
 		registerTool: (tool: any) => ext.tools.set(tool.name, tool),
 		registerCommand: (name: string, command: any) => ext.commands.set(name, command),
 		on: () => {},
@@ -443,6 +446,7 @@ function recorder(): { ext: Extension; api: ExtensionAPI } {
 const makeExtension = (backends: Partial<Record<"claude" | "pi", HostBackend>> = {}): Extension => {
 	const { ext, api } = recorder();
 	fusion(api, { backends: { ...piTripwire(), ...backends }, profiles: memoryProfileStore() });
+	void turnOn(ext.tools.get("fusion_activate"));
 	return ext;
 };
 
@@ -450,6 +454,7 @@ const makeExtension = (backends: Partial<Record<"claude" | "pi", HostBackend>> =
 const defaultExtension = (): Extension => {
 	const { ext, api } = recorder();
 	fusion(api, productionDefaults());
+	void turnOn(ext.tools.get("fusion_activate"));
 	return ext;
 };
 

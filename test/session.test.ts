@@ -9,6 +9,7 @@ import fusion, { nextSession, runRecords } from "../extensions/fusion.ts";
 import { planContextPct, planProblems } from "../extensions/handoff.ts";
 import { memoryProfileStore } from "../extensions/profile-store.ts";
 import { piTripwire } from "./tripwire.ts";
+import { toolList, turnOn } from "./host-tools.ts";
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 process.env.PI_FUSION_CLAUDE_BIN = path.join(repoRoot, "test", "fake-claude.mjs");
@@ -39,7 +40,9 @@ interface Extension {
 
 function makeExtension(): Extension {
 	const ext: Extension = { tools: new Map(), commands: new Map(), handlers: new Map(), appended: [] };
+	const { activeTools: _active, ...toolAccess } = toolList(() => ext.tools.keys());
 	const api = {
+		...toolAccess,
 		registerTool: (tool: Tool) => {
 			ext.tools.set(tool.name, tool);
 		},
@@ -56,6 +59,7 @@ function makeExtension(): Extension {
 	} as unknown as ExtensionAPI;
 	// Nothing here runs a pi child, so the tripwire stands where this build registers its pi backend.
 	fusion(api, { backends: { ...piTripwire() }, profiles: memoryProfileStore() });
+	void turnOn(ext.tools.get("fusion_activate"));
 	return ext;
 }
 

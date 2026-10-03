@@ -11,22 +11,37 @@
 - `/fusion wait run-N` shows the run's activity line and a clock that ticks once a second until the run ends or asks a question. Esc leaves the run running and says so. The wait never takes the report away from the host: a user wait and the host's own `fusion_control wait` are counted apart, so the run's notice still goes out.
 - `/fusion answer [run-N] [text]` answers a waiting run's question, and opens an editor for the answer when no text follows the handle (see [Questions](questions.md)).
 - `/fusion review run-N` starts an independent review of a run that has ended (see [Independent reviews](reviews.md)).
-- `/fusion off` stops the host from starting runs, and `/fusion on` lets it start them again (see [Turning fusion off](#turning-fusion-off)).
+- `/fusion on` turns orchestration on, and `/fusion off` turns it off again, back to ordinary Pi work. Fusion starts off (see [Turning Fusion on and off](#turning-fusion-on-and-off)).
 - `/fusion config` shows and edits this session's role settings, and `/fusion profile [list | use <name> | save <name> | default <name>]` manages the saved profiles; applying settings is refused while a run is unfinished, as off is (see [Profiles and role settings](profiles.md)).
 
 Argument completion offers the forms, and after a form that takes a handle it offers the handles that form can still act on: every run for `status`, this process's and an earlier one's, the active ones for `cancel` and `wait`, the running ones for `steer`, the waiting ones for `answer`, and the reviewable ones, this process's and an earlier one's that was made in this working directory, for `review`. After `profile use`, `profile save` and `profile default` it offers the profile names the profiles file held when it was last read, and `builtin` for `use` and `default`.
 
 Everything the user does through `steer`, `answer` and `review` reaches the host as a message with `triggerTurn: false` and `deliverAs: "followUp"`: it starts no turn, so the user keeps the floor, and the host reads it with its next turn. The message names the run and what the user did, so the host does not repeat work the user has already settled.
 
-### Turning fusion off
+### Turning Fusion on and off
 
-`/fusion off` takes the four tools — `fusion`, `fusion_control`, `claude` and `claude_control` — out of the host's active tool list, so their descriptions and routing guidance leave the system prompt Pi rebuilds for the host's next turn. Pi's own tool list is what changes: a tool the user turned on or off in the meantime stays as the user left it, and `/fusion on` puts back exactly the Fusion tools that were active when off was accepted, so one that was already inactive stays inactive. Earlier messages stay in the transcript. A host whose system prompt is replaced outright keeps whatever that prompt says.
+Fusion starts off. Each time the extension loads — starting Pi, `/new`, a reload, a resume or a fork — the host works as ordinary Pi: the four workflow tools, `fusion`, `fusion_control`, `claude` and `claude_control`, are not active, so neither their descriptions nor their routing guidance are in the system prompt, and no run starts. The one Fusion tool the host has is `fusion_activate`.
 
-Off is refused while any run is unfinished: running, waiting for an answer, or ended and still recording its entry and report, reviews included. The refusal names those runs, `fusion stays on while runs are unfinished: run-3 (implement), run-4 (ask, finishing)`, and changes nothing; wait for them or cancel them with `/fusion cancel run-N`, then retry. That is what lets off hide the control tools as well: no run is left that the host would need them for, and none is cancelled or left without its answer.
+There are two ways to turn it on, and both make the same change:
 
-While off, nothing starts a run: a `fusion` or `claude` call the host's current turn still makes is refused with `fusion is off; turn it on with /fusion on`, for a fresh run, a continuation and a handoff alike, and so is `/fusion review`. `PI_FUSION_AUTO_REVIEW` starts nothing either, and `/fusion on` starts no review of its own. `/fusion status`, `/fusion dashboard` and the forms that read an ended run keep working.
+- type `/fusion on`;
+- ask for Fusion in plain words, such as "use Fusion to implement this" or "turn Fusion on". The host calls `fusion_activate`, which starts no child, and from its next step it has the workflow tools and works under their guidance, in the same turn.
 
-A profile can be applied while fusion is off: the tools' guidance is updated and they stay hidden, and `/fusion on` gives them back with that guidance. The switch lives in this extension instance's memory alone: nothing is written to a file, a variable or the transcript. A reload, `/new`, a resume or a fork builds a new instance, which starts on and takes Pi's own tool selection again. Repeating either form changes nothing and says which state fusion is in.
+Only a request that asks for Fusion, or for a Fusion child, turns it on. A request that names a role, a model or a harness without asking for Fusion — "plan this first", "do a security audit", "use ultracode", "have Claude do it" — does not, and neither does a quoted instruction, a conversation about Fusion, or Fusion having been used earlier in the conversation. The tool's guidance tells the host model so; it is guidance, and nothing can prove a model followed it.
+
+Turning it off is the same in reverse: `/fusion off`, or a plain request such as "turn Fusion off and work directly", which the host carries out with `fusion_deactivate`. Finishing a task never turns it off. While on, the host has `fusion_deactivate` and not `fusion_activate`; while off, the other way round.
+
+On lasts until it is turned off or the extension loads again. `/fusion config`, `/fusion profile`, `/fusion status` and `/fusion dashboard` neither turn it on nor need it on; choosing a profile configures the roles and leaves the mode as it is. Repeating either direction changes nothing and says which state Fusion is in, and so does a late or repeated call of either tool.
+
+Each switch changes Pi's own active tool list and nothing else of it: a tool the user turned on or off in the meantime stays as the user left it. On gives back exactly the workflow tools that were active when Fusion last went off, or, the first time, the ones Pi had active when this extension loaded; one that was inactive stays inactive, and none at all stays none. A reload turns every extension tool back on before this extension hides them, so a selection made before a reload is not remembered. Earlier messages stay in the transcript, and a model request already on its way keeps the tools it was sent with. A host whose system prompt is replaced outright, or another extension that changes the active tools itself, keeps whatever it set.
+
+A `--tools` allow list or an exclusion decides what can be active at all, and Fusion never forces a tool past it. To switch Fusion by plain request, the list has to name `fusion_activate` and `fusion_deactivate`; without them, `/fusion on` and `/fusion off` still work. A mode tool can't bring back a workflow tool the list leaves out.
+
+Off is refused while any run is unfinished: running, waiting for an answer, or ended and still recording its entry and report, reviews included. The refusal names those runs, `fusion stays on while runs are unfinished: run-3 (implement), run-4 (ask, finishing).`, and changes nothing; wait for them or cancel them, then retry. A refused `fusion_deactivate` is an error result with the same reason, and the host is told to wait for your next instruction rather than do the run's work itself. That is what lets off hide the control tools as well: no run is left that the host would need them for, and none is cancelled or left without its answer.
+
+While off, nothing starts a run: a `fusion` or `claude` call the host still makes is refused with `fusion is off; turn it on with /fusion on, or ask for Fusion by name`, for a fresh run, a continuation and a handoff alike, and so is `/fusion review`. `PI_FUSION_AUTO_REVIEW` starts nothing either, and turning Fusion on starts no review of its own. `/fusion status`, `/fusion dashboard` and the forms that read an ended run keep working. Turning Fusion off deletes no record: a run from before can be continued once Fusion is on again.
+
+A profile can be applied while Fusion is off: the tools' guidance is updated and they stay hidden, and turning Fusion on gives them back with that guidance. Neither mode tool changes a profile or enables a role. The mode lives in this extension instance's memory alone: nothing is written to a file, a variable or the transcript.
 
 ## The status line
 

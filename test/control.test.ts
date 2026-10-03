@@ -10,6 +10,7 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import fusion, { parseFusion } from "../extensions/fusion.ts";
 import { memoryProfileStore } from "../extensions/profile-store.ts";
 import { HISTORY_VERSION } from "../extensions/history.ts";
+import { toolList, turnOn } from "./host-tools.ts";
 import { piTripwire } from "./tripwire.ts";
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -89,11 +90,10 @@ function makeHost(cwd = repoRoot, mode: "tui" | "print" = "print", session: { id
 	const renderers = new Map<string, Renderer>();
 	const widgets: Array<[string, string[] | undefined]> = [];
 	let openEditor: ((text: string | undefined) => void) | undefined;
-	/** The host's active tool list, which /fusion off and on are the only things here that change. */
-	const activeTools: string[] = ["read", "bash", "fusion", "fusion_control", "claude", "claude_control"];
+	/** The host's active tool list, which Fusion's own mode changes are the only things here that change. */
+	const { activeTools, ...toolAccess } = toolList(() => tools.keys());
 	const api = {
-		getActiveTools: () => [...activeTools],
-		setActiveTools: (names: string[]) => activeTools.splice(0, activeTools.length, ...names),
+		...toolAccess,
 		registerTool: (tool: Tool) => tools.set(tool.name, tool),
 		registerCommand: (name: string, command: Command) => commands.set(name, command),
 		on: (event: string, handler: (event: any, ctx: any) => Promise<unknown> | unknown) => handlers.set(event, handler),
@@ -128,6 +128,8 @@ function makeHost(cwd = repoRoot, mode: "tui" | "print" = "print", session: { id
 	const sessionManager: Record<string, unknown> = { getSessionId: () => session.id ?? "host-1", getBranch: () => branch };
 	if (session.file !== undefined) sessionManager.getSessionFile = () => session.file;
 	const ctx = { cwd, mode, hasUI: true, ui, sessionManager };
+	// Fusion starts off; every case here delegates, so the host turns it on as a user's request for Fusion does.
+	void turnOn(tools.get("fusion_activate"), ctx);
 	shutdowns.push(async () => handlers.get("session_shutdown")!({ type: "session_shutdown", reason: "quit" }, ctx));
 	const call = (name: string, params: Record<string, unknown>, signal?: AbortSignal) => tools.get(name)!.execute("call-1", params, signal, undefined, ctx);
 	const claude = (params: Record<string, unknown>, signal?: AbortSignal) => call("claude", params, signal);
@@ -571,13 +573,13 @@ test("/fusion off is refused while a run that has ended is still finishing, and 
 		assert.deepEqual(host.notices, [
 			["fusion stays on while runs are unfinished: run-1 (implement, finishing). Wait for each run or cancel it with /fusion cancel run-N, then retry /fusion off.", "warning"],
 		]);
-		assert.deepEqual(host.activeTools, ["read", "bash", "fusion", "fusion_control", "claude", "claude_control"], "a refused off leaves the tools alone");
+		assert.deepEqual(host.activeTools, ["read", "bash", "fusion", "fusion_control", "claude", "claude_control", "fusion_deactivate"], "a refused off leaves the tools alone");
 		fs.rmSync(hold, { force: true });
 		await until("the background report", () => host.sent.length > 0);
 		host.notices.length = 0;
 		await host.command("off");
 		assert.deepEqual(host.notices, [["fusion is off; no run can start until /fusion on", "info"]]);
-		assert.deepEqual(host.activeTools, ["read", "bash"]);
+		assert.deepEqual(host.activeTools, ["read", "bash", "fusion_activate"]);
 	}));
 
 test("session_shutdown waits for a run that has ended but not yet recorded its entry, and sends no notice", () =>

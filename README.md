@@ -2,6 +2,8 @@
 
 A [Pi](https://pi.dev) extension that gives the host model a delegation tool, `fusion`, which hands a job to a headless coding session, and `fusion_control`, which manages the sessions that run in the background. One model orchestrates, others do the thinking and the work.
 
+Fusion starts off: until you ask for it, Pi works as ordinary Pi and none of these tools is offered to the host. Type `/fusion on`, or ask in plain words — "use Fusion to implement this" — and the host turns it on and orchestrates from then on, until you type `/fusion off` or ask it to turn Fusion off. See [Turning Fusion on and off](docs/fusion-command.md#turning-fusion-on-and-off).
+
 `claude` and `claude_control` are the same two tools under their older names, kept for compatibility: `claude` is `fusion` with the backend forced to Claude Code, its schema unchanged, and the two control tools are one executor, so every run is reachable through either name.
 
 ## Backends
@@ -99,11 +101,11 @@ pi install ~/eng/pi-fusion
 pi --model openai-codex/gpt-6-astra --thinking high
 ```
 
-Pi activates every extension tool at startup, so `fusion`, `fusion_control`, `claude` and `claude_control` sit next to Pi's built-ins. To pin the list down, pass `--tools read,grep,find,ls,bash,fusion,fusion_control`. `--tools` is a strict allowlist: leaving `fusion` out leaves the host with no delegation, and leaving `fusion_control` out leaves background runs unmanaged. Keep `claude` and `claude_control` in the list as well if you want the compatibility names; the extension's own messages name the primary pair.
+Pi activates every extension tool at startup, and Fusion then hides its four workflow tools, `fusion`, `fusion_control`, `claude` and `claude_control`, until it is turned on; what the host has meanwhile is `fusion_activate`, and while on, `fusion_deactivate` in its place. To pin the list down, pass `--tools read,grep,find,ls,bash,fusion,fusion_control,fusion_activate,fusion_deactivate`. `--tools` is a strict allowlist: leaving `fusion` out leaves the host with no delegation, leaving `fusion_control` out leaves background runs unmanaged, and leaving the two mode tools out means Fusion can be switched only with `/fusion on` and `/fusion off`, not by asking. Keep `claude` and `claude_control` in the list as well if you want the compatibility names; the extension's own messages name the primary pair.
 
-To stop the host from starting runs for a while without unloading the extension, type `/fusion off`; `/fusion on` turns it back on. Off hides all four tools and is refused while any run is unfinished; see [the /fusion command](docs/fusion-command.md#turning-fusion-off).
+Turning Fusion off is refused while any run is unfinished, and it cancels nothing; see [the /fusion command](docs/fusion-command.md#turning-fusion-on-and-off).
 
-The guidelines tell the host to delegate every implementation task and not to edit files itself. That is an instruction, not enforcement: the host still has bash. To enforce it, drop bash from the tool list. The cost is that the host can no longer run git itself.
+While Fusion is on, the guidelines tell the host to delegate every implementation task and not to edit files itself. That is an instruction, not enforcement: the host still has bash. To enforce it, drop bash from the tool list. The cost is that the host can no longer run git itself.
 
 ## Documentation
 

@@ -22,6 +22,7 @@ import {
 	settingsTable,
 } from "../extensions/profiles.ts";
 import { type FakeBackend, fakeBackend } from "./fake-pi-backend.ts";
+import { turnOn } from "./host-tools.ts";
 import { piTripwire } from "./tripwire.ts";
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -359,6 +360,7 @@ interface Tool {
 	name: string;
 	description: string;
 	promptGuidelines?: string[];
+	executionMode?: string;
 	execute: (id: string, params: any, signal: AbortSignal | undefined, onUpdate: undefined, ctx: any) => Promise<{ content: Array<{ text: string }>; details?: any }>;
 }
 
@@ -371,6 +373,8 @@ interface SdkHostOptions {
 	dialogs?: Array<string | undefined | ((options: string[]) => string | undefined | Promise<string | undefined>)>;
 	ui?: boolean;
 	modelRegistry?: unknown;
+	/** What the host has active before this extension registers anything; read and bash by default. */
+	initial?: string[];
 }
 
 /**
@@ -385,10 +389,13 @@ function sdkHost(options: SdkHostOptions = {}) {
 	const handlers = new Map<string, (event: any, ctx: any) => Promise<unknown> | unknown>();
 	const branch: unknown[] = [];
 	const notices: Array<[string, string]> = [];
-	const active: string[] = ["read", "bash"];
+	const active: string[] = [...(options.initial ?? ["read", "bash"])];
+	/** Set by a case: the next tool list change goes part way and then throws, as a host that failed mid-update would. */
+	let failing = false;
 	const registrations: string[] = [];
 	const dialogs = [...(options.dialogs ?? [])];
 	const titles: string[] = [];
+	const offered = (name: string) => options.allowed === undefined || options.allowed.includes(name);
 	const api = {
 		registerTool: (tool: Tool) => {
 			registrations.push(tool.name);
@@ -398,7 +405,16 @@ function sdkHost(options: SdkHostOptions = {}) {
 			for (const name of options.allowed ?? []) if (tools.has(name) && !active.includes(name)) active.push(name);
 		},
 		getActiveTools: () => [...active],
-		setActiveTools: (names: string[]) => active.splice(0, active.length, ...names),
+		// A name the registry does not hold is dropped, and an allow list keeps a tool it does not name out of the registry.
+		setActiveTools: (names: string[]) => {
+			if (failing) {
+				failing = false;
+				active.splice(0, active.length, ...names.slice(0, 1));
+				throw new Error("the host refused the tool list");
+			}
+			active.splice(0, active.length, ...names.filter((name) => !tools.has(name) || offered(name)));
+		},
+		getAllTools: () => [...tools.keys()].filter(offered).map((name) => ({ name })),
 		registerCommand: (name: string, command: any) => commands.set(name, command),
 		on: (event: string, handler: any) => handlers.set(event, handler),
 		appendEntry: (customType: string, data: unknown) => branch.push({ type: "custom", customType, data }),
@@ -435,9 +451,9 @@ function sdkHost(options: SdkHostOptions = {}) {
 		...(options.modelRegistry === undefined ? {} : { modelRegistry: options.modelRegistry }),
 		sessionManager: { getSessionId: () => "host-1", getBranch: () => branch, getSessionFile: () => undefined },
 	};
-	const call = async (tool: string, params: Record<string, unknown>) => {
+	const call = async (tool: string, params: Record<string, unknown>, signal?: AbortSignal) => {
 		try {
-			const result = await tools.get(tool)!.execute("call-1", params, undefined, undefined, ctx);
+			const result = await tools.get(tool)!.execute("call-1", params, signal, undefined, ctx);
 			return { text: result.content[0]!.text, details: result.details };
 		} catch (error) {
 			return { error: (error as Error).message };
@@ -452,10 +468,16 @@ function sdkHost(options: SdkHostOptions = {}) {
 		branch,
 		dialogs,
 		start: async () => handlers.get("session_start")!({ type: "session_start", reason: "startup" }, ctx),
+		/** Turns Fusion on as a user's request for it does, through the activation tool. */
+		on: () => turnOn(tools.get("fusion_activate"), ctx),
 		command: async (args: string) => commands.get("fusion")!.handler(args, ctx),
 		completions: (prefix: string) => commands.get("fusion")!.getArgumentCompletions(prefix),
 		fusion: (params: Record<string, unknown>) => call("fusion", params),
 		claude: (params: Record<string, unknown>) => call("claude", params),
+		call,
+		failNextToolChange: () => {
+			failing = true;
+		},
 		shutdown: async () => handlers.get("session_shutdown")!({ type: "session_shutdown" }, ctx),
 		last: () => notices.at(-1)?.[0],
 	};
@@ -479,6 +501,8 @@ test("the default profile loads as the session starts, and the host's guidance a
 	assert.ok(guidelines.some((line) => /disables role ultracode: a fusion call to a disabled role is refused/.test(line)), guidelines.join("\n"));
 	assert.ok(!guidelines.some((line) => /Use fusion with role ultracode/.test(line)), "a disabled role is recommended nowhere");
 	assert.match(host.tools.get("claude")!.description, /ultracode is disabled/);
+	assert.deepEqual(host.active, ["read", "bash", "fusion_activate"], "and fusion starts off, with only its way in offered");
+	await host.on();
 	assert.equal((await host.fusion({ role: "implement", task: "x" })).error, undefined);
 	assert.deepEqual([claude.starts[0]!.role.model, claude.starts[0]!.role.effort], ["sonnet", "low"]);
 	assert.equal((host.branch.at(-1) as any).data.effort, "low", "and the run records what it was admitted with");
@@ -547,6 +571,7 @@ test("an edit made to the file elsewhere reaches this session only when a profil
 	const claude = fakeBackend({ name: "claude" });
 	const host = sdkHost({ profiles: store, ui: false, backends: { claude: claude.backend } });
 	await host.start();
+	await host.on();
 	fs.writeFileSync(path.join(fusionDir, PROFILES_FILE), document({ work: WORK }, "work"));
 	assert.equal((await host.fusion({ role: "implement", task: "x" })).error, undefined);
 	assert.equal(claude.starts[0]!.role.model, "opus", "the session keeps the snapshot it loaded");
@@ -567,6 +592,7 @@ test("applying settings is refused while any run is unfinished, and saving or ch
 	const store = memoryProfileStore(document({ work: WORK }));
 	const host = sdkHost({ profiles: store, backends: { claude: claude.backend }, ui: false });
 	await host.start();
+	await host.on();
 	const run = await heldRun(host, claude);
 	await host.command("profile use work");
 	assert.equal(
@@ -630,6 +656,7 @@ test("the editor stages every change and applies them together, and a run that s
 	// A run admitted while the editor is open: the apply is refused and nothing changes.
 	const racing = sdkHost({ backends: { claude: claude.backend } });
 	await racing.start();
+	await racing.on();
 	let run: Awaited<ReturnType<typeof heldRun>> | undefined;
 	// The last answer is a dialog still open while a run is admitted, which is what the apply has to notice.
 	racing.dialogs.push(row("ask"), "enabled: yes", "Back", async () => {
@@ -667,28 +694,34 @@ test("an empty answer changes nothing, and a backend changed and changed back st
 test("a re-registration keeps the host's active tools exactly as they were, under an allow list, while off, and between changes", async () => {
 	const store = memoryProfileStore(document({ work: WORK, other: settings({ ask: { enabled: false, backend: "claude" } }) }));
 	// The host allows `write` as well, and the user has it off: a refresh must not turn it back on.
-	const host = sdkHost({ profiles: store, allowed: ["read", "bash", "write", "fusion", "fusion_control", "claude", "claude_control"], ui: false });
+	const allowed = ["read", "bash", "write", "fusion", "fusion_control", "claude", "claude_control", "fusion_activate", "fusion_deactivate"];
+	const host = sdkHost({ profiles: store, allowed, ui: false });
 	await host.start();
-	assert.deepEqual(host.active, ["read", "bash", "fusion", "claude", "fusion_control", "claude_control"]);
+	assert.deepEqual(host.active, ["read", "bash", "fusion_activate"], "fusion starts off");
+	await host.command("profile use other");
+	assert.deepEqual(host.active, ["read", "bash", "fusion_activate"], "a profile applied while off brings back nothing the allow list names");
+	await host.command("on");
+	const on = ["read", "bash", "fusion", "claude", "fusion_control", "claude_control", "fusion_deactivate"];
+	assert.deepEqual(host.active, on);
 	const before = host.registrations.length;
 	await host.command("profile use work");
 	assert.ok(host.registrations.length > before, "applying a profile re-registered the guidance");
-	assert.deepEqual(host.active, ["read", "bash", "fusion", "claude", "fusion_control", "claude_control"], "write stays off");
+	assert.deepEqual(host.active, on, "write stays off, and activation stays hidden while on");
 
 	// The list is read fresh for each re-registration, so a change made between two applications is kept.
 	host.active.splice(host.active.indexOf("bash"), 1);
 	await host.command("profile use other");
-	assert.deepEqual(host.active, ["read", "fusion", "claude", "fusion_control", "claude_control"]);
+	assert.deepEqual(host.active, ["read", "fusion", "claude", "fusion_control", "claude_control", "fusion_deactivate"]);
 
 	// While off, a profile change re-registers the tools and leaves them hidden; on gives back what off hid.
 	await host.command("off");
-	assert.deepEqual(host.active, ["read"]);
+	assert.deepEqual(host.active, ["read", "fusion_activate"]);
 	await host.command("profile use work");
 	assert.equal(host.last(), "fusion uses profile work in this session; disabled: ultracode");
-	assert.deepEqual(host.active, ["read"], "nothing the allow list names came back while fusion is off");
+	assert.deepEqual(host.active, ["read", "fusion_activate"], "nothing the allow list names came back while fusion is off");
 	assert.match(host.tools.get("fusion")!.description, /implement runs on claude with model sonnet/, "and the hidden tools carry the new guidance");
 	await host.command("on");
-	assert.deepEqual(host.active, ["read", "fusion", "claude", "fusion_control", "claude_control"]);
+	assert.deepEqual(host.active, ["read", "fusion", "claude", "fusion_control", "claude_control", "fusion_deactivate"]);
 	// A profile whose guidance is the same as the current one re-registers nothing.
 	const settled = host.registrations.length;
 	await host.command("profile use work");
@@ -737,4 +770,152 @@ test("the profile chooser lists every profile with its marks and loads the one p
 	await host.command("profile");
 	assert.equal(host.last(), "fusion profile: nothing changed");
 	assert.match(host.tools.get("fusion")!.description, /ultracode runs on claude with model fable/);
+});
+
+/** The tools a session has while fusion is on, under the default host's own active list. */
+const ON_TOOLS = ["read", "bash", "fusion", "claude", "fusion_control", "claude_control", "fusion_deactivate"];
+
+test("fusion starts off: only the activation tool is offered, a direct call starts and records nothing, and status says so", async () => {
+	const claude = fakeBackend({ name: "claude" });
+	const host = sdkHost({ backends: { claude: claude.backend }, ui: false });
+	await host.start();
+	assert.deepEqual(host.active, ["read", "bash", "fusion_activate"]);
+	// A call made from guidance the host had before the mask still lands here, and is refused before anything.
+	for (const tool of ["fusion", "claude"]) {
+		assert.equal((await host.call(tool, { role: "implement", task: "x" })).error, "fusion is off; turn it on with /fusion on, or ask for Fusion by name");
+	}
+	assert.equal(claude.starts.length, 0);
+	assert.deepEqual(host.branch, []);
+	await host.command("status");
+	assert.match(host.last() ?? "", /^fusion: off\nno runs in this Pi session yet/);
+	// Neither config nor a profile command, nor a second session_start, turns it on.
+	await host.command("profile list");
+	await host.start();
+	assert.deepEqual(host.active, ["read", "bash", "fusion_activate"]);
+	await host.command("on");
+	await host.start();
+	assert.deepEqual(host.active, ON_TOOLS, "a late session_start never undoes an activation");
+	await host.shutdown();
+});
+
+test("the mode tools and the commands make the same change, each idempotent, keeping every unrelated tool as it is", async () => {
+	const host = sdkHost({ ui: false });
+	await host.start();
+	const activated = await host.call("fusion_activate", {});
+	assert.match(activated.text ?? "", /^Fusion is on\./);
+	assert.deepEqual(activated.details, { enabled: true, changed: true });
+	assert.deepEqual(host.active, ON_TOOLS);
+	assert.deepEqual((await host.call("fusion_activate", {})).details, { enabled: true, changed: false }, "a stale second activation changes nothing");
+	assert.deepEqual(host.active, ON_TOOLS);
+
+	// A tool the user turned on and one they turned off while on both survive the round trip.
+	host.active.push("grep");
+	host.active.splice(host.active.indexOf("claude_control"), 1);
+	const deactivated = await host.call("fusion_deactivate", {});
+	assert.match(deactivated.text ?? "", /^Fusion is off\. From your next step you work directly/);
+	assert.deepEqual(deactivated.details, { enabled: false, changed: true });
+	assert.deepEqual(host.active, ["read", "bash", "grep", "fusion_activate"]);
+	assert.deepEqual((await host.call("fusion_deactivate", {})).details, { enabled: false, changed: false });
+	await host.command("on");
+	assert.deepEqual(host.active, ["read", "bash", "grep", "fusion", "claude", "fusion_control", "fusion_deactivate"]);
+	await host.command("off");
+	assert.deepEqual(host.active, ["read", "bash", "grep", "fusion_activate"]);
+	await host.call("fusion_activate", {});
+	assert.deepEqual(host.active, ["read", "bash", "grep", "fusion", "claude", "fusion_control", "fusion_deactivate"], "the tool gives back what the command took");
+});
+
+test("deactivation is refused while a run is running, waiting or finishing, by the tool and the command alike, and cancels nothing", async () => {
+	const claude = fakeBackend({ name: "claude", scripts: [{ pending: true }, { questions: ["Which name?"] }, {}] });
+	const host = sdkHost({ backends: { claude: claude.backend }, ui: false });
+	await host.start();
+	await host.on();
+	const run = await heldRun(host, claude);
+	const refused = await host.call("fusion_deactivate", {});
+	assert.equal(refused.error, "fusion stays on while runs are unfinished: run-1 (implement). Wait for each run or cancel it with fusion_control, then ask again.");
+	await host.command("off");
+	assert.equal(host.last(), "fusion stays on while runs are unfinished: run-1 (implement). Wait for each run or cancel it with /fusion cancel run-N, then retry /fusion off.");
+	assert.deepEqual(host.active, ON_TOOLS, "the host keeps its way to the run, and its way out");
+	run.release();
+	assert.equal((await run.call).error, undefined, "a refused deactivation cancels nothing: the run ends as it would have");
+
+	const asked = await host.fusion({ role: "ask", task: "a question" });
+	assert.equal(asked.details.state, "waiting");
+	assert.match((await host.call("fusion_deactivate", {})).error ?? "", /^fusion stays on while runs are unfinished: run-2 \(ask\)\./);
+	await host.call("fusion_control", { action: "message", run: "run-2", message: "call it foo" });
+	await host.call("fusion_control", { action: "wait", run: "run-2" });
+	assert.deepEqual((await host.call("fusion_deactivate", {})).details, { enabled: false, changed: true });
+	await host.shutdown();
+});
+
+test("an empty saved subset stays empty, and a host that excludes a mode tool keeps it out while the command still switches", async () => {
+	// The user had none of the workflow tools active when fusion started: on gives back none of them.
+	const bare = sdkHost({ initial: ["read"], ui: false });
+	for (const name of ["fusion", "claude", "fusion_control", "claude_control"]) bare.active.splice(0, bare.active.length, ...bare.active.filter((tool) => tool !== name));
+	await bare.start();
+	assert.deepEqual(bare.active, ["read", "fusion_activate"]);
+	await bare.command("on");
+	assert.deepEqual(bare.active, ["read", "fusion_deactivate"], "an empty subset is not a request for all four");
+
+	// An allow list that names the workflow tools but no mode tool: nothing forces a mode tool in.
+	const allowed = ["read", "bash", "fusion", "fusion_control", "claude", "claude_control"];
+	const strict = sdkHost({ allowed, ui: false });
+	await strict.start();
+	assert.deepEqual(strict.active, ["read", "bash"]);
+	await strict.command("on");
+	assert.deepEqual(strict.active, ["read", "bash", "fusion", "claude", "fusion_control", "claude_control"]);
+	await strict.command("profile use builtin");
+	assert.deepEqual(strict.active, ["read", "bash", "fusion", "claude", "fusion_control", "claude_control"], "a re-registration under the allow list brings no mode tool back");
+	await strict.command("off");
+	assert.deepEqual(strict.active, ["read", "bash"]);
+});
+
+test("a host that fails mid-update leaves the mode and the saved subset as they were, and an aborted call changes nothing", async () => {
+	const host = sdkHost({ ui: false });
+	await host.start();
+	host.failNextToolChange();
+	await host.command("on");
+	assert.equal(host.last(), "fusion stays off: the host's tool list did not change: the host refused the tool list");
+	assert.deepEqual(host.active, ["read", "bash", "fusion_activate"], "the partial change was put back");
+	await host.command("status");
+	assert.match(host.last() ?? "", /^fusion: off/);
+	const aborted = AbortSignal.abort();
+	assert.equal((await host.call("fusion_activate", {}, aborted)).error, "fusion stays off: the call was cancelled");
+	assert.deepEqual(host.active, ["read", "bash", "fusion_activate"]);
+	await host.command("on");
+	assert.deepEqual(host.active, ON_TOOLS, "the subset saved at startup is still the one on gives back");
+	host.failNextToolChange();
+	assert.equal((await host.call("fusion_deactivate", {})).error, "fusion stays on: the host's tool list did not change: the host refused the tool list");
+	assert.deepEqual(host.active, ON_TOOLS);
+	assert.equal((await host.call("fusion_deactivate", {}, aborted)).error, "fusion stays on: the call was cancelled");
+	assert.deepEqual(host.active, ON_TOOLS);
+});
+
+test("a host that never emits session_start is masked by its first command or call", async () => {
+	const claude = fakeBackend({ name: "claude" });
+	const commanded = sdkHost({ backends: { claude: claude.backend }, ui: false });
+	assert.ok(commanded.active.includes("fusion"), "before anything binds, the SDK's own activation stands");
+	await commanded.command("status");
+	assert.deepEqual(commanded.active, ["read", "bash", "fusion_activate"]);
+	const called = sdkHost({ backends: { claude: claude.backend }, ui: false });
+	assert.match((await called.fusion({ role: "implement", task: "x" })).error ?? "", /^fusion is off/);
+	assert.deepEqual(called.active, ["read", "bash", "fusion_activate"]);
+	assert.equal(claude.starts.length, 0);
+});
+
+test("the mode tools carry only their own guidance, and the workflow guidance says it applies while fusion is on", () => {
+	const host = sdkHost({ ui: false });
+	const activate = host.tools.get("fusion_activate")!;
+	const deactivate = host.tools.get("fusion_deactivate")!;
+	for (const tool of [activate, deactivate]) {
+		assert.equal(tool.executionMode, "sequential");
+		const text = [tool.description, ...(tool.promptGuidelines ?? [])].join("\n");
+		assert.match(text, /explicitly asks/);
+		assert.doesNotMatch(text, /do not edit files|delegate implementation|role plan|Route section/, "no orchestration mandate rides on a mode tool");
+	}
+	assert.match(activate.promptGuidelines!.join("\n"), /names a role, a model or a harness without asking for Fusion, such as a plan, a security audit, ultracode, Claude or Pi, does not qualify/);
+	assert.match(activate.promptGuidelines!.join("\n"), /Fusion having been used earlier in this conversation/);
+	assert.match(deactivate.promptGuidelines!.join("\n"), /never because a task ended/);
+	for (const name of ["fusion", "claude"]) {
+		assert.match(host.tools.get(name)!.promptGuidelines![0]!, new RegExp(`^These ${name} guidelines apply while Fusion is on`));
+	}
 });

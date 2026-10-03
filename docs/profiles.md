@@ -41,7 +41,7 @@ The built-in configuration is the legacy behavior. Every role is enabled. `secur
 
 When an extension instance starts, it loads the default profile from the file. Starting Pi, `/new`, a reload, a resume and a fork each start a new instance. If there is no default profile, the session starts on `builtin`. If the file can't be read, isn't valid, or names a default it doesn't hold, the session also starts on `builtin`, and you get a warning once a notice can be shown. Nothing rewrites the file in that case.
 
-A session's choice of profile, and any edits it makes, live in memory only, like `/fusion off`. A new instance loads the default profile again.
+A session's choice of profile, and any edits it makes, live in memory only, like whether Fusion is on. A new instance loads the default profile again.
 
 Loading a profile copies its settings into the session. A later save from another session does not change this one, and neither does editing the file. External edits reach a session only when it loads a profile again; nothing watches the file. Changing the default affects only future sessions, and other running sessions keep what they have.
 
