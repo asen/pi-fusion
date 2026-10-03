@@ -4,7 +4,7 @@ import * as fs from "node:fs";
 import * as http from "node:http";
 import * as os from "node:os";
 import * as path from "node:path";
-import test from "node:test";
+import test, { afterEach } from "node:test";
 import { fileURLToPath } from "node:url";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import fusion, { parseFusion } from "../extensions/fusion.ts";
@@ -52,6 +52,27 @@ const ESC = "\u001b";
 const BEL = "\u0007";
 
 /** A host whose branch grows with every entry the extension appends, as Pi's does. */
+/**
+ * The shutdown of every host a test made, run after that test whatever it did. A test that fails an assertion stops
+ * before its own cancel, and a `hang` child left running keeps this file's process alive after its last test, so the
+ * suite would wait on it forever instead of reporting the failure.
+ */
+const shutdowns: Array<() => Promise<unknown>> = [];
+const SHUTDOWN_MS = 10_000;
+
+afterEach(async () => {
+	const pending = shutdowns.splice(0);
+	let timer: NodeJS.Timeout | undefined;
+	const late = new Promise<never>((_, reject) => {
+		timer = setTimeout(() => reject(new Error(`a host this test made did not shut down within ${SHUTDOWN_MS}ms`)), SHUTDOWN_MS);
+	});
+	try {
+		await Promise.race([Promise.all(pending.map((shutdown) => shutdown())), late]);
+	} finally {
+		clearTimeout(timer);
+	}
+});
+
 function makeHost(cwd = repoRoot, mode: "tui" | "print" = "print", session: { id?: string; file?: string } = {}) {
 	const tools = new Map<string, Tool>();
 	const commands = new Map<string, Command>();
@@ -105,6 +126,7 @@ function makeHost(cwd = repoRoot, mode: "tui" | "print" = "print", session: { id
 	const sessionManager: Record<string, unknown> = { getSessionId: () => session.id ?? "host-1", getBranch: () => branch };
 	if (session.file !== undefined) sessionManager.getSessionFile = () => session.file;
 	const ctx = { cwd, mode, hasUI: true, ui, sessionManager };
+	shutdowns.push(async () => handlers.get("session_shutdown")!({ type: "session_shutdown", reason: "quit" }, ctx));
 	const call = (name: string, params: Record<string, unknown>, signal?: AbortSignal) => tools.get(name)!.execute("call-1", params, signal, undefined, ctx);
 	const claude = (params: Record<string, unknown>, signal?: AbortSignal) => call("claude", params, signal);
 	const control = (params: Record<string, unknown>, signal?: AbortSignal) => call("claude_control", params, signal);

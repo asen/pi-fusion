@@ -7,7 +7,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ```bash
 npm install            # also fetches the Claude Code binary bundled with the Agent SDK (~200 MB)
 npm run typecheck      # tsc -p . (noEmit); the only static check, there is no linter or formatter
-npm test               # node --test "test/*.test.ts"
+npm test               # node --test --test-timeout=60000 "test/*.test.ts"; a test past 60 s is cancelled and named
 node --test test/control.test.ts                      # one file
 node --test --test-name-pattern="continue" test/control.test.ts   # one test
 ```
