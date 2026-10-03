@@ -1647,6 +1647,7 @@ export default function fusion(pi: ExtensionAPI, options: FusionOptions = {}) {
 		role: run.role.name,
 		...(run.role.mode === undefined ? {} : { mode: run.role.mode }),
 		model: run.role.model,
+		...(run.role.effort ? { effort: run.role.effort } : {}),
 		hostSessionId: run.hostSessionId ?? "",
 		cwd: run.cwd,
 		...(run.tool === undefined ? {} : { tool: run.tool }),
@@ -1700,7 +1701,9 @@ export default function fusion(pi: ExtensionAPI, options: FusionOptions = {}) {
 			const held = interrupted ?? read;
 			if (interrupted) corrected.push(interrupted);
 			if (held.usage) ledger.update(held.id, held.usage);
-			store.restore(held);
+			// A Pi run's verified selection names the effort its child confirmed, which a run that named none only learns there.
+			const effort = held.selection?.effort ?? held.effort;
+			store.restore({ ...held, ...(effort ? { effort } : {}) });
 			historical.set(held.handle, held);
 		}
 		saveHistory(ctx, hostSessionId, ...corrected);
@@ -2127,6 +2130,7 @@ export default function fusion(pi: ExtensionAPI, options: FusionOptions = {}) {
 				backend: run.backend,
 				role: role.name,
 				model: role.model,
+				...(role.effort ? { effort: role.effort } : {}),
 				...(toolCallId === undefined ? {} : { toolCallId }),
 				...(call.tool === undefined ? {} : { tool: call.tool }),
 				origin: call.origin,

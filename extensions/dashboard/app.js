@@ -172,7 +172,7 @@ const runItem = (run, step) => {
 		for (const flag of flags) row.appendChild(flagBadge(flag));
 		item.appendChild(row);
 	}
-	const model = str(run.modelId) || str(run.model);
+	const model = backendOf(run) + " · " + (str(run.modelId) || str(run.model));
 	item.appendChild(el("span", "run-model", run.background === true ? model + " · background" : model));
 	if (str(run.question)) item.appendChild(el("span", "run-question", str(run.question)));
 	const meta = el("span", "run-meta");
@@ -305,7 +305,9 @@ const factsList = (detail) => {
 	if (isNum(detail.costUsd)) addFact(facts, "Cost (estimate)", formatUsd(detail.costUsd));
 	if (isNum(detail.numTurns)) addFact(facts, "Model turns", formatCount(detail.numTurns));
 	if (isNum(detail.apiMs)) addFact(facts, "API time", formatSeconds(detail.apiMs));
+	addFact(facts, "Backend", backendOf(detail));
 	if (str(detail.modelId)) addFact(facts, "Model id", str(detail.modelId));
+	if (str(detail.effort)) addFact(facts, "Effort", str(detail.effort));
 	if (isNum(detail.contextTokens) && isNum(detail.contextWindow) && detail.contextWindow > 0) addFact(facts, "Context", contextMeter(detail));
 	if (str(detail.tool)) addFact(facts, "Pi tool", str(detail.tool));
 	if (str(detail.toolCallId)) addFact(facts, "Pi tool call", str(detail.toolCallId));

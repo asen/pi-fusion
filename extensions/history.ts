@@ -41,6 +41,8 @@ export interface HistoryRecord {
 	role: string;
 	mode?: string;
 	model: string;
+	/** The effort the run was admitted with; a Pi run that named none leaves it unset, and its `selection` says what ran. */
+	effort?: string;
 	hostSessionId: string;
 	cwd: string;
 	tool?: string;
@@ -128,7 +130,7 @@ const joined = (...warnings: Array<string | undefined>): string | undefined => {
 	return held.length ? held.join("; ") : undefined;
 };
 
-const STRING_FIELDS = ["mode", "tool", "toolCallId", "reviews", "reviewedBy", "sessionId", "checkpoint", "backend", "contract", "title"] as const;
+const STRING_FIELDS = ["mode", "effort", "tool", "toolCallId", "reviews", "reviewedBy", "sessionId", "checkpoint", "backend", "contract", "title"] as const;
 
 /** A copy of the record with every text, list and number a bounded one, so one run can never fill a session file. */
 export function boundRecord(record: HistoryRecord): HistoryRecord {

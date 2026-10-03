@@ -1177,6 +1177,29 @@ test("a run's tasks are drawn on a timeline of the run", { skip }, async () => {
 	assert.equal(await page.evaluate<string>("document.querySelector('.timeline-axis').textContent"), "0s10s");
 });
 
+test("a run's backend is in the list and its facts, beside the model and effort it ran with", { skip }, async () => {
+	const { page, store, url } = await fixture();
+	store.start({ id: "shown-claude", backend: "claude", role: "shown-claude-role", model: "opus", effort: "high" });
+	store.start({ id: "shown-pi", backend: "pi", role: "shown-pi-role", model: "deepseek/deepseek-chat" });
+	await page.open(url);
+	const MODEL_OF = (role: string) =>
+		`(() => { const item = Array.from(document.querySelectorAll('.run')).find((node) => node.querySelector('.run-role').textContent === ${JSON.stringify(role)}); return item ? item.querySelector('.run-model').textContent : ''; })()`;
+	await page.until<string>("the claude run names its backend", MODEL_OF("shown-claude-role"), (text) => text === "claude · opus");
+	assert.equal(await page.evaluate<string>(MODEL_OF("shown-pi-role")), "pi · deepseek/deepseek-chat");
+
+	await page.until<string>("the claude run is listed and clicked", CLICK_RUN("shown-claude-role"), (result) => result === "clicked");
+	await page.until<string>("the claude run is shown", DETAIL_TITLE, (title) => title === "shown-claude-role");
+	assert.equal(await page.evaluate<string>(FACT_VALUE("Backend")), "claude");
+	assert.equal(await page.evaluate<string>(FACT_VALUE("Effort")), "high");
+
+	await page.until<string>("the pi run is listed and clicked", CLICK_RUN("shown-pi-role"), (result) => result === "clicked");
+	await page.until<string>("the pi run is shown", DETAIL_TITLE, (title) => title === "shown-pi-role");
+	assert.equal(await page.evaluate<string>(FACT_VALUE("Backend")), "pi");
+	assert.equal(await page.evaluate<string>(FACT_VALUE("Effort")), "", "a pi run that named no effort shows none until its child confirms one");
+	store.progress("shown-pi", { toolCalls: 0, tokensIn: 0, tokensOut: 0, modelId: "deepseek/deepseek-chat", selection: { model: "deepseek/deepseek-chat", effort: "medium" } });
+	await page.until<string>("the confirmed effort appears", FACT_VALUE("Effort"), (text) => text === "medium");
+});
+
 const COUNT_TEXT = "(document.querySelector('.log-count') || {}).textContent || ''";
 const LOG_TOP = "document.querySelector('.log').getBoundingClientRect().top";
 const FIT_COUNT_AT_EDGE = `(() => {

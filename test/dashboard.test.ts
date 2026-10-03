@@ -378,6 +378,23 @@ test("progress copies cost, cache, context, model usage and thinking, and caps t
 	assert.ok(!("thinking" in summary) && !("models" in summary), "the run list stays small");
 });
 
+test("a run keeps the backend and effort it was admitted with, and a pi run takes the effort its child confirmed", () => {
+	const { store } = makeStore();
+	store.start({ id: "claude-run", backend: "claude", role: "implement", model: "opus", effort: "high" });
+	store.start({ id: "pi-run", backend: "pi", role: "security", model: "deepseek/deepseek-chat" });
+	store.start({ id: "plain-run", role: "ask", model: "sonnet" });
+	assert.equal(detailOf(store, "claude-run").backend, "claude");
+	assert.equal(detailOf(store, "claude-run").effort, "high");
+	assert.equal(detailOf(store, "pi-run").backend, "pi");
+	assert.ok(!("effort" in detailOf(store, "pi-run")), "a pi run that named no effort has none until its child confirms one");
+	assert.ok(!("effort" in detailOf(store, "plain-run")));
+	store.progress("pi-run", { toolCalls: 0, tokensIn: 0, tokensOut: 0, modelId: "deepseek/deepseek-chat", selection: { model: "deepseek/deepseek-chat", effort: "medium" } });
+	assert.equal(detailOf(store, "pi-run").effort, "medium");
+	assert.equal(store.summaries().find((run) => run.id === "pi-run")?.effort, "medium", "the run list carries it too");
+	assert.equal(store.restore({ id: "held", backend: "pi", role: "plan", model: "deepseek/deepseek-chat", effort: "low", state: "done", startedAt: 1 }), true);
+	assert.equal(detailOf(store, "held").effort, "low");
+});
+
 test("a tool call keeps its input and result and marks its log entry", () => {
 	const { store } = started();
 	store.event("run-1", { type: "tool_call", name: "Bash", brief: "npm test", id: "tu-1", input: { command: "npm test" } });

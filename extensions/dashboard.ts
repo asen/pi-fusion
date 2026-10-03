@@ -61,6 +61,8 @@ export interface RunProgress {
 	workflowTokens?: number;
 	sessionId?: string;
 	deniedTools?: string[];
+	/** What a Pi child confirmed it runs with, which is where a run that named no effort learns the child's own. */
+	selection?: { model: string; effort: string };
 }
 
 export interface RunSummary {
@@ -72,8 +74,10 @@ export interface RunSummary {
 	background?: boolean;
 	role: string;
 	model: string;
-	/** The model id Claude Code reported at init. Until then the list shows `model`, the role's alias. */
+	/** The model id the child reported: Claude Code's at init, a Pi child's once its selection is confirmed. Until then the list shows `model`. */
 	modelId?: string;
+	/** The effort the run was admitted with, or the one a Pi child confirmed; none for a run that names none. */
+	effort?: string;
 	title?: string;
 	/** The Pi tool that started the run, the id of that tool call, and the Pi session it was made in. */
 	tool?: string;
@@ -185,6 +189,7 @@ export interface RunStart {
 	background?: boolean;
 	role: string;
 	model: string;
+	effort?: string;
 	title?: string;
 	tool?: string;
 	toolCallId?: string;
@@ -205,6 +210,7 @@ export interface RestoredRun {
 	background?: boolean;
 	role: string;
 	model: string;
+	effort?: string;
 	title?: string;
 	tool?: string;
 	toolCallId?: string;
@@ -261,6 +267,7 @@ interface StoredRun {
 	background?: boolean;
 	role: string;
 	model: string;
+	effort?: string;
 	title?: string;
 	tool?: string;
 	toolCallId?: string;
@@ -362,6 +369,7 @@ function summaryOf(run: StoredRun): RunSummary {
 	if (run.background) summary.background = true;
 	if (run.question !== undefined) summary.question = run.question;
 	if (run.modelId !== undefined) summary.modelId = run.modelId;
+	if (run.effort !== undefined) summary.effort = run.effort;
 	if (run.title !== undefined) summary.title = run.title;
 	if (run.tool !== undefined) summary.tool = run.tool;
 	if (run.toolCallId !== undefined) summary.toolCallId = run.toolCallId;
@@ -511,6 +519,7 @@ export class RunStore {
 		};
 		if (input.handle !== undefined) run.handle = cap(String(input.handle));
 		if (input.background === true) run.background = true;
+		if (input.effort) run.effort = cap(String(input.effort));
 		if (input.title !== undefined) run.title = cap(String(input.title));
 		if (input.tool !== undefined) run.tool = cap(String(input.tool));
 		if (input.toolCallId !== undefined) run.toolCallId = cap(String(input.toolCallId));
@@ -575,6 +584,7 @@ export class RunStore {
 		if (endedAt !== undefined) run.endedAt = endedAt;
 		if (input.handle !== undefined) run.handle = cap(String(input.handle));
 		if (input.background === true) run.background = true;
+		if (input.effort) run.effort = cap(String(input.effort));
 		if (input.title !== undefined) run.title = cap(String(input.title));
 		if (input.tool !== undefined) run.tool = cap(String(input.tool));
 		if (input.toolCallId !== undefined) run.toolCallId = cap(String(input.toolCallId));
@@ -856,6 +866,7 @@ export class RunStore {
 		const contextWindow = num(snapshot.contextWindow);
 		if (contextWindow !== undefined) run.contextWindow = contextWindow;
 		if (snapshot.modelId !== undefined) run.modelId = cap(String(snapshot.modelId));
+		if (typeof snapshot.selection?.effort === "string" && snapshot.selection.effort) run.effort = cap(snapshot.selection.effort);
 		if (Array.isArray(snapshot.models)) run.models = modelsOf(snapshot.models);
 		if (Array.isArray(snapshot.thinking)) run.thinking = snapshot.thinking.slice(-MAX_THINKING_BLOCKS).map((text) => capBytes(String(text), THINKING_CAP_BYTES).text);
 		const workflowTokens = num(snapshot.workflowTokens);

@@ -98,6 +98,17 @@ test("a second save of the same run replaces its record, and another run is appe
 	});
 });
 
+test("a record keeps the effort its run was admitted with", () => {
+	withDir((root) => {
+		const history = new History(path.join(root, "history"));
+		history.save("host-1", "/work", record({ effort: "high" }));
+		history.save("host-1", "/work", record({ id: "id-2", handle: "run-2", startedAt: 2_000 }));
+		const [kept, none] = history.load("host-1").records;
+		assert.equal(kept?.effort, "high");
+		assert.ok(none && !("effort" in none), "a run that named no effort comes back with none");
+	});
+});
+
 test("a session file keeps the newest records and drops the oldest past the cap", () => {
 	withDir((root) => {
 		const dir = path.join(root, "history");
