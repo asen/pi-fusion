@@ -80,6 +80,8 @@ const SELECTED_TAB = "(document.querySelector('.tab[aria-selected=\"true\"]') ||
 const VISIBLE_PANEL = "(document.querySelector('.panel:not(.hidden)') || { dataset: {} }).dataset.tab || ''";
 const TAB = (label: string) => `Array.from(document.querySelectorAll('.tab')).find((node) => node.firstChild.textContent === ${JSON.stringify(label)})`;
 const CLICK_TAB = (label: string) => `(() => { const tab = ${TAB(label)}; if (!tab) return 'missing'; tab.click(); return 'clicked'; })()`;
+const CLICK_RUN = (role: string) =>
+	`(() => { const item = Array.from(document.querySelectorAll('.run')).find((node) => node.querySelector('.run-role').textContent === ${JSON.stringify(role)}); if (!item) return 'missing'; item.click(); return 'clicked'; })()`;
 const TAB_BADGE = (label: string) => `(() => { const tab = ${TAB(label)}; const badge = tab && tab.querySelector('.badge'); return badge ? badge.textContent + (badge.classList.contains('badge-hot') ? '*' : '') : ''; })()`;
 const PANEL = (tab: string) => `document.querySelector('.panel[data-tab="${tab}"]')`;
 const PANEL_SCROLL = (tab: string) => `(${PANEL(tab)} || {}).scrollTop`;
@@ -1166,7 +1168,7 @@ test("a run's tasks are drawn on a timeline of the run", { skip }, async () => {
 	shift(4_000);
 	store.finish("gantt", { status: "done" });
 	await page.open((await fixture()).url);
-	await page.evaluate<string>("(() => { Array.from(document.querySelectorAll('.run')).find((node) => node.querySelector('.run-role').textContent === 'gantt-role').click(); return 'ok'; })()");
+	await page.until<string>("the gantt run is listed and clicked", CLICK_RUN("gantt-role"), (result) => result === "clicked");
 	await page.until<string>("the gantt run is shown", DETAIL_TITLE, (title) => title === "gantt-role");
 	const bars = await page.evaluate<string[]>(
 		"Array.from(document.querySelectorAll('.timeline-row')).filter((row) => row.querySelector('.timeline-bar')).map((row) => { const bar = row.querySelector('.timeline-bar'); return [row.querySelector('.timeline-label').textContent, Math.round(parseFloat(bar.style.left)), Math.round(parseFloat(bar.style.width)), bar.className].join(' '); })",
@@ -1200,7 +1202,7 @@ test("the log stays in place when its entry count gains a digit", { skip }, asyn
 	const { page, store } = await fixture();
 	store.start({ id: "digits", role: "digits-role", model: "opus" });
 	await page.open((await fixture()).url);
-	await page.evaluate<string>("(() => { Array.from(document.querySelectorAll('.run')).find((node) => node.querySelector('.run-role').textContent === 'digits-role').click(); return 'ok'; })()");
+	await page.until<string>("the digits run is listed and clicked", CLICK_RUN("digits-role"), (result) => result === "clicked");
 	await page.until<string>("the digits run is shown", DETAIL_TITLE, (title) => title === "digits-role");
 	let added = 0;
 	const fill = async (entries: number, brief: string): Promise<void> => {
