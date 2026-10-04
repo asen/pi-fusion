@@ -8,7 +8,7 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import ts from "typescript";
 import { claudeBackend, type Role } from "../extensions/backends/claude.ts";
 import { createCodexBackend } from "../extensions/backends/codex.ts";
-import { CODEX_FRESH_ONLY } from "../extensions/backends/codex-outcome.ts";
+import { CODEX_FOREIGN_SESSION, CODEX_NO_CHECKPOINT } from "../extensions/backends/codex-outcome.ts";
 import { hostBackend, isPiModel, keptRef, keptSelection, piModelParts, resolvedSelectionOf, sessionRefOf } from "../extensions/backends/types.ts";
 import { ASK_MODES, type AskMode, type ChildRun as ExportedChildRun, codexResumeCommand, failed, ROLE_NAMES } from "../extensions/fusion.ts";
 import { ChildTree } from "../extensions/process-tree.ts";
@@ -154,10 +154,13 @@ test("this build's default codex backend is lazy: constructing it reads, locates
 	try {
 		const backend = hostBackend(createCodexBackend());
 		assert.equal(backend.name, "codex");
-		assert.equal(backend.control().open, false, "a codex child takes no steer: its input is closed from the start");
+		assert.equal(backend.control().open, true, "a codex run's input is open from its admission, holding steers until its turn is named");
 		assert.deepEqual(backend.session({ kind: "new" }), { kind: "new" });
-		assert.throws(() => backend.session({ kind: "resume", ref: { backend: "codex", sessionId: "thr-1", checkpoint: "turn-1" } }), new RegExp(`^Error: ${CODEX_FRESH_ONLY}$`));
-		assert.throws(() => backend.session({ kind: "fork", from: { backend: "codex", sessionId: "thr-1", checkpoint: "turn-1" } }), new RegExp(`^Error: ${CODEX_FRESH_ONLY}$`));
+		const baseline = { inputTokens: 30, cachedInputTokens: 20, outputTokens: 4, reasoningOutputTokens: 1, totalTokens: 34 };
+		assert.deepEqual(backend.session({ kind: "resume", ref: { backend: "codex", sessionId: "thr-1", checkpoint: "turn-1", baseline } }), { kind: "resume", id: "thr-1", at: "turn-1", baseline });
+		assert.deepEqual(backend.session({ kind: "fork", from: { backend: "codex", sessionId: "thr-1", checkpoint: "turn-1", baseline } }), { kind: "fork", from: "thr-1", at: "turn-1", baseline });
+		assert.throws(() => backend.session({ kind: "resume", ref: { backend: "codex", sessionId: "thr-1", checkpoint: "turn-1" } }), { message: CODEX_NO_CHECKPOINT });
+		assert.throws(() => backend.session({ kind: "fork", from: { backend: "claude", sessionId: "thr-1", checkpoint: "turn-1" } }), { message: CODEX_FOREIGN_SESSION });
 	} finally {
 		for (const [name, value] of Object.entries(kept)) {
 			if (value === undefined) delete process.env[name];

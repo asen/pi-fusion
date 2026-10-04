@@ -7,7 +7,7 @@ import { fileURLToPath } from "node:url";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { CODEX_HOST_DEFAULT, codexRole } from "../extensions/backends/codex-binding.ts";
 import { createCodexBackend } from "../extensions/backends/codex.ts";
-import { CODEX_FRESH_ONLY } from "../extensions/backends/codex-outcome.ts";
+import { CONTRACT_UNREADABLE } from "../extensions/backends/codex.ts";
 import { type PiRole, piModelVariable, piRole } from "../extensions/backends/pi-binding.ts";
 import type { Backend, BackendName, ChildControl, ChildRun, HostBackend, PiSessionRef, ResolvedSelection, SessionIntent } from "../extensions/backends/types.ts";
 import { hostBackend } from "../extensions/backends/types.ts";
@@ -892,7 +892,7 @@ test("a codex call goes to the codex backend this host registers, named or confi
 	assert.deepEqual(ext.appended, [], "a backend that threw returned no outcome, so nothing was recorded");
 });
 
-test("a codex record is refused before this build's codex backend runs anything: a readable thread by its record, a continuable one by the fresh-only mapping", async () => {
+test("a codex record is refused for reading before this build's codex backend runs anything, and a continuable one is mapped and reaches the backend's first seam", async () => {
 	const codex = fencedCodex();
 	const ext = makeExtension({ codex: codex.backend });
 	assert.equal(
@@ -902,11 +902,13 @@ test("a codex record is refused before this build's codex backend runs anything:
 	);
 	const { baseline, ...unmeasured } = CODEX_REF;
 	assert.match((await call(ext, "fusion", { continue: "run-1", task: "x" }, makeCtx([entry(codexEntry({ session: unmeasured }))]))).error ?? "", /^run-1 ran on codex and recorded its checkpoint with no usage baseline, so it is kept for reading/, "a checkpoint with no baseline is refused for reading too");
-	// A record with a checkpoint no codex run of this build writes still goes nowhere: the backend maps no resume.
-	assert.equal((await call(ext, "fusion", { continue: "run-1", task: "x" }, makeCtx([entry(codexEntry())]))).error, CODEX_FRESH_ONLY);
-	assert.equal((await call(ext, "fusion", { continue: "run-1", task: "x" }, makeCtx([entry(codexEntry())], "host-2"))).error, CODEX_FRESH_ONLY, "nor a fork, which another host session's continuation is");
-	assert.deepEqual(codex.reached, [], "no contract was read, no binary located and nothing started");
-	assert.deepEqual(ext.appended, [], "a refused call records nothing");
+	assert.deepEqual(codex.reached, [], "no contract was read, no binary located and nothing started for a record kept for reading");
+	// A checkpoint with its baseline is mapped to a resume, and in another host session to a fork, and the run reaches
+	// the fenced contract read first: no binary is located and nothing starts.
+	assert.equal((await call(ext, "fusion", { continue: "run-1", task: "x" }, makeCtx([entry(codexEntry())]))).error, CONTRACT_UNREADABLE);
+	assert.equal((await call(ext, "fusion", { continue: "run-1", task: "x" }, makeCtx([entry(codexEntry())], "host-2"))).error, CONTRACT_UNREADABLE, "and a fork, which another host session's continuation is");
+	assert.deepEqual(codex.reached, ["contract", "contract"], "the contract read is the first and only seam reached");
+	assert.deepEqual(ext.appended, [], "a run that threw records nothing");
 });
 
 test("a host that left out every backend says so, rather than offering an empty list of harnesses", async () => {
@@ -971,7 +973,7 @@ test("an effort only codex takes is accepted on codex, named or configured, whil
 	assert.deepEqual(continued.bound, { ...CODEX_IMPLEMENT, model: "o3", provider: "openai", effort: "ultra" });
 });
 
-test("a codex record routes through fusion alone, on the selection and provider it recorded, and this build's codex backend refuses to continue it", async () => {
+test("a codex record routes through fusion alone, on the selection and provider it recorded, and reaches this build's codex backend as a continuation", async () => {
 	const records = runRecords([entry(codexEntry())]);
 	const route = fusionRoute({ continue: "run-1", task: "x" }, records);
 	assert.deepEqual([route.backend, route.role, route.handle, route.record?.session], ["codex", "implement", "run-1", CODEX_REF]);
@@ -988,20 +990,22 @@ test("a codex record routes through fusion alone, on the selection and provider 
 	assert.deepEqual(fusionCall({ continue: "run-1", task: "x" }, withEffort).bound, { ...codexAsk("review"), model: "gpt-5-codex", provider: "azure", effort: "minimal" });
 	assert.throws(() => fusionCall({ continue: "run-1", task: "x", fresh: true }, records), /^Error: fresh is not allowed with continue$/);
 	assert.throws(() => claudeRoute({ continue: "run-1", task: "x" }, records), /^Error: run-1 ran on the codex backend, which the claude tool does not run; continue it with fusion and continue run-1$/);
-	// This build's codex backend over refusing seams: the binding succeeds, so the fresh-only session mapping is what
-	// stops the call, before any seam could be reached.
+	// This build's codex backend over refusing seams: the binding and the session mapping succeed, so the fenced contract
+	// read is what stops the call, before any binary lookup or start.
 	const codex = fencedCodex();
 	const ext = makeExtension({ codex: codex.backend });
 	const branch = [entry(codexEntry())];
-	assert.equal((await call(ext, "fusion", { continue: "run-1", task: "x" }, makeCtx(branch))).error, CODEX_FRESH_ONLY);
-	assert.deepEqual(codex.reached, []);
+	assert.equal((await call(ext, "fusion", { continue: "run-1", task: "x" }, makeCtx(branch))).error, CONTRACT_UNREADABLE);
+	assert.deepEqual(codex.reached, ["contract"]);
 	assert.equal((await call(ext, "claude", { continue: "run-1", task: "x" }, makeCtx(branch))).error, "run-1 ran on the codex backend, which the claude tool does not run; continue it with fusion and continue run-1");
-	// Controls of either pair name fusion for a codex run, and a thread kept only for reading says how to reopen it.
+	// Controls of either pair name fusion for a codex run, and a thread kept only for reading says how to reopen it. An
+	// extension that ran nothing knows run-1 from its record alone, as a later Pi process would.
+	const idle = makeExtension({ codex: fencedCodex().backend });
 	for (const tool of ["claude_control", "fusion_control"]) {
-		const ended = await call(ext, tool, { action: "message", run: "run-1", message: "more" }, makeCtx(branch));
+		const ended = await call(idle, tool, { action: "message", run: "run-1", message: "more" }, makeCtx(branch));
 		assert.match(ended.text ?? "", /Continue it with fusion and continue run-1, or take no action\.$/, tool);
 		const { checkpoint, baseline, ...bare } = CODEX_REF;
-		const readable = await call(ext, tool, { action: "message", run: "run-1", message: "more" }, makeCtx([entry(codexEntry({ session: bare }))]));
+		const readable = await call(idle, tool, { action: "message", run: "run-1", message: "more" }, makeCtx([entry(codexEntry({ session: bare }))]));
 		assert.match(readable.text ?? "", /open its thread with codex resume thread-1, and new work needs a new run without continue\.$/, tool);
 		assert.doesNotMatch(readable.text ?? "", /claude --resume/, tool);
 	}

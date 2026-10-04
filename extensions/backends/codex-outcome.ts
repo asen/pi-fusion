@@ -1,7 +1,7 @@
 import type { CodexRole } from "./codex-binding.ts";
-import { type CodexDenial, type CodexThreadRead, type CodexThreadStart, sandboxModeOf } from "./codex-protocol.ts";
+import { type CodexDenial, type CodexThreadRead, type CodexThreadStart, type CodexTokenBreakdown, sandboxModeOf } from "./codex-protocol.ts";
 import type { CodexExit, CodexNotification, CodexTurnEvidence, CodexTurnResult } from "./codex-transport.ts";
-import { type ChildEvent, type ChildRun, type ResolvedSelection, resolvedSelectionOf, type SessionIntent } from "./types.ts";
+import { type ChildEvent, type ChildRun, type CodexUsageBaseline, type ResolvedSelection, resolvedSelectionOf, type SessionIntent, sessionRefOf } from "./types.ts";
 
 /**
  * What one Codex call reports, decided from evidence the composition in `codex.ts` gathered and from nothing else: the
@@ -18,18 +18,42 @@ import { type ChildEvent, type ChildRun, type ResolvedSelection, resolvedSelecti
 /** A Codex child's run: the shared record over this backend's own role shape. */
 export type CodexRun = ChildRun<CodexRole>;
 
-/** The only session this build's Codex backend runs: a fresh thread. Continuing one is not qualified yet. */
-export interface CodexSession {
-	kind: "new";
-}
+/**
+ * The session one Codex call runs in: a new thread, the thread a resume loads, or the thread a fork copies through one
+ * turn. A continuation always carries the checkpoint it restores — a completed turn of that thread — and the cumulative
+ * usage the thread had there, which is what this call's own usage is measured from. Nothing else of a record is here.
+ */
+export type CodexSession = { kind: "new" } | { kind: "resume"; id: string; at: string; baseline: CodexUsageBaseline } | { kind: "fork"; from: string; at: string; baseline: CodexUsageBaseline };
 
-/** Why a resume or a fork never reaches a Codex child in this build, said before anything is looked up or started. */
-export const CODEX_FRESH_ONLY = "the codex backend runs fresh threads only in this build, so a codex run cannot be resumed or forked; start a new run without continue that carries the earlier report as context";
+/** Why a continuation never reaches a Codex child: its reference is another backend's, or no codex thread at all. */
+export const CODEX_FOREIGN_SESSION = "the codex backend continues only a codex thread, and this run's reference names another backend's session or no codex thread at all";
+/** Why a codex thread with no trusted checkpoint, or none with its usage baseline, is never continued. */
+export const CODEX_NO_CHECKPOINT = "the codex backend continues a thread only from a trusted checkpoint and the usage baseline recorded with it, and this reference carries no such pair; start a new run without continue that carries the earlier report as context";
 
-/** The session an intent becomes: a new thread, or a refusal made before any binary lookup, contract read or spawn. */
+/**
+ * The session an intent becomes, or a refusal made before any binary lookup, contract read or spawn. A continuation's
+ * reference is read by the host's own grammar, so a malformed baseline or one with no checkpoint is no reference here
+ * either, and only the thread, the checkpoint and the baseline are carried on.
+ */
 export function codexSession(intent: SessionIntent): CodexSession {
 	if (intent.kind === "new") return { kind: "new" };
-	throw new Error(CODEX_FRESH_ONLY);
+	const ref = sessionRefOf(intent.kind === "resume" ? intent.ref : intent.from, "codex");
+	if (!ref) throw new Error(CODEX_FOREIGN_SESSION);
+	if (ref.checkpoint === undefined || ref.baseline === undefined) throw new Error(CODEX_NO_CHECKPOINT);
+	return intent.kind === "resume" ? { kind: "resume", id: ref.sessionId, at: ref.checkpoint, baseline: ref.baseline } : { kind: "fork", from: ref.sessionId, at: ref.checkpoint, baseline: ref.baseline };
+}
+
+/**
+ * Whether a value handed to a run is a session `codexSession` could have made, checked the same way: a run is not
+ * handed one by anything else, so one that is not is refused before anything is read or located.
+ */
+export function isCodexSession(value: unknown): value is CodexSession {
+	const session = value as Record<string, unknown> | null;
+	if (!session || typeof session !== "object") return false;
+	if (session.kind === "new") return true;
+	const thread = session.kind === "resume" ? session.id : session.kind === "fork" ? session.from : undefined;
+	const ref = sessionRefOf({ backend: "codex", sessionId: thread, checkpoint: session.at, baseline: session.baseline }, "codex");
+	return ref !== undefined && ref.sessionId === thread && ref.checkpoint === session.at && ref.baseline !== undefined;
 }
 
 /** The record a run starts from: everything at zero, nothing claimed and no thread named before one is verified. */
@@ -53,6 +77,19 @@ export const NO_FINAL = "the codex turn completed without a final agent message 
 export const NO_USAGE = "the codex turn completed without reporting its usage before its thread was read back";
 export const NOT_IDLE = "the codex thread did not read back as idle after its turn";
 export const TERMINAL_ERROR = "the codex turn reported a terminal error and still claimed to complete";
+/**
+ * A resumed thread that is no longer at its recorded checkpoint, completed: a failed or cancelled call can leave a turn
+ * past it. The record stays what it was, and nothing here forks, rewinds or replays to get back to it, so the way on is
+ * a new run.
+ */
+export const RESUME_MOVED = "the codex thread's latest turn is not the checkpoint this run continues from, so no turn was started; start a new run without continue that carries the earlier report as context";
+export const RESUME_UNSETTLED = "the codex thread's checkpoint turn is not completed, so no turn was started; start a new run without continue that carries the earlier report as context";
+export const FORK_SAME_THREAD = "the codex child answered the fork with the thread it was asked to fork from, so no turn was started";
+export const FORK_WRONG_SOURCE = "the codex child reported its forked thread as forked from another thread than the one this run forked, so no turn was started";
+export const FORK_NO_TIP = "the codex forked thread reported no turns, so it has no starting checkpoint and no turn was started";
+export const FORK_TIP_UNSETTLED = "the codex forked thread's latest turn is not completed, so it has no starting checkpoint and no turn was started";
+/** A thread total below the baseline this call started from: the call's usage cannot be told, so nothing is settled on. */
+export const USAGE_BASELINE_INCONSISTENT = "the codex thread reported a cumulative usage below the baseline this run continued from, so its own usage cannot be told and no checkpoint was settled on";
 export const CLEANUP_UNCERTAIN = "the turn finished and the codex child's own shutdown did not end cleanly";
 export const CLEANUP_ATTENTION = "cleaning up needs attention";
 const CLEANUP_LEFT = "the cleanup after it left";
@@ -170,35 +207,125 @@ export function exitConcerns(exit: CodexExit | undefined, unverified: boolean): 
 	return found;
 }
 
-/** What the composition settled before the child's one shutdown: a verified success, or one sentence of failure. */
-export type CodexVerdict = { ok: true; text: string; cut: boolean; selection: ResolvedSelection; notes: string[] } | { ok: false; stage: CodexStage; message: string; aborted: boolean };
+/**
+ * What the composition settled before the child's one shutdown: a verified success, or one sentence of failure. A
+ * success names the checkpoint it settled on — its own admitted turn, completed — and the thread's cumulative usage
+ * read at the barrier after it, which is the baseline a later call is measured from.
+ */
+export type CodexVerdict = { ok: true; text: string; cut: boolean; selection: ResolvedSelection; notes: string[]; checkpoint: string; baseline: CodexUsageBaseline } | { ok: false; stage: CodexStage; message: string; aborted: boolean };
 
 /**
  * How one call ended. `none` is a call cancelled before anything was read or launched. Otherwise `thread` is the id of a
- * thread whose start passed its checks, `evidence` the primary turn's last snapshot, `exit` the report of the one
- * shutdown, and `unverified` a shutdown or start seam that threw instead of reporting.
+ * thread whose start passed its checks, `start` the completed turn a fork's new thread reported as its tip before any
+ * turn of this call, `baseline` the usage the call's session started from, `evidence` the primary turn's last snapshot,
+ * `exit` the report of the one shutdown, and `unverified` a shutdown or start seam that threw instead of reporting.
  */
-export type CodexEnding = { kind: "none" } | { kind: "ended"; verdict: CodexVerdict; thread?: string; evidence?: CodexTurnEvidence; exit?: CodexExit; unverified: boolean };
+export type CodexEnding = { kind: "none" } | { kind: "ended"; verdict: CodexVerdict; thread?: string; start?: string; baseline?: CodexUsageBaseline; evidence?: CodexTurnEvidence; exit?: CodexExit; unverified: boolean };
 
 /**
- * The parent thread's own usage, which is all a fresh thread's cumulative total covers: input already counts its cached
- * part, so the cache read is shown beside it and never added. The cache write is reported as Codex reported it, and the
- * input is Codex's own `inputTokens` unchanged: whether cache-write tokens are a subset of the input is not settled by
- * the source this reads and stays a native qualification question (Q14), so nothing here sums, subtracts or clamps
- * them, and no lifecycle or context-cap decision may lean on that relationship until Q14 is measured. The context is
- * the latest model response's input against the window when the child named one. No cost: Codex reports none, and
- * none is estimated here.
+ * One call's own share of a thread's cumulative usage: the five core counts of the total less the baseline the call
+ * started from, and with no baseline — a fresh thread — the total as it is, since nothing came before it. One count
+ * below its baseline is a thread whose total this call cannot account for, and there is then no usage at all rather
+ * than a clamped one. The cache write is a diagnostic and never decides that: it is a difference only where the
+ * baseline recorded one and the total has not fallen under it, and otherwise unobserved, which is not zero.
  */
-function publishUsage(run: CodexRun, usage: NonNullable<CodexTurnEvidence["usage"]>): void {
-	run.tokensIn = usage.total.inputTokens;
-	run.tokensOut = usage.total.outputTokens;
-	run.cacheRead = usage.total.cachedInputTokens;
-	run.cacheWrite = usage.total.cacheWriteInputTokens;
-	run.contextTokens = usage.last.inputTokens;
-	if (usage.modelContextWindow === null) delete run.contextWindow;
-	else run.contextWindow = usage.modelContextWindow;
+export interface CodexCallUsage {
+	inputTokens: number;
+	cachedInputTokens: number;
+	outputTokens: number;
+	reasoningOutputTokens: number;
+	totalTokens: number;
+	cacheWriteInputTokens?: number;
+}
+
+const CORE_COUNTS = ["inputTokens", "cachedInputTokens", "outputTokens", "reasoningOutputTokens", "totalTokens"] as const;
+
+export function callUsage(total: CodexTokenBreakdown, baseline?: CodexUsageBaseline): CodexCallUsage | undefined {
+	const core = Object.fromEntries(CORE_COUNTS.map((field) => [field, total[field] - (baseline?.[field] ?? 0)])) as Record<(typeof CORE_COUNTS)[number], number>;
+	if (CORE_COUNTS.some((field) => core[field] < 0)) return undefined;
+	if (baseline === undefined) return { ...core, cacheWriteInputTokens: total.cacheWriteInputTokens };
+	const before = baseline.cacheWriteInputTokens;
+	return before !== undefined && total.cacheWriteInputTokens >= before ? { ...core, cacheWriteInputTokens: total.cacheWriteInputTokens - before } : core;
+}
+
+/**
+ * The baseline a settled call leaves for the next one: the thread's total exactly as the reader returned it. The reader
+ * reads a cache write the child left out as zero, so the baseline carries one whenever the total did.
+ */
+export const baselineOf = (total: CodexTokenBreakdown): CodexUsageBaseline => ({
+	inputTokens: total.inputTokens,
+	cachedInputTokens: total.cachedInputTokens,
+	outputTokens: total.outputTokens,
+	reasoningOutputTokens: total.reasoningOutputTokens,
+	totalTokens: total.totalTokens,
+	cacheWriteInputTokens: total.cacheWriteInputTokens,
+});
+
+/**
+ * One call's usage as the run shows it, live or final, from one rule. Input already counts its cached part, so the
+ * cache read is shown beside it and never added; the cache write is shown as the call's difference, or zero where it
+ * was unobserved, and nothing sums, subtracts or clamps it against the input — whether cache-write tokens are part of
+ * the input is unqualified. The context is the latest model response's input against the window, shown only when both
+ * are positive: a thread's total is never context occupancy, and a zero or missing half clears what was shown before
+ * rather than leaving an older estimate standing.
+ */
+function showUsage(run: CodexRun, usage: CodexCallUsage, context: number | undefined, window: number | null | undefined): void {
+	run.tokensIn = usage.inputTokens;
+	run.tokensOut = usage.outputTokens;
+	run.cacheRead = usage.cachedInputTokens;
+	run.cacheWrite = usage.cacheWriteInputTokens ?? 0;
+	if (context !== undefined && context > 0 && typeof window === "number" && window > 0) {
+		run.contextTokens = context;
+		run.contextWindow = window;
+	} else {
+		delete run.contextTokens;
+		delete run.contextWindow;
+	}
+}
+
+/**
+ * The parent thread's usage for this call, from the turn's final usage less the baseline the call started from: the
+ * thread's total is cumulative and seeded from history on a resume or a fork, so neither it nor a sum of the per-response
+ * updates is the call's. No cost: Codex reports none, and none is estimated here. False when the total fell below the
+ * baseline, and then nothing is published from it.
+ */
+function publishUsage(run: CodexRun, usage: NonNullable<CodexTurnEvidence["usage"]>, baseline: CodexUsageBaseline | undefined): boolean {
+	const call = callUsage(usage.total, baseline);
+	if (call === undefined) return false;
+	showUsage(run, call, usage.last.inputTokens, usage.modelContextWindow);
 	delete run.costUsd;
 	delete run.models;
+	return true;
+}
+
+/**
+ * What became of the steers pushed to one run, each sent at most once. `accepted` is the child taking one into the
+ * running turn's input, which is delivery and not evidence that the model read it; `rejected` the child's own refusal;
+ * `unconfirmed` one written with no answer before its bound or before the child ended, so whether it arrived is unknown;
+ * `unsent` one the transport would not send; `dropped` one still queued when the run's input closed.
+ */
+export interface CodexSteerReport {
+	pushed: number;
+	accepted: number;
+	rejected: number;
+	unconfirmed: number;
+	unsent: number;
+	dropped: number;
+}
+
+const messages = (count: number): string => `${count} message${count === 1 ? "" : "s"}`;
+
+/** The one note a run's steers owe its reader, said once, or nothing when none was pushed. */
+export function steerNote(steers: CodexSteerReport | undefined): string | undefined {
+	if (steers === undefined || steers.pushed === 0) return undefined;
+	const parts = [
+		steers.accepted > 0 ? `${steers.accepted} taken into its turn's input, which does not show the model read ${steers.accepted === 1 ? "it" : "them"}` : undefined,
+		steers.rejected > 0 ? `${steers.rejected} refused by the codex child` : undefined,
+		steers.unconfirmed > 0 ? `${steers.unconfirmed} sent with no answer, so whether the child took ${steers.unconfirmed === 1 ? "it" : "them"} is unknown` : undefined,
+		steers.unsent > 0 ? `${steers.unsent} not sent, because the child could no longer take ${steers.unsent === 1 ? "it" : "them"}` : undefined,
+		steers.dropped > 0 ? `${steers.dropped} still queued when the run stopped taking input, and never sent` : undefined,
+	].filter((part): part is string => part !== undefined);
+	return `Note: of the ${messages(steers.pushed)} sent to this codex run while it ran, ${parts.join("; ")}. None was sent twice.`;
 }
 
 /** A denial as a run lists it: what kind of approval, and the command it was for when it named one. */
@@ -208,17 +335,21 @@ const deniedTool = (denial: CodexDenial): string => (denial.command === undefine
  * The record one ended call hands to the run lifecycle, mutated in place and handed back, and the one composer of its
  * `cleanupNotice`. A success stays one only while its child's one shutdown was clean — no failure on the exit, an
  * actual clean exit, nothing left behind — and is otherwise demoted, keeping the thread and the verified selection
- * because both are true of the work that was done. No checkpoint is ever published: a fresh Codex thread in this build
- * settles on none, so its record is kept for reading and a follow-up is a new run.
+ * because both are true of the work that was done. Only a success that stays one publishes its checkpoint and the
+ * baseline beside it; a fork that ended any other way keeps the starting checkpoint its new thread reported, with no
+ * baseline, and every other ending none. No flat checkpoint is ever set.
  */
-export function finishCodexRun(run: CodexRun, ending: CodexEnding, ms: number): CodexRun {
+export function finishCodexRun(run: CodexRun, ending: CodexEnding, ms: number, steers?: CodexSteerReport): CodexRun {
 	run.ms = ms;
 	run.stderr = "";
 	delete run.checkpoint;
+	const note = steerNote(steers);
+	const withNote = (text: string): string => (note === undefined ? text : text === "" ? note : `${text}\n\n${note}`);
 	if (ending.kind === "none") {
 		run.aborted = true;
 		run.stopReason = "aborted";
 		run.errorMessage = RUN_CANCELLED;
+		run.text = withNote(run.text);
 		delete run.cleanupNotice;
 		return run;
 	}
@@ -227,12 +358,7 @@ export function finishCodexRun(run: CodexRun, ending: CodexEnding, ms: number): 
 	const cleanStop = exit !== undefined && exit.stopRequested && exit.cleanExit;
 	run.exitCode = exit === undefined ? null : cleanStop ? 0 : exit.exit.code;
 	run.signal = exit === undefined || cleanStop ? null : exit.exit.signal;
-	if (ending.thread !== undefined) {
-		run.session = { backend: "codex", sessionId: ending.thread };
-		// A diagnostic only: the host records a Codex run by its reference and never by this scalar.
-		run.sessionId = ending.thread;
-	}
-	if (evidence?.usage !== undefined) publishUsage(run, evidence.usage);
+	if (evidence?.usage !== undefined) publishUsage(run, evidence.usage, ending.baseline);
 	if (evidence !== undefined && evidence.denialCount > 0) run.deniedTools = evidence.denials.map(deniedTool);
 
 	let stopReason: string;
@@ -255,6 +381,13 @@ export function finishCodexRun(run: CodexRun, ending: CodexEnding, ms: number): 
 		// The primary turn's own last message, marked when cut, and never another thread's or turn's.
 		const last = evidence?.finalMessage;
 		run.text = last === undefined ? "" : `${last.text}${last.cut ? "…" : ""}`;
+	}
+	run.text = withNote(run.text);
+	if (ending.thread !== undefined) {
+		const at = verdict.ok && stopReason === "stop" ? { checkpoint: verdict.checkpoint, baseline: { ...verdict.baseline } } : ending.start === undefined ? {} : { checkpoint: ending.start };
+		run.session = { backend: "codex", sessionId: ending.thread, ...at };
+		// A diagnostic only: the host records a Codex run by its reference and never by this scalar.
+		run.sessionId = ending.thread;
 	}
 	run.aborted = stopReason === "aborted";
 	run.stopReason = stopReason;
@@ -286,6 +419,17 @@ type Fields = { [key: string]: unknown };
 const record = (value: unknown): Fields | undefined => (typeof value === "object" && value !== null && !Array.isArray(value) ? (value as Fields) : undefined);
 const text = (value: unknown): string | undefined => (typeof value === "string" ? value : undefined);
 const count = (value: unknown): number | undefined => (typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? value : undefined);
+
+/** A usage breakdown as the display reads one, by the reader's rules: five counts, cached within input, an absent cache write zero. */
+function breakdownOf(value: unknown): CodexTokenBreakdown | undefined {
+	const data = record(value);
+	if (!data) return undefined;
+	const [inputTokens, cachedInputTokens, outputTokens, reasoningOutputTokens, totalTokens] = CORE_COUNTS.map((field) => count(data[field]));
+	const cacheWriteInputTokens = data.cacheWriteInputTokens === undefined ? 0 : count(data.cacheWriteInputTokens);
+	if (inputTokens === undefined || cachedInputTokens === undefined || outputTokens === undefined || reasoningOutputTokens === undefined || totalTokens === undefined || cacheWriteInputTokens === undefined) return undefined;
+	if (cachedInputTokens > inputTokens) return undefined;
+	return { inputTokens, cachedInputTokens, outputTokens, reasoningOutputTokens, totalTokens, cacheWriteInputTokens };
+}
 
 /** The first `max` code points, with the cut saying for itself that it happened. */
 function capped(value: string, max: number): string {
@@ -343,9 +487,10 @@ export interface CodexFeed {
  * turn: a subagent's thread, another turn of the same thread and anything before the thread was verified are dropped.
  * Between the thread and the turn's admission, the primary thread's notifications are held, bounded, and the ones for
  * the turn that was then admitted replayed. It holds no text past what one event carries, never throws back into the
- * transport, and decides nothing: a run's report, selection and final usage come from the turn's own evidence.
+ * transport, and decides nothing: a run's report, selection and final usage come from the turn's own evidence. Usage
+ * is shown as the call's own, measured from `baseline` when the call continued a thread.
  */
-export function codexFeed(run: CodexRun, emit: CodexFeedEmit): CodexFeed {
+export function codexFeed(run: CodexRun, emit: CodexFeedEmit, baseline?: CodexUsageBaseline): CodexFeed {
 	let threadId: string | undefined;
 	let turnId: string | undefined;
 	let closed = false;
@@ -418,21 +563,17 @@ export function codexFeed(run: CodexRun, emit: CodexFeedEmit): CodexFeed {
 			}
 			case "thread/tokenUsage/updated": {
 				const usage = record(data.tokenUsage);
-				const total = record(usage?.total);
-				const input = count(total?.inputTokens);
-				const output = count(total?.outputTokens);
-				const cached = count(total?.cachedInputTokens);
-				if (input === undefined || output === undefined || cached === undefined) return undefined;
-				const written = count(total?.cacheWriteInputTokens) ?? 0;
+				const total = breakdownOf(usage?.total);
+				if (total === undefined) return undefined;
+				// The same rule as the final usage: the call's share of the thread's total, so an update sent again with the
+				// same total shows the same counts rather than adding to them. A total below the baseline is not shown and
+				// not warned about here: the run's own mapping is what decides what it means.
+				const call = callUsage(total, baseline);
+				if (call === undefined) return undefined;
 				const context = count(record(usage?.last)?.inputTokens);
 				const window = count(usage?.modelContextWindow);
 				return () => {
-					run.tokensIn = input;
-					run.tokensOut = output;
-					run.cacheRead = cached;
-					run.cacheWrite = written;
-					if (context !== undefined) run.contextTokens = context;
-					if (window !== undefined) run.contextWindow = window;
+					showUsage(run, call, context, window);
 					progress();
 				};
 			}

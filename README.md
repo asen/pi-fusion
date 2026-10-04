@@ -58,7 +58,7 @@ Pi roles have no model default. For example, the host can call `fusion` with:
 
 Alternatively, configure that role through `/fusion config` or `PI_FUSION_PI_IMPLEMENT_MODEL`. A profile can route fresh runs to Pi without a `backend` parameter. Continuations stay on their recorded backend and selection unless a permitted model/effort override is supplied. Nothing falls back to Claude when a Pi call fails.
 
-Codex is registered and experimental, for fresh `implement` and `ask` runs: its stage 1 native gate passed on one Linux x64 host with Codex reporting app-server 0.160, and other platforms and versions are unmeasured ([evidence](docs/codex-backend.md#evidence)). Builtin routes no role to it, so it runs only when a call names `backend: "codex"` or your settings put `implement` or `ask` there. It runs fresh threads only, under your own Codex home, configuration, and login, with no model required (the host's Codex default chooses one). A Codex child cannot ask a question, take a steer, or be continued; a follow-up is a new run carrying the report. Codex reports no cost, so its runs are left out of the dollar estimate and labelled as such. See [Codex backend](docs/codex-backend.md).
+Codex is registered and experimental, for `implement` and `ask` runs: its stage 1 native gate for fresh runs passed on one Linux x64 host with Codex reporting app-server 0.160, and other platforms and versions are unmeasured ([evidence](docs/codex-backend.md#evidence)). Builtin routes no role to it, so it runs only when a call names `backend: "codex"` or your settings put `implement` or `ask` there. It runs under your own Codex home, configuration, and login, with no model required (the host's Codex default chooses one). A Codex run can be continued from its trusted checkpoint and a running one takes steers, both untested on a native Codex so far; a Codex child cannot ask a question. Codex reports no cost, so its runs are left out of the dollar estimate and labelled as such. See [Codex backend](docs/codex-backend.md).
 
 The host's routing guidance is: plan when the design is unresolved, implement bounded tasks in dependency order, and use `ultracode` only when you ask. [Role settings](docs/profiles.md) can disable any role. The [contracts](contracts/) define each child's behavior; these instructions are not a sandbox or permission boundary.
 
@@ -103,7 +103,7 @@ While on, the host is instructed to delegate implementation and not edit files i
 - [Ultracode](docs/ultracode.md): Claude workflows, permission modes, and cost.
 - [Dashboard](docs/dashboard.md): local, read-only monitoring and sensitive-output limits.
 - [Pi backend](docs/pi-backend.md): architecture, storage, runtime checks, and qualification limits.
-- [Codex backend](docs/codex-backend.md): the experimental fresh-only backend, its inherited install, checks, evidence, and gated later stages.
+- [Codex backend](docs/codex-backend.md): the experimental backend, its inherited install, checks, continuation and steers, evidence, and gated stages.
 - [Development](docs/development.md): module map, deterministic tests, and manual harness commands.
 
 Change role behavior in `contracts/*.md`. Children are instructed not to commit; the host commits only when you ask.

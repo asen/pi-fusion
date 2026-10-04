@@ -109,7 +109,8 @@ test("every contract a codex role runs under is a shipped file, and the addendum
 	for (const name of CODEX_CONTRACT_FILES) assert.ok(fs.existsSync(path.join(repoRoot, "contracts", name)), `contracts/${name} is not shipped`);
 	const addendum = fs.readFileSync(path.join(repoRoot, "contracts", "codex-no-questions.md"), "utf8");
 	assert.match(addendum, /no ask_orchestrator tool/);
-	assert.match(addendum, /no message or steer arrives/);
+	assert.match(addendum, /A message from the user or the orchestrator may arrive while you work\. It is not an answer to a question of yours\./);
+	assert.doesNotMatch(addendum, /no message or steer arrives/, "a codex run's input is open, so the addendum no longer says nothing arrives");
 	assert.match(addendum, /under Escalation/);
 	assert.match(addendum, /under Escalation for an implement report, under Open questions for an ask answer, and under Notes for an ask review/);
 	// Each section the addendum sends a missing decision to is one the shared contract of that role and mode really has,

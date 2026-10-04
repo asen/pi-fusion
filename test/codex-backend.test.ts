@@ -7,11 +7,35 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import ts from "typescript";
 import { CODEX_CONTRACT_FILES, type CodexCall, codexRole } from "../extensions/backends/codex-binding.ts";
 import { CODEX_APP_SERVER_ARGS, type CodexLaunch, type CodexLaunchRequest } from "../extensions/backends/codex-launch.ts";
-import { CODEX_CLIENT_VERSION_UNKNOWN, CONTRACT_UNREADABLE, type CodexBackendDeps, type CodexCallReport, codexClientInfo, createCodexBackend } from "../extensions/backends/codex.ts";
-import { CLEANUP_ATTENTION, CLEANUP_UNCERTAIN, CODEX_FRESH_ONLY, CWD_MISMATCH, threadStartProblem, HOME_MISMATCH, NO_FINAL, NO_USAGE, NOT_IDLE, RUN_ABORTED, RUN_CANCELLED, type CodexRun } from "../extensions/backends/codex-outcome.ts";
+import { CODEX_CLIENT_VERSION_UNKNOWN, CODEX_SESSION_INVALID, CONTRACT_UNREADABLE, type CodexBackendDeps, type CodexCallReport, codexClientInfo, createCodexBackend } from "../extensions/backends/codex.ts";
+import {
+	CLEANUP_ATTENTION,
+	CLEANUP_UNCERTAIN,
+	CODEX_FOREIGN_SESSION,
+	CODEX_NO_CHECKPOINT,
+	callUsage,
+	codexFeed,
+	CWD_MISMATCH,
+	FORK_NO_TIP,
+	FORK_SAME_THREAD,
+	FORK_TIP_UNSETTLED,
+	finishCodexRun,
+	HOME_MISMATCH,
+	NO_FINAL,
+	NO_USAGE,
+	NOT_IDLE,
+	newCodexRun,
+	RESUME_MOVED,
+	RESUME_UNSETTLED,
+	RUN_ABORTED,
+	RUN_CANCELLED,
+	threadStartProblem,
+	USAGE_BASELINE_INCONSISTENT,
+	type CodexRun,
+} from "../extensions/backends/codex-outcome.ts";
 import type { CodexThreadStart } from "../extensions/backends/codex-protocol.ts";
 import { type CodexBounds, type CodexChild, type CodexChildOptions, type CodexExit, CodexTransportError, startCodexChild } from "../extensions/backends/codex-transport.ts";
-import { type ChildEvent, failed, hostBackend } from "../extensions/backends/types.ts";
+import { type ChildControl, type ChildEvent, type CodexUsageBaseline, failed, hostBackend, type ResolvedSelection, type SessionIntent } from "../extensions/backends/types.ts";
 import { type OwnedCleanup, productionFacilities } from "../extensions/process-tree.ts";
 
 /*
@@ -102,6 +126,8 @@ interface Outcome {
 	report: CodexCallReport;
 	/** Shutdowns the composition asked of the child it was handed; undefined when it was handed none. */
 	shutdowns?: number;
+	/** The control the run was handed, as it was left. */
+	input: ChildControl;
 }
 
 interface CaseOptions {
@@ -119,6 +145,12 @@ interface CaseOptions {
 	onRead?: (when: "sent" | "answered") => void;
 	onEvent?: (event: ChildEvent) => void;
 	prompt?: string;
+	/** What the host asks of the session, mapped by the backend's own `session`. A new thread when unset. */
+	intent?: SessionIntent;
+	/** The selection the run it continues recorded, which the binding repeats. */
+	recorded?: ResolvedSelection;
+	/** Steers pushed into the run's control before the run is started. */
+	steers?: string[];
 }
 
 interface Fixture {
@@ -193,15 +225,17 @@ async function withBackend(scenario: string, body: (fixture: Fixture) => Promise
 			});
 			const events: ChildEvent[] = [];
 			let progress = 0;
+			const input = backend.control();
+			for (const steer of options.steers ?? []) assert.equal(input.push(steer), true, "a steer is taken before the run starts");
 			const run = await within(
 				"a run",
 				backend.run({
-					role: codexRole(call, undefined, {}),
+					role: codexRole(call, options.recorded, {}),
 					prompt: options.prompt ?? "do the task",
 					cwd: work,
-					session: backend.session({ kind: "new" }),
+					session: backend.session(options.intent ?? { kind: "new" }),
 					signal: options.signal,
-					input: backend.control(),
+					input,
 					onProgress: () => (progress += 1),
 					onEvent: (event) => {
 						events.push(event);
@@ -210,7 +244,7 @@ async function withBackend(scenario: string, body: (fixture: Fixture) => Promise
 					killGraceMs: 1_000,
 				}),
 			);
-			return { run, events, progress, report: report!, ...(shutdowns === undefined ? {} : { shutdowns: shutdowns() }) };
+			return { run, events, progress, report: report!, input, ...(shutdowns === undefined ? {} : { shutdowns: shutdowns() }) };
 		},
 	};
 	let failure: unknown;
@@ -241,8 +275,11 @@ function ended(outcome: Outcome, stopReason: string): void {
 	assert.equal(outcome.report.shutdowns, 1);
 	assert.equal(outcome.events.filter((event) => event.type === "turn_result").length, 1, "one terminal event");
 	assert.equal(outcome.run.stopReason, stopReason, outcome.run.errorMessage);
-	assert.equal(outcome.run.checkpoint, undefined, "a fresh codex thread publishes no checkpoint");
-	assert.equal(outcome.run.session?.checkpoint, undefined);
+	assert.equal(outcome.run.checkpoint, undefined, "no flat checkpoint is ever set");
+	// Only a success that stays one settles on a checkpoint with its baseline; nothing else claims a baseline.
+	if (stopReason === "stop") assert.ok(outcome.run.session?.backend === "codex" && outcome.run.session.checkpoint !== undefined && outcome.run.session.baseline !== undefined);
+	else assert.ok(outcome.run.session?.backend !== "codex" || outcome.run.session.baseline === undefined);
+	assert.equal(outcome.input.open, false, "the run's input is closed once it has ended");
 	assert.equal(outcome.run.costUsd, undefined, "no cost is reported or estimated");
 	assert.equal(outcome.run.models, undefined);
 }
@@ -263,7 +300,8 @@ test("a host-default implement run: one thread, one turn, the readback barrier, 
 		assert.equal(run.errorMessage, undefined);
 		assert.equal(run.cleanupNotice, undefined);
 		assert.equal(run.text, "fake answer\n\nNote: the codex child reported no effort for this thread, so this run records none and its effort was whatever the host's Codex configuration chose.");
-		assert.deepEqual(run.session, { backend: "codex", sessionId: "thr-1" });
+		// The admitted turn, completed, is the checkpoint, and the thread's total at the readback barrier its baseline.
+		assert.deepEqual(run.session, { backend: "codex", sessionId: "thr-1", checkpoint: "turn-1", baseline: { inputTokens: 1_200, cachedInputTokens: 400, outputTokens: 130, reasoningOutputTokens: 25, totalTokens: 1_330, cacheWriteInputTokens: 0 } });
 		assert.equal(run.sessionId, "thr-1", "a diagnostic scalar the host's writer filters for codex");
 		assert.deepEqual(run.selection, { model: "gpt-host-default", provider: "openai" });
 		assert.equal(run.modelId, "gpt-host-default");
@@ -316,7 +354,7 @@ test("a readback with no model and no effort, and usage with no window: the star
 		ended(outcome, "stop");
 		assert.deepEqual(outcome.run.selection, { model: "gpt-host-default", provider: "openai" });
 		assert.equal(outcome.run.contextWindow, undefined, "no window is guessed");
-		assert.equal(outcome.run.contextTokens, 200);
+		assert.equal(outcome.run.contextTokens, undefined, "and with no window no context is shown either");
 		const notes = outcome.run.text.split("\n\n").slice(1);
 		assert.deepEqual(notes, [
 			"Note: the codex thread read back no model after its turn, so the model its start reported, gpt-host-default, is what this run records.",
@@ -646,28 +684,251 @@ for (const when of ["sent", "answered"] as const) {
 }
 
 /* ------------------------------------------------------------------------------------------------------------------
+ * Continuation: resume and fork from a checkpoint and its usage baseline
+ * ---------------------------------------------------------------------------------------------------------------- */
+
+const usage = (input: number, cached: number, output: number, reasoning: number): CodexUsageBaseline => ({ inputTokens: input, cachedInputTokens: cached, outputTokens: output, reasoningOutputTokens: reasoning, totalTokens: input + output });
+/** The fake's own seed: what a persisted thread's total already is when a fake process loads it. */
+const SEED = usage(5_000, 2_000, 200, 50);
+/** The one response a loaded thread's turn reports in the fake. */
+const LAST = usage(400, 300, 20, 5);
+const RECORDED: ResolvedSelection = { model: "gpt-5", provider: "openai" };
+const resume = (at = "turn-seed-2", baseline: CodexUsageBaseline = SEED): SessionIntent => ({ kind: "resume", ref: { backend: "codex", sessionId: "thr-old", checkpoint: at, baseline } });
+const fork = (at = "turn-seed-2", baseline: CodexUsageBaseline = SEED): SessionIntent => ({ kind: "fork", from: { backend: "codex", sessionId: "thr-old", checkpoint: at, baseline } });
+const plus = (a: CodexUsageBaseline, b: CodexUsageBaseline): CodexUsageBaseline => ({ inputTokens: a.inputTokens + b.inputTokens, cachedInputTokens: a.cachedInputTokens + b.cachedInputTokens, outputTokens: a.outputTokens + b.outputTokens, reasoningOutputTokens: a.reasoningOutputTokens + b.reasoningOutputTokens, totalTokens: a.totalTokens + b.totalTokens });
+
+test("a resume loads the recorded thread on its recorded selection, checks its tip, and settles on its own turn with the call's usage and a new baseline", async () => {
+	await withBackend("resume-ok", async (fixture) => {
+		// Every usage update is sent twice: the same total, re-sent, is not counted twice.
+		const outcome = await fixture.call({ role: "implement" }, { intent: resume(), recorded: { ...RECORDED, effort: "high" }, env: { FAKE_CODEX_REEMIT: "1" } });
+		ended(outcome, "stop");
+		const { run } = outcome;
+		assert.equal(run.text, "loaded answer");
+		assert.deepEqual(methods(fixture), ["initialize", "initialized", "thread/resume", "thread/turns/list", "turn/start", "thread/read"]);
+		assert.deepEqual(sent(fixture, "thread/resume")[0].params, { threadId: "thr-old", model: "gpt-5", modelProvider: "openai", sandbox: "workspace-write", approvalPolicy: "never", developerInstructions: INSTRUCTIONS("implement"), excludeTurns: true });
+		assert.deepEqual(sent(fixture, "thread/turns/list")[0].params, { threadId: "thr-old", limit: 1, sortDirection: "desc", itemsView: "notLoaded" });
+		assert.deepEqual(sent(fixture, "turn/start")[0].params, { threadId: "thr-old", input: [{ type: "text", text: "do the task" }], effort: "high" }, "the recorded effort goes on turn/start only");
+		assert.deepEqual(run.session, { backend: "codex", sessionId: "thr-old", checkpoint: "turn-1", baseline: { ...plus(SEED, LAST), cacheWriteInputTokens: 0 } });
+		assert.deepEqual(run.selection, { model: "gpt-5", provider: "openai", effort: "high" });
+		// The call's own share: the thread's total less the baseline, not the total the history seeded.
+		assert.deepEqual([run.tokensIn, run.tokensOut, run.cacheRead, run.cacheWrite], [400, 20, 300, 0]);
+		// The context is the latest response's input, never the thread's total.
+		assert.deepEqual([run.contextTokens, run.contextWindow], [400, 200_000]);
+	});
+});
+
+const RESUME_REFUSALS: [string, string, SessionIntent, Record<string, string>, string | RegExp][] = [
+	["a thread moved past its checkpoint", "resume-moved", resume(), {}, RESUME_MOVED],
+	["a checkpoint turn that is not completed", "turns-interrupted", resume("turn-cold"), {}, RESUME_UNSETTLED],
+	["a thread that ended cold after its checkpoint", "turns-interrupted", resume(), {}, RESUME_MOVED],
+	["another provider than the recorded one", "resume-mismatch", resume(), {}, /^the codex child started its thread on provider azure, not the provider openai this call named, so no turn was started$/],
+	["an answer naming another thread", "resume-ok", resume(), { FAKE_CODEX_BAD: "resume-id" }, /its thread\/resume answer names another thread/],
+];
+
+for (const [what, scenario, intent, env, message] of RESUME_REFUSALS) {
+	test(`a resume of ${what} is refused before any turn and settles on nothing`, async () => {
+		await withBackend(scenario, async (fixture) => {
+			const outcome = await fixture.call({ role: "implement" }, { intent, recorded: RECORDED, env });
+			ended(outcome, "thread");
+			if (typeof message === "string") {
+				assert.equal(outcome.run.errorMessage, message);
+				// A thread no longer at its checkpoint is not continued another way: the refusal says what to do instead.
+				assert.match(message, /; start a new run without continue that carries the earlier report as context$/);
+			} else assert.match(outcome.run.errorMessage ?? "", message);
+			assert.equal(sent(fixture, "turn/start").length, 0, "no turn was started");
+			assert.equal(outcome.run.session?.checkpoint, undefined);
+			assert.deepEqual([outcome.run.tokensIn, outcome.run.tokensOut], [0, 0]);
+		});
+	});
+}
+
+test("a fork checks its new thread and starting tip, measures from the source's baseline, and settles on its own turn", async () => {
+	await withBackend("fork-ok", async (fixture) => {
+		// The fork's copied turns are named anew, as nothing says a native fork keeps the source's turn ids.
+		const outcome = await fixture.call({ role: "ask" }, { intent: fork(), recorded: RECORDED, env: { FAKE_CODEX_FORK_RENAME: "1" } });
+		ended(outcome, "stop");
+		assert.deepEqual(methods(fixture), ["initialize", "initialized", "thread/fork", "thread/turns/list", "turn/start", "thread/read"]);
+		assert.deepEqual(sent(fixture, "thread/fork")[0].params, { threadId: "thr-old", lastTurnId: "turn-seed-2", model: "gpt-5", modelProvider: "openai", sandbox: "read-only", approvalPolicy: "never", developerInstructions: INSTRUCTIONS("ask"), excludeTurns: true });
+		assert.deepEqual(sent(fixture, "thread/turns/list")[0].params.threadId, "thr-fork-1", "the tip read is the new thread's, never the source's");
+		assert.deepEqual(outcome.run.session, { backend: "codex", sessionId: "thr-fork-1", checkpoint: "turn-1", baseline: { ...plus(SEED, LAST), cacheWriteInputTokens: 0 } });
+		assert.deepEqual([outcome.run.tokensIn, outcome.run.tokensOut, outcome.run.cacheRead], [400, 20, 300]);
+	});
+});
+
+test("a fork that fails after its starting tip keeps the new thread at that tip, not the source's checkpoint, and no baseline", async () => {
+	await withBackend("fork-ok", async (fixture) => {
+		const outcome = await fixture.call({ role: "ask" }, { intent: fork(), recorded: RECORDED, env: { FAKE_CODEX_FORK_RENAME: "1", FAKE_CODEX_READ: JSON.stringify({ modelProvider: "azure" }) } });
+		ended(outcome, "verify");
+		assert.deepEqual(outcome.run.session, { backend: "codex", sessionId: "thr-fork-1", checkpoint: "fork-turn-seed-2" });
+	});
+});
+
+const FORK_REFUSALS: [string, string, SessionIntent, string, Record<string, unknown> | undefined][] = [
+	["an answer naming the source thread", "fork-same-id", fork(), FORK_SAME_THREAD, undefined],
+	["a new thread with no turns", "fork-tip-missing", fork(), FORK_NO_TIP, { backend: "codex", sessionId: "thr-fork-1" }],
+	["a new thread whose tip is not completed", "turns-interrupted", fork("turn-cold"), FORK_TIP_UNSETTLED, { backend: "codex", sessionId: "thr-fork-1" }],
+];
+
+for (const [what, scenario, intent, message, session] of FORK_REFUSALS) {
+	test(`a fork with ${what} is refused before any turn, naming at most the verified new thread alone`, async () => {
+		await withBackend(scenario, async (fixture) => {
+			const outcome = await fixture.call({ role: "implement" }, { intent, recorded: RECORDED });
+			ended(outcome, "thread");
+			assert.equal(outcome.run.errorMessage, message);
+			assert.equal(sent(fixture, "turn/start").length, 0);
+			assert.deepEqual(outcome.run.session, session);
+		});
+	});
+}
+
+/* ------------------------------------------------------------------------------------------------------------------
+ * Usage against a baseline
+ * ---------------------------------------------------------------------------------------------------------------- */
+
+test("a thread total below the baseline in any core count fails the run after its turn, with no usage, checkpoint or baseline", async () => {
+	await withBackend("resume-ok", async (fixture) => {
+		const outcome = await fixture.call({ role: "implement" }, { intent: resume("turn-seed-2", { ...SEED, outputTokens: 999_999 }), recorded: RECORDED });
+		ended(outcome, "verify");
+		assert.equal(outcome.run.errorMessage, USAGE_BASELINE_INCONSISTENT);
+		assert.deepEqual(outcome.run.session, { backend: "codex", sessionId: "thr-old" });
+		assert.deepEqual([outcome.run.tokensIn, outcome.run.tokensOut, outcome.run.cacheRead], [0, 0, 0], "neither the display nor the outcome showed a count it could not attribute");
+		assert.equal(sent(fixture, "turn/start").length, 1);
+	});
+});
+
+test("a recorded cache write the total fell below is unobserved, shown as 0, and fails nothing", async () => {
+	await withBackend("resume-ok", async (fixture) => {
+		const outcome = await fixture.call({ role: "implement" }, { intent: resume("turn-seed-2", { ...SEED, cacheWriteInputTokens: 50 }), recorded: RECORDED });
+		ended(outcome, "stop");
+		assert.equal(outcome.run.cacheWrite, 0);
+		assert.equal(outcome.run.session?.backend === "codex" && outcome.run.session.baseline?.cacheWriteInputTokens, 0, "the new baseline is the total as read");
+	});
+});
+
+const total = (over: Partial<CodexUsageBaseline> = {}) => ({ ...plus(SEED, LAST), cacheWriteInputTokens: 0, ...over });
+const CALL_USAGE: [string, ReturnType<typeof total>, CodexUsageBaseline | undefined, ReturnType<typeof callUsage>][] = [
+	["a fresh thread: the raw total, cache write included", total({ cacheWriteInputTokens: 7 }), undefined, { ...total(), cacheWriteInputTokens: 7 }],
+	["a baseline with no cache write: none observed", total({ cacheWriteInputTokens: 7 }), SEED, { ...LAST }],
+	["a baseline cache write within the total: the difference", total({ cacheWriteInputTokens: 7 }), { ...SEED, cacheWriteInputTokens: 3 }, { ...LAST, cacheWriteInputTokens: 4 }],
+	["a baseline cache write above the total: none observed", total({ cacheWriteInputTokens: 2 }), { ...SEED, cacheWriteInputTokens: 3 }, { ...LAST }],
+	["the same total as the baseline: all zero", total(), plus(SEED, LAST), { inputTokens: 0, cachedInputTokens: 0, outputTokens: 0, reasoningOutputTokens: 0, totalTokens: 0 }],
+	["an input below the baseline", total(), { ...SEED, inputTokens: 9_999 }, undefined],
+	["a reasoning count below the baseline", total(), { ...SEED, reasoningOutputTokens: 999 }, undefined],
+	["a total count below the baseline", total(), { ...SEED, totalTokens: 99_999 }, undefined],
+];
+
+for (const [what, current, baseline, expected] of CALL_USAGE) {
+	test(`a call's usage, ${what}`, () => assert.deepEqual(callUsage(current, baseline), expected));
+}
+
+/** One thread/tokenUsage/updated as the transport hands it to the feed. */
+const update = (turnId: string, tokenTotal: Record<string, number>, last: Record<string, number>, window: number | null) => ({ method: "thread/tokenUsage/updated", params: { threadId: "thr-1", turnId, tokenUsage: { total: tokenTotal, last, modelContextWindow: window } } });
+
+test("the live display shows the call's share of each update, the same counts for a re-sent total, and clears its context when a half is zero or absent", () => {
+	const run = newCodexRun(codexRole({ role: "implement" }, undefined, {}));
+	let progress = 0;
+	const feed = codexFeed(run, { progress: () => (progress += 1), event: () => {} }, SEED);
+	feed.thread("thr-1");
+	feed.turn("turn-1");
+	const show = () => [run.tokensIn, run.tokensOut, run.cacheRead, run.cacheWrite, run.contextTokens, run.contextWindow];
+	feed.onNotification(update("turn-1", plus(SEED, LAST) as never, LAST as never, 200_000));
+	assert.deepEqual(show(), [400, 20, 300, 0, 400, 200_000]);
+	feed.onNotification(update("turn-1", plus(SEED, LAST) as never, LAST as never, 200_000));
+	assert.deepEqual(show(), [400, 20, 300, 0, 400, 200_000], "a re-sent total is not added again");
+	feed.onNotification(update("turn-1", plus(SEED, LAST) as never, LAST as never, 0));
+	assert.deepEqual(show(), [400, 20, 300, 0, undefined, undefined], "a zero window clears the share rather than keeping the older one");
+	feed.onNotification(update("turn-1", plus(SEED, LAST) as never, LAST as never, 200_000));
+	feed.onNotification(update("turn-1", plus(SEED, LAST) as never, { ...LAST, inputTokens: 0, cachedInputTokens: 0 } as never, 200_000));
+	assert.deepEqual(show().slice(4), [undefined, undefined], "and so does a zero context");
+	const before = progress;
+	feed.onNotification(update("turn-1", { ...SEED, outputTokens: SEED.outputTokens - 1, totalTokens: SEED.totalTokens - 1 } as never, SEED as never, 200_000));
+	feed.onNotification(update("turn-1", { ...plus(SEED, LAST), inputTokens: 1 } as never, LAST as never, 200_000));
+	assert.equal(progress, before, "a total below the baseline is neither shown nor said");
+	assert.deepEqual(show().slice(0, 4), [400, 20, 300, 0]);
+	feed.end();
+});
+
+test("the final usage clears a context the display showed when the final one has no window, and publishes no cost", () => {
+	const run = newCodexRun(codexRole({ role: "implement" }, undefined, {}));
+	Object.assign(run, { contextTokens: 900, contextWindow: 200_000, costUsd: 1 });
+	const evidence = { threadId: "thr-1", turnId: "turn-1", started: true, usage: { total: { ...plus(SEED, LAST), cacheWriteInputTokens: 0 }, last: { ...LAST, cacheWriteInputTokens: 0 }, modelContextWindow: null }, usageUpdates: 1, usageAfterCompletion: 0, retryableErrors: 0, terminalErrors: 0, reroutes: [], rerouteCount: 0, denials: [], denialCount: 0, items: { started: 0, completed: 0 }, notifications: 1 };
+	finishCodexRun(run, { kind: "ended", verdict: { ok: false, stage: "turn", message: "x", aborted: false }, thread: "thr-1", baseline: SEED, evidence, unverified: false }, 1);
+	assert.deepEqual([run.tokensIn, run.contextTokens, run.contextWindow, run.costUsd], [400, undefined, undefined, undefined]);
+});
+
+/* ------------------------------------------------------------------------------------------------------------------
+ * Steers
+ * ---------------------------------------------------------------------------------------------------------------- */
+
+const STEER_CASES: [string, string[], string, number][] = [
+	["accepted once", ["accept"], "Note: of the 1 message sent to this codex run while it ran, 1 taken into its turn's input, which does not show the model read it. None was sent twice.", 1],
+	["refused, and the next accepted", ["reject", "accept"], "Note: of the 2 messages sent to this codex run while it ran, 1 taken into its turn's input, which does not show the model read it; 1 refused by the codex child. None was sent twice.", 2],
+	["unanswered inside its bound, and the next accepted", ["silent", "accept"], "Note: of the 2 messages sent to this codex run while it ran, 1 taken into its turn's input, which does not show the model read it; 1 sent with no answer, so whether the child took it is unknown. None was sent twice.", 2],
+];
+
+for (const [what, script, note, steers] of STEER_CASES) {
+	test(`a steer pushed before the turn is admitted waits, then goes to that turn once: ${what}`, async () => {
+		await withBackend("steer-script", async (fixture) => {
+			const texts = script.map((_, at) => `steer ${at + 1}`);
+			const outcome = await fixture.call({ role: "implement" }, { steers: texts, env: { FAKE_CODEX_STEERS: script.join(",") }, deps: { bounds: { ...TEST_BOUNDS, requestMs: 1_000 } } });
+			ended(outcome, "stop");
+			assert.equal(outcome.run.text.split("\n\n")[0], "steered answer");
+			assert.equal(outcome.run.text.split("\n\n").at(-1), note);
+			const steered = sent(fixture, "turn/steer").map((message) => message.params);
+			assert.equal(steered.length, steers, "each steer was sent once and none was retried");
+			assert.deepEqual(steered, texts.map((text) => ({ threadId: "thr-1", expectedTurnId: "turn-1", input: [{ type: "text", text }] })));
+			const order = methods(fixture);
+			assert.ok(order.indexOf("turn/steer") > order.indexOf("turn/start"), "nothing is steered before the turn is named");
+		});
+	});
+}
+
+test("steers still queued when the run stops taking input are dropped, noted once, and never sent", async () => {
+	await withBackend("ok", async (fixture) => {
+		const outcome = await fixture.call({ role: "implement" }, { steers: ["one", "two"], expectedCodexHome: path.join(fixture.root, "other-home") });
+		ended(outcome, "startup");
+		assert.equal(outcome.run.text, "Note: of the 2 messages sent to this codex run while it ran, 2 still queued when the run stopped taking input, and never sent. None was sent twice.");
+		assert.equal(sent(fixture, "turn/steer").length, 0);
+		assert.equal(outcome.input.push("three"), false, "a closed input takes nothing more");
+	});
+	await withBackend("ok", async (fixture) => {
+		const controller = new AbortController();
+		controller.abort();
+		const outcome = await fixture.call({ role: "implement" }, { steers: ["one"], signal: controller.signal });
+		assert.equal(outcome.run.errorMessage, RUN_CANCELLED);
+		assert.match(outcome.run.text, /1 still queued when the run stopped taking input, and never sent/);
+		assert.equal(outcome.input.open, false);
+	});
+});
+
+/* ------------------------------------------------------------------------------------------------------------------
  * Composition boundaries
  * ---------------------------------------------------------------------------------------------------------------- */
 
-test("a resume or a fork is refused before any contract, lookup or start, and the control is closed", async () => {
+test("a continuation of another backend's session, or of a thread with no checkpoint and baseline, is refused before any contract, lookup or start", async () => {
 	let touched = 0;
 	const touch = () => {
 		touched += 1;
 		throw new Error("reached");
 	};
 	const backend = createCodexBackend({ readContract: touch, launch: touch, start: touch, clientInfo: touch });
-	const ref = { backend: "codex" as const, sessionId: "thr-1", checkpoint: "cp" };
-	assert.throws(() => backend.session({ kind: "resume", ref }), { message: CODEX_FRESH_ONLY });
-	assert.throws(() => backend.session({ kind: "fork", from: ref }), { message: CODEX_FRESH_ONLY });
+	const bare = { backend: "codex" as const, sessionId: "thr-1", checkpoint: "cp" };
+	assert.throws(() => backend.session({ kind: "resume", ref: bare }), { message: CODEX_NO_CHECKPOINT });
+	assert.throws(() => backend.session({ kind: "fork", from: { backend: "codex", sessionId: "thr-1" } }), { message: CODEX_NO_CHECKPOINT });
+	assert.throws(() => backend.session({ kind: "resume", ref: { backend: "claude", sessionId: "thr-1", checkpoint: "cp" } }), { message: CODEX_FOREIGN_SESSION });
+	assert.throws(() => backend.session({ kind: "fork", from: { backend: "pi", sessionId: "thr-1", sessionFile: "/x.jsonl", checkpoint: "cp" } }), { message: CODEX_FOREIGN_SESSION });
+	// A session the mapping did not make — here one with no baseline — is refused by the run before anything is touched.
 	await assert.rejects(
-		backend.run({ role: codexRole({ role: "implement" }, undefined, {}), prompt: "x", cwd: repoRoot, session: { kind: "resume" } as never, signal: undefined, onProgress: () => {} }),
-		{ message: CODEX_FRESH_ONLY },
+		backend.run({ role: codexRole({ role: "implement" }, undefined, {}), prompt: "x", cwd: repoRoot, session: { kind: "resume", id: "thr-1", at: "cp" } as never, signal: undefined, onProgress: () => {} }),
+		{ message: CODEX_SESSION_INVALID },
 	);
 	assert.equal(touched, 0);
 	const control = backend.control();
-	assert.equal(control.open, false);
-	assert.equal(control.push("steer"), false);
+	assert.equal(control.open, true, "the input is open from admission");
+	assert.equal(control.push(""), false, "an empty steer is not taken");
 	control.end();
+	assert.equal(control.open, false);
+	assert.equal(control.push("late"), false, "a closed input takes nothing");
 	assert.equal(backend.name, "codex");
 	// The host's erased view takes it as it is: the role and session shapes fit the shared boundary.
 	assert.equal(hostBackend(backend).name, "codex");
