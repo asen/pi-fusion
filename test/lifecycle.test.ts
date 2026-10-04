@@ -2582,7 +2582,7 @@ test("/fusion off hides the fusion tools and starts nothing, and /fusion on give
 		assert.equal(host.notices.at(-1), "fusion is already off; turn it on with /fusion on");
 		assert.deepEqual(host.activeTools, ["read", "bash", "fusion_activate"], "a second off changes nothing");
 		await host.command("status");
-		assert.match(host.notices.at(-1) ?? "", /^fusion: off\nrun-1 · implement · /);
+		assert.match(host.notices.at(-1) ?? "", /^fusion: off\nprofile: builtin\n\n[\s\S]*?\n\nrun-1 · implement · /);
 
 		// A call already in the host's turn when off was accepted still reaches the tools, and every one of them is refused.
 		assert.equal((await host.fusion({ role: "implement", task: "second", backend: "pi" })).error, OFF_REFUSAL);

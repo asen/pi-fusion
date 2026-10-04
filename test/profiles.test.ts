@@ -578,6 +578,8 @@ test("the default profile loads as the session starts, and the host's guidance a
 	assert.ok(!guidelines.some((line) => /Use fusion with role ultracode/.test(line)), "a disabled role is recommended nowhere");
 	assert.match(host.tools.get("claude")!.description, /ultracode is disabled/);
 	assert.deepEqual(host.active, ["read", "bash", "fusion_activate"], "and fusion starts off, with only its way in offered");
+	await host.command("status");
+	assert.deepEqual(host.last()?.split("\n").slice(0, 9), ["fusion: off", "profile: work", "", ...settingsTable(WORK)]);
 	await host.on();
 	assert.equal((await host.fusion({ role: "implement", task: "x" })).error, undefined);
 	assert.deepEqual([claude.starts[0]!.role.model, claude.starts[0]!.role.effort], ["sonnet", "low"]);
@@ -856,6 +858,10 @@ test("the editor stages every change and applies them together, and a run that s
 	assert.match(host.tools.get("fusion")!.description, /implement runs on pi with model openrouter\/deepseek\/deepseek-r1 at effort high; ultracode is disabled/);
 	await host.command("profile list");
 	assert.match(host.last() ?? "", /^builtin \(current, modified; default for new sessions\)$/m);
+	await host.command("status");
+	assert.match(host.last() ?? "", /^fusion: off\nprofile: builtin \(modified\)\n/);
+	assert.match(host.last() ?? "", /^implement\s+yes\s+pi\s+openrouter\/deepseek\/deepseek-r1\s+high$/m);
+	assert.match(host.last() ?? "", /^ultracode\s+no\s+claude\s+/m);
 
 	// A run admitted while the editor is open: the apply is refused and nothing changes.
 	const racing = sdkHost({ backends: { claude: claude.backend } });
@@ -1107,7 +1113,7 @@ test("fusion starts off: only the activation tool is offered, a direct call star
 	assert.equal(claude.starts.length, 0);
 	assert.deepEqual(host.branch, []);
 	await host.command("status");
-	assert.match(host.last() ?? "", /^fusion: off\nno runs in this Pi session yet/);
+	assert.match(host.last() ?? "", /^fusion: off\nprofile: builtin\n\n[\s\S]*?\n\nno runs in this Pi session yet/);
 	// Neither config nor a profile command, nor a second session_start, turns it on.
 	await host.command("profile list");
 	await host.start();

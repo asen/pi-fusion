@@ -3228,7 +3228,7 @@ export default function fusion(pi: ExtensionAPI, options: FusionOptions = {}) {
 				if (command.handle === undefined) {
 					const all = [...runs.values()];
 					const earlier = heldRuns(ctx).map((held) => `${held.handle} · ${held.role} · ${held.model} · ${held.state} · earlier Pi process`);
-					notice([`fusion: ${enabled ? "on" : "off"}`, ...(all.length ? all.map(statusLine) : ["no runs in this Pi session yet"]), ...earlier, usageLine()].join("\n"), "info");
+					notice([`fusion: ${enabled ? "on" : "off"}`, `profile: ${configurationLabel(configuration)}`, "", ...settingsTable(configuration.roles), "", ...(all.length ? all.map(statusLine) : ["no runs in this Pi session yet"]), ...earlier, usageLine()].join("\n"), "info");
 					return;
 				}
 				const run = live(command.handle);
