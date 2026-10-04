@@ -91,7 +91,7 @@ The dashboard browser test looks for `PI_FUSION_CHROME`, usual platform paths, t
 
 These stay under `test/spikes/`, outside the default test glob. Run them only as an explicitly agreed qualification step, one at a time in the foreground. This documentation cleanup does **not** rerun them. Every harness below except the Codex one is a Pi harness; none qualifies Claude.
 
-### Codex app-server (G1 passed on one host; Q14 measured once natively; G2 pending)
+### Codex app-server (G1, Q14 and G2 passed on one host)
 
 ```bash
 node test/spikes/codex-app-server.mjs --list                    # catalogue only; exits 2
@@ -186,6 +186,6 @@ Use a fresh sanitized setup for another qualification stage. Retargeting customa
 
 ## Evidence discipline
 
-Keep three labels distinct: **source inspection**, **deterministic fake/double test**, and **manual native measurement**. Document versions/platforms and skipped cases; do not promote one into another or into a guarantee for future Pi versions. The [backend evidence table](pi-backend.md#evidence-and-limits) records current Pi qualification boundaries, including no native security-role, macOS, Windows, live-provider, or paid-inference qualification. [Codex evidence](codex-backend.md#evidence) is source inspection, deterministic fakes, and manual native measurement on one Linux x64 host with app-server 0.160, where stage 1's gate G1 passed and Q14, a stage 2 usage measurement outside G1, passed once; that covers that version and platform only, G2's cases are implemented and have not run natively (G2 pending), and passing fakes are not native evidence.
+Keep three labels distinct: **source inspection**, **deterministic fake/double test**, and **manual native measurement**. Document versions/platforms and skipped cases; do not promote one into another or into a guarantee for future Pi versions. The [backend evidence table](pi-backend.md#evidence-and-limits) records current Pi qualification boundaries, including no native security-role, macOS, Windows, live-provider, or paid-inference qualification. [Codex evidence](codex-backend.md#evidence) is source inspection, deterministic fakes, and manual native measurement on one Linux x64 host with app-server 0.160, where stage 1's gate G1 passed and Q14, a stage 2 usage measurement outside G1, passed once; that covers that version and platform only, G2 passed there for `ask` runs on the host-default selection, and passing fakes are not native evidence.
 
 Historical plans and detailed rounds are retained in Git history. Earlier deviations and possible outside-root effects remain unknown where recorded. Removing obsolete prose authorizes no investigation or cleanup of those artifacts, real profiles, caches, or processes, and no upstream issue submission. The declined helper proposal was never submitted and no SDK source was modified.
