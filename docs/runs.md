@@ -36,7 +36,7 @@ Every child runs in the host's working directory. Claude and Pi append the role 
 
 A Codex role is bound with a sandbox instead of a tool list: `implement` in `workspace-write`, `ask` (both modes) in `read-only`, with approval policy `never`. The child's tools, MCP servers, writable roots, network setting and multi-agent features are whatever the user's Codex configuration gives that sandbox mode; Fusion isolates none of them. See [Codex backend](codex-backend.md#inheritance-not-isolation).
 
-Every Claude and Pi child also gets [ask_orchestrator](questions.md); a Codex child does not. Fixed-tool Claude roles use `bypassPermissions` and strict MCP configuration with only that question server. Fusion leaves Claude's normal settings/plugin/CLAUDE.md loading in place; ultracode's permission mode is [configurable](ultracode.md). Pi instead uses in-memory settings and explicit resources; see [its lifecycle](pi-backend.md#one-calls-lifecycle).
+Every Claude and Pi child also gets [ask_orchestrator](questions.md); a Codex child gets it experimentally as a dynamic tool, when its thread has one ([Questions on Codex](questions.md#on-codex)). Fixed-tool Claude roles use `bypassPermissions` and strict MCP configuration with only that question server. Fusion leaves Claude's normal settings/plugin/CLAUDE.md loading in place; ultracode's permission mode is [configurable](ultracode.md). Pi instead uses in-memory settings and explicit resources; see [its lifecycle](pi-backend.md#one-calls-lifecycle).
 
 Contracts restrict scope and ask's file changes, but a shell tool can still write files. These lists are not an operating-system permission boundary.
 
