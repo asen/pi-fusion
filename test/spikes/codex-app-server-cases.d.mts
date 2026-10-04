@@ -73,6 +73,14 @@ export interface Observation {
 }
 export declare function classifyWrite(match: ProbeMatch, state: { exists: boolean; content?: string }, token: string): Observation;
 export declare function classifyNetwork(match: ProbeMatch, hits: number): Observation;
+export declare const PROBE_OUTPUT_MAX_BYTES: number;
+export declare const PROBE_REPORT_MAX_BYTES: number;
+export declare function boundedUtf8(text: string, max: number): string;
+/** What a probe report line kept: only its verb, `ok` and an error-code token, or why nothing was read. */
+export type ProbeReportRead = { report: { probe: string; ok: boolean; code?: string } } | { none: string } | { unavailable: string };
+export declare function readProbeReport(output: unknown, verb: string): ProbeReportRead;
+export declare function formatProbeReport(read: ProbeReportRead): string;
+export declare function probeReport(notifications: { method: string; params: unknown }[], expected: string, verb: string, scope: { threadId?: string; turnId?: string }): string;
 
 export type Status = "pass" | "fail" | "skip" | "unproven";
 export declare function probeVerdict(expectation: Expectation, observation: Observation): { status: Status; why: string };

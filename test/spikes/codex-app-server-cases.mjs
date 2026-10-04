@@ -376,6 +376,93 @@ export function classifyNetwork(match, hits) {
 	return { observed: "inconclusive", detail: `exit ${exits.join(",")}, listener saw ${hits} request(s); not a denial signature this harness reads as the sandbox` };
 }
 
+/** How much of an exact probe item's output is read at all; anything longer is not the probe's one report line. */
+export const PROBE_OUTPUT_MAX_BYTES = 1024;
+/** The most a printed probe report line may take, in UTF-8 bytes. */
+export const PROBE_REPORT_MAX_BYTES = 256;
+
+/** The fields each verb's report may carry as `codex-app-server-probe.mjs` writes it; any other field rejects the report. */
+const REPORT_FIELDS = Object.freeze({ write: ["probe", "ok", "code"], net: ["probe", "ok", "code", "status"], sleep: ["probe", "ok", "code", "slept"] });
+/** An operating-system or Node error code, the only text from a report that is ever printed. */
+const ERROR_CODE = /^E[A-Z0-9_]{1,31}$/;
+/** Control and line-separator characters: no report line carries one. */
+const CONTROL = /[\u0000-\u001f\u007f-\u009f\u2028\u2029]/;
+
+/** `text` cut to at most `max` UTF-8 bytes, never inside a character. */
+export function boundedUtf8(text, max) {
+	if (Buffer.byteLength(text, "utf8") <= max) return text;
+	let out = "";
+	let bytes = 0;
+	for (const char of text) {
+		const size = Buffer.byteLength(char, "utf8");
+		if (bytes + size > max) break;
+		out += char;
+		bytes += size;
+	}
+	return out;
+}
+
+/**
+ * The probe's own report from one exact command item's output, reduced to its verb, `ok` and error code: a diagnostic
+ * for the log, never evidence. Only a single bounded line that parses whole as this verb's known shape is read; an
+ * oversize or truncated output, another line, an unknown field or a code that is not an error-code token makes it
+ * unavailable, and nothing else from the output is kept.
+ */
+export function readProbeReport(output, verb) {
+	const fields = Object.hasOwn(REPORT_FIELDS, verb) ? REPORT_FIELDS[verb] : undefined;
+	if (fields === undefined) return { unavailable: "not a known probe verb" };
+	if (output === undefined || output === null || output === "") return { none: "the item carried no output" };
+	if (typeof output !== "string") return { unavailable: "the output is not text" };
+	if (Buffer.byteLength(output, "utf8") > PROBE_OUTPUT_MAX_BYTES) return { unavailable: `the output is over ${PROBE_OUTPUT_MAX_BYTES} bytes` };
+	const line = output.trim();
+	if (line === "") return { none: "the item carried no output" };
+	if (CONTROL.test(line)) return { unavailable: "the output is not one probe report line" };
+	let value;
+	try {
+		value = JSON.parse(line);
+	} catch {
+		return { unavailable: "the output is not one probe report line" };
+	}
+	if (!value || typeof value !== "object" || Array.isArray(value)) return { unavailable: "the output is not a probe report" };
+	if (!Object.keys(value).every((key) => fields.includes(key)) || value.probe !== verb || typeof value.ok !== "boolean") return { unavailable: "the output is not this probe's report shape" };
+	if (Object.hasOwn(value, "status") && !Number.isInteger(value.status)) return { unavailable: "the output is not this probe's report shape" };
+	if (Object.hasOwn(value, "slept") && typeof value.slept !== "number") return { unavailable: "the output is not this probe's report shape" };
+	if (Object.hasOwn(value, "code") && (value.ok || typeof value.code !== "string" || !ERROR_CODE.test(value.code))) return { unavailable: "the report's code is not an error-code token" };
+	return { report: Object.hasOwn(value, "code") ? { probe: verb, ok: value.ok, code: value.code } : { probe: verb, ok: value.ok } };
+}
+
+/** One probe report line for the log, bounded, from what `readProbeReport` kept. */
+export function formatProbeReport(read) {
+	const text = read.report
+		? `probe=${read.report.probe} ok=${read.report.ok}${read.report.code === undefined ? "" : ` code=${read.report.code}`} (the probe's own output; diagnostic only, not evidence)`
+		: read.none !== undefined
+			? `none captured (${read.none})`
+			: `unavailable (${read.unavailable})`;
+	return boundedUtf8(text, PROBE_REPORT_MAX_BYTES);
+}
+
+/**
+ * The probe's own report, for the log only, from the primary turn's single completed command item that is exactly its
+ * command. No item, or more than one, reads nothing; the verdict never consults this, and its absence is no evidence.
+ */
+export function probeReport(notifications, expected, verb, scope) {
+	if (typeof scope?.threadId !== "string" || typeof scope?.turnId !== "string") return formatProbeReport({ none: "no primary turn" });
+	let exact = 0;
+	let output;
+	for (const notification of notifications) {
+		if (notification.method !== "item/completed") continue;
+		const params = notification.params;
+		if (!params || typeof params !== "object" || params.threadId !== scope.threadId || params.turnId !== scope.turnId) continue;
+		const item = params.item;
+		if (!item || item.type !== "commandExecution" || !sameProbeCommand(item.command, expected)) continue;
+		exact += 1;
+		output = exact === 1 ? item.aggregatedOutput : undefined;
+	}
+	if (exact === 0) return formatProbeReport({ none: "no command item was the probe's exact command" });
+	if (exact > 1) return formatProbeReport({ unavailable: `${exact} command items were the probe's exact command; none is read` });
+	return formatProbeReport(readProbeReport(output, verb));
+}
+
 /** One probe's verdict: skip when not applicable, unproven without evidence, fail on a declined approval or a mismatch. */
 export function probeVerdict(expectation, observation) {
 	if (!expectation.applicable) return { status: "skip", why: expectation.reason };

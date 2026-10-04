@@ -73,6 +73,7 @@ import {
 	pickOutside,
 	probeAfter,
 	probeItems,
+	probeReport,
 	probeVerdict,
 	q5Verdict,
 	sameProbeCommand,
@@ -958,6 +959,7 @@ const RUNNERS = {
 				const observation = entry.kind === "write" ? classifyWrite(match, fileState(entry.target), entry.key) : classifyNetwork(match, net.hits(entry.key));
 				const verdict = entry.kind === "write" ? probeVerdict(expectation, observation) : networkVerdict(expectation, observation, controls);
 				result.fact(`probe ${entry.name}`, entry.command);
+				result.fact(`probe ${entry.name} report`, probeReport(record.notifications, entry.command, entry.kind, scope));
 				result.fact(`probe ${entry.name} verdict`, `${verdict.status.toUpperCase()} ${verdict.why}`);
 				measured.push({ name: entry.name, observation, verdict });
 			}
@@ -1066,6 +1068,7 @@ const RUNNERS = {
 		result.check(record.run.stopReason === "aborted", "production verdict: aborted");
 		result.check(record.exit?.stopRequested === true, "the host requested the stop");
 		if (ctx.fake) return;
+		result.fact("probe sleep report", probeReport(record.notifications, command, "sleep", { threadId: record.thread?.threadId, turnId: record.turn?.turnId }));
 		if (!seen?.identity) {
 			ctx.keep("Q6: the sleep probe was never identified, so whether it is gone is unknown");
 			return result.unproven(`the sleep probe was not identified before cancellation (${seen?.why ?? "it never started"}), so nothing says it is gone`);

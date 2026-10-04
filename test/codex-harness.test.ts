@@ -14,6 +14,7 @@ import {
 	canonicalPath,
 	classifyNetwork,
 	caseStatus,
+	boundedUtf8,
 	classifyWrite,
 	combine,
 	composeInstructions,
@@ -22,6 +23,7 @@ import {
 	expectWrite,
 	type Expectation,
 	forcedExitNotice,
+	formatProbeReport,
 	identifyProbe,
 	type LoopbackControl,
 	networkVerdict,
@@ -32,10 +34,14 @@ import {
 	probeAfter,
 	type ProbeProc,
 	probeItems,
+	probeReport,
 	probeVerdict,
+	PROBE_OUTPUT_MAX_BYTES,
+	PROBE_REPORT_MAX_BYTES,
 	Q5_NO_DENIAL,
 	q5Verdict,
 	readPidText,
+	readProbeReport,
 	type ReportedSandbox,
 	sameProbeCommand,
 	selectCases,
@@ -213,6 +219,117 @@ test("probe evidence is the exact command item's status and exit and the fixture
 	assert.equal(classifyNetwork(only({ status: "failed", exitCode: 11 }), 0).observed, "inconclusive", "a connection error is not assumed to be the sandbox");
 	assert.equal(classifyNetwork(only({ status: "completed", exitCode: 0 }), 0).observed, "inconclusive", "a zero exit the listener never saw is not reach");
 	assert.equal(classifyNetwork(only(), 0).observed, "not-run");
+});
+
+test("a probe's own report is logged from its single exact item as verb, ok and an error-code token only, and never changes a verdict", () => {
+	const scope = { threadId: "thr-1", turnId: "turn-1" };
+	const item = (command: unknown, extra: Record<string, unknown> = {}, ids = scope) => ({ method: "item/completed", params: { ...ids, item: { type: "commandExecution", id: "c", command, status: "failed", exitCode: 11, ...extra } } });
+	const report = (output: unknown) => item(WRITE_CMD, { aggregatedOutput: output });
+	const enoent = `${JSON.stringify({ probe: "write", ok: false, code: "ENOENT" })}\n`;
+
+	// Exit 11 with ENOENT is displayed, but the write is still inconclusive and Q5 still unproven.
+	const notes = [report(enoent)];
+	const line = probeReport(notes, WRITE_CMD, "write", scope);
+	assert.equal(line, "probe=write ok=false code=ENOENT (the probe's own output; diagnostic only, not evidence)");
+	const match = probeItems(notes, WRITE_CMD, "tok-1", scope);
+	assert.deepEqual(match, { items: [{ status: "failed", exitCode: 11 }], unrecognised: 0 }, "the match still keeps no output");
+	const observation = classifyWrite(match, { exists: false }, "tok-1");
+	assert.equal(observation.observed, "inconclusive");
+	const verdict = probeVerdict({ applicable: true, expected: "deny", reason: "outside" }, observation);
+	assert.equal(verdict.status, "unproven");
+	const ok = { sandboxType: "workspaceWrite", approvals: 0 };
+	const inside = { name: "inside", observation: { observed: "permit" as const, detail: "" }, verdict: { status: "pass" as Status, why: "" } };
+	assert.equal(q5Verdict([inside, { name: "outside", observation, verdict }], ok).status, "unproven");
+
+	// Exit 10 EACCES with the target absent stays a denial; a report never makes or unmakes one.
+	const eacces = [report(JSON.stringify({ probe: "write", ok: false, code: "EACCES" }))].map((note) => ({ ...note, params: { ...note.params, item: { ...note.params.item, exitCode: 10 } } }));
+	assert.match(probeReport(eacces, WRITE_CMD, "write", scope), /^probe=write ok=false code=EACCES /);
+	assert.equal(classifyWrite(probeItems(eacces, WRITE_CMD, "tok-1", scope), { exists: false }, "tok-1").observed, "deny");
+	assert.equal(classifyWrite(probeItems([item(WRITE_CMD, { exitCode: 10 })], WRITE_CMD, "tok-1", scope), { exists: false }, "tok-1").observed, "deny", "no report is not evidence either way");
+
+	// No output, no exact item, or more than one exact item: nothing is read.
+	assert.equal(probeReport([item(WRITE_CMD)], WRITE_CMD, "write", scope), "none captured (the item carried no output)");
+	assert.equal(probeReport([report("")], WRITE_CMD, "write", scope), "none captured (the item carried no output)");
+	assert.equal(probeReport([report("  \n")], WRITE_CMD, "write", scope), "none captured (the item carried no output)");
+	assert.equal(probeReport([], WRITE_CMD, "write", scope), "none captured (no command item was the probe's exact command)");
+	assert.match(probeReport([report(enoent), report(enoent)], WRITE_CMD, "write", scope), /^unavailable \(2 command items were the probe's exact command; none is read\)$/);
+	assert.match(probeReport([report(enoent)], WRITE_CMD, "write", {}), /^none captured \(no primary turn\)$/);
+	for (const other of [
+		item(`bash -lc "echo tok-1; exit 11"`, { aggregatedOutput: enoent }),
+		item("echo tok-1", { aggregatedOutput: enoent }),
+		item(PROBE_CMD("write", "'/fx/target.txt'", "tok-2"), { aggregatedOutput: enoent }),
+		item(WRITE_CMD, { aggregatedOutput: enoent }, { threadId: "thr-sub", turnId: "turn-sub" }),
+		{ method: "item/started", params: { ...scope, item: { type: "commandExecution", command: WRITE_CMD, aggregatedOutput: enoent } } },
+		{ method: "item/completed", params: { ...scope, item: { type: "agentMessage", command: WRITE_CMD, text: enoent } } },
+	]) assert.match(probeReport([other], WRITE_CMD, "write", scope), /^none captured \(no command item/, JSON.stringify(other));
+
+	// Only the whitelisted primitives are ever printed; anything else rejects the report outright.
+	const secret = "sk-SECRET-/home/u/.codex/auth.json-NONCE";
+	for (const output of [
+		JSON.stringify({ probe: "write", ok: false, code: "ENOENT", path: secret }),
+		JSON.stringify({ probe: "write", ok: false, code: secret }),
+		JSON.stringify({ probe: "write", ok: false, code: "ENOENT\u001b[2J" }),
+		JSON.stringify({ probe: "write", ok: false, code: "unknown" }),
+		JSON.stringify({ probe: "write", ok: false, code: "E".repeat(40) }),
+		JSON.stringify({ probe: "write", ok: false, code: 2 }),
+		JSON.stringify({ probe: "write", ok: true, code: "ENOENT" }),
+		JSON.stringify({ probe: "write", ok: "false" }),
+		JSON.stringify({ probe: "net", ok: false, code: "ENOENT" }),
+		JSON.stringify({ probe: "write", ok: false, status: 500 }),
+		JSON.stringify([{ probe: "write", ok: false }]),
+		"null",
+		`${JSON.stringify({ probe: "write", ok: false, code: "ENOENT" })}\n${secret}`,
+		`${secret}\n${enoent}`,
+		`{"probe":"write","ok":false,"code":"ENOENT"`,
+		`{"probe":"write","ok":false,"code":"ENOENT","x":"${"a".repeat(2_000)}"}`,
+		`{"probe":"write","ok":false,"code":"ENOENT","x":"\u0007"}`,
+		{ probe: "write", ok: false, code: "ENOENT" },
+	]) {
+		const printed = probeReport([report(output)], WRITE_CMD, "write", scope);
+		assert.match(printed, /^unavailable \(/, String(output).slice(0, 80));
+		assert.ok(!printed.includes("SECRET") && !printed.includes("/home/") && !printed.includes("\u001b"), printed);
+		assert.ok(Buffer.byteLength(printed, "utf8") <= PROBE_REPORT_MAX_BYTES);
+	}
+	assert.ok("unavailable" in readProbeReport(enoent, "eval"), "an unknown verb is never read");
+	assert.deepEqual(readProbeReport(JSON.stringify({ probe: "net", ok: false, status: 503 }), "net"), { report: { probe: "net", ok: false } }, "a known numeric field is checked but not printed");
+	assert.deepEqual(readProbeReport(JSON.stringify({ probe: "sleep", ok: true, slept: 120 }), "sleep"), { report: { probe: "sleep", ok: true } });
+	assert.deepEqual(readProbeReport(JSON.stringify({ probe: "net", ok: false, code: "ECONNREFUSED" }), "net"), { report: { probe: "net", ok: false, code: "ECONNREFUSED" } });
+
+	// The scan is bounded in bytes, not characters, and the printed line never splits a character.
+	// U+3000 is whitespace `trim` removes and three UTF-8 bytes: the same report padded by characters under the cap but bytes over it is oversize.
+	const base = enoent.trim();
+	const room = PROBE_OUTPUT_MAX_BYTES - base.length;
+	const fits = `${base}${"\u3000".repeat(Math.floor(room / 3))}`;
+	const over = `${base}${"\u3000".repeat(Math.floor(room / 3) + 1)}`;
+	assert.ok(over.length < PROBE_OUTPUT_MAX_BYTES && Buffer.byteLength(over, "utf8") > PROBE_OUTPUT_MAX_BYTES);
+	assert.deepEqual(readProbeReport(fits, "write"), { report: { probe: "write", ok: false, code: "ENOENT" } });
+	assert.deepEqual(readProbeReport(over, "write"), { unavailable: `the output is over ${PROBE_OUTPUT_MAX_BYTES} bytes` }, "never a parsed prefix");
+	assert.equal(boundedUtf8("ab\u00e9", 3), "ab", "a two-byte character that does not fit is dropped whole");
+	assert.equal(boundedUtf8("a\u{1F600}b", 4), "a", "a four-byte character is never split");
+	assert.equal(boundedUtf8("abc", 3), "abc");
+	assert.ok(Buffer.byteLength(formatProbeReport({ unavailable: "\u00e9".repeat(400) }), "utf8") <= PROBE_REPORT_MAX_BYTES);
+	assert.ok(formatProbeReport({ unavailable: "\u00e9".repeat(400) }).endsWith("\u00e9"), "cut at a character boundary");
+
+	// The cancellation probe's report reads the same primitives from its own exact command.
+	const SLEEP_CMD = PROBE_CMD("sleep", "'/fx/work/tok.pid'", "120");
+	assert.equal(probeReport([item(SLEEP_CMD, { aggregatedOutput: JSON.stringify({ probe: "sleep", ok: false, code: "EEXIST" }) })], SLEEP_CMD, "sleep", scope), "probe=sleep ok=false code=EEXIST (the probe's own output; diagnostic only, not evidence)");
+	assert.match(probeReport([item(SLEEP_CMD, { aggregatedOutput: JSON.stringify({ probe: "sleep", ok: false, code: "EEXIST", pid: secret }) })], SLEEP_CMD, "sleep", scope), /^unavailable \(/);
+	assert.match(probeReport([item(SLEEP_CMD, { aggregatedOutput: enoent })], SLEEP_CMD, "sleep", scope), /^unavailable \(/, "another verb's report is not this probe's");
+});
+
+test("the probe program's own failure output reads back as its error code, and Q5 and Q6 print that report line", () => {
+	const root = fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), "pi-fusion-harness-report-"));
+	try {
+		const run = spawnSync(process.execPath, [PROBE, "write", path.join(root, "absent", "probe.txt"), "tok"], { encoding: "utf8", timeout: 10_000 });
+		assert.equal(run.status, 11, "a missing parent is not an operating-system refusal");
+		assert.deepEqual(readProbeReport(run.stdout, "write"), { report: { probe: "write", ok: false, code: "ENOENT" } });
+	} finally {
+		fs.rmSync(root, { recursive: true, force: true });
+	}
+	const source = fs.readFileSync(HARNESS, "utf8");
+	assert.ok(source.includes("result.fact(`probe ${entry.name} report`, probeReport(record.notifications, entry.command, entry.kind, scope));"), "Q5 prints each probe's report line");
+	assert.ok(source.includes(`result.fact("probe sleep report", probeReport(record.notifications, command, "sleep", { threadId: record.thread?.threadId, turnId: record.turn?.turnId }));`), "Q6 prints the sleep probe's report line");
+	assert.doesNotMatch(source, /aggregatedOutput/, "the entry program never reads command output itself");
 });
 
 const CONTROL_OK: LoopbackControl = { ok: true, exit: 0, hits: 1 };
