@@ -1,36 +1,166 @@
 # Development
 
+## Commands
 
 ```bash
 npm install
 npm run typecheck
 npm test
+node --test test/control.test.ts
+node --test --test-name-pattern="continue" test/control.test.ts
 ```
 
-The tests run the extension against fakes, never against a real child, never against a paid one and never against the Pi backend this build registers. Three fakes do three different jobs: `test/fake-claude.mjs` stands in for the Claude Code binary, `test/fake-pi.mjs` stands in for a Pi child and speaks its native protocol, and `test/fake-pi-backend.ts` stands in for a whole backend.
+The suite uses Node's native TypeScript stripping and a 60-second per-test timeout. Typecheck is the only static check; there is no linter or formatter. `npm install` also installs the Claude Agent SDK's bundled binary (about 200 MB), but tests do not run that binary.
 
-A fourth file is not a fake at all. `test/tripwire.ts` is the pi backend the test hosts register in place of the one `fusion()` registers by default — all but the two named below, which take the real registration only to read the binding's own refusal: each of its entry points records that it was reached and throws one fixed sentence, so a case that routed a call to the production Pi backend — where it would start a real child — fails its whole file instead of passing with the throw swallowed into a tool message or a run report. A host that wants a pi backend of its own spreads it over this one, `{ ...piTripwire(), pi: own }`.
+Editing conventions and invariants live in [AGENTS.md](../AGENTS.md); vocabulary lives in [CONTEXT.md](../CONTEXT.md). Keep user-facing changes in the owning topic page. The code, not historical plans or measurement counts, defines current behavior.
 
-`test/fake-claude.mjs` stands in for the real binary. It speaks the SDK's side of Claude Code's stream-json protocol: it answers the `initialize` control request, takes the prompt from the `user` line that follows, then plays the scenario named by `FAKE_CLAUDE_SCENARIO`. The question scenarios send `mcp_message` and `hook_callback` control requests to the SDK, as Claude Code does, and wait for the reply. `PI_FUSION_CLAUDE_BIN` points the SDK at it; a `.js`, `.mjs` or `.cjs` path runs under node. Set `FAKE_CLAUDE_LOG` to a file to see what the SDK writes to the fake's stdin.
+## Module map
 
-`test/fake-pi.mjs` is the Pi one of the two fakes that are processes. It writes the bootstrap's own stage diagnostics on stderr and speaks the native RPC protocol on stdout and stdin out of literals, importing two node builtins and nothing else: no SDK, no provider, no model runtime and nothing that starts anything. `test/pi-transport.test.ts` drives `extensions/backends/pi-transport.ts` against it through the production storage, input and launch composition, each case under a root of its own, and `test/pi-backend-transport.test.ts` drives `createPiBackend` against it over the real transport and process tree for one whole call. Neither is evidence about Pi: what they measure is this host's own end of the wire.
+```text
+fusion.ts                     host lifecycle and registration
+  +-- roles/profiles/store    capabilities and session configuration
+  +-- backends/types.ts       SDK-neutral boundary
+  |     +-- claude.ts         Claude SDK and stream/questions
+  |     +-- pi-backend.ts     Pi composition (see below)
+  +-- process-tree.ts         launch and descendant cleanup
+  +-- cards/dashboard        terminal and browser monitoring
+  +-- changes/history/budget snapshots, persistence, accounting
+  +-- handoff/review          prompts and eligibility
+```
 
-`test/fake-pi-backend.ts` is a backend the test injects through `fusion(api, { backends })`, which is how another backend reaches this build, spread over the tripwire so it replaces the registered pi backend for that host. It runs no process, speaks no protocol, reads no configuration and needs no variable to enable it: a script says what each run reports — the session reference it verified, the checkpoint, the selection it read back, a failure, a throw, and whether any of that goes through the progress stream at all — and the start it captures gives the test the role and session intent the host handed over, a steer channel, a question channel, a gate that holds a pending run open and an abort response. `test/lifecycle.test.ts` drives the registered tools, the host branch, the on-disk history and both control tools against it, with a `pi`-named and a `claude`-named backend side by side: identity and selection across a restart, a `/tree` rollback and a host fork, the recovery policy for failed and cancelled calls, the outcome shapes a run is failed for, per-backend plan selection and handoff, the single writer slot across backends, questions, steering, cancellation and shutdown. The `security` role is in there too, under the same rules: a `security` call with no backend named runs on `pi` and holds the one writer slot against both backends with `ask` runs beside it, it keeps that slot while it waits for an answer and takes exactly one, a continuation after a fresh extension on the same branch repeats the recorded selection while every `claude` route to it is refused, and the reviewer a finished one gets is a fresh Pi `ask` review child on the model that run ran with at this host's own ask level — with and without `PI_FUSION_PI_ASK_EFFORT`, beside a `claude` `implement` run's Claude reviewer in one host under `PI_FUSION_AUTO_REVIEW`, and for a run an earlier Pi process left, on the model the history recorded. What it proves is Fusion's own policy against a backend's answers; it proves nothing about Pi, whose session semantics stay `test/spikes/pi-session-lifecycle.mjs`'s to measure against a real child, outside the `test/*.test.ts` glob.
+| Module under `extensions/` | Responsibility |
+| --- | --- |
+| `fusion.ts` | Tools/command, mode, configuration application, admission, handles, branch records, questions, controls, reviews, and host lifecycle handlers |
+| `roles.ts` | Supported backends, writer-slot and review eligibility per role |
+| `profiles.ts`, `profile-store.ts` | Captured legacy defaults, settings validation/copies, global profiles file and queued atomic replacement |
+| `backends/types.ts` | Session references/intents, selection, request/outcome/event/callback shapes; imports nothing |
+| `backends/claude.ts` | Claude SDK options, input/question bridges, stream loop; SDK concerns stay here |
+| `backends/pi-binding.ts` | Pure Pi role/model/effort binding, contracts, and tool/resource lists |
+| `backends/pi-storage.ts`, `pi-launch.ts` | Owned layout/catalog publication, call input, environment, launch options, and lazy host agent/package accessors |
+| `backends/pi-bootstrap.mjs` | Child-only public SDK construction, strict input/resource/session checks, in-memory settings, and native RPC serving |
+| `backends/pi-sdk-resolve.mjs`, `pi-bootstrap-protocol.mjs` | Child resolve preload; separately, import-free startup constants shared with transport |
+| `backends/pi-control-extension.mjs`, `pi-session-restore.ts` | Child navigation/fork commands and host restore/readback sequence |
+| `backends/pi-question-tool.mjs`, `pi-question-routing.ts` | Blocking child input tool and host dialog arbitration |
+| `backends/pi-helper-retry.mjs` | One bounded retry around public search tools, not an SDK patch |
+| `backends/pi-transport.ts` | Native RPC framing/correlation, bounded writer/dialogs, readiness/turn lifecycle, and shutdown |
+| `backends/pi-prepare.ts`, `pi-task.ts` | Preparation identity/selection/usage baseline; one task's evidence, steers, readbacks, and single stop |
+| `backends/pi-outcome.ts`, `pi-backend.ts` | Pure diagnostics/disposition/demotion/progress mapping; composition and finalization |
+| `process-tree.ts` | SDK-independent process launching and legacy/owned descendant cleanup |
+| `cards.ts`, `dashboard.ts`, `dashboard/` | Terminal rendering/widget; bounded store, read-only HTTP server, plain DOM page |
+| `changes.ts`, `history.ts`, `budget.ts` | Git snapshots; opt-in host run history; running-total cost ledger |
+| `handoff.ts`, `review.ts` | Plan cap/model-change handoff; independent review eligibility and quoted prompt data |
 
-Several files use neither a fake nor the tripwire. `test/pi-question-routing.test.ts`, `test/pi-prepare.test.ts`, `test/pi-task.test.ts`, `test/pi-outcome.test.ts` and `test/pi-backend.test.ts` each drive one Pi module against scripted in-memory doubles of their own, with no process, protocol, model runtime or SDK behind them; the two that need storage prepare the production layout under a root the case owns and removes. What they measure is this host's own order, gate, accounting and mapping, never what a real Pi child does.
+Role behavior belongs in `contracts/*.md`. Review **selection** belongs in `fusion.ts`: every review uses the session's configured `ask` backend/model/effort, not the reviewed role's backend or model. Architecture, storage, and runtime limitations are in [Pi backend](pi-backend.md).
 
-A run's state turns terminal before its end path takes its last snapshot and appends its branch entry, so a test that waits for a `done` status and then asserts what was recorded is racing the run. Wait for the run's own end instead, which is what the control `wait` action does. `test/lifecycle.test.ts` has one helper for it and uses it wherever it asserts persistence.
+## Test strategy
 
-`test/records.test.ts` covers the record layer on its own: what an entry of each backend reads back as, what a finished run's outcome decides to write, and which intent a record becomes. `test/routing.test.ts` covers where a call goes before a child starts: the backend, the role, the handle, the record it continues and the bindings each backend resolves.
+`npm test` starts **no real Claude/Pi child and no paid inference**. It tests policy/protocols with fakes and doubles. A fake subprocess is still a process; it is not a native backend session.
 
-The extension is split along the backend boundary: `extensions/fusion.ts` owns the run lifecycle and no SDK, `extensions/backends/claude.ts` owns everything Claude Code's SDK touches, `extensions/backends/types.ts` holds the records and callbacks between them, and `extensions/process-tree.ts` spawns the child process and kills it with its descendants. `test/backends.test.ts` keeps that split honest: it checks that the host, the boundary types and the process-tree helper import no backend SDK, that the boundary types import nothing at all, that the helper imports only node itself, and that the backend does not import the extension that routes to it. It reads those dependencies with TypeScript's own scanner, so static imports, bare imports, re-exports and literal dynamic imports and requires all count while a module named in a comment or a string does not. It also keeps the Claude role's `mode` the host's own list of ask modes, at compile time, and runs a child through `claudeBackend` and drives the process tree on its own, without the SDK. The Claude-facing behavior behind that boundary stays covered by `test/child.test.ts`.
+| Layer | Fixture / tests | What a pass establishes |
+| --- | --- | --- |
+| Claude backend | `fake-claude.mjs`, `child.test.ts`, backend tests | Real SDK objects speaking stream-json to a fake binary |
+| Host lifecycle | `fake-pi-backend.ts`, `lifecycle.test.ts`, controls/session/routing/records tests | Admission, writer slot, records, continuations, questions, reviews, and cross-backend policy |
+| Pi native protocol | `fake-pi.mjs`, `pi-transport.test.ts`, `pi-backend-transport.test.ts` | Host framing, request/event order, composition, and process cleanup against literal RPC replies |
+| Pi helper stages | Binding/storage/launch/bootstrap/restore/question/prepare/task/outcome/backend tests | Validation, sequencing, gates, accounting, and mapping against scripted doubles or fenced fake subprocesses |
+| Configuration/mode | `profiles.test.ts` | Settings/store/commands, off-by-default, reminder, refresh/rollback, and allow-list preservation against a modeled host |
+| Presentation/persistence | Cards, dashboard, browser, history, changes, budget, review tests | Bounded/safe rendering and storage, Git snapshots, cost ledger, and review prompts/eligibility |
 
-The same file audits where the suite registers the extension, read with that scanner rather than counted as text: ten registrations, each naming `piTripwire` or `productionDefaults` and never both, and exactly two of them — one in `test/extension.test.ts`, one in `test/routing.test.ts` — taking this build's own registration. Those two are the only cases that read the registered pi backend, and what they read is the binding's refusal: every variable a pi role could resolve a model from is deleted first, `productionDefaults()` refuses the registration outright while one is still set, and the explicit pi call is then refused for having no model, before that backend is asked for a session, a control or a run. It pins the protocol import boundary the same way: `extensions/backends/pi-bootstrap-protocol.mjs`, which holds the two literals both ends of a Pi child's wire agree on, imports no module at all; the transport imports it and never `pi-bootstrap.mjs`; no production module of any extension this repository ships imports that child program; and `pi-launch.ts` names it as the path it launches.
+Extension test hosts register `piTripwire()` in place of production Pi. Every tripwire entry point records a reach and throws; a file-level check catches accidental routing even when the extension turns that throw into a report. An injected backend uses `{ ...piTripwire(), pi: own }`. The two `productionDefaults()` hosts only test missing-model binding refusals and never ask the registered backend to run. Every host injects a memory profile store, so it reads/writes no user `profiles.json`.
 
-`test/extension.test.ts` pins the order `fusion()` loads in — the child marker, the contracts, the child's own program, then the pi registration — and that is a static read of `extensions/fusion.ts` and no more. Nothing in the suite removes a contract or that program from the repository to watch the loader throw, so a real install missing one of them stays a manual check. One such check was made by hand on 2026-10-01, outside this repository and tracked nowhere: a throwaway script loaded the extension into a public Pi install, where a good tree registered the four tools, `/fusion`, the two handlers, the renderer and the status line with no `globalThis.fetch` call logged by the preloaded fetch guard — a record of that one function in that one process, and no boundary on a raw socket, another client or a subprocess — a tree with the child's program removed failed with the loader's own missing-bootstrap error, and a tree with the protocol module removed failed as node's own module error. No child, model or provider was behind any of it, and no case repeats it.
+Activate Fusion through the registered mode tool, not a default-on test option. Security tests must explicitly enable that role. Add scenarios to `fake-claude.mjs` rather than mocking the SDK; `FAKE_CLAUDE_SCENARIO` selects one, `PI_FUSION_CLAUDE_BIN` selects the fake, and `FAKE_CLAUDE_LOG` records its stdin.
 
-Measurements against real Pi children live under `test/spikes/`, outside the `test/*.test.ts` glob, and are run by hand: a claim from one of them is a manual measurement and never a suite result. `test/spikes/pi-profile-guidance.mjs` is the one that measures the host rather than a child: `node test/spikes/pi-profile-guidance.mjs` builds a real Pi session under a throwaway agent directory with this extension loaded over an in-memory profile store, runs `/fusion` commands without a model turn, and checks that Fusion starts off with only `fusion_activate` active and no orchestration guidance in the prompt, that `/fusion on` and `off` and the mode tools themselves switch the active list and the prompt, that the SDK's own next-turn refresh hands the switched tools and prompt to the next response, that a profile change rebuilds the host's system prompt, and that the active tool list survives a re-registration under a `--tools` allow list and while fusion is off. The mode tools run through their registered definitions outside the agent loop, so it shows the state a call leaves and what the next response would get, not a model choosing to call one. It sends no prompt, starts no child and needs no provider.
+A terminal state can precede a run's final Git snapshot and branch entry. Wait for the run's own end (`control wait`) before asserting persistence, not merely for `status: done`.
 
-Every test host registers the extension with a profile store of its own, `memoryProfileStore()`, so no case reads or writes the user's `profiles.json`. `test/profiles.test.ts` covers the profile settings, the profiles file and `/fusion config` and `/fusion profile`, against a host whose tool registry models the SDK's re-registration and allow-list behaviour.
+`test/backends.test.ts` and related static checks use the TypeScript parser/scanner to pin registration, SDK import boundaries, and loader order. They are source checks, not evidence that a real install or default start binding was exercised. The bootstrap suite's two unfenced calls inspect public exports and `getAgentDir()` only; neither constructs a session/model runtime. Its SDK fence is a resolution rule, not a sandbox.
 
-`test/control.test.ts` drives background runs, questions and the control tools through a host whose branch grows with every entry the extension appends. `test/changes.test.ts` runs the git snapshots against a scratch repository. `test/budget.test.ts` covers the ledger: what the two budget variables parse to, that a call's latest total replaces its earlier one instead of adding to it, and when a threshold warns and the limit blocks. `test/review.test.ts` covers the review prompt, the rule that decides which runs can be reviewed, and the policy that decides which backend and which model review one. `test/history.test.ts` writes and reads session files under `os.tmpdir()`, including the caps, the file modes, a symbolic link where a file or the directory should be, a corrupt file and a file from a newer pi-fusion. `test/cards.test.ts` renders the cards and the widget with a theme that names its colors, and checks that no line is wider than the width it was given and that no escape sequence a child wrote reaches the terminal. `test/dashboard.test.ts` covers the run store, the dashboard server over real HTTP requests on a random port, and static safety checks on the page assets: that `index.html` carries no inline script, no inline style and no event handler attributes, that `app.js` parses with node's `vm.Script` and uses none of `innerHTML`, `outerHTML`, `insertAdjacentHTML`, `document.write`, `eval` or `new Function`, and that `app.css` has no `url()` or `@import`. `test/browser.test.ts` drives the page in headless Chrome over the DevTools protocol; it looks at `PI_FUSION_CHROME`, then the usual install paths for the platform, then any Chromium name on `PATH`, and skips itself when it finds none.
+The dashboard browser test looks for `PI_FUSION_CHROME`, usual platform paths, then Chromium on `PATH`, and skips if absent. Static dashboard checks prohibit inline script/style/event attributes, HTML injection APIs, `eval`, `new Function`, CSS `url()` and `@import`. Build DOM nodes individually.
+
+## Manual harnesses
+
+These stay under `test/spikes/`, outside the default test glob. Run them only as an explicitly agreed qualification step, one at a time in the foreground. This documentation cleanup does **not** rerun them.
+
+Use direct Node, not `npx`, with dependencies already installed. Record Node/Pi versions, selected cases, exit status, stdout/stderr, skipped cases, and the kept fixture root. A short success excerpt is not a substitute for reading the complete selected run's footer and evidence. Use a sanitized controller environment as well as each harness's own synthesized child environment; do not supply real credentials or reuse a real profile.
+
+### Session lifecycle
+
+```bash
+node test/spikes/pi-session-lifecycle.mjs --list                  # catalogue only; exits 2
+node test/spikes/pi-session-lifecycle.mjs --case production --keep
+node test/spikes/pi-session-lifecycle.mjs --case row3-fork-at --keep
+node test/spikes/pi-session-lifecycle.mjs --case=stage-b --keep
+node test/spikes/pi-session-lifecycle.mjs --keep                   # all cases
+```
+
+`stage-a` and `stage-b` use generated public-SDK bootstraps and a **simulated** host record ledger. `production` drives `createPiBackend` through storage, bootstrap, transport, restore, questions, task, outcome, and cleanup. Its wrapped start passes the launch unchanged to `startPiChild`; it does not exercise `fusion.ts` routing or the default start binding.
+
+Production launches require the composed environment to carry exactly `PI_OFFLINE=1`, root-contained writable/input paths, and no composed catalog base URL. A scripted loopback service is the only model endpoint configured; there is no fetch guard/egress boundary in this group. PID files are fixture assertion/emergency-cleanup oracles, never inputs to production discovery. The detached case is Linux-only. Launch-to-handoff and descendant-to-pid-file windows remain limitations, not isolation guarantees.
+
+Exit 0 means every selected case passed, 1 means failed/unproven, and 2 means no case ran (including `--list`, unmatched/missing selectors, or unknown arguments). Both `--case value` and `--case=value` are accepted. `--keep` retains the fixture root for inspection.
+
+### Configuration, resources, auth, and helpers
+
+```bash
+node test/spikes/pi-config-writes.mjs --stage impl --keep
+# Read the implementation result before starting a separate historical run:
+node test/spikes/pi-config-writes.mjs --stage historical --keep
+node test/spikes/pi-config-writes.mjs --stage impl --case P7 --keep
+```
+
+Stages are `impl`, `historical`, or `all` (default). `--case` selects a case/group; `--pi <absolute CLI path>` adds an installed-CLI comparison where the historical cases support it. The implementation stage drives storage/input/launch/bootstrap through `pi-storage-caller.mjs`, **not production transport**. P5 covers explicit resources and preflight controls, P6 fixture OAuth rotation/failure, and P7 catalog/helper acquisition and bounded-retry behavior.
+
+`pi-fetch-guard.mjs` wraps only `globalThis.fetch` in preloaded fixture processes, refuses unowned origins, and prevents automatic redirects. It covers no raw socket, other client, or subprocess. P7's `pi-helper-interposer.mjs` loads **after** that guard and maps exact release/asset URLs to owned loopback listeners; it is not a proxy or sandbox. P5's SDK fence and generated `npm`/`git` shims are narrow controls, not filesystem/network confinement.
+
+A native retry notice proves the wrapper matched its failure branch, not an independently counted number of underlying executions or an exact failing syscall. The at-most-two bound comes from wrapper source and fake tests. A recovered call is not relabelled first-attempt success; helper acceptance remains scoped to Linux x64/Node 24.18.0/Pi 0.85.1.
+
+### Credential store and profile guidance
+
+```bash
+node test/spikes/pi-auth.mjs --keep
+node test/spikes/pi-auth.mjs --case A3 --keep
+node test/spikes/pi-auth.mjs --case A1,A5 --keep
+node test/spikes/pi-auth.mjs --package /absolute/path/to/another/pi-package --keep
+node test/spikes/pi-auth.mjs --case C1 --keep
+node test/spikes/pi-profile-guidance.mjs
+```
+
+Auth uses `pi-auth-driver.mjs` and a loopback token service with literal dummy credentials. It constructs a public model runtime/credential store, not a session, model request, RPC client, or registered backend. `--case` accepts comma-separated names/groups; skew legs are **NOT RUN** unless `--package` names another installed Pi package. C1 is a separate fake-package leakage control, not native SDK evidence. The driver's observation code does not read shared credential bytes; the controller snapshots them only before/after all drivers have exited.
+
+Profile guidance constructs a real host session under a throwaway root and tests mode/profile changes through slash commands without inference. Mode tools are invoked directly, outside an agent loop: this measures resulting tools/prompts, not a model choosing or obeying them. It starts no child and configures no provider.
+
+### Sanitized controller example (Unix)
+
+Replace both absolute paths before running. This preserves `PATH` deliberately, clears other inherited variables, owns normal home/temp/cache/Git paths, keeps full logs, and runs one selected harness directly:
+
+```bash
+env -i PATH="$PATH" LANG=C.UTF-8 LC_ALL=C.UTF-8 \
+  /bin/bash --noprofile --norc -c '
+    umask 077
+    root="$(mktemp -d)" || exit 1
+    mkdir -p "$root"/{home,tmp,config,cache,data,state,appdata,localappdata,agent,work,logs,git-template,git-hooks}
+    : > "$root/gitconfig"
+    export HOME="$root/home" USERPROFILE="$root/home"
+    export TMPDIR="$root/tmp" TMP="$root/tmp" TEMP="$root/tmp"
+    export XDG_CONFIG_HOME="$root/config" XDG_CACHE_HOME="$root/cache"
+    export XDG_DATA_HOME="$root/data" XDG_STATE_HOME="$root/state"
+    export APPDATA="$root/appdata" LOCALAPPDATA="$root/localappdata"
+    export PI_CODING_AGENT_DIR="$root/agent" PI_OFFLINE=1
+    export JITI_FS_CACHE="$root/cache/jiti" NODE_COMPILE_CACHE="$root/cache/node"
+    export GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL="$root/gitconfig"
+    export GIT_TEMPLATE_DIR="$root/git-template" GIT_TERMINAL_PROMPT=0
+    export GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=core.hooksPath GIT_CONFIG_VALUE_0="$root/git-hooks"
+    cd "$root/work" || exit 1
+    /absolute/path/to/node /absolute/path/to/pi-fusion/test/spikes/pi-session-lifecycle.mjs \
+      --case production --keep > "$root/logs/stdout" 2> "$root/logs/stderr"
+    status=$?
+    printf "root=%s exit=%s\n" "$root" "$status"
+    exit "$status"
+  '
+```
+
+Use a fresh sanitized setup for another qualification stage. Retargeting customary paths and disabling inherited Git configuration do not disable repository-local configuration or confine every filesystem write. Harness cleanup is bounded and owned, not a universal process kill. Inspect retained fixtures only within the agreed scope.
+
+## Evidence discipline
+
+Keep three labels distinct: **source inspection**, **deterministic fake/double test**, and **manual native measurement**. Document versions/platforms and skipped cases; do not promote one into another or into a guarantee for future Pi versions. The [backend evidence table](pi-backend.md#evidence-and-limits) records current qualification boundaries, including no native security-role, macOS, Windows, live-provider, or paid-inference qualification.
+
+Historical plans and detailed rounds are retained in Git history. Earlier deviations and possible outside-root effects remain unknown where recorded. Removing obsolete prose authorizes no investigation or cleanup of those artifacts, real profiles, caches, or processes, and no upstream issue submission. The declined helper proposal was never submitted and no SDK source was modified.

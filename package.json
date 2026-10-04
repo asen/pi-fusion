@@ -4,7 +4,7 @@
   "private": true,
   "license": "MIT",
   "type": "module",
-  "description": "Pi extension: Astra orchestrates through one claude tool; Fable plans, Opus implements and answers, and Fable runs ultracode.",
+  "description": "Pi extension for delegating planning, implementation, questions and reviews to headless Claude Code or Pi sessions.",
   "keywords": [
     "pi-package"
   ],

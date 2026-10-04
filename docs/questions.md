@@ -1,28 +1,55 @@
 # Questions a child asks
 
+Every delegated child gets `ask_orchestrator(question)`. It asks for a small decision missing from its brief, such as a name or choice between options. The tool call stays open, retaining the child's context, until an answer arrives. Wider scope or an unresolved design decision instead belongs in an implementer's **Escalation** report, which ends the run.
 
-Every Claude child gets an in-process MCP tool, `ask_orchestrator(question)`, which the extension serves through the SDK's `createSdkMcpServer`. How a child is given the question tool is its backend's business, and a Pi child gets it as one of its own tools instead (see [On the pi backend](#on-the-pi-backend)); what a question is for the host — one open question at a time per child, answered exactly once, the run `waiting` until then — is the shared lifecycle's and is the same whichever backend runs the child. The child calls it when a small decision inside its task blocks it, such as a name or a choice between options the brief leaves open. The tool call stays open until the host answers, so the child keeps its context and any running workflow. The contracts keep a wider scope or an open design decision out of it: the `implement` child still reports those under Escalation and ends the run, and an `ask` child asks only when the question it got is unclear.
+```text
+child asks -> run waiting -> host or user supplies one answer
+                               |
+                     child sees tool result and continues
 
-While a question is open the run is `waiting`. A foreground delegation call returns at once with the handle and the question, and the run goes on as a background run. A background run sends the host a `pi-fusion-run` message with the question, the same way it reports its end, unless a `fusion_control wait` is blocked on it, which then returns the question. The host answers with `fusion_control message`, after it asks the user when the decision is theirs, and the answer is the tool result the child sees. A waiting run counts as active: no other run that can change files starts until it ends. When a child has several questions open, the host answers them in order, and the reply to each answer carries the next question.
+cancellation / fatal Pi dialog failure -> child stopped, run ends
+```
 
-Question instructions name the paired control of the delegation tool: `fusion_control` for `fusion`, `claude_control` for `claude`. A control reply names the control called; either name can answer any run's question.
+## Waiting and answering
 
-The user can answer without going through the host. `/fusion answer run-3 <text>` sends the text to that run's child. `/fusion answer run-3` with no text opens an editor titled with the question; an empty answer sends nothing and leaves the run waiting. Without a handle the command answers the one run that waits, and asks for a handle when several do.
+A foreground delegation returns early with the handle/question and becomes background work. A background run announces its question unless a host control `wait` is collecting it; that wait returns the question instead. Waiting still occupies the file-changing slot when the role has one, so another coding run cannot start beside it.
 
-Each question is answered exactly once. A question carries an id, and whoever gets there first answers it: the second attempt sends nothing and says who answered, the host or the user, and with what. A user answer that lands while the host is still composing its `fusion_control message` makes that message return `The user already answered run-3's question with: ...` instead of reaching the child as a steer; the host can send it again, and then it goes as a steer, or as the answer if the child has asked another question by then. `fusion_control status` and `fusion_control wait` both report it as `answered by the user: <text>`, under the status, the question or the report they carry, and the run drops it as soon as its child asks the next question.
+The host uses a control `message` action, asking you first when the decision is yours. Generated hints use `fusion_control` for a `fusion` delegation or `claude_control` for `claude`; either control can answer every run. Further queued questions are answered in order, and an answer reply can carry the next question.
 
-The host is told about a user answer through a message with `triggerTurn: false` and `deliverAs: "followUp"`, which starts no turn and arrives with the host's next one. When the answer uncovers a question the child had queued behind it, that question is announced to the host as any other question is, because the answer message on its own starts no turn.
+You can answer directly:
 
-The server sets `timeout: 2147483647` ms (about 24.8 days), the largest MCP tool timeout Claude Code accepts, because that timeout is a hard wall-clock limit and a question has no time limit. The roles with a fixed tool list keep `--strict-mcp-config`, so their only MCP server is this one; `ultracode` gets it next to the user's servers. `allowedTools` names `mcp__pi-fusion__ask_orchestrator`, so a permission mode other than `bypassPermissions` still lets the child call it.
+```text
+/fusion answer run-3 Use the existing public name
+/fusion answer run-3
+/fusion answer
+```
 
-`ultracode` also has Claude Code's own `AskUserQuestion`. A `PreToolUse` hook, not `canUseTool`, sends its questions down the same path: the children run with `permissionPrompts: "none"`, and with that setting the SDK never calls `canUseTool`. The hook joins the questions and their options into one question, numbered when there are several, and waits for the host's answer. It then allows the call with `updatedInput` set to the original input plus `answers`, a map from each question's text to its answer. When the answer has one line per question, each line answers its question; otherwise every question gets the whole answer. The hook matcher sets `timeout: 2147483` s, because a callback hook otherwise times out after 10 minutes.
+No text opens an editor titled with the question. An empty user-editor answer sends nothing and leaves the run waiting. No handle chooses the sole waiting run; when several wait, supply one.
 
-The timeout values come from reading the Claude Code 2.1.273 binary, not from a run against it. The tests drive both paths through the fake binary, which sends the same control requests Claude Code sends.
+A user answer notifies the host as a follow-up **without starting a turn**. The host reads it with its next response. A newly exposed queued question is still announced separately so that the answer notification cannot hide it.
+
+## Exactly one answer wins
+
+Each question has an id. Whoever answers first wins; the second attempt sends nothing and names who answered and what they supplied.
+
+If your answer lands while the host is composing a control `message`, that message returns `The user already answered run-3's question with: ...` rather than accidentally steering the child. The host may explicitly resend if still appropriate; it then becomes a steer, or an answer if another question is now open. There is no automatic resend.
+
+Control `status` and `wait` report `answered by the user: <text>` until the child asks its next question. Ordinary editor instructions go to the host, not directly to the waiting child. Use `/fusion answer` for an answer and `/fusion steer` for a running child with no open question.
+
+## On Claude Code
+
+The question tool is an in-process MCP server served by the Agent SDK. Fixed-tool roles keep strict MCP configuration with only this server; ultracode gets it beside the user's servers. Its name is allowed even outside `bypassPermissions`.
+
+Ultracode's native `AskUserQuestion` also follows this flow through a `PreToolUse` hook. With unattended `permissionPrompts: "none"`, the SDK does not call `canUseTool`, so that is not the bridge. The hook joins questions/options into one numbered request, then supplies the original input with an answer map. One answer line per question maps separately; otherwise all questions receive the whole answer.
+
+The MCP tool timeout is `2147483647` ms and hook timeout `2147483` seconds, about 24.8 days; these avoid ordinary short timeouts, not a literally infinite wall-clock limit. The hook otherwise defaults to ten minutes. These limits were read from Claude Code 2.1.273, not measured against its real binary; deterministic tests drive the control requests through the fake binary.
 
 ## On the pi backend
 
-A Pi child gets `ask_orchestrator` as one of its own tools, under the same name and the same description, so a contract that tells a child to ask through it reads the same whichever backend runs that child. What holds the call open there is Pi's own blocking input dialog: one dialog per call, with no timeout of its own, routed onto the same flow above — the run is `waiting`, the host or the user answers it once, and the answer is the tool result the child sees. A dialog that produced no answer at all, as against an empty one, fails that tool call and tells the child to ask again if the decision is still needed.
+Pi's tool opens one blocking `ctx.ui.input` dialog with its call signal and no timeout, routed to the same host question flow. Text, including an empty string returned by an internal callback, is an answer; a dialog returning no answer fails the tool call.
 
-Two limits are worth knowing. A native Pi ui request carries nothing that says which extension opened it, and every Pi run this host starts has questions enabled, so every blocking input dialog of that shape inside the child is routed to the host — `ask_orchestrator`'s own and any other code's alike, with nothing here able to tell them apart. And an outcome that is not an answer is fatal: when one dialog cannot be answered at all, the child is stopped and the run fails with one fixed sentence that names how the dialog ended and whether an answer was ever written to it, never the question, the answer or what went wrong behind it. A run that was cancelled stays a cancellation, though — a cancellation outranks a fatal question wherever the signal has gone, and the dialog's own recorded outcome is kept beside that end as evidence rather than becoming the reason.
+Native UI requests contain no extension-origin identity. While questions are enabled, every eligible blocking input dialog inside the child is routed this way; Fusion cannot distinguish its own tool from other trusted code opening the same dialog shape. Unsupported methods, active timeouts, invalid/duplicate requests, and closed routing are refused rather than guessed at. All shipped delegated Pi runs have questions enabled; internal callers without a callback do not.
 
-What stands behind this: a manual harness has driven two native question cases against real Pi children on Linux — one answered through the host with a steer admitted while the dialog was held, one held open until the run was cancelled, where the run ends as the cancellation it was — with a scripted loopback endpoint as the only model it configures. No live provider or paid inference is behind it, the test suite itself runs no Pi child, and the routing's own cases use scripted doubles with no process, protocol or SDK behind them.
+A Pi dialog outcome other than an admitted answer is fatal: the run stops its child and reports fixed wording with the dialog end/admission, not the question, answer, or foreign error. A cancelled run remains cancellation—cancellation outranks a simultaneous fatal question—and the recorded dialog outcome remains evidence beside it.
+
+Manual Linux cases have measured an answered native question with a steer admitted while held, and a question held into cancellation, using a scripted loopback model. They do not qualify real providers or every version/platform. See [Pi backend evidence](pi-backend.md#evidence-and-limits); the default suite's routing doubles prove host arbitration, not native dialogs.

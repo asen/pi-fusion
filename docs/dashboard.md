@@ -1,45 +1,80 @@
 # Monitoring dashboard
 
+## Opening and closing
 
-`/fusion dashboard` starts a local web page that shows what the children are doing. The first call starts an HTTP server on 127.0.0.1 on a random port, notifies the URL, and opens it: `open` on macOS, `xdg-open` on Linux, and on any other platform the notification with the URL is all you get. Later calls reuse the same server and the same URL. `/fusion dashboard stop` closes it.
-
-```
+```text
 /fusion dashboard
 /fusion dashboard stop
 ```
 
-The page only monitors. There is no endpoint for prompting, control, cancelling, editing or running shell commands, and nothing on the page can change a run. The browser polls the server once a second; there is no SSE and no websocket.
+The first command starts a local HTTP server on `127.0.0.1` at a random port, shows the URL, and attempts to open a browser (`open` on macOS, `xdg-open` on Linux; other platforms show the URL only). Later calls reuse the server/URL. `PI_FUSION_DASHBOARD_OPEN=0` suppresses browser opening.
 
-The run list groups runs by the Pi session that made them, newest session first, and numbers each run within its session, so a `plan` call and the `implement` calls that followed it read as one chain. A run's header shows that chain by role; clicking a step opens that run. The facts name the Pi tool, the Pi tool call id and the Pi session id.
+It is **read-only**: no prompting, cancellation, editing, or shell-command endpoint. Use [user commands](fusion-command.md) or a control tool to change runs. The browser polls once per second; there is no SSE or WebSocket.
 
-The run list shows each run's role, handle, backend and model, such as `pi · deepseek/deepseek-chat`, whether it runs in the background, status (`running`, `waiting`, `done`, `failed`, `aborted` or `cancelled`), the open question of a waiting run, elapsed time, and its own and forwarded subagent tool call counts. Selecting a run shows the open question of a waiting run, the prompt the tool sent, with a copy button, the contract appended to the child's system prompt, the session the run asked for (new, a resume at a checkpoint, or a fork), named `Claude session` for a Claude run and `Pi session request` for a Pi one, which is the request and its source and so names the session a fork forked *from*, the current activity, how long ago the last real event from the child arrived, tokens in and out, the workflow agents' tokens, any denied tools, the tasks, with name, type, state, tokens, tool uses, forwarded calls, last tool, summary, and phase and agent states when the SDK reports them, the log in the order the events arrived, the final report or the failure message, and the line that reopens the child session: `claude --resume <session id>` for a Claude run, and for a Pi run the transcript file its session lives in, because `claude --resume` on a Pi session id names a session the Claude CLI cannot open. That file comes from the session the run's backend verified and the host accepted when the run returned, never from the request it was launched with and never from what the child said while it was still working: a run shows no path until its outcome lands and the host has checked it, a fork shows the child it made rather than the parent it forked from, and a run whose backend threw or whose outcome the host refused to record shows none at all. A run an earlier Pi process left behind takes the same reference from the history, so a process killed mid-run comes back with no path either. A session id, a session file and a checkpoint are shown and copied exactly as the child reported them, however long: unlike every other text on the page they are never shortened to fit, because a shortened path names another file, and one longer than 32768 characters is left out altogether instead.
+The server stops on quit, `/reload`, `/new`, `/resume`, or `/fork`. Reopen for a new capability URL and fresh in-memory store, with eligible history restoration when enabled. Runs are captured from extension load, not just from the moment the dashboard opens. See [History](runs.md#runs-across-pi-processes) for disk persistence and restoration rules.
 
-The facts also show the main loop's cache reads and writes, the SDK's cost estimate for the whole run, the model turns and API time, the backend the run went through, the model id the child reported — the one Claude Code reports at init, or the provider and model id a Pi child confirmed when it started — the effort the run was admitted with, or for a Pi run that named none the level its child confirmed, and a context meter: the prompt size of the main loop's latest model call against its context window, amber from 70% and red from 90%. The window is the one the SDK reports for the main model; until the first result it is 1M for a model id ending in `[1m]` and 200k otherwise. A Models table lists each model's tokens and cost from the SDK's `modelUsage`, which counts subagents and workflow agents too, and the run list shows the cost next to each run. The run list shows the model id once the child reports it, and the model the run was admitted with before that: the call's own, or the one the session's configuration gave the role. Under a subscription the cost is an estimate at list price, not a charge. The page also keeps the main loop's last 5 thinking blocks, each capped at 16 KiB.
+## Runs and detail tabs
 
-Above the task table, a timeline draws each task as a bar on the run's own clock, from the task's start to its end, coloured by its state; the bars of running tasks grow every second. It shows where a workflow spent its time and which tasks overlapped.
+Runs are grouped by the host Pi session, newest session first, with numbered steps and a role chain. Clicking a step selects it. Entries show handle, role, backend/model, background state, elapsed time, tool counts, and open questions. States are running, waiting, done, failed, aborted, or cancelled.
 
-Each tool call in the log, the child's own and its subagents', opens on a click to show the call's input and, once it is back, its result; a call waiting for its result is grey and a call that came back with an error is red. The run's tool error count is among its facts. A task started by an Agent tool call shows the prompt the child gave that call. The store keeps a call's input and result, each capped at 16 KiB, for as long as the call's log entry is kept, and an Agent prompt capped at 32 KiB.
+The selected header summarizes status, question, activity, event age, tools/errors, tokens, estimated cost, and context usage. Four tabs split the detail:
 
-A running run with no event from its child for 60 s gets an amber edge and a "no events for" timer in the run list, and its last event time turns amber. A long thinking turn still counts as events, because streamed deltas update the run, so the flag points at a child that stopped reporting.
+| Tab | Contents |
+| --- | --- |
+| **Overview** | Host tool/call/session facts, prompt and contract, requested child session, models/usage, changed files, and accepted transcript/resume hint |
+| **Log** | Ordered run/tool/agent/task/turn events, expandable tool input/results, and search/filter controls |
+| **Tasks** | Task facts, timeline, phases/agent states where emitted, and latest thinking blocks |
+| **Report** | Final report or failure, Markdown/Raw views, Copy, and Escalation/Review/Open questions sections |
 
-When the working directory is in a git work tree, each run lists the files that changed in the work tree while it ran, and the run list shows the count. `ask` runs list no files: they are meant to be read-only and can run next to a run that changes files, whose changes they would otherwise show. The extension takes a snapshot before the child starts and another after it ends: `git status` with untracked files, plus the blob id of each file that differs from HEAD. A file is listed when its status or content differs between the two snapshots, so a file that was already dirty is listed only if the run touched it again. Files in commits made during the run are listed as committed. The line counts are against HEAD, or the whole file for a new one, so for a file that was dirty before the run they include the earlier edits. Git runs at most 10 s per command; if it fails, the list is left out and the tool call goes on. Anything else that writes to the work tree during a run, you included, shows up in that run's list. The store keeps up to 500 files per run.
+Running/waiting runs open on Log. Ended runs open on Report, or Overview if there is no report/failure. Tabs retain scroll positions across refreshes and run selection; left/right arrows on a focused tab move between tabs. The Log tab counts new rows while another tab is visible; Tasks counts tasks/running work; Report shows section badges or `!` for failure.
 
-The report renders as Markdown: headings, paragraphs with their line breaks, lists, tables, code, block quotes and emphasis. The page builds each element as a DOM node and never parses the report as HTML, so markup in a report shows as text; links show their text, with the URL as a tooltip, and do not navigate. A Raw button shows the text as it came back, and Copy copies it, as it does for the prompt and the session line. A report with an `Escalation`, `Review` or `Open questions` heading gets a badge in the run list and in the run's header; clicking the header badge opens the Report tab and scrolls to that section.
+A waiting banner offers each waiting run without changing selection until clicked, and the page title shows the waiting count. Entries get an amber stripe. Focus on banner buttons is preserved when their set remains unchanged.
 
-The run header shows the run's status next to its role, the open question of a waiting run, and a summary line: elapsed time, time since the last event, tool calls and errors, tokens in and out, the cost estimate, the context meter and the current activity. Under the header, four tabs split the rest of the detail. Overview holds the facts, the prompt, the models, the files and that session line. Log holds the log and its filter. Tasks holds the timeline, the tasks and the thinking. Report holds the report, or the failure. One tab shows at a time and fills the rest of the window, so the log is as tall as the window allows and nothing under it moves as the run updates. A running or waiting run opens on Log. A finished run opens on Report, or on Overview when it has neither a report nor a failure. The Log tab counts its entries and, while another tab is shown, the rows that arrived since. The Tasks tab counts its tasks, or the ones still running. The Report tab counts the report's badges, or shows `!` for a failure. Each tab keeps its scroll position while the run updates and while another tab is shown. On a focused tab, the left and right arrow keys move to the tab next to it. The log opens at its newest row and stays there as rows arrive. Scrolled up, it keeps the rows in view and a button counts the rows that arrived below it; clicking the button jumps to the bottom.
+A run with no real event for 60 seconds gets an amber edge/timer. Thinking deltas count as events, so this highlights missing progress, not merely slow reasoning. The page shows only events the backend emits: Claude workflow/task/model details are not promised for Pi. It holds no subagent transcript; Claude `forwardSubagentText` and `agentProgressSummaries` remain off.
 
-Above the log, a search box filters the rows by text, without regard to case, and chips narrow them to one or more kinds (`run`, `tool`, `agent`, `task`, `turn`) or to tool calls that came back with an error. `/` opens the Log tab and focuses the search box. `Escape`, or the Clear button that shows while a filter is set, resets the text, kinds and errors filters at once. The filter applies to every run and survives the page's once-a-second refresh.
+## Log and keyboard navigation
 
-While a run waits for an answer, a Needs input banner under the header shows a button for each waiting run, with its role, handle and the first line of its question, and the page title starts with the number of waiting runs, for example `(1) pi-fusion dashboard`. A waiting run also gets an amber stripe on the right edge of its run list entry. The banner does not change the selected run; a click on a button selects that run, and its question shows directly under the run header. The banner changes only when the set of waiting runs or a question changes, and a banner button that has the focus keeps it.
+Click a tool row to expand its input/result. Awaiting results are grey, error results red, and tool-error count appears in facts. Agent calls can expose their prompts. Task bars run from start to end on the run's clock, grow while active, and show overlap/state.
 
-In the run list, the up and down arrow keys move the focus to the previous or next run without selecting it, and Enter or Space selects the focused run. The focus stays on the same run when the list refreshes.
+The log initially follows newest rows. Scrolling up preserves the visible rows and shows a button counting new arrivals; click it to return to the bottom.
 
-In a window narrower than 768 px, the run list is hidden and a Runs button in the header opens it over the whole width of the page, with the focus on the selected run. Selecting a run, or pressing `Escape`, closes the list and puts the focus back on the button; the run detail keeps its scroll position while the list is open. While the list is open, the run detail behind it takes no focus and no keys, so `/` does not jump to the log search. Widening the window to 768 px or more closes the list, and it stays closed if the window narrows again. Wide tables scroll sideways inside their section, and keep that position when the run updates.
+- `/` opens Log and focuses search.
+- Search is case-insensitive; chips select event kinds or errored tool calls.
+- `Escape` or Clear resets text/kind/error filters together. Filters apply across runs and persist through refreshes.
+- In the run list, up/down moves focus without selecting; Enter/Space selects. Focus survives refreshes.
+- Below 768 px, a **Runs** button opens the list over the page. Selection or Escape closes it and returns focus to the button. The detail behind it takes no focus/keys; widening closes the list and it stays closed on narrowing again.
+- Wide tables scroll horizontally within their sections and preserve position.
 
-What the page can show is what the pinned Agent SDK emits: task lifecycle, usage and last tool for subagents, and phases and agent states for workflows. There are no subagent transcripts, because `forwardSubagentText` and `agentProgressSummaries` stay off. The child's own transcript is still a normal Claude Code session, so `claude --resume <session id>` opens it.
+## Usage, files, and transcript hints
 
-The store keeps 30 runs and evicts the oldest finished run first, never a running one; 100 log entries and 100 tasks per run; the prompt is capped at 256 KiB, the report at 32 KiB and the failure message at 4 KiB, each with a truncation marker on the page.
+The header ledger matches `/fusion status`. Per-run facts include token/cache usage, cost, model/effort, turns/API time where emitted, and context. The context meter turns amber at 70%, red at 90%. Before Claude reports a window, its fallback is 1M for ids ending `[1m]`, 200k otherwise. Cost is a runtime/model-price estimate, not a subscription charge. The model first shows the admitted setting, then the child's confirmed id.
 
-The page shows each child's full prompt, so it holds whatever the host put in it. Environment, argv and raw SDK frames are never exposed. A failure message can carry the last lines of the child's stderr, the same lines Pi's tool result shows. Tool inputs and results, Agent prompts, task summaries and the child's report are exposed too, so the page can contain sensitive project output. The server binds 127.0.0.1, so only this machine can reach it, and the URL carries a random capability token that stands in for authentication. Do not share the URL.
+Pi transcript hints come from a **verified outcome the host accepted**, never a launch request or live progress claim. A fork names the new child, not the source. Live/thrown/rejected Pi runs offer no path. Claude hints use `claude --resume <session id>`. Identity fields are copied exactly, not shortened into another path/id; values over 32768 characters are omitted. The session-request facts are separate and may legitimately name the source a fork was requested from.
 
-The server closes on quit, `/reload`, `/new`, `/resume` and `/fork`. After any of those, run the command again; it gives a fresh URL and a fresh, empty store. Runs are recorded from the moment the extension loads, so a run that finished before the first `/fusion dashboard` is still listed. Everything lives in memory for the Pi session and nothing is written to disk.
+For coding runs in Git trees, snapshots compare status and content before/after work, including untracked and already-dirty files. A file is listed only when it changed between snapshots; a concurrent commit can be marked committed. Line counts are against HEAD (whole new files), so they can include earlier dirty edits. Other writers' changes can also appear: **this is not attribution proof**. Ask runs have no file snapshot. Git commands are bounded to ten seconds; failures omit file data without failing the run. Live counts are sampled at most once per ten seconds.
+
+Reviews show links on both the review and reviewed run. Cleanup/cancellation warnings match the run's terminal text; the dashboard avoids a duplicate activity copy for host-cancelled runs carrying that same warning. It does not prove every descendant stopped.
+
+## Rendering and retained data
+
+Reports render headings, paragraphs, lists, tables, code, quotes, and emphasis by building DOM nodes, **never by parsing child text as HTML**. Links show text and a URL tooltip but do not navigate. Raw shows original text; Copy works for reports, prompts, and session hints. Section badges open Report at Escalation, Review, or Open questions.
+
+The store targets 30 runs, evicting oldest finished work first, never active runs. Other limits:
+
+| Data | Cap |
+| --- | --- |
+| Log entries / tasks per run | 100 each |
+| Prompt | 256 KiB |
+| Report / failure | 32 KiB / 4 KiB |
+| Changed files | 500 |
+| Tool input / result | 16 KiB each while its log row is retained |
+| Agent prompt | 32 KiB |
+| Thinking | Last five blocks, 16 KiB each |
+
+Truncated text is labelled. Pi's progress mapper can impose smaller previews before events reach the store; a dashboard preview is not the full child transcript.
+
+## Sensitive-output boundary
+
+The page contains prompts, contracts, reports/failures, tool arguments/results, Agent prompts, task summaries, thinking previews, and file paths. A startup failure can include a bounded child-stderr excerpt. Environment, argv, and raw SDK frames are not exposed, but output itself can still contain sensitive project data.
+
+The server binds loopback, and its random URL capability token stands in for authentication. **Do not share the URL.** Loopback/capability checks and safe DOM rendering are not a sandbox or secret-redaction guarantee. Host run history is a separate opt-in disk record; closing the dashboard does not erase those files or child transcripts.

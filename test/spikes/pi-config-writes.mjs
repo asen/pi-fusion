@@ -6640,9 +6640,9 @@ async function caseP7HelperOfflineMatrix(ctx) {
  *
  * What these cases are measured against now, and what they were measured against before. The first qualification of
  * this half was run before any recovery existed and its gate was each child's **first underlying attempt** succeeding; it
- * **failed**, with the held child answered by the tool's own unavailable sentence, and that measurement stands in
- * [docs/pi-config-write-spike.md](../../docs/pi-config-write-spike.md) exactly as it was made. The approved **bounded
- * recovery** — which repairs nothing about the SDK's shared-archive race and does not claim to — is
+ * **failed**, with the held child answered by the tool's own unavailable sentence, and that measurement remains in
+ * Git history. Current behavior and qualification limits are in [the Pi backend docs](../../docs/pi-backend.md).
+ * The approved **bounded recovery** — which repairs nothing about the SDK's shared-archive race and does not claim to — is
  * not in the SDK and not in this harness: it is `extensions/backends/pi-helper-retry.mjs` in production, which wraps the
  * public builtin `grep` and `find` definitions so **one model-issued tool call** may make **at most two** underlying
  * builtin attempts, retrying once on that exact sentence alone. So the gate here is now one model-issued tool call per
