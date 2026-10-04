@@ -45,9 +45,11 @@ import { type Backend, type ChildControl, type ChildEvent, failed, type RunReque
  * outcome mapping. It decides the order and owns the child between its start and its one shutdown; every judgement of
  * evidence is `codex-outcome.ts`'s, and every wire and process concern the transport's.
  *
- * **Experimental and unqualified past stage 1.** Every shape this reads is a source reading of Codex 0.160.0's
- * app-server. A fresh call was measured natively once (G1); a resume, a fork and a steer are exercised here only against
- * `test/fake-codex.mjs`, and so is a question: no native question has been measured (G3). The host registers one
+ * **Experimental and narrowly qualified.** Every shape this reads is a source reading of Codex 0.160.0's
+ * app-server. Native qualification, on one host under its default model, covers only a fresh `implement` and `ask` (G1),
+ * an `ask` resume, current-tip fork, moved-tip refusal, one steer and per-call usage on connections with no question
+ * callback (G2), and `ask` questions on fresh, resumed and forked threads plus a cancellation while one waited (G3); the
+ * rest is exercised only against `test/fake-codex.mjs` (see docs/codex-backend.md#evidence). The host registers one
  * backend from `createCodexBackend` when the extension loads, and neither importing this module nor that construction
  * starts, locates or reads anything: the contract, the binary and the client version are all looked for only when a
  * run is requested.

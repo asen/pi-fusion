@@ -126,7 +126,7 @@ async function main(cli) {
 		for (const [name, members] of Object.entries(GROUPS)) console.log(`  ${name.padEnd(11)} ${members.join(", ")}`);
 		console.log("\nG1 needs Q1, Q2, Q3, Q4, Q6, Q7 and Q9 to PASS natively; Q3b is optional named-effort evidence and does not block it.");
 		console.log("G2 needed Q10, Q11, Q12, Q13 and Q19 to PASS natively, and they did, once each on one host, on connections with no question callback.");
-		console.log("G3 needs Q15 and Q16 to PASS natively, one agreed case at a time; neither has run natively, so G3 is pending.");
+		console.log("G3 needed Q15 and Q16 to PASS natively, and they did, once each on one host under its default model: ask questions on fresh, resumed and forked threads and a cancellation while one waited, in the experimental question shape.");
 		console.log("Q14 is stage 2 preparation, a usage measurement outside G1 and G2; Q14b's per-call usage is folded into Q10 and Q12.");
 		console.log("\nNative results so far: docs/codex-backend.md.");
 		return EXIT.none;

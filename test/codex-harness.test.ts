@@ -359,7 +359,7 @@ test("every guard path exits 2 having loaded no production module, located no co
 		for (const id of ["Q10", "Q11", "Q12", "Q13", "Q19"]) assert.match(list, new RegExp(`\n {2}${id} +\\[model\\] \\[fake\\] G2: `));
 		for (const id of ["Q15", "Q16"]) assert.match(list, new RegExp(`\n {2}${id} +\\[model\\] \\[fake\\] G3: `));
 		assert.match(list, /G2 needed Q10, Q11, Q12, Q13 and Q19 to PASS natively, and they did, once each on one host, on connections with no question callback/);
-		assert.match(list, /G3 needs Q15 and Q16 to PASS natively, one agreed case at a time; neither has run natively, so G3 is pending/);
+		assert.match(list, /G3 needed Q15 and Q16 to PASS natively, and they did, once each on one host under its default model: ask questions on fresh, resumed and forked threads and a cancellation while one waited, in the experimental question shape/);
 		assert.match(list, /Q14 is stage 2 preparation, a usage measurement outside G1 and G2; Q14b's per-call usage is folded into Q10 and Q12/);
 		assert.match(harness(box, ["--run", "--case", "Q1", "--outside-dir", "/dev/shm"]).stdout, /unrecognised argument: --outside-dir/);
 		assert.ok(!fs.existsSync(box.tripped), "no codex ran");
