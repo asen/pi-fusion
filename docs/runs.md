@@ -25,7 +25,7 @@ All four workflow tools use sequential execution. Pi serializes tool calls in a 
 
 ## Child tools and settings
 
-Both backends run in the host's working directory with the role contract appended to their own system prompt. Tool lists differ:
+Every child runs in the host's working directory. Claude and Pi append the role contract to their own system prompt; Codex receives it, followed by `contracts/codex-no-questions.md`, as the thread's developer instructions. Tool lists differ:
 
 | Role | Claude Code tools | Pi tools |
 | --- | --- | --- |
@@ -103,9 +103,9 @@ Results, background notices, waits, and detailed status offer:
 
 - Claude: `claude --resume <session id>`. Normal transcripts live under `~/.claude/projects/<encoded working directory>/<session id>.jsonl`.
 - Pi: the **accepted outcome's transcript file**, not a Claude resume command. A fork names its new file, not the source. A running run, thrown backend, or rejected outcome offers no Pi path; a verified session kept only for reading may offer one.
-- Codex: `codex resume <thread id>`, from the accepted outcome's thread only; an id that is not one plain shell word is single-quoted, after `--` when it starts with `-`. A fork names its own thread; a thread kept only for reading names it in its continuation refusal.
+- Codex: `codex resume <thread id>`, from the accepted outcome's thread only, as an intended manual hint that has not been natively measured ([Codex backend](codex-backend.md#stages-and-native-qualification-gates)); an id that is not one plain shell word is single-quoted, after `--` when it starts with `-`. A fork names its own thread; a thread kept only for reading names it in its continuation refusal.
 
-Pi restores only the exact recorded file/id/checkpoint and repeats its recorded selection. Missing files, absent checkpoints, old/malformed transcript formats, leaf mismatches, or clamped thinking levels refuse the call; no fallback or repair is attempted. The detailed [checkpoint checks](pi-backend.md#continuation-and-checkpoints) include their source-only limitations. For either backend, start a new run if its transcript cannot be continued; use `fresh: true` for a new plan.
+Pi restores only the exact recorded file/id/checkpoint and repeats its recorded selection. Missing files, absent checkpoints, old/malformed transcript formats, leaf mismatches, or clamped thinking levels refuse the call; no fallback or repair is attempted. The detailed [checkpoint checks](pi-backend.md#continuation-and-checkpoints) include their source-only limitations. For any backend, start a new run if its transcript cannot be continued; use `fresh: true` for a new plan.
 
 A host started with `--no-session` keeps branch entries only in memory, while children still use their own transcript storage.
 

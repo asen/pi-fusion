@@ -41,16 +41,16 @@ Starting Pi, `/new`, reload, resume, or fork loads instance defaults again. Curr
 fresh run
   call backend, otherwise role's configured backend
     matching backend -> call model/effort, otherwise role settings
-    other backend    -> call model/effort, otherwise captured legacy defaults
+    another backend  -> call model/effort, otherwise captured legacy defaults
 
 continuation
   recorded backend -> call overrides, otherwise recorded selection
   enabled setting still applies
 ```
 
-Profiles do not fill omitted configured fields from variables. An explicit other-backend call is a one-off override, not a profile change. `claude` uses that override when a role is configured on Pi; both tools' guidance recommends `fusion` for Pi roles unless you explicitly request Claude Code.
+Profiles do not fill omitted configured fields from variables. An explicit call to another backend is a one-off override, not a profile change. `claude` uses that override when a role is configured on Pi or Codex; both tools' guidance recommends `fusion` for Pi roles unless you explicitly request Claude Code, and says that only `fusion` runs Codex roles.
 
-Pi with no model is shown as `unconfigured` and refuses before admission unless the call supplies one. A disabled role also refuses before any handle, child, or file snapshot, for new calls **and continuations**, despite explicit backend/model/effort parameters. Disabling a role unregisters neither backend and removes no workflow tool. Enabled security still requires an explicit user security request in host guidance.
+Pi with no model is shown as `unconfigured` and refuses before admission unless the call supplies one. A disabled role also refuses before any handle, child, or file snapshot, for new calls **and continuations**, despite explicit backend/model/effort parameters. Disabling a role unregisters no backend and removes no workflow tool. Enabled security still requires an explicit user security request in host guidance.
 
 Recorded settings, plan handoffs, and refusal recovery are described in [Runs](runs.md). Independent review always uses a fresh configured `ask` run; disabled `ask` means no reviewer.
 

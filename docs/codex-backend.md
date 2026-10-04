@@ -12,15 +12,19 @@
 | Questions and steers | None: no `ask_orchestrator`, and the input is closed from the start. A control `message` or `/fusion steer` to a running Codex run is refused at once; `wait`, `status` and `cancel` work as for any run |
 | Reviews | A manual or automatic review runs on Codex when the session's **ask** role is configured there, as a fresh read-only thread; it inherits nothing from the reviewed run, and disabled ask refuses manual review and skips automatic review quietly |
 | Writer slot | `implement` holds the single file-changing slot across Claude, Pi and Codex, like any coding run; `ask` runs beside it |
-| Follow-up | A new run carrying the report as context. The stats line, status and dashboard name `codex resume <thread id>`, from the accepted thread only, so you can open the thread in Codex yourself; an id a shell would not read as one plain word is single-quoted, and one starting with `-` follows `--` |
+| Follow-up | A new run carrying the report as context. The stats line, status and dashboard name `codex resume <thread id>`, from the accepted thread only, as an intended manual recovery hint for opening the thread in Codex yourself. It is based on Codex's source and documentation; whether the CLI reopens a thread the app-server created has not been measured natively ([Stages](#stages-and-native-qualification-gates)). An id a shell would not read as one plain word is single-quoted, and one starting with `-` follows `--` |
 
 Loading the extension constructs the backend and does nothing else: no binary is looked for, no contract, configuration or home is read, and nothing starts. A machine without `codex` loads Fusion, Claude and Pi as before, and a Codex run there fails with the launch's own sentence about the missing binary.
 
 ## The host's own install
 
-A run uses the host's `codex`: `PI_FUSION_CODEX_BIN` (an absolute path) or the first executable `codex` on the inherited `PATH`, located when the run starts ([configuration](configuration.md)). The child gets the host's environment copied unchanged and runs in the host's working directory. It therefore uses the user's own Codex home (`CODEX_HOME`, else `~/.codex`), configuration, profiles and login: Fusion copies, writes and checks no auth or configuration file, and needs no API key of its own. The home is predicted only so the handshake can compare it with the one the child reports.
+A run uses the host's `codex`: `PI_FUSION_CODEX_BIN` (an absolute path) or the first executable `codex` on the inherited `PATH`, located when the run starts ([configuration](configuration.md)). The child gets the host's environment copied unchanged and runs in the host's working directory. It therefore uses the user's own Codex home (`CODEX_HOME`, else `~/.codex`), configuration, profiles and login: Fusion copies, writes and checks no auth or configuration file, and needs no API key of its own. It adds no Codex SDK or npm dependency and downloads or installs no binary; `npm install` is unchanged. The home is predicted only so the handshake can compare it with the one the child reports.
+
+Lookup and launch follow POSIX rules only. Linux x64 is the intended native qualification target; macOS runs the same code and is unqualified. On Windows a Codex run is refused when it starts, because a `codex` on `PATH` there is a `.cmd` shim that needs a shell; loading the extension is unaffected.
 
 The sandbox **mode** is named per thread and checked at start. Everything else about that mode — writable roots, network access, shell environment policy and any other policy the user's configuration sets for `workspace-write` or `read-only` — is inherited and neither set nor checked.
+
+That network setting concerns the commands the child runs. Codex's hosted web search, when the user's configuration enables it, is Codex's own provider-side tool and is inherited the same way: Fusion neither enables nor disables it, and the addendum tells the child to name its sources or say which fact it could not check. Neither has been measured natively.
 
 **The request names no cwd (open native question Q2).** Neither thread/start nor turn/start names a working directory. Read in the 0.160.0 source, naming one can make Codex record a trust entry for an untrusted writable project in the user's configuration; leaving it out avoids that, and the reported cwd is checked against the launch's realpath instead. Whether that holds natively, and how a real app-server treats a project it does not trust when no cwd is named, is unmeasured (Q2). A fallback that names the cwd, and so may write a trust entry into the user's Codex configuration, is not implemented and would need the user's explicit consent first.
 
@@ -32,7 +36,19 @@ Keep these three apart:
 | --- | --- |
 | Source inspection | Every app-server shape (initialize, thread/start, turn/start, thread/read, notifications, approvals) as read in Codex **0.160.0**'s app-server protocol source. That includes the reading that `developerInstructions`, `Thread.model` and `Thread.reasoningEffort` are stable fields there. A later version may change any of it. |
 | Deterministic fake | `test/codex-backend.test.ts` drives the composition against `test/fake-codex.mjs`, a builtins-only node program that speaks literal JSON-RPC. It is launched by path through an injected launch, with no Codex binary, home, auth, `PATH` lookup or model. One lifecycle case registers this build's backend in a test host over the same fake, for a delegated run and an independently configured reviewer; host controls, records and presentation are otherwise tested with in-memory doubles. A pass shows that this host's sequencing, checks and mapping behave as written against those literals. |
-| Native measurement | **None.** No real app-server, provider, paid model request, platform or version has been qualified. Linux x64 is the intended qualification target. |
+| Native measurement | **None.** No real app-server, provider, paid model request, platform or version has been qualified. Linux x64 is the intended qualification target; macOS and Windows are not. |
+
+## Stages and native qualification gates
+
+Stage 1 is what this build ships. Later stages are planned, not shipped, and each sits behind a manual native qualification gate that the user agrees to before any paid run:
+
+| Stage | Scope | State |
+| --- | --- | --- |
+| 1 | Fresh `implement` and `ask` on the app-server's stable methods | Shipped and experimental; its native gate has not been run |
+| 2 | Verified continuation and fork from a trusted turn checkpoint, `plan` on Codex, and steers | Not shipped: resume, fork, `plan` and steers are refused today |
+| 3 | Questions through Codex's experimental question surfaces, which 0.160.0 gates behind its experimental API (source-read) | Not shipped: a Codex child has no question tool |
+
+The stage 1 native harness is the next planned step. It is **not in this repository yet**, so there is no command to run. As planned, it stays under `test/spikes/` outside the default test glob and runs one agreed case group at a time in the foreground against the user's own install, login and configuration, which can mean paid requests. It records the Codex version, platform, Node version, selected and skipped cases, exit status and full output. Its cases are to settle the open native questions above and below, such as Q2 (no named cwd) and Q14 (cache write vs input), and to observe sandbox behavior under the host's current Codex policy as it stands, with no configuration override and no assumption that network or outside-cwd access is denied. A later, manual and non-gating check can also record whether `codex resume <thread id>` from the host's CLI reopens a thread the app-server created; until then that hint is unmeasured. A fallback that names the cwd is considered only if Q2 fails, and only with the user's consent, because it may write a trust entry. Until a gate passes, nothing here claims native qualification, cost or context-window guarantees.
 
 ## One call
 
@@ -87,7 +103,7 @@ A verified success whose shutdown was not clean is demoted. It keeps its thread 
 
 ## Records and usage
 
-- The outcome reference is `{ backend: "codex", sessionId: <thread id> }` with **no checkpoint**. The record is kept for reading, and a follow-up is a new run (`codex resume <id>` opens the thread). A scalar `sessionId` is set as a diagnostic, and the host's writer does not record it for Codex.
+- The outcome reference is `{ backend: "codex", sessionId: <thread id> }` with **no checkpoint**. The record is kept for reading, and a follow-up is a new run. `codex resume <id>` is named as an intended manual hint for opening the thread, not a natively measured one. A scalar `sessionId` is set as a diagnostic, and the host's writer does not record it for Codex.
 - `modelId` and the selection are the configured model, provider and effort.
 - Tokens are the fresh thread's final cumulative **total**: input (which already includes cached input), output, cache read (= cached input, shown and never added again) and cache write as reported. Context is the latest response's input, and the window appears only when the child reports one. With no window, no share is shown or guessed.
 - **Cache write vs input is unqualified (Q14).** Whether Codex's cache-write tokens are part of `inputTokens` is not settled by the 0.160.0 source and has not been measured natively. Fusion uses Codex's `inputTokens` unchanged and reports cache write beside it, with no sum, subtraction or clamp. No lifecycle, budget or context-cap behavior may rely on that relationship until Q14 is measured.

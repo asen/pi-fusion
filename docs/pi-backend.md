@@ -1,6 +1,6 @@
 # The Pi backend
 
-The `pi` backend runs a headless Pi child in the host's working directory. It is registered beside `claude`; a [profile](profiles.md) or a call's `backend` selects it. There is no backend-disable variable, automatic fallback to Claude, or provider client implemented by Fusion.
+The `pi` backend runs a headless Pi child in the host's working directory. It is registered beside `claude` and the experimental [`codex`](codex-backend.md); a [profile](profiles.md) or a call's `backend` selects it. There is no backend-disable variable, automatic fallback to Claude, or provider client implemented by Fusion.
 
 Pi supports `plan`, `implement`, `ask`, and `security`. `ultracode` is Claude-only. Security is **disabled in `builtin`**: enable it through settings or a profile before calling or continuing it. A model parameter or environment variable does not enable a disabled role.
 
@@ -22,6 +22,9 @@ Host Pi session
     mode, configuration, handles, writer slot, questions, branch records
       |
       +-- backends/claude.ts --> Claude Agent SDK --> Claude Code child
+      |
+      +-- backends/codex.ts --> codex app-server (host install) --> Codex child
+      |     (see codex-backend.md)
       |
       +-- backends/pi-backend.ts
             storage --> prepare/restore --> task --> outcome
@@ -199,7 +202,7 @@ Manual evidence has narrower scopes:
 | `pi-auth.mjs` | Public model-runtime credential store | No session, model request, RPC, or registered backend; skew legs need explicit `--package` |
 | `pi-profile-guidance.mjs` | Real host tool/prompt refresh and mode/profile changes | No model inference or child; does not prove a model follows guidance |
 
-The session harness's full fifteen cases passed on Pi 1.0.1 on 2026-10-03, including production children using the host-SDK preload; a mixed-install case ran a child on 0.85.1 despite 1.0.1 beside the bootstrap. These are recorded manual measurements, not results of this documentation cleanup. The production group injects a wrapped start that calls `startPiChild`; it does not route through `fusion.ts` or exercise the default start binding. Its exact `PI_OFFLINE=1` requirement is a harness precondition, not a sandbox; that group has no fetch guard or general network boundary.
+The session harness's full fifteen cases passed on Pi 1.0.1 on 2026-10-03, including production children using the host-SDK preload; a mixed-install case ran a child on 0.85.1 despite 1.0.1 beside the bootstrap. These are recorded manual measurements, not results of this documentation cleanup, and they qualify nothing about the Codex backend, whose [evidence](codex-backend.md#evidence) is separate. The production group injects a wrapped start that calls `startPiChild`; it does not route through `fusion.ts` or exercise the default start binding. Its exact `PI_OFFLINE=1` requirement is a harness precondition, not a sandbox; that group has no fetch guard or general network boundary.
 
 Current/older assistant checkpoints, an assistant-target fork, and a user-target refusal have been measured in the production group. Custom-message/label checkpoints, reconstruction appending a missing thinking entry, a fork file absent on disk at inspection, and the actual leaf after the refused user-target move remain unmeasured there. Native behavior can differ across versions (including aborts with queued work and overflow recovery). No macOS, Windows, live-provider, paid-inference, or native `security` run is qualified by these results. Security routing/reviews are tested against in-memory backends only.
 

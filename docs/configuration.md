@@ -29,7 +29,7 @@ Use [profiles and role settings](profiles.md) for session configuration; environ
 | `PI_FUSION_HISTORY` | Unset; `1` saves prompts/reports/usage for durable host sessions; see [History](runs.md#runs-across-pi-processes) |
 | `PI_FUSION_HISTORY_DIR` | Unset; default `<agent dir>/pi-fusion/history` |
 
-Role model/effort variables are read once when the extension instance starts. Changing the shell afterwards requires a new instance. A profile is a complete snapshot and never falls back to a variable for an omitted configured field. An explicit call naming the other backend uses that backend's captured legacy defaults, not the model of the configured backend.
+Role model/effort variables are read once when the extension instance starts. Changing the shell afterwards requires a new instance. A profile is a complete snapshot and never falls back to a variable for an omitted configured field. An explicit call naming another backend uses that backend's captured legacy defaults, not the model of the configured backend.
 
 The built-in configuration enables every role except **security**, whose backend is Pi. `PI_FUSION_PI_SECURITY_MODEL` supplies its model, not its enabled state. Saved profiles retain their own enabled settings. Backend capabilities are code: `ultracode` is Claude-only, `security` Pi-only, and Codex supports only fresh `implement` and `ask` runs (experimental; see [Codex backend](codex-backend.md)); disabling a role does not unregister a backend.
 

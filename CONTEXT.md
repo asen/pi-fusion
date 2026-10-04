@@ -9,7 +9,7 @@ The Pi model that talks with the user and decides which work to hand off. No par
 _Avoid_: orchestrator, main model, parent
 
 **Child**:
-A headless coding session doing work the host handed off: Claude Code or Pi, according to its backend.
+A headless coding session doing work the host handed off: Claude Code, Pi, or Codex, according to its backend.
 _Avoid_: subagent, worker, delegate
 
 **Backend**:
@@ -33,7 +33,7 @@ A run that goes on after the host's delegation call returns, so the host can kee
 _Avoid_: async run, detached run
 
 **Question**:
-A request for a small decision a child sends while it works. It is not an escalation that ends the run.
+A request for a small decision a child sends while it works. It is not an escalation that ends the run. A Codex child has no question tool; it reports a missing decision instead.
 _Avoid_: escalation, prompt, elicitation
 
 **Waiting**:
@@ -53,7 +53,7 @@ The part of an `implement` report saying the task needs wider scope or an unreso
 _Avoid_: question, blocker
 
 **Steer**:
-Text sent to a running child with no open question. Acceptance for delivery does not prove model consumption or action; a late steer can remain unread. Ordinary editor text targets the host. See [Background controls](docs/runs.md#background-runs).
+Text sent to a running child with no open question. Acceptance for delivery does not prove model consumption or action; a late steer can remain unread. A Codex child takes none. Ordinary editor text targets the host. See [Background controls](docs/runs.md#background-runs).
 _Avoid_: interrupt, nudge, follow-up
 
 **Review run**:

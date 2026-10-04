@@ -10,7 +10,7 @@ node --test test/control.test.ts
 node --test --test-name-pattern="continue" test/control.test.ts
 ```
 
-The suite uses Node's native TypeScript stripping and a 60-second per-test timeout. Typecheck is the only static check; there is no linter or formatter. `npm install` also installs the Claude Agent SDK's bundled binary (about 200 MB), but tests do not run that binary.
+The suite uses Node's native TypeScript stripping and a 60-second per-test timeout. Typecheck is the only static check; there is no linter or formatter. `npm install` also installs the Claude Agent SDK's bundled binary (about 200 MB), but tests do not run that binary. The Codex backend adds no dependency: it uses the host's own `codex` at run time, and no test needs one installed.
 
 Editing conventions and invariants live in [AGENTS.md](../AGENTS.md); vocabulary lives in [CONTEXT.md](../CONTEXT.md). Keep user-facing changes in the owning topic page. The code, not historical plans or measurement counts, defines current behavior.
 
@@ -22,7 +22,7 @@ fusion.ts                     host lifecycle and registration
   +-- backends/types.ts       SDK-neutral boundary
   |     +-- claude.ts         Claude SDK and stream/questions
   |     +-- pi-backend.ts     Pi composition (see below)
-  |     +-- codex.ts          Codex composition (experimental, registered, fresh-only)
+  |     +-- codex.ts          Codex app-server composition (experimental, registered, fresh-only)
   +-- process-tree.ts         launch and descendant cleanup
   +-- cards/dashboard        terminal and browser monitoring
   +-- changes/history/budget snapshots, persistence, accounting
@@ -60,7 +60,7 @@ Role behavior belongs in `contracts/*.md`. Review **selection** belongs in `fusi
 
 ## Test strategy
 
-`npm test` starts **no real Claude/Pi child and no paid inference**. It tests policy/protocols with fakes and doubles. A fake subprocess is still a process; it is not a native backend session.
+`npm test` starts **no real Claude/Pi/Codex child and no paid inference**, and no test host call locates a native `codex`. It tests policy/protocols with fakes and doubles. A fake subprocess is still a process; it is not a native backend session.
 
 | Layer | Fixture / tests | What a pass establishes |
 | --- | --- | --- |
@@ -88,7 +88,9 @@ The dashboard browser test looks for `PI_FUSION_CHROME`, usual platform paths, t
 
 ## Manual harnesses
 
-These stay under `test/spikes/`, outside the default test glob. Run them only as an explicitly agreed qualification step, one at a time in the foreground. This documentation cleanup does **not** rerun them.
+These stay under `test/spikes/`, outside the default test glob. Run them only as an explicitly agreed qualification step, one at a time in the foreground. This documentation cleanup does **not** rerun them. Every harness below is a Pi harness; none qualifies Claude or Codex.
+
+**Codex has no manual harness yet.** Its stage 1 native harness is the next planned step and does not exist in this repository, so there is no command to run; the [Codex stages and gates](codex-backend.md#stages-and-native-qualification-gates) describe what it is planned to record and what each later stage waits for. Unlike the Pi harnesses it is to use the user's own Codex install, login and configuration, which can mean paid requests, so each run needs its own explicit agreement.
 
 Use direct Node, not `npx`, with dependencies already installed. Record Node/Pi versions, selected cases, exit status, stdout/stderr, skipped cases, and the kept fixture root. A short success excerpt is not a substitute for reading the complete selected run's footer and evidence. Use a sanitized controller environment as well as each harness's own synthesized child environment; do not supply real credentials or reuse a real profile.
 
@@ -172,6 +174,6 @@ Use a fresh sanitized setup for another qualification stage. Retargeting customa
 
 ## Evidence discipline
 
-Keep three labels distinct: **source inspection**, **deterministic fake/double test**, and **manual native measurement**. Document versions/platforms and skipped cases; do not promote one into another or into a guarantee for future Pi versions. The [backend evidence table](pi-backend.md#evidence-and-limits) records current qualification boundaries, including no native security-role, macOS, Windows, live-provider, or paid-inference qualification.
+Keep three labels distinct: **source inspection**, **deterministic fake/double test**, and **manual native measurement**. Document versions/platforms and skipped cases; do not promote one into another or into a guarantee for future Pi versions. The [backend evidence table](pi-backend.md#evidence-and-limits) records current Pi qualification boundaries, including no native security-role, macOS, Windows, live-provider, or paid-inference qualification. [Codex evidence](codex-backend.md#evidence) is source inspection and deterministic fakes only: passing fakes are not native evidence.
 
 Historical plans and detailed rounds are retained in Git history. Earlier deviations and possible outside-root effects remain unknown where recorded. Removing obsolete prose authorizes no investigation or cleanup of those artifacts, real profiles, caches, or processes, and no upstream issue submission. The declined helper proposal was never submitted and no SDK source was modified.
