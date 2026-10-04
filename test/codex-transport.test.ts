@@ -15,12 +15,15 @@ import {
 	readItem,
 	readReroute,
 	readThreadRead,
+	readThreadResume,
 	readThreadStart,
 	readThreadStatusChanged,
 	readTokenUsage,
 	readTurnCompleted,
 	readTurnStart,
 	readTurnStarted,
+	readTurnSteer,
+	readTurnsList,
 	sandboxModeOf,
 } from "../extensions/backends/codex-protocol.ts";
 import {
@@ -185,6 +188,50 @@ test("turns: the start answer names a turn and nothing more, completion has thre
 	assert.equal(readErrorNotice({ threadId: "t", turnId: "u", error: { message: "x" } }, 64).ok, false, "an error must say whether it retries");
 	assert.deepEqual(readReroute({ threadId: "t", turnId: "u", fromModel: "a", toModel: "b", reason: "highRiskCyberActivity" }), { ok: true, value: { threadId: "t", turnId: "u", fromModel: "a", toModel: "b", reason: "highRiskCyberActivity" } });
 	assert.equal(readReroute({ threadId: "t", turnId: "u", fromModel: "a", reason: "r" }).ok, false);
+});
+
+test("resume and fork answers share thread/start's core and its refusals, and report a forked-from id only when one was named", () => {
+	const core = { threadId: "thr-1", model: "gpt-5", modelProvider: "openai", cwd: "/work", sandbox: { type: "workspaceWrite" }, reasoningEffort: null, approvalPolicy: "never" };
+	assert.deepEqual(readThreadResume(START), { ok: true, value: core });
+	assert.deepEqual(readThreadResume({ ...START, thread: { ...START.thread, forkedFromId: null } }), { ok: true, value: core }, "a null forked-from id is none");
+	assert.deepEqual(readThreadResume({ ...START, thread: { ...START.thread, id: "thr-2", forkedFromId: "thr-1" } }, "thread/fork"), { ok: true, value: { ...core, threadId: "thr-2", forkedFromId: "thr-1" } });
+	const malformed = readThreadResume({ ...START, thread: { ...START.thread, forkedFromId: 7 } }, "thread/fork");
+	assert.deepEqual(malformed, { ok: false, reason: "its thread/fork answer reports a forked-from id that is not one" });
+	for (const [what, value] of [
+		["no thread id", { ...START, thread: {} }],
+		["no provider", { ...START, modelProvider: undefined }],
+		["relative cwd", { ...START, cwd: "work" }],
+		["untagged sandbox", { ...START, sandbox: "read-only" }],
+		["effort of another type", { ...START, reasoningEffort: 3 }],
+	] as [string, unknown][]) {
+		const read = readThreadResume(value, "thread/resume");
+		assert.ok(!read.ok && read.reason.startsWith("its thread/resume answer"), what);
+	}
+	assert.match((readThreadStart({}) as { reason: string }).reason, /^its thread\/start answer/, "thread/start keeps its own reasons");
+});
+
+test("the latest listed turn is its id and one of four statuses, an empty list is none, and any other shape is refused", () => {
+	for (const status of ["completed", "interrupted", "failed", "inProgress"]) {
+		assert.deepEqual(readTurnsList({ data: [{ id: "turn-9", items: [], status, error: null }, { id: "turn-8", status: "completed" }], nextCursor: null }), { ok: true, value: { none: false, turnId: "turn-9", status } }, status);
+	}
+	assert.deepEqual(readTurnsList({ data: [], nextCursor: null }), { ok: true, value: { none: true } });
+	for (const [what, value] of [
+		["no data", { nextCursor: null }],
+		["data not a list", { data: { id: "turn-1", status: "completed" } }],
+		["entry not an object", { data: ["turn-1"] }],
+		["entry with no id", { data: [{ status: "completed" }] }],
+		["entry with a blank id", { data: [{ id: "", status: "completed" }] }],
+		["status this version lacks", { data: [{ id: "turn-1", status: "pending" }] }],
+		["no status", { data: [{ id: "turn-1" }] }],
+		["not an object", null],
+	] as [string, unknown][]) {
+		assert.equal(readTurnsList(value).ok, false, what);
+	}
+});
+
+test("a steer answer names the turn it went to, and nothing else is one", () => {
+	assert.deepEqual(readTurnSteer({ turnId: "turn-1", later: true }), { ok: true, value: { turnId: "turn-1" } });
+	for (const bad of [{}, { turnId: "" }, { turnId: 1 }, { turn: { id: "turn-1" } }, null]) assert.equal(readTurnSteer(bad).ok, false, JSON.stringify(bad));
 });
 
 test("usage: cumulative total and latest response apart, cached input inside input, the window nullable, malformed refused", () => {
@@ -852,6 +899,179 @@ test("a child that stops reading: frames past the pipe wait in the bounded write
 		assert.equal(exit.cleanup.root, "stopped");
 		assert.equal(exit.stopRequested, true);
 		assert.equal(exit.cleanExit, true);
+	});
+});
+
+/* ------------------------------------------------------------------------------------------------------------------
+ * Resume, fork, latest turn and steer: transport foundations, against the same fake. No backend drives them yet.
+ * ---------------------------------------------------------------------------------------------------------------- */
+
+/** The persisted thread every resume and fork case loads, and the tip a host would have recorded for it. */
+const PERSISTED = "thr-persisted";
+const RECORDED_TIP = "turn-seed-2";
+const OPEN = { sandbox: "workspace-write", approvalPolicy: "never", developerInstructions: CONTRACT } as const;
+const SEED = { inputTokens: 5_000, cachedInputTokens: 2_000, outputTokens: 200, reasoningOutputTokens: 50, totalTokens: 5_200, cacheWriteInputTokens: 0 };
+const LOADED_LAST = { inputTokens: 400, cachedInputTokens: 300, outputTokens: 20, reasoningOutputTokens: 5, totalTokens: 420, cacheWriteInputTokens: 0 };
+
+test("resume: the exact request with excludeTurns, the answer read back as reported, the thread owned, its tip listed newest first and unloaded", async () => {
+	await withFake("resume-ok", async (fixture) => {
+		const child = await fixture.start();
+		assert.equal((await refusal(child.latestTurn(PERSISTED))).kind, "refused", "a thread not yet loaded is not this transport's");
+		const resumed = await within("thread/resume", child.resumeThread({ threadId: PERSISTED, model: "gpt-asked", modelProvider: "openai", ...OPEN }));
+		assert.deepEqual(resumed, { threadId: PERSISTED, model: "gpt-asked", modelProvider: "openai", cwd: fixture.work, sandbox: { type: "workspaceWrite" }, reasoningEffort: "high", approvalPolicy: "never" }, "a null forked-from id is left out");
+		assert.deepEqual(await within("thread/turns/list", child.latestTurn(PERSISTED)), { none: false, turnId: RECORDED_TIP, status: "completed" });
+
+		const turn = await within("turn/start", child.startTurn({ threadId: PERSISTED, text: "go on", effort: "high" }));
+		const result = await within("the turn", turn.done);
+		assert.equal(result.outcome, "completed");
+		assert.deepEqual(result.usage?.total, { inputTokens: 5_400, cachedInputTokens: 2_300, outputTokens: 220, reasoningOutputTokens: 55, totalTokens: 5_620, cacheWriteInputTokens: 0 }, "cumulative from the seed, reported as it arrived");
+		assert.deepEqual(result.usage?.last, LOADED_LAST);
+		assert.deepEqual(await within("thread/turns/list", child.latestTurn(PERSISTED)), { none: false, turnId: turn.turnId, status: "completed" });
+		assert.equal((await within("thread/read", child.readThread(PERSISTED))).threadId, PERSISTED);
+		assert.equal((await refusal(child.steer(turn, "too late"))).kind, "refused", "an ended turn takes no steer");
+
+		const sent = requests(fixture).filter((message) => !["initialize", "initialized"].includes(message.method));
+		assert.deepEqual(sent, [
+			{ id: 2, method: "thread/resume", params: { threadId: PERSISTED, sandbox: "workspace-write", approvalPolicy: "never", developerInstructions: CONTRACT, model: "gpt-asked", modelProvider: "openai", excludeTurns: true } },
+			{ id: 3, method: "thread/turns/list", params: { threadId: PERSISTED, limit: 1, sortDirection: "desc", itemsView: "notLoaded" } },
+			{ id: 4, method: "turn/start", params: { threadId: PERSISTED, input: [{ type: "text", text: "go on" }], effort: "high" } },
+			{ id: 5, method: "thread/turns/list", params: { threadId: PERSISTED, limit: 1, sortDirection: "desc", itemsView: "notLoaded" } },
+			{ id: 6, method: "thread/read", params: { threadId: PERSISTED, includeTurns: false } },
+		], "the provider only on the thread method, the effort only on turn/start, and no refused call on the wire");
+	});
+});
+
+test("resume: an answer naming another thread is never adopted: a protocol failure, and nothing registered", async () => {
+	await withFake(
+		"resume-ok",
+		async (fixture) => {
+			const child = await fixture.start();
+			const refused = await refusal(child.resumeThread({ threadId: PERSISTED, ...OPEN }));
+			assert.equal(refused.kind, "protocol");
+			assert.match(refused.message, /thread\/resume answer names another thread/);
+			const exit = await within("the exit", child.exited);
+			assert.equal(exit.failure?.kind, "protocol");
+			assert.equal(child.threadStatus("thr-foreign"), undefined);
+		},
+		{ FAKE_CODEX_BAD: "resume-id" },
+	);
+});
+
+test("resume: a total below the seed in one field, a moved tip, a provider that differs and a cold interrupted tip are reported as they arrived", async () => {
+	await withFake("resume-reset", async (fixture) => {
+		const child = await fixture.start();
+		await within("thread/resume", child.resumeThread({ threadId: PERSISTED, ...OPEN }));
+		const turn = await within("turn/start", child.startTurn({ threadId: PERSISTED, text: "x" }));
+		const total = (await within("the turn", turn.done)).usage?.total;
+		assert.deepEqual(total, { inputTokens: 5_400, cachedInputTokens: 2_300, outputTokens: 20, reasoningOutputTokens: 55, totalTokens: 5_420, cacheWriteInputTokens: 0 });
+		assert.ok(total!.outputTokens < SEED.outputTokens, "below the seed in output alone; judging that is not the transport's");
+	});
+	await withFake("resume-moved", async (fixture) => {
+		const child = await fixture.start();
+		await within("thread/resume", child.resumeThread({ threadId: PERSISTED, ...OPEN }));
+		assert.deepEqual(await within("thread/turns/list", child.latestTurn(PERSISTED)), { none: false, turnId: "turn-moved", status: "completed" });
+	});
+	await withFake("resume-mismatch", async (fixture) => {
+		const child = await fixture.start();
+		const resumed = await within("thread/resume", child.resumeThread({ threadId: PERSISTED, modelProvider: "openai", ...OPEN }));
+		assert.equal(resumed.modelProvider, "azure");
+		assert.equal(requests(fixture).find((message) => message.method === "thread/resume")?.params.modelProvider, "openai");
+	});
+	await withFake("turns-interrupted", async (fixture) => {
+		const child = await fixture.start();
+		await within("thread/resume", child.resumeThread({ threadId: PERSISTED, ...OPEN }));
+		assert.deepEqual(await within("thread/turns/list", child.latestTurn(PERSISTED)), { none: false, turnId: "turn-cold", status: "interrupted" });
+	});
+});
+
+test("fork: the exact request through an inclusive turn, the new thread alone registered, its forked-from id and tip reported", async () => {
+	await withFake("fork-ok", async (fixture) => {
+		const child = await fixture.start();
+		const forked = await within("thread/fork", child.forkThread({ threadId: PERSISTED, lastTurnId: RECORDED_TIP, sandbox: "read-only", approvalPolicy: "never", developerInstructions: CONTRACT }));
+		assert.deepEqual(forked, { threadId: "thr-fork-1", model: "gpt-host-default", modelProvider: "openai", cwd: fixture.work, sandbox: { type: "readOnly" }, reasoningEffort: "high", approvalPolicy: "never", forkedFromId: PERSISTED });
+		assert.deepEqual(await within("thread/turns/list", child.latestTurn(forked.threadId)), { none: false, turnId: RECORDED_TIP, status: "completed" });
+		assert.equal((await refusal(child.latestTurn(PERSISTED))).kind, "refused", "the source of a fork is not this transport's");
+		const turn = await within("turn/start", child.startTurn({ threadId: forked.threadId, text: "x" }));
+		assert.equal((await within("the turn", turn.done)).outcome, "completed");
+		const sent = requests(fixture).filter((message) => message.method === "thread/fork" || message.method === "thread/turns/list");
+		assert.deepEqual(sent, [
+			{ id: 2, method: "thread/fork", params: { threadId: PERSISTED, lastTurnId: RECORDED_TIP, sandbox: "read-only", approvalPolicy: "never", developerInstructions: CONTRACT, excludeTurns: true } },
+			{ id: 3, method: "thread/turns/list", params: { threadId: "thr-fork-1", limit: 1, sortDirection: "desc", itemsView: "notLoaded" } },
+		]);
+	});
+});
+
+test("fork: an answer under the source's own id, and a fork with no turn listed, are reported for the backend to judge", async () => {
+	await withFake("fork-same-id", async (fixture) => {
+		const child = await fixture.start();
+		const forked = await within("thread/fork", child.forkThread({ threadId: PERSISTED, lastTurnId: RECORDED_TIP, ...OPEN }));
+		assert.deepEqual([forked.threadId, forked.forkedFromId], [PERSISTED, PERSISTED]);
+	});
+	await withFake("fork-tip-missing", async (fixture) => {
+		const child = await fixture.start();
+		const forked = await within("thread/fork", child.forkThread({ threadId: PERSISTED, lastTurnId: RECORDED_TIP, ...OPEN }));
+		assert.notEqual(forked.threadId, PERSISTED);
+		assert.deepEqual(await within("thread/turns/list", child.latestTurn(forked.threadId)), { none: true });
+	});
+});
+
+test("steer: one exact turn/steer for an own running turn, accepted without ending it, and a second turn still busy", async () => {
+	await withFake("steer-ok", async (fixture) => {
+		const child = await fixture.start();
+		const thread = await within("thread/start", child.startThread(OPEN));
+		const turn = await within("turn/start", child.startTurn({ threadId: thread.threadId, text: "x" }));
+		assert.equal((await refusal(child.steer({ threadId: thread.threadId, turnId: "turn-guessed" }, "y"))).kind, "refused", "a turn this transport did not admit");
+		assert.equal((await refusal(child.steer({ threadId: "thr-elsewhere", turnId: turn.turnId }, "y"))).kind, "refused");
+		await assert.rejects(child.steer(turn, ""), TypeError);
+		assert.deepEqual(await within("turn/steer", child.steer(turn, "also check the tests")), { outcome: "accepted" });
+		assert.equal(turn.snapshot().completion, undefined);
+		assert.equal(await settledYet(turn.done), false, "accepted is delivery, not the turn's end");
+		assert.equal((await refusal(child.startTurn({ threadId: thread.threadId, text: "z" }))).kind, "busy");
+		const steers = requests(fixture).filter((message) => message.method === "turn/steer");
+		assert.deepEqual(steers, [{ id: 4, method: "turn/steer", params: { threadId: thread.threadId, expectedTurnId: turn.turnId, input: [{ type: "text", text: "also check the tests" }] } }]);
+		const exit = await within("the shutdown", child.shutdown());
+		assert.equal(exit.failure, undefined);
+		assert.equal((await turn.done).outcome, "aborted");
+	});
+});
+
+test("steer: an answer naming another turn is a protocol failure", async () => {
+	await withFake(
+		"steer-ok",
+		async (fixture) => {
+			const child = await fixture.start();
+			const thread = await within("thread/start", child.startThread(OPEN));
+			const turn = await within("turn/start", child.startTurn({ threadId: thread.threadId, text: "x" }));
+			const refused = await refusal(child.steer(turn, "y"));
+			assert.equal(refused.kind, "protocol");
+			assert.match(refused.message, /turn\/steer answer names another turn/);
+			assert.equal((await within("the exit", child.exited)).failure?.kind, "protocol");
+		},
+		{ FAKE_CODEX_BAD: "steer-turn" },
+	);
+});
+
+test("steer: a JSON-RPC error answering it resolves refused with its code, once, and the turn and the child go on", async () => {
+	await withFake("steer-rejected", async (fixture) => {
+		const child = await fixture.start();
+		const thread = await within("thread/start", child.startThread(OPEN));
+		const turn = await within("turn/start", child.startTurn({ threadId: thread.threadId, text: "x" }));
+		const steered = await within("turn/steer", child.steer(turn, "y"));
+		assert.equal(steered.outcome, "refused");
+		assert.ok(steered.outcome === "refused" && steered.failure.kind === "rejected" && steered.failure.code === -32600);
+		assert.match(steered.outcome === "refused" ? steered.failure.message : "", /takes no input now/);
+		assert.equal(await settledYet(turn.done), false);
+		assert.equal((await within("thread/read", child.readThread(thread.threadId))).status.type, "active", "the child is still read");
+		assert.equal(requests(fixture).filter((message) => message.method === "turn/steer").length, 1, "nothing retried or resent");
+	});
+});
+
+test("stage 1 scenarios answer none of the new methods: their wire stays what it was", async () => {
+	await withFake("ok", async (fixture) => {
+		const child = await fixture.start();
+		const refused = await refusal(child.resumeThread({ threadId: PERSISTED, ...OPEN }));
+		assert.equal(refused.kind, "rejected");
+		assert.equal(refused.code, -32601);
 	});
 });
 

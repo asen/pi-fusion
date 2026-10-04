@@ -6,10 +6,12 @@ import {
 	type CodexDenial,
 	type CodexInitialize,
 	type CodexItem,
+	type CodexLatestTurn,
 	type CodexRead,
 	type CodexReroute,
 	type CodexSandboxRequest,
 	type CodexThreadRead,
+	type CodexThreadResume,
 	type CodexThreadStart,
 	type CodexThreadStatus,
 	type CodexTokenUsage,
@@ -22,12 +24,15 @@ import {
 	readItem,
 	readReroute,
 	readThreadRead,
+	readThreadResume,
 	readThreadStart,
 	readThreadStatusChanged,
 	readTokenUsage,
 	readTurnCompleted,
 	readTurnStart,
 	readTurnStarted,
+	readTurnSteer,
+	readTurnsList,
 } from "./codex-protocol.ts";
 import { LineFramer, MAX_TIMER_MS, type PiLine } from "./pi-transport.ts";
 
@@ -46,9 +51,10 @@ import { LineFramer, MAX_TIMER_MS, type PiLine } from "./pi-transport.ts";
  * The capabilities this build gives a child are deliberately few: it declares none at the handshake, answers every
  * command or file approval with `decline`, and has no answer for anything else the child asks — a question for the
  * user, a dynamic tool call, an elicitation — which is answered with a JSON-RPC error and ends the run as unsupported.
- * There is no steer, no navigation and no generic request: the only methods it sends are the handshake, thread/start,
- * turn/start, thread/read and turn/interrupt. Shapes come from `codex-protocol.ts`, read in Codex 0.160.0's source and
- * not measured against a running app-server.
+ * There is no navigation and no generic request: the only methods it sends are the handshake, thread/start, turn/start,
+ * thread/read and turn/interrupt, and the stable resume, fork, latest-turn and steer foundations — thread/resume,
+ * thread/fork, thread/turns/list and turn/steer — that no backend drives yet. Shapes come from `codex-protocol.ts`, read
+ * in Codex 0.160.0's source and not measured against a running app-server.
  *
  * Framing reuses the Pi transport's byte-capped `LineFramer` and nothing else of it; the lifecycle, writer, readers and
  * failures here are this backend's own. The defaults below are bounded and internal: no environment variable, tool
@@ -443,6 +449,31 @@ export interface CodexThreadStartParams {
 	developerInstructions: string;
 }
 
+/**
+ * What one thread/resume sends: the persisted thread to load and the same fields a thread/start takes, and
+ * `excludeTurns: true` beside them, so the answer carries no history this transport would have to hold. The answer
+ * must name this very thread; one naming another is refused, never adopted.
+ */
+export interface CodexThreadResumeParams extends CodexThreadStartParams {
+	threadId: string;
+}
+
+/**
+ * What one thread/fork sends: the source thread, the turn the fork keeps through — inclusive, a persisted turn id the
+ * caller verified — the thread/start fields and `excludeTurns: true`. Only the thread the answer names is registered
+ * as this transport's; the source is not. Whether that thread is distinct from the source, and the `forkedFromId` it
+ * reports, are handed back as reported for the backend to check.
+ */
+export interface CodexThreadForkParams extends CodexThreadResumeParams {
+	lastTurnId: string;
+}
+
+/**
+ * How one steer ended: the child took the input for the turn it was meant for, or answered with a JSON-RPC error and
+ * took nothing. Accepted is delivery, never consumption. A refusal is final: nothing here resends it.
+ */
+export type CodexSteerResult = { outcome: "accepted" } | { outcome: "refused"; failure: CodexFailure };
+
 /** What one turn/start sends: the thread, the prompt as one text input, and a model and effort a call named. No provider, sandbox policy or configuration. */
 export interface CodexTurnStartParams {
 	threadId: string;
@@ -598,6 +629,18 @@ export interface CodexChild {
 	 * is only counted. Nothing is retried, replayed or interrupted on a guessed id.
 	 */
 	startTurn(params: CodexTurnStartParams, timeoutMs?: number): Promise<CodexTurn>;
+	/** Loads one persisted thread and reads back what it was loaded with. The answer must name the thread asked for. */
+	resumeThread(params: CodexThreadResumeParams, timeoutMs?: number): Promise<CodexThreadResume>;
+	/** Forks one persisted thread through one turn, and registers the thread the answer names. Its metadata is reported, not judged. */
+	forkThread(params: CodexThreadForkParams, timeoutMs?: number): Promise<CodexThreadResume>;
+	/** The newest turn of one own thread, by id and stored status, or none: one thread/turns/list, no items and no history. */
+	latestTurn(threadId: string, timeoutMs?: number): Promise<CodexLatestTurn>;
+	/**
+	 * Sends one turn/steer for one admitted turn still running, once: a JSON-RPC error answering it resolves `refused`
+	 * and is never retried. An answer naming another turn is a protocol failure. Accepting a steer changes nothing about
+	 * the turn: it is still running, and a second turn/start is still `busy`.
+	 */
+	steer(turn: CodexTurnKey, text: string, timeoutMs?: number): Promise<CodexSteerResult>;
 	/** Reads one own thread's configured selection and status. Notifications the child sent before answering are applied first. */
 	readThread(threadId: string, timeoutMs?: number): Promise<CodexThreadRead>;
 	/** Asks the child to interrupt one admitted turn. The answer is an acknowledgement; the turn ends with its own completion. */
@@ -622,6 +665,8 @@ const DUPLICATE_COMPLETION = "it completed one turn twice";
 const NOT_OWN_THREAD = "the thread is not one this transport started";
 const NOT_OWN_TURN = "the turn is not one this transport admitted, or it has ended";
 const WRONG_THREAD = "its thread/read answer names another thread";
+const WRONG_RESUME = "its thread/resume answer names another thread";
+const WRONG_STEER = "its turn/steer answer names another turn";
 
 /** The JSON-RPC code a refused server request is answered with: Codex's own method-not-found. */
 export const CODEX_UNSUPPORTED_CODE = -32601;
@@ -973,21 +1018,69 @@ class CodexChildImpl implements CodexChild {
 	startThread(params: CodexThreadStartParams, timeoutMs?: number): Promise<CodexThreadStart> {
 		const refused = this.refusal(timeoutMs);
 		if (refused) return Promise.reject(refused);
-		if (params.sandbox !== "read-only" && params.sandbox !== "workspace-write") return Promise.reject(new TypeError("sandbox is read-only or workspace-write"));
-		if (params.approvalPolicy !== "never") return Promise.reject(new TypeError("the approval policy is never"));
-		if (typeof params.developerInstructions !== "string" || params.developerInstructions === "") return Promise.reject(new TypeError("developerInstructions is the role's non-empty contract text"));
-		if (Buffer.byteLength(params.developerInstructions) > this.bounds.maxInstructionsBytes) return Promise.reject(new CodexTransportError(codexFailure("refused", { reason: "the developer instructions are longer than this transport sends" })));
-		for (const field of ["model", "modelProvider"] as const) {
-			if (params[field] !== undefined && (typeof params[field] !== "string" || params[field] === "")) return Promise.reject(new TypeError(`${field} is a non-empty string when named`));
-		}
-		// Composed from the named fields alone, so nothing a caller's object carries beside them reaches the wire.
-		const body: Record<string, unknown> = { sandbox: params.sandbox, approvalPolicy: params.approvalPolicy, developerInstructions: params.developerInstructions };
-		if (params.model !== undefined) body.model = params.model;
-		if (params.modelProvider !== undefined) body.modelProvider = params.modelProvider;
+		const body = this.threadBody(params);
+		if (body instanceof Error) return Promise.reject(body);
 		return this.call("thread/start", body, timeoutMs ?? this.bounds.requestMs, "request", (result) => {
 			const read = this.readOrFail(readThreadStart(result));
 			this.threads.set(read.threadId, {});
 			return read;
+		});
+	}
+
+	resumeThread(params: CodexThreadResumeParams, timeoutMs?: number): Promise<CodexThreadResume> {
+		const refused = this.refusal(timeoutMs);
+		if (refused) return Promise.reject(refused);
+		if (typeof params.threadId !== "string" || params.threadId === "") return Promise.reject(new TypeError("threadId is the persisted thread's id"));
+		const fields = this.threadBody(params);
+		if (fields instanceof Error) return Promise.reject(fields);
+		const body = { threadId: params.threadId, ...fields, excludeTurns: true };
+		return this.call("thread/resume", body, timeoutMs ?? this.bounds.requestMs, "request", (result) => {
+			const read = this.readOrFail(readThreadResume(result, "thread/resume"));
+			if (read.threadId !== params.threadId) return this.readOrFail<never>({ ok: false, reason: WRONG_RESUME });
+			this.own(read.threadId);
+			return read;
+		});
+	}
+
+	forkThread(params: CodexThreadForkParams, timeoutMs?: number): Promise<CodexThreadResume> {
+		const refused = this.refusal(timeoutMs);
+		if (refused) return Promise.reject(refused);
+		if (typeof params.threadId !== "string" || params.threadId === "") return Promise.reject(new TypeError("threadId is the source thread's id"));
+		if (typeof params.lastTurnId !== "string" || params.lastTurnId === "") return Promise.reject(new TypeError("lastTurnId is the persisted turn the fork keeps through"));
+		const fields = this.threadBody(params);
+		if (fields instanceof Error) return Promise.reject(fields);
+		const body = { threadId: params.threadId, lastTurnId: params.lastTurnId, ...fields, excludeTurns: true };
+		return this.call("thread/fork", body, timeoutMs ?? this.bounds.requestMs, "request", (result) => {
+			const read = this.readOrFail(readThreadResume(result, "thread/fork"));
+			this.own(read.threadId);
+			return read;
+		});
+	}
+
+	latestTurn(threadId: string, timeoutMs?: number): Promise<CodexLatestTurn> {
+		const refused = this.refusal(timeoutMs);
+		if (refused) return Promise.reject(refused);
+		if (!this.threads.has(threadId)) return Promise.reject(new CodexTransportError(codexFailure("refused", { reason: NOT_OWN_THREAD })));
+		const body = { threadId, limit: 1, sortDirection: "desc", itemsView: "notLoaded" };
+		return this.call("thread/turns/list", body, timeoutMs ?? this.bounds.requestMs, "request", (result) => this.readOrFail(readTurnsList(result)));
+	}
+
+	steer(turn: CodexTurnKey, text: string, timeoutMs?: number): Promise<CodexSteerResult> {
+		const refused = this.refusal(timeoutMs);
+		if (refused) return Promise.reject(refused);
+		if (typeof text !== "string" || text === "") return Promise.reject(new TypeError("a steer carries non-empty text"));
+		const record = this.turns.get(keyOf(turn));
+		if (!record || record.done) return Promise.reject(new CodexTransportError(codexFailure("refused", { reason: NOT_OWN_TURN })));
+		const body = { threadId: turn.threadId, expectedTurnId: turn.turnId, input: [{ type: "text", text }] };
+		const steered = this.call("turn/steer", body, timeoutMs ?? this.bounds.requestMs, "request", (result): CodexSteerResult => {
+			const read = this.readOrFail(readTurnSteer(result));
+			if (read.turnId !== turn.turnId) return this.readOrFail<never>({ ok: false, reason: WRONG_STEER });
+			return { outcome: "accepted" };
+		});
+		// The child's own refusal is an answer, not a failure of this call; every other end of it still rejects.
+		return steered.catch((error: unknown): CodexSteerResult => {
+			if (error instanceof CodexTransportError && error.kind === "rejected") return { outcome: "refused", failure: error.failure };
+			throw error;
 		});
 	}
 
@@ -1082,6 +1175,29 @@ class CodexChildImpl implements CodexChild {
 			return error as Error;
 		}
 		return undefined;
+	}
+
+	/**
+	 * The fields every thread-opening request shares, checked and composed from the named fields alone, so nothing a
+	 * caller's object carries beside them reaches the wire. No effort: none of these requests takes one.
+	 */
+	private threadBody(params: CodexThreadStartParams): Record<string, unknown> | Error {
+		if (params.sandbox !== "read-only" && params.sandbox !== "workspace-write") return new TypeError("sandbox is read-only or workspace-write");
+		if (params.approvalPolicy !== "never") return new TypeError("the approval policy is never");
+		if (typeof params.developerInstructions !== "string" || params.developerInstructions === "") return new TypeError("developerInstructions is the role's non-empty contract text");
+		if (Buffer.byteLength(params.developerInstructions) > this.bounds.maxInstructionsBytes) return new CodexTransportError(codexFailure("refused", { reason: "the developer instructions are longer than this transport sends" }));
+		for (const field of ["model", "modelProvider"] as const) {
+			if (params[field] !== undefined && (typeof params[field] !== "string" || params[field] === "")) return new TypeError(`${field} is a non-empty string when named`);
+		}
+		const body: Record<string, unknown> = { sandbox: params.sandbox, approvalPolicy: params.approvalPolicy, developerInstructions: params.developerInstructions };
+		if (params.model !== undefined) body.model = params.model;
+		if (params.modelProvider !== undefined) body.modelProvider = params.modelProvider;
+		return body;
+	}
+
+	/** Registers a thread an answer named as this transport's. One already owned keeps the status it has. */
+	private own(threadId: string): void {
+		if (!this.threads.has(threadId)) this.threads.set(threadId, {});
 	}
 
 	/** A reader's answer, or the protocol failure it is: malformed evidence ends the child, and the call says so. */

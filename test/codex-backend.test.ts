@@ -81,6 +81,10 @@ function counted(child: CodexChild, hooks: { onTurn?: () => void; onRead?: (when
 				hooks.onRead?.("answered");
 				return answer;
 			},
+			resumeThread: (params, timeoutMs) => child.resumeThread(params, timeoutMs),
+			forkThread: (params, timeoutMs) => child.forkThread(params, timeoutMs),
+			latestTurn: (threadId, timeoutMs) => child.latestTurn(threadId, timeoutMs),
+			steer: (turn, text, timeoutMs) => child.steer(turn, text, timeoutMs),
 			interrupt: (turn, timeoutMs) => child.interrupt(turn, timeoutMs),
 			threadStatus: (threadId) => child.threadStatus(threadId),
 			shutdown: (reason) => {

@@ -34,7 +34,7 @@ Keep these three apart:
 
 | Kind | What it covers |
 | --- | --- |
-| Source inspection | Every app-server shape (initialize, thread/start, turn/start, thread/read, notifications, approvals) as read in Codex **0.160.0**'s app-server protocol source. That includes the reading that `developerInstructions`, `Thread.model` and `Thread.reasoningEffort` are stable fields there. A later version may change any of it. |
+| Source inspection | Every app-server shape (initialize, thread/start, turn/start, thread/read, notifications, approvals, and the not-yet-driven thread/resume, thread/fork, thread/turns/list and turn/steer) as read in Codex **0.160.0**'s app-server protocol source. That includes the reading that `developerInstructions`, `Thread.model` and `Thread.reasoningEffort` are stable fields there. A later version may change any of it. |
 | Deterministic fake | `test/codex-backend.test.ts` drives the composition against `test/fake-codex.mjs`, a builtins-only node program that speaks literal JSON-RPC. It is launched by path through an injected launch, with no Codex binary, home, auth, `PATH` lookup or model. One lifecycle case registers this build's backend in a test host over the same fake, for a delegated run and an independently configured reviewer; host controls, records and presentation are otherwise tested with in-memory doubles. A pass shows that this host's sequencing, checks and mapping behave as written against those literals. |
 | Native measurement | **G1 passed for stage 1 on one host.** The [stage 1 harness](#the-stage-1-harness) measured Q1, Q2, Q3, Q4, Q7 and Q9 as of commit `c2f2477`, and Q6 as of commit `cf8f0cd` (2026-10-04), each PASS, on one Linux x64 host running Node 24.18 with the child reporting app-server 0.160 (reported in its user agent, not independently verified). That is the experimental scope: macOS, Windows and other Codex versions are not measured. Q14, a stage 2 preparation measurement of usage counters outside G1, ran once at commit `625061e` (2026-10-04) on the same host and reported version and PASSED; it is not G2. A `--fake` run of the harness is a deterministic fake, not a measurement. |
 
@@ -45,7 +45,7 @@ Stage 1 is what this build ships. Later stages are planned, not shipped, and eac
 | Stage | Scope | State |
 | --- | --- | --- |
 | 1 | Fresh `implement` and `ask` on the app-server's stable methods | Shipped and experimental; its native gate (G1) passed on one Linux x64 host with app-server 0.160 |
-| 2 | Verified continuation and fork from a trusted turn checkpoint, `plan` on Codex, and steers | Not shipped: resume, fork, `plan` and steers are refused today. Its gate G2 is not enabled; its first preparation measurement, Q14 (usage counters), ran natively once and passed, which qualifies no stage 2 behavior |
+| 2 | Verified continuation and fork from a trusted turn checkpoint, `plan` on Codex, and steers | Not shipped: resume, fork, `plan` and steers are refused today. Its gate G2 is not enabled; its first preparation measurement, Q14 (usage counters), ran natively once and passed, which qualifies no stage 2 behavior. The transport has source-read foundations for thread/resume, thread/fork, thread/turns/list and turn/steer, tested only against the deterministic fake; no backend or host path calls them |
 | 3 | Questions through Codex's experimental question surfaces, which 0.160.0 gates behind its experimental API (source-read) | Not shipped: a Codex child has no question tool |
 
 ### The stage 1 harness

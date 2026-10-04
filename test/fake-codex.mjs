@@ -14,6 +14,11 @@ import * as path from "node:path";
  * `FAKE_CODEX_EXIT_CODE` is the status an orderly end of stdin exits with. All are this fixture's own and no production
  * module reads any of them.
  *
+ * thread/resume, thread/fork, thread/turns/list and turn/steer are answered only in the scenarios named in
+ * `FOUNDATIONS`, and method-not-found in every other one, so a stage 1 scenario's wire is what it was. Those scenarios
+ * treat any thread id they are asked to load as a persisted thread with a fixed history and a fixed cumulative usage
+ * seed: the seed is this fixture's own constant, and no request field carries or asks for it.
+ *
  * It stays alive through its stdin reader, so a host's own shutdown — which ends stdin first — is what ends it, and the
  * owned cleanup's report is about a process that was really there. Two scenarios differ on purpose: `hang` ignores the
  * end of stdin and `no-read` stops reading it, and both stay up on a bounded keepalive until the cleanup signals them.
@@ -83,13 +88,37 @@ let afterReplies;
 
 const usage = (input, cached, output, reasoning) => ({ inputTokens: input, cachedInputTokens: cached, outputTokens: output, reasoningOutputTokens: reasoning, totalTokens: input + output });
 
+/** The scenarios that answer the resume, fork, latest-turn and steer methods. */
+const FOUNDATIONS = new Set(["resume-ok", "resume-reset", "resume-moved", "resume-mismatch", "fork-ok", "fork-same-id", "fork-tip-missing", "turns-interrupted", "steer-ok", "steer-rejected"]);
+/** What a persisted thread's cumulative total already is when it is loaded: the fake's seed, never a request's. */
+const SEED = usage(5_000, 2_000, 200, 50);
+let forkCount = 0;
+
+/** A persisted thread's turns, oldest first. `resume-moved` has one past the tip a host recorded; `turns-interrupted` ends cold. */
+const persisted = () => {
+	const history = [
+		{ id: "turn-seed-1", status: "completed" },
+		{ id: "turn-seed-2", status: "completed" },
+	];
+	if (SCENARIO === "resume-moved") history.push({ id: "turn-moved", status: "completed" });
+	if (SCENARIO === "turns-interrupted") history.push({ id: "turn-cold", status: "interrupted" });
+	return history;
+};
+
+const plus = (a, b) => Object.fromEntries(Object.keys(a).map((key) => [key, a[key] + b[key]]));
+
 const tokenUsage = (threadId, turnId, total, last, window = 200_000) => notify("thread/tokenUsage/updated", { threadId, turnId, tokenUsage: { total, last, modelContextWindow: window } });
 
 const completed = (threadId, turnId, status = "completed", error = null) => {
 	notify("turn/completed", { threadId, turn: { id: turnId, status, items: [], error, durationMs: 12 } });
 	notify("thread/status/changed", { threadId, status: { type: "idle" } });
 	const thread = threads.get(threadId);
-	if (thread) thread.status = { type: "idle" };
+	if (thread) {
+		thread.status = { type: "idle" };
+		if (thread.activeTurn === turnId) thread.activeTurn = undefined;
+		const listed = thread.history?.find((turn) => turn.id === turnId);
+		if (listed) listed.status = status;
+	}
 };
 
 function initialize(id) {
@@ -147,6 +176,8 @@ function startTurn(id, params) {
 	const turnId = `turn-${turnCount}`;
 	if (params.effort !== undefined) thread.turnEffort = params.effort;
 	thread.status = { type: "active", activeFlags: [] };
+	thread.activeTurn = turnId;
+	thread.history?.push({ id: turnId, status: "inProgress" });
 	const answer = () => respond(id, { turn: { id: turnId, status: "inProgress", items: [], error: null } });
 	notify("thread/status/changed", { threadId, status: { type: "active", activeFlags: [] } });
 	// Early: the turn's own start goes out ahead of the answer that names it.
@@ -159,6 +190,8 @@ function startTurn(id, params) {
 			answer();
 			return;
 		case "forever":
+		case "steer-ok":
+		case "steer-rejected":
 		case "interrupt":
 		case "signal-on-interrupt":
 		case "exit-nonzero":
@@ -271,6 +304,24 @@ function startTurn(id, params) {
 			completed(threadId, turnId);
 			return;
 		}
+		case "resume-ok":
+		case "resume-reset":
+		case "resume-moved":
+		case "resume-mismatch":
+		case "fork-ok":
+		case "fork-same-id":
+		case "fork-tip-missing":
+		case "turns-interrupted": {
+			// One answer on a loaded thread: its total is cumulative from the seed, except `resume-reset`'s output.
+			answer();
+			const last = usage(400, 300, 20, 5);
+			let total = plus(thread.seed ?? usage(0, 0, 0, 0), last);
+			if (SCENARIO === "resume-reset") total = { ...total, outputTokens: last.outputTokens, totalTokens: total.inputTokens + last.outputTokens };
+			notify("item/completed", { threadId, turnId, completedAtMs: 2, item: { type: "agentMessage", id: "msg-1", text: "loaded answer", phase: null } });
+			tokenUsage(threadId, turnId, total, last);
+			completed(threadId, turnId);
+			return;
+		}
 		case "bad-completed":
 			answer();
 			notify("turn/completed", { threadId, turn: { id: turnId, status: "inProgress", items: [] } });
@@ -339,6 +390,51 @@ function readThread(id, params) {
 	respond(id, result);
 }
 
+/** thread/resume and thread/fork: a persisted thread loaded under its own id, or forked under a new one. */
+function loadThread(id, method, params) {
+	if (!FOUNDATIONS.has(SCENARIO)) return fail(id, -32601, "method not found");
+	const source = params?.threadId;
+	if (typeof source !== "string" || source === "") return fail(id, -32600, "no thread id");
+	let history = persisted();
+	let threadId = source;
+	let forkedFromId = null;
+	if (method === "thread/fork") {
+		const at = history.findIndex((turn) => turn.id === params.lastTurnId);
+		if (at === -1) return fail(id, -32600, "no such turn");
+		history = SCENARIO === "fork-tip-missing" ? [] : history.slice(0, at + 1);
+		forkedFromId = source;
+		if (SCENARIO !== "fork-same-id") {
+			forkCount += 1;
+			threadId = `thr-fork-${forkCount}`;
+		}
+	}
+	if (method === "thread/resume" && BAD === "resume-id") threadId = "thr-foreign";
+	const model = params?.model ?? "gpt-host-default";
+	const modelProvider = SCENARIO === "resume-mismatch" ? "azure" : (params?.modelProvider ?? "openai");
+	threads.set(threadId, { model, modelProvider, startEffort: "high", turnEffort: undefined, status: { type: "idle" }, history, seed: SEED });
+	const sandbox = params?.sandbox === "read-only" ? { type: "readOnly", networkAccess: false } : { type: "workspaceWrite", writableRoots: [], networkAccess: false };
+	const thread = { id: threadId, forkedFromId, sessionId: threadId, cwd, modelProvider, status: { type: "idle" }, turns: [], preview: "", ephemeral: false, cliVersion: "0.160.0", createdAt: 1, updatedAt: 1, source: "appServer", projectId: "p" };
+	respond(id, { thread, model, modelProvider, cwd, sandbox, reasoningEffort: "high", approvalPolicy: params?.approvalPolicy ?? "on-request", approvalsReviewer: "user", instructionSources: [] });
+}
+
+/** thread/turns/list, newest first: each turn's id and status, with no items. */
+function listTurns(id, params) {
+	if (!FOUNDATIONS.has(SCENARIO)) return fail(id, -32601, "method not found");
+	const thread = threads.get(params?.threadId);
+	if (!thread) return fail(id, -32600, "no such thread");
+	const newest = [...(thread.history ?? [])].reverse().slice(0, params.limit ?? Infinity);
+	respond(id, { data: newest.map((turn) => ({ id: turn.id, items: [], status: turn.status, error: null })), nextCursor: null });
+}
+
+/** turn/steer: taken for the running turn it expects, or refused whole in `steer-rejected`. */
+function steer(id, params) {
+	if (!FOUNDATIONS.has(SCENARIO)) return fail(id, -32601, "method not found");
+	if (SCENARIO === "steer-rejected") return fail(id, -32600, "the turn takes no input now");
+	const thread = threads.get(params?.threadId);
+	if (!thread || thread.activeTurn !== params.expectedTurnId) return fail(id, -32600, "expected turn mismatch");
+	respond(id, { turnId: BAD === "steer-turn" ? "turn-other" : params.expectedTurnId });
+}
+
 function interrupt(id, params) {
 	// A death the host did not cause, by a signal that leaves no core or crash report behind.
 	if (SCENARIO === "signal-on-interrupt") {
@@ -379,6 +475,13 @@ function request(message) {
 			return readThread(message.id, message.params);
 		case "turn/interrupt":
 			return interrupt(message.id, message.params);
+		case "thread/resume":
+		case "thread/fork":
+			return loadThread(message.id, message.method, message.params);
+		case "thread/turns/list":
+			return listTurns(message.id, message.params);
+		case "turn/steer":
+			return steer(message.id, message.params);
 		default:
 			return fail(message.id, -32601, "method not found");
 	}

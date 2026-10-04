@@ -133,22 +133,48 @@ export interface CodexThreadStart {
 }
 
 export function readThreadStart(result: unknown): CodexRead<CodexThreadStart> {
-	if (!isRecord(result)) return no("its thread/start answer is not an object");
-	if (!isRecord(result.thread)) return no("its thread/start answer carries no thread");
+	return readThreadOpened(result, "thread/start");
+}
+
+/**
+ * The core every answer that opens a thread shares — thread/start, thread/resume and thread/fork — read the same way
+ * and refused the same way, each reason naming the method that answered.
+ */
+function readThreadOpened(result: unknown, method: string): CodexRead<CodexThreadStart> {
+	if (!isRecord(result)) return no(`its ${method} answer is not an object`);
+	if (!isRecord(result.thread)) return no(`its ${method} answer carries no thread`);
 	const threadId = ident(result.thread.id);
-	if (threadId === undefined) return no("its thread/start answer names no thread id");
+	if (threadId === undefined) return no(`its ${method} answer names no thread id`);
 	const model = ident(result.model);
-	if (model === undefined) return no("its thread/start answer names no model");
+	if (model === undefined) return no(`its ${method} answer names no model`);
 	const modelProvider = ident(result.modelProvider);
-	if (modelProvider === undefined) return no("its thread/start answer names no model provider");
+	if (modelProvider === undefined) return no(`its ${method} answer names no model provider`);
 	const cwd = absolute(result.cwd);
-	if (cwd === undefined) return no("its thread/start answer names no absolute working directory");
+	if (cwd === undefined) return no(`its ${method} answer names no absolute working directory`);
 	const sandbox = readSandbox(result.sandbox);
-	if (sandbox === undefined) return no("its thread/start answer reports no tagged sandbox policy");
+	if (sandbox === undefined) return no(`its ${method} answer reports no tagged sandbox policy`);
 	const effort = nullableIdent(result.reasoningEffort);
-	if (effort === undefined) return no("its thread/start answer reports an effort that is not one");
+	if (effort === undefined) return no(`its ${method} answer reports an effort that is not one`);
 	const approval = ident(result.approvalPolicy);
 	return ok({ threadId, model, modelProvider, cwd, sandbox, reasoningEffort: effort.value, ...(approval === undefined ? {} : { approvalPolicy: approval }) });
+}
+
+/**
+ * What a thread/resume or thread/fork answered: the same core as thread/start — 0.160.0's resume and fork responses
+ * carry the start response's fields, none of them experimental (source inspection only) — and the thread's
+ * `forkedFromId` when it named one. Null and absent both mean it named none and are left out. That id is metadata
+ * reported as it arrived: whether a fork's answer names the source it was asked for is the backend's postcondition.
+ */
+export interface CodexThreadResume extends CodexThreadStart {
+	forkedFromId?: string;
+}
+
+export function readThreadResume(result: unknown, method: "thread/resume" | "thread/fork" = "thread/resume"): CodexRead<CodexThreadResume> {
+	const core = readThreadOpened(result, method);
+	if (!core.ok) return core;
+	const forked = nullableIdent((result as { thread: Fields }).thread.forkedFromId);
+	if (forked === undefined) return no(`its ${method} answer reports a forked-from id that is not one`);
+	return ok(forked.value === null ? core.value : { ...core.value, forkedFromId: forked.value });
 }
 
 /** A thread's runtime status, by its tag. `activeFlags` is present for an active thread and nowhere else. */
@@ -225,6 +251,38 @@ export function readTurnStart(result: unknown): CodexRead<{ turnId: string }> {
 	if (!isRecord(result) || !isRecord(result.turn)) return no("its turn/start answer carries no turn");
 	const turnId = ident(result.turn.id);
 	if (turnId === undefined) return no("its turn/start answer names no turn id");
+	return ok({ turnId });
+}
+
+/** The statuses a listed turn may carry in 0.160.0: the three ends, and `inProgress`. */
+export type CodexListedTurnStatus = CodexTurnStatus | "inProgress";
+
+const LISTED_STATUSES: readonly string[] = ["completed", "interrupted", "failed", "inProgress"];
+
+/**
+ * A thread's latest turn as thread/turns/list answered it, asked for newest first and one at a time: its id and status,
+ * or `none` when the thread has no turn. Only `data` and its first entry's id and status are read. A status is the
+ * child's as stored, not a live observation: a turn left in progress on a thread that is not loaded may be listed as
+ * `interrupted`, so a caller that needs a finished checkpoint requires exactly `completed`.
+ */
+export type CodexLatestTurn = { none: true } | { none: false; turnId: string; status: CodexListedTurnStatus };
+
+export function readTurnsList(result: unknown): CodexRead<CodexLatestTurn> {
+	if (!isRecord(result) || !Array.isArray(result.data)) return no("its thread/turns/list answer carries no list of turns");
+	if (result.data.length === 0) return ok({ none: true });
+	const first: unknown = result.data[0];
+	if (!isRecord(first)) return no("its thread/turns/list answer lists a turn that is not one");
+	const turnId = ident(first.id);
+	if (turnId === undefined) return no("its thread/turns/list answer lists a turn with no id");
+	if (typeof first.status !== "string" || !LISTED_STATUSES.includes(first.status)) return no("its thread/turns/list answer lists a turn with no status this version has");
+	return ok({ none: false, turnId, status: first.status as CodexListedTurnStatus });
+}
+
+/** What a turn/steer answered: the turn the input went to. Accepted is not consumed; nothing here says the model read it. */
+export function readTurnSteer(result: unknown): CodexRead<{ turnId: string }> {
+	if (!isRecord(result)) return no("its turn/steer answer is not an object");
+	const turnId = ident(result.turnId);
+	if (turnId === undefined) return no("its turn/steer answer names no turn id");
 	return ok({ turnId });
 }
 
