@@ -102,7 +102,19 @@ export interface CodexSandboxPolicy {
 	type: string;
 	/** The policy's network flag when it is a boolean; Codex's external policy uses a word here, which is left out. */
 	networkAccess?: boolean;
+	/**
+	 * Diagnostics only, kept for a manual qualification to read and never by anything that decides a run: the explicit
+	 * writable roots a `workspaceWrite` policy reports, and its two temp-directory exclusions. Each is left out when the
+	 * answer does not carry a well-formed one, so absent means unknown, never an empty list or `false`. The roots are
+	 * the configured ones only; the cwd and any implicit temp grant are not among them.
+	 */
+	writableRoots?: string[];
+	excludeTmpdirEnvVar?: boolean;
+	excludeSlashTmp?: boolean;
 }
+
+/** How many writable roots a reported policy may list before the diagnostic field is left out altogether. */
+export const CODEX_MAX_WRITABLE_ROOTS = 64;
 
 /** The request mode a reported policy tag corresponds to, or nothing for a tag no request of this host's names. */
 export function sandboxModeOf(policy: CodexSandboxPolicy): CodexSandboxRequest | undefined {
@@ -115,7 +127,15 @@ const readSandbox = (value: unknown): CodexSandboxPolicy | undefined => {
 	if (!isRecord(value)) return undefined;
 	const type = ident(value.type);
 	if (type === undefined) return undefined;
-	return { type, ...(typeof value.networkAccess === "boolean" ? { networkAccess: value.networkAccess } : {}) };
+	const roots = Array.isArray(value.writableRoots) && value.writableRoots.length <= CODEX_MAX_WRITABLE_ROOTS ? value.writableRoots.map(absolute) : undefined;
+	return {
+		type,
+		...(typeof value.networkAccess === "boolean" ? { networkAccess: value.networkAccess } : {}),
+		// One malformed root drops the whole list: a partial list would read as fewer grants than the policy has.
+		...(roots !== undefined && roots.every((root) => root !== undefined) ? { writableRoots: roots as string[] } : {}),
+		...(typeof value.excludeTmpdirEnvVar === "boolean" ? { excludeTmpdirEnvVar: value.excludeTmpdirEnvVar } : {}),
+		...(typeof value.excludeSlashTmp === "boolean" ? { excludeSlashTmp: value.excludeSlashTmp } : {}),
+	};
 };
 
 /**
