@@ -329,6 +329,45 @@ function piRecord(base: RunRecord, data: Record<string, unknown>): RunRecord {
 }
 
 /**
+ * The Codex half of an entry. A Codex run is identified by the tagged thread reference it recorded and by nothing else,
+ * and repeats only the configured selection, provider included, that its outcome read back. A flat Claude id or
+ * checkpoint, a Pi session file or a flat Claude model beside it is another backend's shape mixed into this one, and is
+ * refused rather than read as part of the thread. A thread with no trusted checkpoint is kept for reading and points at
+ * `codex resume`, never continued from its tip: a continuation restores a checkpoint, and that run settled on none.
+ */
+function codexRecord(base: RunRecord, data: Record<string, unknown>): RunRecord {
+	const record: RunRecord = { ...base, backend: "codex" };
+	const loose = ["sessionId", "checkpoint", "sessionFile", "model", "effort"].filter((field) => data[field] !== undefined);
+	if (data.session === undefined) {
+		if (loose.length) return refused(record, `records its codex run in ${loose.join(", ")} rather than in a thread reference; it cannot be continued, so start a new run`);
+		return refused(record, "ran on codex and recorded no verified thread, so it cannot be continued; start a new run without continue");
+	}
+	const ref = sessionRefOf(data.session, "codex");
+	if (!ref) return refused(record, "has an incomplete or mismatched codex thread reference; it cannot be continued, so start a new run");
+	const held: RunRecord = { ...record, session: ref };
+	if (loose.length) return refused(held, `carries both a codex thread reference and ${loose.join(", ")}; it cannot be continued, so start a new run`);
+	if (!ref.checkpoint) {
+		return refused(
+			held,
+			`ran on codex and recorded no trusted checkpoint, so it is kept for reading and not continued; open its thread with codex resume ${ref.sessionId}, and new work needs a new run without continue`,
+		);
+	}
+	const selection = resolvedSelectionOf(data.selection, "codex");
+	if (!selection) {
+		return refused(
+			held,
+			`recorded no codex model and provider this host can repeat, so it is kept for reading and not continued against whatever is configured now; open its thread with codex resume ${ref.sessionId}, and new work needs a new run without continue`,
+		);
+	}
+	return {
+		...held,
+		selection,
+		...(typeof data.contextTokens === "number" ? { contextTokens: data.contextTokens } : {}),
+		...(typeof data.contextWindow === "number" ? { contextWindow: data.contextWindow } : {}),
+	};
+}
+
+/**
  * Entries written before handles existed carry only the plan session, under the consolidator keys. Generation g
  * reads as handle run-(g+1), so each fresh plan session keeps a handle of its own.
  */
@@ -344,8 +383,7 @@ function recordOf(data: Record<string, unknown>): RunRecord | undefined {
 		};
 		if (data.backend === undefined || data.backend === "claude") return claudeRecord(base, data);
 		if (data.backend === "pi") return piRecord(base, data);
-		// This build names Codex and runs none of it yet: an entry tagged codex keeps its handle and is read as nothing to continue.
-		if (data.backend === "codex") return refused({ ...base, backend: "codex" }, "ran on codex, which this build cannot continue; start a new run");
+		if (data.backend === "codex") return codexRecord(base, data);
 		return refused(base, `was recorded by backend ${shown(data.backend)}, which this pi-fusion does not know; it cannot be continued, so start a new run`);
 	}
 	if (typeof data.consolidatorGeneration !== "number") return undefined;
@@ -388,12 +426,24 @@ export function runRecords(branch: readonly unknown[]): RunRecords {
 export function intentFor(record: RunRecord | undefined, hostSessionId: string): SessionIntent {
 	if (!record) return { kind: "new" };
 	if (record.refusal) throw new Error(record.refusal);
-	// A Claude record keeps its identity flat, and a record from before backends were tagged has nothing else.
-	const flat: SessionRef | undefined =
-		(record.backend !== undefined && record.backend !== "claude") || !record.sessionId ? undefined : { backend: "claude", sessionId: record.sessionId, ...(record.checkpoint ? { checkpoint: record.checkpoint } : {}) };
-	const ref = record.session ?? flat;
+	const ref = record.backend === "codex" ? codexSource(record) : (record.session ?? flatRef(record));
 	if (!ref) return { kind: "new" };
 	return record.hostSessionId === hostSessionId ? { kind: "resume", ref } : { kind: "fork", from: ref };
+}
+
+/** A Claude record keeps its identity flat, and a record from before backends were tagged has nothing else. */
+const flatRef = (record: RunRecord): SessionRef | undefined =>
+	(record.backend !== undefined && record.backend !== "claude") || !record.sessionId ? undefined : { backend: "claude", sessionId: record.sessionId, ...(record.checkpoint ? { checkpoint: record.checkpoint } : {}) };
+
+/**
+ * The exact thread and checkpoint a Codex continuation restores. A Codex record is never a new run in disguise: one
+ * without its tagged thread and trusted checkpoint, which only a record built by hand can be, is refused rather than
+ * mapped to a new thread over a child that exists.
+ */
+function codexSource(record: RunRecord): SessionRef {
+	const ref = sessionRefOf(record.session, "codex");
+	if (!ref?.checkpoint) throw new Error(`${record.handle} names no codex thread with a trusted checkpoint, so it cannot be continued; start a new run without continue`);
+	return ref;
 }
 
 /** The Claude session a record continues in: the shared intent, mapped by the backend that allocates the ids. */
@@ -530,6 +580,61 @@ function piDecision(call: RecordCall, outcome: RunOutcome, entry: Record<string,
 	return { entry };
 }
 
+/**
+ * The Codex entry a finished run writes, under the Pi rules with two differences. A successful call needs its tagged
+ * thread and the configured selection it read back, provider included; a new call needs no checkpoint, and a thread
+ * that settled on none is recorded for reading and the read side refuses to continue it, while a resume or a fork,
+ * which restored a trusted checkpoint, must report the one it settled on. And a thread's identity is its id alone, so a
+ * resume must report the thread it resumed and a fork one that is not the thread it forked. Flat Claude fields in the
+ * outcome are another backend's identity and fail the run rather than stand in for a thread it did not report.
+ */
+function codexDecision(call: RecordCall, outcome: RunOutcome, entry: Record<string, unknown>): RecordDecision {
+	const { handle, intent } = call;
+	if (outcome.sessionId !== undefined || outcome.checkpoint !== undefined) return postcondition(handle, "reported a flat session id or checkpoint, which no codex thread is identified by");
+	const source = intent.kind === "resume" ? intent.ref : intent.kind === "fork" ? intent.from : undefined;
+	if (source && source.backend !== "codex") return postcondition(handle, `was started from a ${source.backend} session, which no codex run can continue`);
+	const ref = outcome.session === undefined ? undefined : sessionRefOf(outcome.session, "codex");
+	if (outcome.session !== undefined && !ref) return postcondition(handle, "reported a session reference that is not a codex thread");
+	if (ref && source) {
+		if (intent.kind === "resume" && ref.sessionId !== source.sessionId) return postcondition(handle, "resumed one thread and reported another");
+		if (intent.kind === "fork" && ref.sessionId === source.sessionId) return postcondition(handle, "forked its thread and reported the thread it forked from");
+	}
+	const selection = resolvedSelectionOf(outcome.selection, "codex");
+	if (outcome.ok) {
+		if (!ref) return postcondition(handle, "succeeded without reporting the thread it ran in");
+		if (!selection) return postcondition(handle, "succeeded without reporting the configured model and provider it ran with");
+		// A new thread may settle on no checkpoint and is then kept for reading. A continuation restored a trusted one and
+		// must report the one it settled on: recording it without one would replace a continuable record with one that
+		// is only readable, so it fails and the prior record stays authoritative instead.
+		if (intent.kind !== "new" && !ref.checkpoint) return postcondition(handle, "continued its thread and succeeded without reporting the checkpoint it settled on");
+		entry.session = { ...ref };
+		entry.selection = selection;
+		if (outcome.contextTokens && outcome.contextWindow) {
+			entry.contextTokens = outcome.contextTokens;
+			entry.contextWindow = outcome.contextWindow;
+		}
+		return { entry };
+	}
+	if (!ref) {
+		// Nothing was verified, so a continuation leaves its record alone and a brand new handle records itself alone.
+		if (intent.kind !== "new" || call.prior) return { keep: true };
+		return { entry };
+	}
+	if (intent.kind === "resume") return { keep: true };
+	if (intent.kind === "fork") {
+		const at = source?.checkpoint;
+		if (!at || ref.checkpoint !== at) return postcondition(handle, "forked and failed without keeping the checkpoint it forked at");
+		// As on Pi: the fork's own thread is kept at the point it forked at, and its selection only when it read one back.
+		entry.session = { ...ref };
+		if (selection) entry.selection = selection;
+		return { entry };
+	}
+	if (ref.checkpoint) return postcondition(handle, "failed and claimed a trusted checkpoint, which only a settled call or a fork has");
+	entry.session = { ...ref };
+	if (selection) entry.selection = selection;
+	return { entry };
+}
+
 /** What the host branch records for a finished run, decided from the outcome alone and from no id guessed before it. */
 export function recordDecision(call: RecordCall, outcome: RunOutcome): RecordDecision {
 	const entry: Record<string, unknown> = { run: call.handle, role: call.role, backend: call.backend, hostSessionId: call.hostSessionId };
@@ -540,8 +645,7 @@ export function recordDecision(call: RecordCall, outcome: RunOutcome): RecordDec
 		case "pi":
 			return piDecision(call, outcome, entry);
 		case "codex":
-			// No Codex run is recorded by this build: an outcome tagged codex is never read as a Claude or a Pi one.
-			return postcondition(call.handle, "ran on codex, which this build does not record");
+			return codexDecision(call, outcome, entry);
 	}
 }
 
@@ -802,12 +906,12 @@ export function fusionCall(params: FusionParams, records: RunRecords, planPct: n
 
 /**
  * The claude tool's own route: the shared one with the backend forced, so nothing infers Pi from a call or a record.
- * A Pi run is continued through fusion, which knows its backend and the selection it has to repeat. A role the
+ * A Pi or Codex run is continued through fusion, which knows its backend and the selection it has to repeat. A role the
  * configuration puts on Pi is run on Claude here as any call naming the other backend is: on the legacy defaults.
  */
 export function claudeRoute(params: ClaudeParams, records: RunRecords, planPct: number = planContextPct(), config?: Configuration): FusionRoute {
 	const prior = params.continue === undefined ? undefined : records.runs.get(params.continue);
-	if (prior?.backend === "pi") throw new Error(`${prior.handle} ran on the pi backend, which the claude tool does not run; continue it with fusion and continue ${prior.handle}`);
+	if (prior?.backend !== undefined && prior.backend !== "claude") throw new Error(`${prior.handle} ran on the ${prior.backend} backend, which the claude tool does not run; continue it with fusion and continue ${prior.handle}`);
 	// A fresh call's role is checked against the four this tool advertises before the shared route reads a capability:
 	// a role that runs on Pi alone is one this tool does not know, and saying so is what it has always done.
 	if (params.continue === undefined && params.role !== undefined) claudeRoleName(params.role);
@@ -848,12 +952,14 @@ export function budgetBlockMessage(block: { limitUsd: number; costUsd: number })
  * How to reach the child's session again, in its own backend's terms. The backend is the one the run went through,
  * named by the caller and never inferred from the fields: a Pi run that ended before it verified a reference can
  * still carry a scalar session id as a diagnostic, and `claude --resume` on such an id names a session the Claude
- * CLI cannot open. Only a Claude run's flat id is a resume command, and only a verified Pi reference names a file.
+ * CLI cannot open. Only a Claude run's flat id is a resume command, only a verified Pi reference names a file, and
+ * only a verified Codex reference names the thread `codex resume` reopens.
  * That reference is passed in, never read off the snapshot: what a child claimed in progress and what an outcome
  * the host refused carried are both on the snapshot, and neither is a path anyone may be handed.
  */
 function sessionHint(run: { sessionId?: string } | undefined, ref: SessionRef | undefined, backend: BackendName): string[] {
 	if (ref?.backend === "pi") return [`pi session ${ref.sessionFile}`];
+	if (ref?.backend === "codex") return [`codex resume ${ref.sessionId}`];
 	return backend === "claude" && run?.sessionId ? [`claude --resume ${run.sessionId}`] : [];
 }
 
@@ -1211,8 +1317,8 @@ function summary(run: LiveRun): string {
 	return text.length > SUMMARY_CHARS ? `${text.slice(0, SUMMARY_CHARS)}…` : text;
 }
 
-/** A continuation uses the invoking tool pair when known; a Pi or Codex run is only ever continued through the primary tool. */
-const continueWith = (backend: string | undefined, tool?: string): string => (backend === "pi" || backend === "codex" || tool === TOOL_NAME || tool === CONTROL_TOOL_NAME ? TOOL_NAME : CLAUDE_TOOL_NAME);
+/** A continuation uses the invoking tool pair when known; a run on any backend but Claude is only ever continued through the primary tool. */
+const continueWith = (backend: string | undefined, tool?: string): string => ((backend !== undefined && backend !== "claude") || tool === TOOL_NAME || tool === CONTROL_TOOL_NAME ? TOOL_NAME : CLAUDE_TOOL_NAME);
 
 function handleNumber(handle: string): number {
 	return Number(HANDLE.exec(handle)?.[1] ?? 0);
@@ -1805,6 +1911,13 @@ export default function fusion(pi: ExtensionAPI, options: FusionOptions = {}) {
 			const other = branch.session?.backend === "pi" ? branch.session : undefined;
 			if (!one || !other) return !one && !other;
 			return one.sessionId === other.sessionId && one.sessionFile === other.sessionFile;
+		}
+		// A Codex thread is its id alone, and like a Pi session only a verified reference names it.
+		if (backend === "codex" || branch.backend === "codex") {
+			const one = held.ref?.backend === "codex" ? held.ref : undefined;
+			const other = branch.session?.backend === "codex" ? branch.session : undefined;
+			if (!one || !other) return !one && !other;
+			return one.sessionId === other.sessionId;
 		}
 		const one = held.ref?.sessionId ?? held.sessionId;
 		const other = branch.session?.sessionId ?? branch.sessionId;

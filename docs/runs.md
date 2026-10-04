@@ -52,7 +52,7 @@ For example, the host can continue a completed run with:
 { "continue": "run-3", "task": "The migration test still fails; diagnose and fix it" }
 ```
 
-The run retains its role/backend. Supplying a different role or backend refuses the call. A profile switch alone does not change its recorded model/effort; permitted call overrides can. Disabling that role prevents continuation until it is enabled again. Pi continuations require `fusion`, never the forced-Claude compatibility tool.
+The run retains its role/backend. Supplying a different role or backend refuses the call. A profile switch alone does not change its recorded model/effort; permitted call overrides can. Disabling that role prevents continuation until it is enabled again. Pi and Codex continuations require `fusion`, never the forced-Claude compatibility tool.
 
 ### Resumes, tree navigation, and host forks
 
@@ -73,11 +73,12 @@ A host fork copies no child immediately. On first use, Claude resumes with `--fo
 | --- | --- |
 | Claude | Flat session id, last assistant-message UUID checkpoint, and admitted model/effort, defaults included |
 | Pi | Structured session id, absolute transcript file, trusted checkpoint where available, and actual model/thinking selection |
+| Codex | Tagged thread id, trusted checkpoint where available, and the configured model and provider read back from the child, with its effort when it names one |
 | Older untagged entry | Claude, preserving compatibility with entries written before backend tags |
 
 Older Claude records missing model/effort use the legacy defaults captured when this extension instance loaded, **not** the current profile, and the result says so. A Claude entry without a checkpoint resumes the whole session. Very old plan entries under `consolidator` keys with generation `g` read as handle `run-<g+1>`.
 
-Unknown backend tags, Codex-tagged entries (this build continues none), mixed/incomplete session formats, and Pi records without a trusted checkpoint or repeatable selection are kept for reading, not guessed into a continuation. A refused latest plan stops implicit continuation; Fusion does not walk back to an older usable plan or hand off to escape the refusal.
+Unknown backend tags, mixed/incomplete session formats, and Pi or Codex records without a trusted checkpoint or repeatable selection are kept for reading, not guessed into a continuation. A Codex record is read only from its tagged thread reference and its selection only with a provider; flat Claude ids, checkpoints, models, or a Pi session file in a Codex entry refuse it. This build has no Codex binding, so even a continuable Codex record is refused as unavailable. A refused latest plan stops implicit continuation; Fusion does not walk back to an older usable plan or hand off to escape the refusal.
 
 ### Recovery policy
 
@@ -86,7 +87,9 @@ Unknown backend tags, Codex-tagged entries (this build continues none), mixed/in
 | Resume failed/cancelled | No new branch record; the previous successful checkpoint stays authoritative |
 | Fork failed after a verified new identity | Keep that fork at its starting checkpoint, avoiding a second fork; without verified selection it is readable but cannot continue |
 | First Pi call established a session but no trusted checkpoint | Read the session, but refuse continuation rather than replay the failed prompt |
-| First Pi call established no verified session | Keep handle/failure, refuse explicit **and** implicit continuation; start a new role call without `continue` (`plan` also takes `fresh: true`) |
+| First Codex call (no `continue`, no host fork) reported its thread but no trusted checkpoint, successful or not | Keep the thread for reading and refuse continuation; the refusal names `codex resume <thread id>`, and new work needs a new run |
+| Codex resume/fork succeeded without a trusted checkpoint | Fail the run and record nothing; the previous record stays authoritative |
+| First Pi or Codex call established no verified session | Keep handle/failure, refuse explicit **and** implicit continuation; start a new role call without `continue` (`plan` also takes `fresh: true`) |
 | Claude call failed before reporting a session | Keep handle; continuation can start a new Claude session |
 | Outcome claims an impossible identity or incomplete success | Fail the run and publish no identity to branch/history; any previous record remains unchanged |
 
@@ -98,6 +101,7 @@ Results, background notices, waits, and detailed status offer:
 
 - Claude: `claude --resume <session id>`. Normal transcripts live under `~/.claude/projects/<encoded working directory>/<session id>.jsonl`.
 - Pi: the **accepted outcome's transcript file**, not a Claude resume command. A fork names its new file, not the source. A running run, thrown backend, or rejected outcome offers no Pi path; a verified session kept only for reading may offer one.
+- Codex: `codex resume <thread id>`, from the accepted outcome's thread only. A fork names its own thread; a thread kept only for reading names it in its continuation refusal.
 
 Pi restores only the exact recorded file/id/checkpoint and repeats its recorded selection. Missing files, absent checkpoints, old/malformed transcript formats, leaf mismatches, or clamped thinking levels refuse the call; no fallback or repair is attempted. The detailed [checkpoint checks](pi-backend.md#continuation-and-checkpoints) include their source-only limitations. For either backend, start a new run if its transcript cannot be continued; use `fresh: true` for a new plan.
 
@@ -161,13 +165,13 @@ Claude steers use the SDK's queued user-message input; Pi buffers until task inp
 
 Ordinary editor text targets the host. `/fusion steer run-N <text>` targets the child and logs the instruction in the host conversation. A waiting child instead needs `/fusion answer`; the host may forward an ordinary instruction through a control tool at its discretion.
 
-Generated questions/cards/handoffs use the invoking tool pair (`fusion`/`fusion_control` or `claude`/`claude_control`); a control reply uses the name called. Pi continuation hints always use `fusion`. Reviews with no initiating delegation tool use the primary pair. User commands always remain `/fusion ...`.
+Generated questions/cards/handoffs use the invoking tool pair (`fusion`/`fusion_control` or `claude`/`claude_control`); a control reply uses the name called. Pi and Codex continuation hints always use `fusion`. Reviews with no initiating delegation tool use the primary pair. User commands always remain `/fusion ...`.
 
 ## Runs across Pi processes
 
 An earlier process's branch-recorded run is not active. Controls explain that distinction; `fusion` can continue it only when its record is usable. Reports live in memory unless `PI_FUSION_HISTORY=1` saves them for a durable host session. No history is written for `--no-session`.
 
-History writes on start, token updates, and end. It restores earlier reports/usage/dashboard entries; branch entries remain continuation authority. A history record must name the same child as the branch: Claude session id, or Pi id **and file**. A mismatched identity is not shown/reviewed as that run. A fork reads ancestor history but never writes to that ancestor's file. A run left active by a dead process restores as `aborted`.
+History writes on start, token updates, and end. It restores earlier reports/usage/dashboard entries; branch entries remain continuation authority. A history record must name the same child as the branch: Claude session id, Pi id **and file**, or Codex thread id. A mismatched identity is not shown/reviewed as that run. A fork reads ancestor history but never writes to that ancestor's file. A run left active by a dead process restores as `aborted`.
 
 Detailed earlier-run status shows its state, elapsed time, changed-file count, and first 600 report/failure characters. It offers continuation only with a usable branch record and review only for work made in this working directory. Restored usage seeds the session ledger, and handles are not reused.
 

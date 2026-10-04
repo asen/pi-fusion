@@ -31,6 +31,19 @@ const entry = (data: Record<string, unknown>) => ({ type: "custom", customType: 
 const PI_REF: PiSessionRef = { backend: "pi", sessionId: "pi-1", sessionFile: "/sessions/pi-1.jsonl", checkpoint: "entry-9" };
 const PI_SELECTION: ResolvedSelection = { model: "deepseek/deepseek-chat", effort: "medium" };
 
+const CODEX_REF = { backend: "codex", sessionId: "thread-1", checkpoint: "turn-2" } as const;
+
+/** A codex entry a later codex binding could continue: its tagged thread, a trusted checkpoint and the configured selection. */
+const codexEntry = (data: Record<string, unknown> = {}) => ({
+	run: "run-1",
+	role: "implement",
+	backend: "codex",
+	hostSessionId: "host-1",
+	session: { ...CODEX_REF },
+	selection: { model: "gpt-5-codex", provider: "openai" },
+	...data,
+});
+
 const piEntry = (data: Record<string, unknown> = {}) => ({
 	run: "run-1",
 	role: "implement",
@@ -613,6 +626,46 @@ test("a run of an injected backend keeps its backend, reference and selection in
 	}
 });
 
+test("an earlier process's codex run is the branch's run only when both name the same thread", async () => {
+	const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fusion-routing-history-"));
+	tempDirs.push(dir);
+	process.env.PI_FUSION_HISTORY = "1";
+	process.env.PI_FUSION_HISTORY_DIR = dir;
+	try {
+		const held = (id: string, ref?: object) => ({
+			id,
+			handle: "run-1",
+			role: "implement",
+			model: "gpt-5-codex",
+			hostSessionId: "host-1",
+			cwd: "/elsewhere",
+			origin: "tool" as const,
+			state: "done" as const,
+			startedAt: 1_000,
+			endedAt: 2_000,
+			prompt: "do the thing",
+			report: `report of ${id}`,
+			backend: "codex" as const,
+			...(ref ? { ref: ref as never } : {}),
+		});
+		const branch = [entry(codexEntry())];
+		const status = async (record: ReturnType<typeof held>): Promise<string> => {
+			fs.rmSync(path.join(dir, "host-1.json"), { force: true });
+			assert.equal(new History(dir).save("host-1", "/elsewhere", record), undefined);
+			const ext = makeExtension();
+			const ctx = { ...makeCtx(branch), sessionManager: { ...makeCtx(branch).sessionManager, getSessionFile: () => path.join(dir, "host-1.jsonl") } };
+			return (await call(ext, "fusion_control", { action: "status", run: "run-1" }, ctx)).text ?? "";
+		};
+		// The checkpoint is the run's position, not its identity: the same thread at another turn is the same child.
+		assert.match(await status(held("same", { ...CODEX_REF, checkpoint: "turn-1" })), /^run-1 \(implement\) ran in an earlier Pi process: done, 1s, 0 changed files\nreport of same\ncontinue it with fusion and continue run-1$/);
+		assert.doesNotMatch(await status(held("other", { ...CODEX_REF, sessionId: "thread-9" })), /report of other/, "another thread is not this run");
+		assert.doesNotMatch(await status(held("none")), /report of none/, "nor is a run that verified no thread at all");
+	} finally {
+		delete process.env.PI_FUSION_HISTORY;
+		delete process.env.PI_FUSION_HISTORY_DIR;
+	}
+});
+
 test("a pi run's scalar session id stays a diagnostic: no resume command, no record field and no host detail", async () => {
 	process.env.PI_FUSION_PI_IMPLEMENT_MODEL = "deepseek/deepseek-chat";
 	try {
@@ -747,7 +800,16 @@ test("a codex call goes nowhere in this build: named or configured, it is refuse
 	assert.equal((await call(ext, "fusion", { role: "implement", task: "x", backend: "codex" }, makeCtx())).error, unavailable);
 	assert.equal((await call(ext, "fusion", { role: "implement", task: "x" }, makeCtx())).error, unavailable, "a profile that puts the role on codex is refused the same way");
 	assert.equal((await call(ext, "fusion", { role: "implement", task: "x", backend: "codex", model: "gpt 5", effort: "whatever" }, makeCtx())).error, unavailable, "and no binding is asked about the model first");
-	assert.match((await call(ext, "fusion", { continue: "run-1", task: "x" }, makeCtx([entry({ run: "run-1", role: "implement", backend: "codex", hostSessionId: "host-1", session: { backend: "codex", sessionId: "thread-1" } })]))).error ?? "", /^run-1 ran on codex, which this build cannot continue; start a new run$/);
+	assert.equal(
+		(await call(ext, "fusion", { continue: "run-1", task: "x" }, makeCtx([entry({ ...codexEntry(), session: { backend: "codex", sessionId: "thread-1" } })]))).error,
+		"run-1 ran on codex and recorded no trusted checkpoint, so it is kept for reading and not continued; open its thread with codex resume thread-1, and new work needs a new run without continue",
+		"a thread with no trusted checkpoint is refused for reading before the backend is looked for",
+	);
+	assert.equal(
+		(await call(ext, "fusion", { continue: "run-1", task: "x" }, makeCtx([entry(codexEntry())]))).error,
+		"the codex backend is not available in this build: run-1 ran on it, and this pi-fusion runs claude, pi only. Nothing was started and nothing was recorded. Read what that run reported and start a new run on claude, pi; no configuration makes codex available here.",
+		"a continuable codex record goes nowhere either",
+	);
 	assert.equal(started, 0, "no session was mapped and no child started");
 	assert.deepEqual(ext.appended, [], "a refused call records nothing");
 });
@@ -784,6 +846,31 @@ test("the claude tool refuses to continue a pi run and names the tool that can",
 	const refused = await call(ext, "claude", { continue: "run-1", task: "more" }, makeCtx(branch));
 	assert.match(refused.error ?? "", /^run-1 ran on the pi backend, which the claude tool does not run; continue it with fusion and continue run-1$/);
 	assert.deepEqual(ext.appended, []);
+});
+
+test("a codex run is continued through fusion alone, and its route stops at the missing binding before any backend is asked", async () => {
+	const records = runRecords([entry(codexEntry())]);
+	const route = fusionRoute({ continue: "run-1", task: "x" }, records);
+	assert.deepEqual([route.backend, route.role, route.handle, route.record?.session], ["codex", "implement", "run-1", CODEX_REF]);
+	assert.deepEqual(route.defaults, {}, "a codex continuation takes no configured or legacy defaults");
+	assert.throws(() => fusionRoute({ continue: "run-1", task: "x", backend: "claude" }, records), /^Error: run-1 ran on the codex backend; omit backend or use codex$/);
+	assert.throws(() => fusionCall({ continue: "run-1", task: "x" }, records), /^Error: role implement cannot be bound for the codex backend: this build has no codex binding$/);
+	assert.throws(() => claudeRoute({ continue: "run-1", task: "x" }, records), /^Error: run-1 ran on the codex backend, which the claude tool does not run; continue it with fusion and continue run-1$/);
+	// The codex tripwire is registered here: the call is refused at the binding, and the tripwire's file check proves nothing reached it.
+	const ext = makeExtension();
+	const branch = [entry(codexEntry())];
+	assert.equal((await call(ext, "fusion", { continue: "run-1", task: "x" }, makeCtx(branch))).error, "role implement cannot be bound for the codex backend: this build has no codex binding");
+	assert.equal((await call(ext, "claude", { continue: "run-1", task: "x" }, makeCtx(branch))).error, "run-1 ran on the codex backend, which the claude tool does not run; continue it with fusion and continue run-1");
+	// Controls of either pair name fusion for a codex run, and a thread kept only for reading says how to reopen it.
+	for (const tool of ["claude_control", "fusion_control"]) {
+		const ended = await call(ext, tool, { action: "message", run: "run-1", message: "more" }, makeCtx(branch));
+		assert.match(ended.text ?? "", /Continue it with fusion and continue run-1, or take no action\.$/, tool);
+		const { checkpoint, ...bare } = CODEX_REF;
+		const readable = await call(ext, tool, { action: "message", run: "run-1", message: "more" }, makeCtx([entry(codexEntry({ session: bare }))]));
+		assert.match(readable.text ?? "", /open its thread with codex resume thread-1, and new work needs a new run without continue\.$/, tool);
+		assert.doesNotMatch(readable.text ?? "", /claude --resume/, tool);
+	}
+	assert.deepEqual(ext.appended, [], "a refused call records nothing");
 });
 
 test("every role the tools advertise has capabilities and a binding on each backend it names, so the lists cannot drift", () => {
