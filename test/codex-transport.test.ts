@@ -8,8 +8,6 @@ import ts from "typescript";
 import { CODEX_APP_SERVER_ARGS } from "../extensions/backends/codex-launch.ts";
 import {
 	boundText,
-	CODEX_MAX_WRITABLE_ROOTS,
-	CODEX_PATH_MAX_CHARS,
 	CODEX_PROTOCOL_PROVENANCE,
 	readApproval,
 	readErrorNotice,
@@ -121,7 +119,7 @@ const START = {
 
 test("thread/start is read for its identity and selection, effort nullable, extra fields tolerated, and every missing piece refused", () => {
 	const read = readThreadStart(START);
-	assert.deepEqual(read, { ok: true, value: { threadId: "thr-1", model: "gpt-5", modelProvider: "openai", cwd: "/work", sandbox: { type: "workspaceWrite", networkAccess: false, writableRoots: [] }, reasoningEffort: null, approvalPolicy: "never" } });
+	assert.deepEqual(read, { ok: true, value: { threadId: "thr-1", model: "gpt-5", modelProvider: "openai", cwd: "/work", sandbox: { type: "workspaceWrite" }, reasoningEffort: null, approvalPolicy: "never" } });
 	const { reasoningEffort: _effort, ...noEffort } = START;
 	assert.equal(readThreadStart(noEffort).ok && (readThreadStart(noEffort) as { value: { reasoningEffort: unknown } }).value.reasoningEffort, null, "an effort left out is the same as null");
 	assert.deepEqual(readThreadStart({ ...START, reasoningEffort: "high" }).ok && (readThreadStart({ ...START, reasoningEffort: "high" }) as { value: { reasoningEffort: unknown } }).value.reasoningEffort, "high");
@@ -143,21 +141,14 @@ test("thread/start is read for its identity and selection, effort nullable, extr
 	for (const [what, value] of broken) assert.equal(readThreadStart(value).ok, false, what);
 });
 
-test("a reported sandbox keeps its writable roots and temp exclusions as diagnostics, each left out rather than guessed when malformed", () => {
+test("a reported sandbox is read for its tag alone, whatever else the policy carries tolerated and left out", () => {
 	const sandbox = (policy: unknown) => {
 		const read = readThreadStart({ ...START, sandbox: policy });
-		assert.ok(read.ok, "a diagnostic field never fails the answer");
+		assert.ok(read.ok, "a policy field beyond the tag never fails the answer");
 		return read.value.sandbox;
 	};
-	assert.deepEqual(sandbox({ type: "workspaceWrite", writableRoots: ["/a", "/b/c"], networkAccess: true, excludeTmpdirEnvVar: false, excludeSlashTmp: true }), { type: "workspaceWrite", networkAccess: true, writableRoots: ["/a", "/b/c"], excludeTmpdirEnvVar: false, excludeSlashTmp: true });
-	assert.deepEqual(sandbox({ type: "workspaceWrite" }), { type: "workspaceWrite" }, "absent fields stay absent: unknown, never [] or false");
-	assert.deepEqual(sandbox({ type: "workspaceWrite", writableRoots: ["/a", "relative"] }), { type: "workspaceWrite" }, "one malformed root drops the whole list");
-	assert.deepEqual(sandbox({ type: "workspaceWrite", writableRoots: ["/a", 5] }), { type: "workspaceWrite" });
-	assert.deepEqual(sandbox({ type: "workspaceWrite", writableRoots: "/a" }), { type: "workspaceWrite" });
-	assert.deepEqual(sandbox({ type: "workspaceWrite", writableRoots: Array.from({ length: CODEX_MAX_WRITABLE_ROOTS + 1 }, (_, index) => `/r${index}`) }), { type: "workspaceWrite" }, "a list over the cap is left out");
-	assert.equal(sandbox({ type: "workspaceWrite", writableRoots: Array.from({ length: CODEX_MAX_WRITABLE_ROOTS }, (_, index) => `/r${index}`) }).writableRoots?.length, CODEX_MAX_WRITABLE_ROOTS);
-	assert.deepEqual(sandbox({ type: "workspaceWrite", writableRoots: [`/${"x".repeat(CODEX_PATH_MAX_CHARS)}`] }), { type: "workspaceWrite" }, "an over-long root drops the list");
-	assert.deepEqual(sandbox({ type: "workspaceWrite", excludeTmpdirEnvVar: "no", excludeSlashTmp: 0 }), { type: "workspaceWrite" }, "a flag that is not a boolean is unknown");
+	assert.deepEqual(sandbox({ type: "workspaceWrite", writableRoots: ["/a", "relative"], networkAccess: "yes", excludeSlashTmp: 0 }), { type: "workspaceWrite" });
+	assert.deepEqual(sandbox({ type: "externalSandbox", networkAccess: "restricted" }), { type: "externalSandbox" });
 	assert.equal(sandboxModeOf(sandbox({ type: "workspaceWrite", writableRoots: ["/a"] })), "workspace-write", "the mode comparison reads the tag alone");
 });
 
@@ -370,7 +361,7 @@ test("a valid stream: handshake, a host-default thread, an explicit-effort turn 
 		assert.ok(child.pid > 0);
 		assert.deepEqual(child.initialize, { codexHome: path.join(fixture.root, "codex-home"), platformFamily: "unix", platformOs: "linux", userAgent: "fake-codex/0.160.0" });
 		const thread = await within("thread/start", child.startThread({ sandbox: "workspace-write", approvalPolicy: "never", developerInstructions: CONTRACT }));
-		assert.deepEqual(thread, { threadId: "thr-1", model: "gpt-host-default", modelProvider: "openai", cwd: fixture.work, sandbox: { type: "workspaceWrite", networkAccess: false, writableRoots: [] }, reasoningEffort: null, approvalPolicy: "never" });
+		assert.deepEqual(thread, { threadId: "thr-1", model: "gpt-host-default", modelProvider: "openai", cwd: fixture.work, sandbox: { type: "workspaceWrite" }, reasoningEffort: null, approvalPolicy: "never" });
 		assert.equal(sandboxModeOf(thread.sandbox), "workspace-write");
 
 		const turn = await within("turn/start", child.startTurn({ threadId: thread.threadId, text: "do the task", effort: "high" }));
