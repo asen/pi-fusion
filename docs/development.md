@@ -37,6 +37,7 @@ fusion.ts                     host lifecycle and registration
 | `backends/claude.ts` | Claude SDK options, input/question bridges, stream loop; SDK concerns stay here |
 | `backends/pi-binding.ts` | Pure Pi role/model/effort binding, contracts, and tool/resource lists |
 | `backends/codex-binding.ts` | Pure Codex role/model/provider/effort binding, contracts and no-questions addendum, sandbox and approval policy; imports only `types.ts`, and no Codex backend is registered |
+| `backends/codex-launch.ts` | Pure Codex binary location (`PI_FUSION_CODEX_BIN` or first executable `codex` on `PATH`), app-server stdio launch options with the host's cwd and unchanged environment, and the expected cwd realpath and Codex home; starts nothing, POSIX only |
 | `backends/pi-storage.ts`, `pi-launch.ts` | Owned layout/catalog publication, call input, environment, launch options, and lazy host agent/package accessors |
 | `backends/pi-bootstrap.mjs` | Child-only public SDK construction, strict input/resource/session checks, in-memory settings, and native RPC serving |
 | `backends/pi-sdk-resolve.mjs`, `pi-bootstrap-protocol.mjs` | Child resolve preload; separately, import-free startup constants shared with transport |
