@@ -8,6 +8,7 @@ import { fileURLToPath } from "node:url";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { visibleWidth } from "@earendil-works/pi-tui";
 import { CARD_REPORT_LINES } from "../extensions/cards.ts";
+import { CODEX_CONTRACT_FILES, CODEX_MODES, CODEX_ROLE_NAMES, codexRole } from "../extensions/backends/codex-binding.ts";
 import { PI_CONTRACT_FILES, PI_ROLE_NAMES, piRole } from "../extensions/backends/pi-binding.ts";
 import { PI_CHILD_MARKER, PI_CHILD_VARIABLE } from "../extensions/backends/pi-launch.ts";
 import fusion from "../extensions/fusion.ts";
@@ -331,13 +332,15 @@ test("the claude tool keeps the exact schema it had: four roles, five efforts an
 	assert.deepEqual(properties.mode.enum, ["answer", "review"]);
 	assert.equal(properties.mode.type, "string");
 	assert.equal(properties.role.type, "string");
+	// Exactly the Claude levels, as a plain string enum: the compatibility tool runs on claude alone, so its schema is that grammar.
 	assert.deepEqual(properties.effort.enum, ["low", "medium", "high", "xhigh", "max"]);
+	assert.equal(properties.effort.type, "string");
 	assert.equal(properties.continue.type, "string");
 	assert.equal(properties.backend, undefined, "the compatibility tool advertises no backend at all");
 	assert.deepEqual(byName("claude").parameters.required, ["task"]);
 });
 
-test("the fusion tool advertises every role a backend runs, a backend and every backend's effort levels, all as plain string enums", () => {
+test("the fusion tool advertises every role a backend runs and a backend as plain string enums, and its effort as a string each backend checks", () => {
 	const properties = byName("fusion").parameters.properties;
 	assert.deepEqual(Object.keys(properties), ["role", "task", "continue", "context", "background", "fresh", "mode", "backend", "model", "effort"]);
 	assert.deepEqual(properties.role.enum, ["plan", "implement", "ultracode", "ask", "security"], "the primary tool advertises security, which runs on pi alone");
@@ -345,8 +348,13 @@ test("the fusion tool advertises every role a backend runs, a backend and every 
 	assert.match(properties.role.description, /^plan, implement, ultracode, ask or security\. Required unless continue is set\.$/);
 	assert.deepEqual(properties.backend.enum, ["claude", "pi", "codex"]);
 	assert.equal(properties.backend.type, "string");
-	assert.deepEqual(properties.effort.enum, ["off", "minimal", "low", "medium", "high", "xhigh", "max"]);
-	for (const level of ["low", "medium", "high", "xhigh", "max"]) assert.ok(properties.effort.enum.includes(level), `the claude tiers must stay in the union: ${level}`);
+	// No enum: a codex level is the model's own, so the schema cannot list it, and each backend's binding checks its own grammar.
+	assert.equal(properties.effort.type, "string");
+	assert.equal(properties.effort.enum, undefined, "the fusion effort is not an enum");
+	assert.equal(properties.effort.anyOf, undefined, "nor a union of literals");
+	for (const named of [/low, medium, high, xhigh or max/, /off, minimal, low, medium, high, xhigh or max/, /codex backend one level with no whitespace/, /codex model or server may still refuse/, /before anything starts/]) {
+		assert.match(properties.effort.description, named);
+	}
 	assert.deepEqual(properties.mode.enum, ["answer", "review"]);
 	assert.equal(properties.model.type, "string");
 	assert.deepEqual(byName("fusion").parameters.required, ["task"]);
@@ -611,7 +619,7 @@ test("the loader refuses a child, a missing contract and a missing bootstrap in 
 	assert.equal(source.split(MISSING_BOOTSTRAP).length - 1, 1, "the missing-bootstrap refusal must be written in exactly one place, or one of them can drift");
 });
 
-test("the load-time contract check covers every contract either backend's roles name, the pi-only one included", () => {
+test("the load-time contract check covers every contract any backend's roles name, the pi-only one and the codex addendum included", () => {
 	// What the loader adds to the claude roles' own contracts is the binding's own list, so a contract only a pi role
 	// names is checked at load for the same reason: it is a broken install whichever backend would have run it. The
 	// loader is read here rather than run with a file gone, as the order case above reads it.
@@ -621,11 +629,21 @@ test("the load-time contract check covers every contract either backend's roles 
 		assert.ok(PI_CONTRACT_FILES.includes(bound.contract), `the loader never checks the contract role ${role} runs under: ${bound.contract}`);
 	}
 	for (const name of PI_CONTRACT_FILES) assert.ok(fs.existsSync(path.join(repoRoot, "contracts", name)), `this install ships no contracts/${name}`);
+	// Codex names the shared contracts and one addendum of its own, which is checked at load like any other contract.
+	assert.deepEqual([...CODEX_CONTRACT_FILES].sort(), ["ask-answer.md", "ask-review.md", "codex-no-questions.md", "implement.md"]);
+	for (const role of CODEX_ROLE_NAMES) {
+		for (const mode of role === "ask" ? CODEX_MODES : [undefined]) {
+			const bound = codexRole({ role, ...(mode === undefined ? {} : { mode }) }, undefined, {} as NodeJS.ProcessEnv);
+			assert.ok(CODEX_CONTRACT_FILES.includes(bound.contract), `the loader never checks the contract role ${role} runs under on codex: ${bound.contract}`);
+			assert.ok(CODEX_CONTRACT_FILES.includes(bound.addendum), `the loader never checks the addendum role ${role} runs under on codex: ${bound.addendum}`);
+		}
+	}
+	for (const name of CODEX_CONTRACT_FILES) assert.ok(fs.existsSync(path.join(repoRoot, "contracts", name)), `this install ships no contracts/${name}`);
 	const source = fs.readFileSync(path.join(repoRoot, "extensions", "fusion.ts"), "utf8");
-	assert.ok(
-		source.includes("new Set([...Object.values(ROLES).map((role) => role.contract), ...Object.values(ASK_CONTRACTS), ...PI_CONTRACT_FILES])"),
-		"the load-time check no longer reads the pi bindings' own contracts beside the claude roles'",
-	);
+	const check = "new Set([...Object.values(ROLES).map((role) => role.contract), ...Object.values(ASK_CONTRACTS), ...PI_CONTRACT_FILES, ...CODEX_CONTRACT_FILES])";
+	assert.ok(source.includes(check), "the load-time check no longer reads the pi and codex bindings' own contracts beside the claude roles'");
+	// After the internal child's early return, so a pi child registers nothing before any contract is read.
+	assert.ok(source.indexOf('if (process.env.PI_FUSION_CHILD === "pi") return;') < source.indexOf(check), "the contract check is written before the internal child guard, which must return first");
 });
 
 test("the security contract scopes one investigation, says where the authorization to fix comes from, and fixes its sections", () => {

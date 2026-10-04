@@ -24,7 +24,7 @@ Disabled roles are not recommended and calls to them refuse. If a design questio
 
 ## Selecting a backend and model
 
-Unless you name overrides, the host leaves `backend`, `model`, and `effort` unset and uses the session's configured settings. Builtin routes enabled roles to Claude; security is assigned to Pi but remains disabled. Once enabled, a security call needs no `backend` because only Pi supports it. Ultracode is Claude-only. Codex supports `implement` and `ask` only; this build runs no Codex child, so a call named or configured for it is refused as unavailable before anything starts.
+Unless you name overrides, the host leaves `backend`, `model`, and `effort` unset and uses the session's configured settings. Builtin routes enabled roles to Claude; security is assigned to Pi but remains disabled. Once enabled, a security call needs no `backend` because only Pi supports it. Ultracode is Claude-only. Codex supports fresh `implement` and `ask` runs only; this build binds them but registers no Codex backend, so a call named or configured for it is refused as unavailable before anything starts. A Codex child cannot ask a question or take a steer, so guidance asks the host to settle every decision in the brief, expect a missing one under Escalation (`implement`), Open questions (`ask` answer) or Notes (`ask` review), and follow up with a new run carrying the report rather than `continue`.
 
 An explicit other-backend override uses that backend's captured legacy defaults, not the configured backend's model/effort. Pi requires an exact `provider/model-id` and guesses none. Unsupported role/backend combinations refuse before admission, once the enabled-role check permits routing.
 

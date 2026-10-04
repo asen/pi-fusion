@@ -13,7 +13,7 @@ import { memoryProfileStore, type ProfileStore } from "../extensions/profile-sto
 import { History, type HistoryRecord } from "../extensions/history.ts";
 import { type FakeBackend, fakeBackend, type FakeScript } from "./fake-pi-backend.ts";
 import { securityProfiles, toolList, turnOn } from "./host-tools.ts";
-import { codexTripwire, tripwireReaches, tripwires } from "./tripwire.ts";
+import { tripwireReaches, tripwires } from "./tripwire.ts";
 
 /**
  * The shared run lifecycle, driven end to end against backends injected in memory: the registered tools, the host
@@ -1967,38 +1967,92 @@ test("an ask reviewer configured on a backend this host did not register is refu
 	});
 });
 
-const NO_CODEX_BINDING = "cannot be bound for the codex backend: this build has no codex binding";
-
-test("a registered codex backend is still refused at its binding: a direct call and a configured one take no handle, session or run", async () => {
-	// The shared codex tripwire, named here although every host takes it: this case is about a registered codex backend
-	// that this build has no binding for, and each of its entry points records a reach and throws.
-	const claude = fakeBackend({ name: "claude" });
-	const host = makeHost({ backends: { claude: claude.backend, ...codexTripwire() }, profiles: profileWith({ implement: { enabled: true, backend: "codex" } }) });
-	assert.equal((await host.fusion({ role: "ask", task: "x", backend: "codex" })).error, `role ask ${NO_CODEX_BINDING}`, "a call naming codex is refused by the binding, not by availability");
-	assert.equal((await host.fusion({ role: "implement", task: "x" })).error, `role implement ${NO_CODEX_BINDING}`, "and so is a role the profile puts on codex");
-	assert.deepEqual(tripwireReaches("codex"), [], "no control, session or run was asked of the codex backend");
-	assert.deepEqual(claude.starts, [], "and no claude child stood in for it");
-	assert.deepEqual(host.entries(), [], "nothing was recorded");
-	assert.equal((await host.fusion({ role: "implement", task: "x", backend: "claude" })).error, undefined);
-	assert.equal(host.entries()[0]!.run, "run-1", "the refused calls took no handle");
+/**
+ * What an own in-memory codex double reports for a run that settled: its own thread, and the model and provider the
+ * child read back. The fake builds no codex identity of its own, so a case scripts the one a correct child reports.
+ */
+const codexScript = (thread: string, over: FakeScript = {}): FakeScript => ({
+	session: { backend: "codex", sessionId: thread },
+	selection: { model: "gpt-5.5", provider: "openai" },
+	extra: { modelId: "gpt-5.5" },
+	...over,
 });
 
-test("a manual review by an ask role configured on a registered codex backend is refused at its binding, and starts, records and links nothing", async () => {
+test("a codex role is bound before it reaches a registered codex backend, and the runtime gets the raw role with no host-default label in it", async () => {
+	// An own in-memory double over the shared codex tripwire: with a binding in place, a call that reaches a backend at all
+	// reaches this one, and nothing here is a production codex child.
+	const codex = fakeBackend({ name: "codex", scripts: [codexScript("thread-1"), codexScript("thread-2", { text: "## Answer\nyes" })] });
+	const claude = fakeBackend({ name: "claude" });
+	const host = makeHost({ backends: { claude: claude.backend, codex: codex.backend }, profiles: profileWith({ implement: { enabled: true, backend: "codex" } }) });
+	const done = await host.fusion({ role: "implement", task: "do the thing" });
+	assert.equal(done.error, undefined);
+	const runtime = codex.starts[0]!.role as unknown as Record<string, unknown>;
+	assert.deepEqual(runtime, { name: "implement", contract: "implement.md", addendum: "codex-no-questions.md", sandboxMode: "workspace-write", approvalPolicy: "never" });
+	assert.equal("model" in runtime, false, "the runtime is never handed the display label as a model");
+	assert.deepEqual(codex.starts[0]!.session, { kind: "new", intent: { kind: "new" } });
+	// The stats line names the host default and what the child reported it was, and the thread to reopen.
+	assert.match(done.text ?? "", /\[run-1 · implement · host default -> gpt-5\.5 · \d+s · 2 tool calls · in 10 out 5 · codex resume thread-1\]$/);
+	assert.equal(done.details.model, "host default -> gpt-5.5");
+	assert.match(await statusOf(host, "run-1"), /^run-1 · implement · host default -> gpt-5\.5 · done/);
+	// The record keeps the thread and the selection the child read back, and no label stands in for a model.
+	assert.deepEqual(host.entries()[0], { run: "run-1", role: "implement", backend: "codex", hostSessionId: "host-1", session: { backend: "codex", sessionId: "thread-1" }, selection: { model: "gpt-5.5", provider: "openai" } });
+	// A call naming codex and a model is bound with that model and shown on it alone.
+	const named = await host.fusion({ role: "ask", task: "a question", backend: "codex", model: "gpt-5-codex", effort: "high" });
+	assert.equal(named.error, undefined);
+	assert.deepEqual(codex.starts[1]!.role, { name: "ask", model: "gpt-5-codex", effort: "high", contract: "ask-answer.md", addendum: "codex-no-questions.md", mode: "answer", sandboxMode: "read-only", approvalPolicy: "never" });
+	assert.match(named.text ?? "", /\[run-2 · ask · gpt-5-codex · /);
+	assert.deepEqual(claude.starts, [], "no claude child stood in for codex");
+	assert.deepEqual(tripwireReaches("codex"), [], "the own double stood in for the tripwire, which nothing reached");
+});
+
+test("the registered fusion tool hands an effort only codex takes to the codex backend, named or configured, and claude and pi refuse it before starting", async () => {
+	await withEnv(piEnv(), async () => {
+		// Own in-memory doubles spread over the shared tripwires by the host: no production backend and no process.
+		const codex = fakeBackend({ name: "codex", scripts: [codexScript("thread-1"), codexScript("thread-2")] });
+		const pi = fakeBackend();
+		const claude = fakeBackend({ name: "claude" });
+		const host = makeHost({ backends: { ...both(pi, claude), codex: codex.backend }, profiles: profileWith({ ask: { enabled: true, backend: "codex" } }) });
+		const named = await host.fusion({ role: "implement", task: "x", backend: "codex", effort: "ultra" });
+		assert.equal(named.error, undefined);
+		assert.equal(codex.starts[0]!.role.effort, "ultra", "the call's level reached the codex backend as written");
+		const configured = await host.fusion({ role: "ask", task: "a question", effort: "ultra" });
+		assert.equal(configured.error, undefined);
+		assert.deepEqual([codex.starts[1]!.role.name, codex.starts[1]!.role.effort], ["ask", "ultra"], "a role configured on codex takes it with no backend parameter");
+		assert.equal((await host.fusion({ role: "implement", task: "x", effort: "ultra" })).error, "unknown effort ultra; use one of low, medium, high, xhigh, max");
+		assert.equal((await host.claude({ role: "implement", task: "x", effort: "ultra" })).error, "unknown effort ultra; use one of low, medium, high, xhigh, max");
+		assert.equal(
+			(await host.fusion({ role: "implement", task: "x", backend: "pi", effort: "ultra" })).error,
+			'the call names effort "ultra", which is not a pi thinking level; use one of off, minimal, low, medium, high, xhigh, max',
+		);
+		assert.match((await host.fusion({ role: "implement", task: "x", backend: "codex", effort: "very high" })).error ?? "", /^the call names effort "very high", which is not a codex effort/);
+		assert.equal(codex.starts.length, 2, "the refused calls started nothing");
+		assert.deepEqual([pi.starts.length, claude.starts.length], [0, 0]);
+		assert.equal(host.entries().length, 2, "and recorded nothing");
+		assert.deepEqual(tripwireReaches("codex"), []);
+		assert.deepEqual(tripwireReaches("pi"), []);
+	});
+});
+
+test("a manual review by an ask role configured on codex is bound read-only on it, and inherits nothing from the reviewed run", async () => {
 	const dir = gitRepo("security-review-codex");
 	await withEnv(securityEnv(), async () => {
 		const pi = fakeBackend({ scripts: [{ pending: true }, {}] });
 		const claude = fakeBackend({ name: "claude" });
-		const host = makeSecurityHost({ backends: { ...both(pi, claude), ...codexTripwire() }, cwd: dir, profiles: profileWith({ ask: { enabled: true, backend: "codex" } }) });
+		const codex = fakeBackend({ name: "codex", scripts: [codexScript("thread-1", { text: "## Verdict\nReady" })] });
+		const host = makeSecurityHost({ backends: { ...both(pi, claude), codex: codex.backend }, cwd: dir, profiles: profileWith({ ask: { enabled: true, backend: "codex" } }) });
 		const done = await runThatChanged(host, pi, dir, { role: "security", task: "audit the token check" });
 		assert.equal(done.error, undefined);
 		host.notices.length = 0;
 		await host.command("review run-1");
-		assert.deepEqual(host.notices, [`run-2 would review run-1, and its reviewer could not be bound: role ask ${NO_CODEX_BINDING}`]);
-		assert.deepEqual(tripwireReaches("codex"), [], "no control, session or run was asked of the codex backend");
-		assert.equal(pi.starts.length, 1, "no reviewer was started");
+		assert.deepEqual(host.notices, ["run-2 reviews run-1 in the background; its report arrives as a message"]);
+		const reviewer = await codex.started();
+		assert.deepEqual(reviewer.role, { name: "ask", contract: "ask-review.md", addendum: "codex-no-questions.md", mode: "review", sandboxMode: "read-only", approvalPolicy: "never" }, "the reviewer is the configured codex ask role, not the security run's model");
+		assert.deepEqual(reviewer.session, { kind: "new", intent: { kind: "new" } }, "nobody briefed the reviewer: it is a thread of its own");
+		await ended(host, "run-2");
+		assert.equal(pi.starts.length, 1, "no pi child reviewed it");
 		assert.deepEqual(claude.starts, [], "and no claude child stood in for it");
-		assert.equal(host.entries().length, 1, "nothing was recorded for a handle nothing took");
-		assert.equal((await host.control({ action: "status", run: "run-1" })).details.reviewedBy, undefined, "and the source is linked to no review");
+		assert.equal((await host.control({ action: "status", run: "run-1" })).details.reviewedBy, "run-2");
+		assert.deepEqual(tripwireReaches("codex"), []);
 	});
 });
 

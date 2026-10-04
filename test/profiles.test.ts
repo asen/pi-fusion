@@ -627,6 +627,30 @@ test("mixed-profile guidance recommends each role's configured backend", async (
 	}
 });
 
+test("roles configured on codex are described as fresh runs that cannot ask or be steered, in each tool's own name", async () => {
+	const codexRoles = settings({ implement: { enabled: true, backend: "codex" }, ask: { enabled: true, backend: "codex", model: "gpt-5-codex", effort: "high" } });
+	const host = sdkHost({ profiles: memoryProfileStore(document({ work: codexRoles }, "work")) });
+	await host.start();
+	const fusionGuidance = host.tools.get("fusion")!.promptGuidelines!;
+	const codexLine = fusionGuidance.find((guideline) => guideline.startsWith("Role implement and role ask run on codex"));
+	assert.ok(codexLine, "the fusion guidance does not say what a codex run is");
+	assert.match(codexLine, /cannot ask you a question and takes no message while it runs/);
+	assert.match(codexLine, /under Escalation for role implement, Open questions for role ask and Notes for role ask with mode review\./, "a review report has no Open questions section, so its missing decision goes under Notes");
+	assert.match(codexLine, /with a new fusion run that carries its report as context, not with continue/);
+	assert.doesNotMatch(codexLine, /\bclaude\b/);
+	const claudeGuidance = host.tools.get("claude")!.promptGuidelines!;
+	assert.ok(claudeGuidance.some((guideline) => /^This session routes role implement, role ask to codex\. Use fusion for these roles/.test(guideline)));
+	assert.ok(claudeGuidance.some((guideline) => guideline.startsWith("Role implement and role ask run on codex in this session, which fusion runs and claude does not.")));
+	const description = host.tools.get("fusion")!.description;
+	assert.match(description, /implement runs on codex with the host's default codex model; .*ask runs on codex with model gpt-5-codex at effort high/);
+	assert.match(description, /backend codex names implement, in a workspace-write sandbox, and ask, read-only, as fresh runs/);
+	assert.match(description, /A codex child gets no ask_orchestrator and takes no message while it runs/);
+	assert.match(description, /This build registers no codex backend, so a call routed to codex is refused as unavailable before anything starts\./);
+	// A builtin session routes nothing to codex, so neither tool carries the line.
+	await host.command("profile use builtin");
+	for (const tool of ["fusion", "claude"]) assert.ok(!host.tools.get(tool)!.promptGuidelines!.some((guideline) => / on codex in this session/.test(guideline)), tool);
+});
+
 test("a broken profiles file or a missing default leaves the built-in configuration and a warning, and rewrites nothing", async () => {
 	const broken = memoryProfileStore("{ nope");
 	const host = sdkHost({ profiles: broken });
@@ -845,9 +869,17 @@ test("the editor puts a role on codex with the host's defaults, offers codex lev
 			"gpt-5-codex",
 			"effort: host default",
 			(options) => {
-				assert.deepEqual(options, ["low", "medium", "high", "xhigh", "host default"]);
+				assert.deepEqual(options, ["low", "medium", "high", "xhigh", "Type a codex effort…", "host default"], "the levels are suggestions, so one can be typed");
 				return "xhigh";
 			},
+			// A typed level with whitespace in it is refused and the effort stays as it was.
+			"effort: xhigh",
+			"Type a codex effort…",
+			"very high",
+			// A single token the suggestions do not list is the model's own to take or refuse, so the editor keeps it.
+			"effort: xhigh",
+			"Type a codex effort…",
+			"none",
 			"Back",
 			"Apply",
 		],
@@ -855,8 +887,33 @@ test("the editor puts a role on codex with the host's defaults, offers codex lev
 	await host.start();
 	await host.command("config");
 	assert.ok(host.notices.some(([text]) => text === "gpt 5 has whitespace in it, which no codex model id has; the model is unchanged"));
+	assert.ok(host.notices.some(([text]) => text === "very high has whitespace in it, which no codex effort has; the effort is unchanged"));
 	assert.equal(host.last(), "fusion settings applied to this session; disabled: security; save them with /fusion profile save <name>");
-	assert.match(host.tools.get("fusion")!.description, /implement runs on codex with model gpt-5-codex at effort xhigh/);
+	assert.match(host.tools.get("fusion")!.description, /implement runs on codex with model gpt-5-codex at effort none/);
+});
+
+test("the editor takes a codex role back to the host's defaults, and the table and description say so", async () => {
+	const roles = builtinSettings(captureBaseline({} as NodeJS.ProcessEnv));
+	roles.ask = { enabled: true, backend: "codex", model: "gpt-5-codex", effort: "high" };
+	const host = sdkHost({
+		profiles: memoryProfileStore(serializeDocument({ version: 1, defaultProfile: "codex", profiles: { codex: roles } })),
+		dialogs: [
+			(options) => options.find((option) => option.startsWith("ask ")),
+			"model: gpt-5-codex",
+			"Host default",
+			"effort: high",
+			"host default",
+			(options) => {
+				assert.deepEqual(options.slice(2, 4), ["model: host default", "effort: host default"], "neither field holds the label as a value");
+				return "Back";
+			},
+			"Apply",
+		],
+	});
+	await host.start();
+	await host.command("config");
+	assert.equal(host.last(), "fusion settings applied to this session; disabled: security; save them with /fusion profile save <name>");
+	assert.match(host.tools.get("fusion")!.description, /ask runs on codex with the host's default codex model;/);
 });
 
 test("an empty answer changes nothing, and a backend changed and changed back starts from that backend's own defaults", async () => {

@@ -328,7 +328,12 @@ export interface Backend<TRole, TSession, TControl extends ChildControl = ChildC
  */
 export interface HostRole {
 	name: string;
-	model: string;
+	/**
+	 * The model the role names. Claude and Pi roles always name one. A Codex role that names none runs on the host's own
+	 * Codex default, and leaves this unset rather than carrying a placeholder a runtime could mistake for a model id:
+	 * how such a role is shown is the host's presentation, never this field.
+	 */
+	model?: string;
 	/** The effort the role runs at, when it names one: a Pi role that names none leaves the child its own default. */
 	effort?: string;
 	contract: string;

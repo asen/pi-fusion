@@ -314,7 +314,7 @@ function child(
 					: { ...ref, checkpoint };
 	const selection =
 		script.selection === undefined
-			? backend.name === "pi"
+			? backend.name === "pi" && role.model !== undefined
 				? { model: role.model, effort: (role as HostRole & { effort?: string }).effort ?? backend.defaultEffort }
 				: undefined
 			: (script.selection ?? undefined);

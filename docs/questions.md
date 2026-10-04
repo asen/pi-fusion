@@ -1,6 +1,6 @@
 # Questions a child asks
 
-Every delegated child gets `ask_orchestrator(question)`. It asks for a small decision missing from its brief, such as a name or choice between options. The tool call stays open, retaining the child's context, until an answer arrives. Wider scope or an unresolved design decision instead belongs in an implementer's **Escalation** report, which ends the run.
+Every delegated Claude or Pi child gets `ask_orchestrator(question)`; a Codex child gets none ([below](#on-codex)). It asks for a small decision missing from its brief, such as a name or choice between options. The tool call stays open, retaining the child's context, until an answer arrives. Wider scope or an unresolved design decision instead belongs in an implementer's **Escalation** report, which ends the run.
 
 ```text
 child asks -> run waiting -> host or user supplies one answer
@@ -53,3 +53,7 @@ Native UI requests contain no extension-origin identity. While questions are ena
 A Pi dialog outcome other than an admitted answer is fatal: the run stops its child and reports fixed wording with the dialog end/admission, not the question, answer, or foreign error. A cancelled run remains cancellation—cancellation outranks a simultaneous fatal question—and the recorded dialog outcome remains evidence beside it.
 
 Manual Linux cases have measured an answered native question with a steer admitted while held, and a question held into cancellation, using a scripted loopback model. They do not qualify real providers or every version/platform. See [Pi backend evidence](pi-backend.md#evidence-and-limits); the default suite's routing doubles prove host arbitration, not native dialogs.
+
+## On Codex
+
+A Codex child has no question tool and takes no steer: nothing is sent to it while it runs. Its role contract is followed by `contracts/codex-no-questions.md`, which tells it to stop when it cannot go on without a decision and report the question, its options, and its recommendation under **Escalation** (`implement`), **Open questions** (`ask` answer), or **Notes** (`ask` review). The host's guidance asks for briefs that settle every decision and for follow-ups as new runs carrying the report, not continuations. This build binds Codex roles but registers no Codex backend, so no Codex child runs yet.

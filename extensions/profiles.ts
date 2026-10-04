@@ -1,3 +1,4 @@
+import { CODEX_HOST_DEFAULT } from "./backends/codex-binding.ts";
 import { type BackendName, isBackendName, isCodexToken, isPiModel, PI_EFFORTS } from "./backends/types.ts";
 import { KNOWN_ROLE_NAMES, type KnownRoleName, ROLE_SPECS } from "./roles.ts";
 
@@ -244,10 +245,10 @@ export function serializeDocument(document: ProfileDocument): string {
 
 /** The effort a role's setting runs at, as a person reads it: ultracode's fixed one, or what the setting names. */
 export const effortShown = (role: KnownRoleName, setting: RoleSetting): string =>
-	role === "ultracode" ? `${ULTRACODE_EFFORT} (fixed)` : (setting.effort ?? (setting.backend === "pi" ? "child default" : setting.backend === "codex" ? "host default" : "none"));
+	role === "ultracode" ? `${ULTRACODE_EFFORT} (fixed)` : (setting.effort ?? (setting.backend === "pi" ? "child default" : setting.backend === "codex" ? CODEX_HOST_DEFAULT : "none"));
 
 /** The model a role's setting runs on, as a person reads it: a Codex role that names none takes the host's own default. */
-export const modelShown = (setting: RoleSetting): string => setting.model ?? (setting.backend === "codex" ? "host default" : "unconfigured");
+export const modelShown = (setting: RoleSetting): string => setting.model ?? (setting.backend === "codex" ? CODEX_HOST_DEFAULT : "unconfigured");
 
 /** One line per role, in columns: what `/fusion config` shows and what the editor offers to change. */
 export function settingsTable(settings: RoleSettings): string[] {

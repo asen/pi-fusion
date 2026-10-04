@@ -15,9 +15,9 @@ The host calls `fusion` with a task; optional parameters select how it runs. `cl
 | `background` | `true` returns a handle immediately; the report arrives later. Available for every role. |
 | `fresh` | `plan` only: start a new plan instead of implicitly continuing. Cannot accompany `continue`. |
 | `mode` | `ask` only: `answer` (default) or `review`, choosing the corresponding contract. A continuation keeps its mode unless overridden. |
-| `model` | Override a model: Claude alias/id for `plan`, `implement`, or `ask`; `provider/model-id` for every Pi role. `ultracode` rejects it. |
-| `effort` | Claude `low`, `medium`, `high`, `xhigh`, or `max` for `plan`, `implement`, or `ask`; Pi also accepts `off` and `minimal`. Optional on Pi; fixed for `ultracode`, which rejects the parameter. |
-| `backend` | `fusion` only: `claude`, `pi`, or `codex`. Codex supports `implement`/`ask` and is refused as unavailable in this build. Fresh calls otherwise use role settings; continuations cannot change backend. |
+| `model` | Override a model: Claude alias/id for `plan`, `implement`, or `ask`; `provider/model-id` for every Pi role; a Codex model id without whitespace for `implement` or `ask`. `ultracode` rejects it. |
+| `effort` | Claude `low`, `medium`, `high`, `xhigh`, or `max` for `plan`, `implement`, or `ask`; Pi also accepts `off` and `minimal`; Codex any single level without whitespace for `implement` or `ask`. `fusion` advertises it as a plain string and the routed backend's binding checks it before admission; `claude` keeps the Claude enum. A Codex level passes the binding lexically, and the model or server may still refuse it when the run starts. Optional on Pi and Codex; fixed for `ultracode`, which rejects the parameter. |
+| `backend` | `fusion` only: `claude`, `pi`, or `codex`. Codex binds `implement`/`ask` (no `fresh`, `mode` for `ask` only) but registers no backend in this build, so a call routed there is refused as unavailable. Fresh calls otherwise use role settings; continuations cannot change backend. |
 
 A role that does not accept a supplied parameter refuses it before starting a child. Disabled roles refuse new runs and continuations, including calls supplying their own model/backend. Security must be enabled separately through [settings](profiles.md); a model does not enable it.
 
@@ -34,7 +34,9 @@ Both backends run in the host's working directory with the role contract appende
 | `ultracode` | Claude's own tools, Workflow, Agent, and the user's MCP servers | Unsupported |
 | Enabled `security` | Unsupported | Same as Pi implement |
 
-Every child also gets [ask_orchestrator](questions.md). Fixed-tool Claude roles use `bypassPermissions` and strict MCP configuration with only that question server. Fusion leaves Claude's normal settings/plugin/CLAUDE.md loading in place; ultracode's permission mode is [configurable](ultracode.md). Pi instead uses in-memory settings and explicit resources; see [its lifecycle](pi-backend.md#one-calls-lifecycle).
+A Codex role is bound with a sandbox instead of a tool list: `implement` in `workspace-write`, `ask` (both modes) in `read-only`, with approval policy `never`. This build registers no Codex backend, so no Codex child runs yet.
+
+Every Claude and Pi child also gets [ask_orchestrator](questions.md); a Codex child does not. Fixed-tool Claude roles use `bypassPermissions` and strict MCP configuration with only that question server. Fusion leaves Claude's normal settings/plugin/CLAUDE.md loading in place; ultracode's permission mode is [configurable](ultracode.md). Pi instead uses in-memory settings and explicit resources; see [its lifecycle](pi-backend.md#one-calls-lifecycle).
 
 Contracts restrict scope and ask's file changes, but a shell tool can still write files. These lists are not an operating-system permission boundary.
 
@@ -78,7 +80,7 @@ A host fork copies no child immediately. On first use, Claude resumes with `--fo
 
 Older Claude records missing model/effort use the legacy defaults captured when this extension instance loaded, **not** the current profile, and the result says so. A Claude entry without a checkpoint resumes the whole session. Very old plan entries under `consolidator` keys with generation `g` read as handle `run-<g+1>`.
 
-Unknown backend tags, mixed/incomplete session formats, and Pi or Codex records without a trusted checkpoint or repeatable selection are kept for reading, not guessed into a continuation. A Codex record is read only from its tagged thread reference and its selection only with a provider; flat Claude ids, checkpoints, models, or a Pi session file in a Codex entry refuse it. This build has no Codex binding, so even a continuable Codex record is refused as unavailable. A refused latest plan stops implicit continuation; Fusion does not walk back to an older usable plan or hand off to escape the refusal.
+Unknown backend tags, mixed/incomplete session formats, and Pi or Codex records without a trusted checkpoint or repeatable selection are kept for reading, not guessed into a continuation. A Codex record is read only from its tagged thread reference and its selection only with a provider; flat Claude ids, checkpoints, models, or a Pi session file in a Codex entry refuse it. This build binds a continuable Codex record to its recorded model and provider but registers no Codex backend, so the call is still refused as unavailable. A refused latest plan stops implicit continuation; Fusion does not walk back to an older usable plan or hand off to escape the refusal.
 
 ### Recovery policy
 

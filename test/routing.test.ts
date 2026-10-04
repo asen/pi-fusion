@@ -5,10 +5,11 @@ import * as path from "node:path";
 import test, { after } from "node:test";
 import { fileURLToPath } from "node:url";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { CODEX_HOST_DEFAULT, codexRole } from "../extensions/backends/codex-binding.ts";
 import { type PiRole, piModelVariable, piRole } from "../extensions/backends/pi-binding.ts";
 import type { Backend, BackendName, ChildControl, ChildRun, HostBackend, PiSessionRef, ResolvedSelection, SessionIntent } from "../extensions/backends/types.ts";
 import { hostBackend } from "../extensions/backends/types.ts";
-import fusion, { builtinConfiguration, claudeCall, claudeRoute, type FusionParams, fusionCall, fusionRoute, ROLE_NAMES, roleFor, type RunRecords, runRecords } from "../extensions/fusion.ts";
+import fusion, { builtinConfiguration, claudeCall, claudeRoute, type FusionParams, fusionCall, fusionRoute, modelText, ROLE_NAMES, roleFor, type RunRecords, runRecords } from "../extensions/fusion.ts";
 import { KNOWN_ROLE_NAMES, roleSpec } from "../extensions/roles.ts";
 import { History } from "../extensions/history.ts";
 import { memoryProfileStore, type ProfileStore } from "../extensions/profile-store.ts";
@@ -766,14 +767,75 @@ test("a backend a host left out is refused without asking the user to configure 
 	assert.deepEqual(ext.appended, [], "a refused call records nothing");
 });
 
-test("codex runs implement and ask alone, and a route to it binds no role in this build", () => {
-	const route = fusionRoute({ role: "implement", task: "x", backend: "codex" }, records());
+/** A configuration over no variables at all, so a codex binding test never depends on what this process has set. */
+const bareConfiguration = () => builtinConfiguration(captureBaseline({} as NodeJS.ProcessEnv));
+
+/** What every codex role carries beside its selection, by role and mode. */
+const CODEX_IMPLEMENT = { name: "implement", contract: "implement.md", addendum: "codex-no-questions.md", sandboxMode: "workspace-write", approvalPolicy: "never" };
+const codexAsk = (mode: "answer" | "review") => ({ name: "ask", contract: `ask-${mode}.md`, addendum: "codex-no-questions.md", mode, sandboxMode: "read-only", approvalPolicy: "never" });
+
+test("codex runs implement and ask alone, and its route binds each role with the parameters it takes and refuses the rest", () => {
+	const config = bareConfiguration();
+	const route = fusionRoute({ role: "implement", task: "x", backend: "codex" }, records(), 35, config);
 	assert.deepEqual([route.backend, route.role, route.handle], ["codex", "implement", "run-1"]);
-	assert.deepEqual(fusionRoute({ role: "ask", task: "x", backend: "codex", mode: "review" }, records()).call.mode, "review");
-	assert.throws(() => fusionRoute({ role: "ask", task: "x", backend: "codex", mode: "summary" }, records()), /^Error: unknown mode summary; use one of answer, review$/);
-	assert.throws(() => fusionRoute({ role: "plan", task: "x", backend: "codex" }, records()), /^Error: role plan does not run on the codex backend; use one of claude, pi$/);
-	assert.throws(() => fusionRoute({ role: "ultracode", task: "x", backend: "codex" }, records()), /^Error: role ultracode does not run on the codex backend; use one of claude$/);
-	assert.throws(() => fusionCall({ role: "implement", task: "x", backend: "codex" }, records()), /^Error: role implement cannot be bound for the codex backend: this build has no codex binding$/);
+	// Nothing names a model, so none is bound: the role carries no model field at all, and the host default is a display.
+	const bound = fusionCall({ role: "implement", task: "x", backend: "codex" }, records(), 35, config).bound;
+	assert.deepEqual(bound, CODEX_IMPLEMENT);
+	assert.equal("model" in bound, false, "the host-default label is never handed to a runtime as a model");
+	assert.deepEqual(fusionCall({ role: "ask", task: "x", backend: "codex" }, records(), 35, config).bound, codexAsk("answer"));
+	assert.deepEqual(fusionCall({ role: "ask", task: "x", backend: "codex", mode: "review" }, records(), 35, config).bound, codexAsk("review"));
+	assert.throws(() => fusionRoute({ role: "ask", task: "x", backend: "codex", mode: "summary" }, records(), 35, config), /^Error: unknown mode summary; use one of answer, review$/);
+	assert.throws(() => fusionRoute({ role: "implement", task: "x", backend: "codex", mode: "review" }, records(), 35, config), /^Error: mode is not allowed for role implement on the codex backend$/);
+	// fresh is a plan call's alone, and no plan runs on codex, so no codex call takes it, false included.
+	for (const fresh of [true, false]) {
+		assert.throws(() => fusionRoute({ role: "implement", task: "x", backend: "codex", fresh }, records(), 35, config), /^Error: fresh is not allowed for role implement on the codex backend$/);
+		assert.throws(() => fusionRoute({ role: "ask", task: "x", backend: "codex", fresh }, records(), 35, config), /^Error: fresh is not allowed for role ask on the codex backend$/);
+	}
+	assert.throws(() => fusionRoute({ role: "plan", task: "x", backend: "codex" }, records(), 35, config), /^Error: role plan does not run on the codex backend; use one of claude, pi$/);
+	assert.throws(() => fusionRoute({ role: "ultracode", task: "x", backend: "codex" }, records(), 35, config), /^Error: role ultracode does not run on the codex backend; use one of claude$/);
+	const security = bareConfiguration();
+	security.roles.security.enabled = true;
+	assert.throws(() => fusionRoute({ role: "security", task: "x", backend: "codex" }, records(), 35, security), /^Error: role security does not run on the codex backend; use one of pi$/);
+});
+
+test("a run is shown on the model its role names, and a codex role that names none on the host default and then on what the child reported", () => {
+	const codex = codexRole({ role: "implement" }, undefined, {} as NodeJS.ProcessEnv);
+	assert.equal(CODEX_HOST_DEFAULT, "host default");
+	assert.equal(modelText(codex), "host default");
+	assert.equal(modelText(codex, "gpt-5.5"), "host default -> gpt-5.5");
+	// A role that names its model is shown on it, whatever the child reported: Claude's and Pi's lines are unchanged.
+	assert.equal(modelText(codexRole({ role: "implement", model: "gpt-5-codex" }, undefined, {} as NodeJS.ProcessEnv), "gpt-5.5"), "gpt-5-codex");
+	assert.equal(modelText(roleFor({ role: "implement", task: "x" }, { model: "opus", effort: "high" }), "claude-opus-5[1m]"), "opus");
+	assert.equal(modelText(piRole({ role: "implement" }, undefined, piEnv()), "deepseek-chat"), "deepseek/deepseek-chat");
+});
+
+test("a fresh codex call takes the call's model and effort, then the session's configuration, then the variables this instance started with, and refuses what no codex value can be", () => {
+	// A profile that puts the role on codex, so the configured values are the profile's and a refusal names it.
+	const profile = bareConfiguration();
+	profile.profile = "work";
+	profile.roles.implement = { enabled: true, backend: "codex", model: "gpt-5-codex", effort: "high" };
+	assert.deepEqual(fusionCall({ role: "implement", task: "x" }, records(), 35, profile).bound, { ...CODEX_IMPLEMENT, model: "gpt-5-codex", effort: "high" });
+	assert.deepEqual(fusionCall({ role: "implement", task: "x", model: " o3 ", effort: "low" }, records(), 35, profile).bound, { ...CODEX_IMPLEMENT, model: "o3", effort: "low" }, "the call's own fields win, trimmed");
+	// The effort is optional on its own: a model with no level leaves the level to the host.
+	profile.roles.implement = { enabled: true, backend: "codex", model: "gpt-5-codex" };
+	assert.deepEqual(fusionCall({ role: "implement", task: "x" }, records(), 35, profile).bound, { ...CODEX_IMPLEMENT, model: "gpt-5-codex" });
+	// A configuration that was never checked by the profile grammar is still refused by the binding, which names where it came from.
+	profile.roles.implement = { enabled: true, backend: "codex", model: "gpt 5", effort: "very high" };
+	assert.throws(() => fusionCall({ role: "implement", task: "x" }, records(), 35, profile), /^Error: profile work names model "gpt 5", which is not a codex model: name one model id with no whitespace in it, or leave it unset for the host default$/);
+	assert.throws(() => fusionCall({ role: "implement", task: "x", model: "gpt-5-codex" }, records(), 35, profile), /^Error: profile work names effort "very high", which is not a codex effort: name one level with no whitespace in it, or leave it unset for the host default$/);
+	// A call that names the other backend than the configured one runs on the variables this instance captured, and a
+	// refusal names the variable.
+	const captured = builtinConfiguration(captureBaseline({ PI_FUSION_CODEX_IMPLEMENT_MODEL: "gpt-5-codex", PI_FUSION_CODEX_IMPLEMENT_EFFORT: "medium", PI_FUSION_CODEX_ASK_MODEL: "o 3" } as NodeJS.ProcessEnv));
+	assert.deepEqual(fusionCall({ role: "implement", task: "x", backend: "codex" }, records(), 35, captured).bound, { ...CODEX_IMPLEMENT, model: "gpt-5-codex", effort: "medium" });
+	assert.throws(() => fusionCall({ role: "ask", task: "x", backend: "codex" }, records(), 35, captured), /^Error: PI_FUSION_CODEX_ASK_MODEL names model "o 3", which is not a codex model/);
+	// The call's own blank or spaced value is refused, never replaced by the configured one.
+	for (const blank of ["", " "]) {
+		assert.throws(() => fusionCall({ role: "implement", task: "x", backend: "codex", model: blank }, records(), 35, captured), /^Error: the call names an empty model for the codex backend/, JSON.stringify(blank));
+		assert.throws(() => fusionCall({ role: "implement", task: "x", backend: "codex", effort: blank }, records(), 35, captured), /^Error: the call names an empty effort for the codex backend/, JSON.stringify(blank));
+	}
+	assert.throws(() => fusionCall({ role: "implement", task: "x", backend: "codex", model: "gpt 5" }, records(), 35, captured), /^Error: the call names model "gpt 5", which is not a codex model/);
+	// A fresh codex call has no provider to name and none is invented.
+	assert.equal("provider" in fusionCall({ role: "implement", task: "x", backend: "codex" }, records(), 35, captured).bound, false);
 });
 
 test("a codex call goes nowhere in this build: named or configured, it is refused as unavailable before anything starts", async () => {
@@ -848,18 +910,59 @@ test("the claude tool refuses to continue a pi run and names the tool that can",
 	assert.deepEqual(ext.appended, []);
 });
 
-test("a codex run is continued through fusion alone, and its route stops at the missing binding before any backend is asked", async () => {
+test("an effort only codex takes is accepted on codex, named or configured, while claude and pi refuse it and every backend refuses whitespace", () => {
+	const config = bareConfiguration();
+	// Named on the call: the codex binding takes any single token, and which levels a model has is the child's check.
+	assert.equal(fusionCall({ role: "implement", task: "x", backend: "codex", effort: "ultra" }, records(), 35, config).bound.effort, "ultra");
+	assert.equal(fusionCall({ role: "ask", task: "x", backend: "codex", mode: "review", effort: "ultra" }, records(), 35, config).bound.effort, "ultra");
+	// Configured: a profile that puts the role on codex takes the same level with no backend parameter at all.
+	const profile = bareConfiguration();
+	profile.profile = "work";
+	profile.roles.implement = { enabled: true, backend: "codex" };
+	const configured = fusionCall({ role: "implement", task: "x", effort: "ultra" }, records(), 35, profile);
+	assert.deepEqual([configured.backend, configured.bound.effort], ["codex", "ultra"]);
+	// The same token is not a claude level and not a pi thinking level, and neither grammar changed to take it.
+	assert.throws(() => fusionCall({ role: "implement", task: "x", backend: "claude", effort: "ultra" }, records(), 35, config), /^Error: unknown effort ultra; use one of low, medium, high, xhigh, max$/);
+	assert.throws(() => fusionCall({ role: "implement", task: "x", effort: "ultra" }, records(), 35, config), /^Error: unknown effort ultra; use one of low, medium, high, xhigh, max$/, "the configured claude route refuses it the same way");
+	assert.throws(
+		() => fusionCall({ role: "implement", task: "x", backend: "pi", model: "deepseek/deepseek-chat", effort: "ultra" }, records(), 35, config),
+		/^Error: the call names effort "ultra", which is not a pi thinking level; use one of off, minimal, low, medium, high, xhigh, max$/,
+	);
+	// A level with whitespace in it is refused by every backend.
+	assert.throws(() => fusionCall({ role: "implement", task: "x", backend: "claude", effort: "very high" }, records(), 35, config), /^Error: unknown effort very high; use one of low, medium, high, xhigh, max$/);
+	assert.throws(() => fusionCall({ role: "implement", task: "x", backend: "pi", model: "deepseek/deepseek-chat", effort: "very high" }, records(), 35, config), /^Error: the call names effort "very high", which is not a pi thinking level/);
+	assert.throws(() => fusionCall({ role: "implement", task: "x", backend: "codex", effort: "very high" }, records(), 35, config), /^Error: the call names effort "very high", which is not a codex effort: name one level with no whitespace in it, or leave it unset for the host default$/);
+	assert.throws(() => fusionCall({ role: "implement", task: "x", effort: "very\thigh" }, records(), 35, profile), /^Error: the call names effort "very\\thigh", which is not a codex effort/);
+	// A continuation that overrides the model and names a codex-only level keeps the provider its thread recorded.
+	const continued = fusionCall({ continue: "run-1", task: "x", model: "o3", effort: "ultra" }, runRecords([entry(codexEntry())]), 35, config);
+	assert.deepEqual(continued.bound, { ...CODEX_IMPLEMENT, model: "o3", provider: "openai", effort: "ultra" });
+});
+
+test("a codex run is continued through fusion alone, on the selection and provider it recorded, and goes nowhere while no codex backend is registered", async () => {
 	const records = runRecords([entry(codexEntry())]);
 	const route = fusionRoute({ continue: "run-1", task: "x" }, records);
 	assert.deepEqual([route.backend, route.role, route.handle, route.record?.session], ["codex", "implement", "run-1", CODEX_REF]);
 	assert.deepEqual(route.defaults, {}, "a codex continuation takes no configured or legacy defaults");
 	assert.throws(() => fusionRoute({ continue: "run-1", task: "x", backend: "claude" }, records), /^Error: run-1 ran on the codex backend; omit backend or use codex$/);
-	assert.throws(() => fusionCall({ continue: "run-1", task: "x" }, records), /^Error: role implement cannot be bound for the codex backend: this build has no codex binding$/);
+	// The binding repeats the recorded model and provider, and a configuration that changed since is not read.
+	const config = bareConfiguration();
+	config.profile = "work";
+	config.roles.implement = { enabled: true, backend: "codex", model: "o3", effort: "low" };
+	assert.deepEqual(fusionCall({ continue: "run-1", task: "x" }, records, 35, config).bound, { ...CODEX_IMPLEMENT, model: "gpt-5-codex", provider: "openai" });
+	// A permitted override wins for its field, and the thread's provider stays: the call has no field to name another.
+	assert.deepEqual(fusionCall({ continue: "run-1", task: "x", model: "o3", effort: "high" }, records, 35, config).bound, { ...CODEX_IMPLEMENT, model: "o3", provider: "openai", effort: "high" });
+	const withEffort = runRecords([entry(codexEntry({ role: "ask", mode: "review", selection: { model: "gpt-5-codex", provider: "azure", effort: "minimal" } }))]);
+	assert.deepEqual(fusionCall({ continue: "run-1", task: "x" }, withEffort).bound, { ...codexAsk("review"), model: "gpt-5-codex", provider: "azure", effort: "minimal" });
+	assert.throws(() => fusionCall({ continue: "run-1", task: "x", fresh: true }, records), /^Error: fresh is not allowed with continue$/);
 	assert.throws(() => claudeRoute({ continue: "run-1", task: "x" }, records), /^Error: run-1 ran on the codex backend, which the claude tool does not run; continue it with fusion and continue run-1$/);
-	// The codex tripwire is registered here: the call is refused at the binding, and the tripwire's file check proves nothing reached it.
-	const ext = makeExtension();
+	// Codex left out over its tripwire, which is how this build stands: the binding succeeds, so nothing but the
+	// missing registration may stop the call, and no tripwire is there to be reached.
+	const ext = makeExtension({ codex: undefined });
 	const branch = [entry(codexEntry())];
-	assert.equal((await call(ext, "fusion", { continue: "run-1", task: "x" }, makeCtx(branch))).error, "role implement cannot be bound for the codex backend: this build has no codex binding");
+	assert.equal(
+		(await call(ext, "fusion", { continue: "run-1", task: "x" }, makeCtx(branch))).error,
+		"the codex backend is not available in this build: run-1 ran on it, and this pi-fusion runs claude, pi only. Nothing was started and nothing was recorded. Read what that run reported and start a new run on claude, pi; no configuration makes codex available here.",
+	);
 	assert.equal((await call(ext, "claude", { continue: "run-1", task: "x" }, makeCtx(branch))).error, "run-1 ran on the codex backend, which the claude tool does not run; continue it with fusion and continue run-1");
 	// Controls of either pair name fusion for a codex run, and a thread kept only for reading says how to reopen it.
 	for (const tool of ["claude_control", "fusion_control"]) {
@@ -895,9 +998,12 @@ test("every role the tools advertise has capabilities and a binding on each back
 		assert.ok(spec, `role ${role} is advertised and has no capabilities`);
 		assert.ok(spec.backends.length, `role ${role} is advertised and runs on no backend`);
 		for (const backend of spec.backends) {
-			// Codex is listed for its roles before it has a binding: until one exists, binding a role there is refused outright.
 			if (backend === "codex") {
-				assert.throws(() => fusionCall({ role, task: "x", backend }, records()), new RegExp(`^Error: role ${role} cannot be bound for the codex backend: this build has no codex binding$`), role);
+				// A codex role that names no model runs on the host's own default, so it binds with none and says so in display alone.
+				const bound = codexRole({ role }, undefined, {} as NodeJS.ProcessEnv);
+				assert.equal(bound.name, role, `the codex binding of ${role} bound another role`);
+				assert.equal(bound.model, undefined, `the codex binding of ${role} invented a model rather than leave it to the host`);
+				for (const contract of [bound.contract, bound.addendum]) assert.ok(fs.existsSync(path.join(repoRoot, "contracts", contract)), `the codex binding of ${role} names a contract that is not there: ${contract}`);
 				continue;
 			}
 			const bound = backend === "claude" ? roleFor({ role, task: "x" }) : piRole({ role }, undefined, env);

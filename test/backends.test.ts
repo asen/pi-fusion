@@ -82,6 +82,23 @@ test("the pi binding is a binding, not an adapter: it depends on the boundary al
 	assert.deepEqual(names, ["./types.ts"], `a role binding must name no host, no process and no SDK; it names ${names.join(", ")}`);
 });
 
+test("the codex binding is a binding, not an adapter: it depends on the boundary alone and names no SDK", () => {
+	const names = dependenciesOf("backends/codex-binding.ts");
+	assert.deepEqual(names, ["./types.ts"], `a role binding must name no host, no process, no protocol and no SDK; it names ${names.join(", ")}`);
+});
+
+test("nothing outside the host and the profiles reaches into the codex binding, and no codex runtime is registered by this build", () => {
+	// The binding is read by routing and by the settings' display label, and by nothing else in this build: no backend
+	// module imports it, because no codex backend is registered here. The registration list is the host's own.
+	const importers = productionModules()
+		.filter((file) => modulesNamedIn(fs.readFileSync(file, "utf8")).some((name) => /(^|\/)codex-binding\.ts$/.test(name)))
+		.map((file) => path.relative(path.join(repoRoot, "extensions"), file))
+		.sort();
+	assert.deepEqual(importers, ["fusion.ts", "profiles.ts"]);
+	const source = fs.readFileSync(path.join(repoRoot, "extensions", "fusion.ts"), "utf8");
+	assert.ok(source.includes("const backends: Partial<Record<BackendName, HostBackend>> = { claude: hostBackend(claudeBackend), pi: hostBackend(createPiBackend()), ...options.backends };"), "the host registers a backend beside claude and pi");
+});
+
 test("the pi outcome mapping is pure: node's own path helper, this backend's own modules, and nothing else", () => {
 	const names = dependenciesOf("backends/pi-outcome.ts");
 	// `node:path` is there for one thing, deciding whether a recorded session file is absolute; everything else it
