@@ -87,14 +87,14 @@ test("the codex binding is a binding, not an adapter: it depends on the boundary
 	assert.deepEqual(names, ["./types.ts"], `a role binding must name no host, no process, no protocol and no SDK; it names ${names.join(", ")}`);
 });
 
-test("nothing outside the host and the profiles reaches into the codex binding, and no codex runtime is registered by this build", () => {
-	// The binding is read by routing and by the settings' display label, and by nothing else in this build: no backend
-	// module imports it, because no codex backend is registered here. The registration list is the host's own.
+test("nothing outside the host, the profiles and the codex backend's own modules reaches into the codex binding, and no codex runtime is registered by this build", () => {
+	// The binding is read by routing and by the settings' display label, and by the codex backend's composition and
+	// outcome mapping for its role shape. That backend is not registered here: the registration list is the host's own.
 	const importers = productionModules()
 		.filter((file) => modulesNamedIn(fs.readFileSync(file, "utf8")).some((name) => /(^|\/)codex-binding\.ts$/.test(name)))
 		.map((file) => path.relative(path.join(repoRoot, "extensions"), file))
 		.sort();
-	assert.deepEqual(importers, ["fusion.ts", "profiles.ts"]);
+	assert.deepEqual(importers, ["backends/codex-outcome.ts", "backends/codex.ts", "fusion.ts", "profiles.ts"]);
 	const source = fs.readFileSync(path.join(repoRoot, "extensions", "fusion.ts"), "utf8");
 	assert.ok(source.includes("const backends: Partial<Record<BackendName, HostBackend>> = { claude: hostBackend(claudeBackend), pi: hostBackend(createPiBackend()), ...options.backends };"), "the host registers a backend beside claude and pi");
 });
@@ -121,7 +121,18 @@ test("the codex transport is a transport over its own protocol readers: it takes
 		.filter((candidate) => modulesNamedIn(fs.readFileSync(candidate, "utf8")).some((name) => /(^|\/)codex-(transport|protocol)\.ts$/.test(name)))
 		.map((candidate) => path.relative(path.join(repoRoot, "extensions"), candidate))
 		.sort();
-	assert.deepEqual(importers, ["backends/codex-transport.ts"], "no backend, host or registration reaches the codex transport in this build");
+	assert.deepEqual(importers, ["backends/codex-outcome.ts", "backends/codex-transport.ts", "backends/codex.ts"], "only the codex backend's own composition and outcome mapping reach the codex transport and protocol");
+});
+
+test("the codex backend composes its own modules and nothing registers it yet: no host, other backend or package reaches it", () => {
+	assert.deepEqual(dependenciesOf("backends/codex.ts").sort(), ["../process-tree.ts", "./codex-binding.ts", "./codex-launch.ts", "./codex-outcome.ts", "./codex-protocol.ts", "./codex-transport.ts", "./types.ts", "node:fs", "node:path", "node:url"]);
+	// The mapping is pure: the boundary, the binding's role shape and the protocol and transport types, no process or file.
+	assert.deepEqual(dependenciesOf("backends/codex-outcome.ts").sort(), ["./codex-binding.ts", "./codex-protocol.ts", "./codex-transport.ts", "./types.ts"]);
+	const importers = productionModules()
+		.filter((candidate) => modulesNamedIn(fs.readFileSync(candidate, "utf8")).some((name) => /(^|\/)codex(-outcome)?\.ts$/.test(name)))
+		.map((candidate) => path.relative(path.join(repoRoot, "extensions"), candidate))
+		.sort();
+	assert.deepEqual(importers, ["backends/codex.ts"], "the host registers no codex backend in this build");
 });
 
 test("the pi outcome mapping is pure: node's own path helper, this backend's own modules, and nothing else", () => {

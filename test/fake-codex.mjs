@@ -9,7 +9,10 @@ import * as path from "node:path";
  * own path under this host's node.
  *
  * `FAKE_CODEX_SCENARIO` chooses what it does and `FAKE_CODEX_LOG` names a file every line it read is appended to, as
- * the json it parsed to or the raw text it was. Both are this fixture's own and no production module reads either.
+ * the json it parsed to or the raw text it was. `FAKE_CODEX_START` and `FAKE_CODEX_READ` are json objects laid over a
+ * thread/start answer and a thread/read answer's thread, so a backend case can make one field disagree, and
+ * `FAKE_CODEX_EXIT_CODE` is the status an orderly end of stdin exits with. All are this fixture's own and no production
+ * module reads any of them.
  *
  * It stays alive through its stdin reader, so a host's own shutdown — which ends stdin first — is what ends it, and the
  * owned cleanup's report is about a process that was really there. Two scenarios differ on purpose: `hang` ignores the
@@ -21,6 +24,16 @@ const SCENARIO = process.env.FAKE_CODEX_SCENARIO ?? "ok";
 const BAD = process.env.FAKE_CODEX_BAD ?? "";
 const LOG = process.env.FAKE_CODEX_LOG;
 const KEEPALIVE_MS = 30_000;
+const json = (name) => {
+	try {
+		return JSON.parse(process.env[name] ?? "{}");
+	} catch {
+		return {};
+	}
+};
+const START_OVER = json("FAKE_CODEX_START");
+const READ_OVER = json("FAKE_CODEX_READ");
+const EXIT_CODE = Number(process.env.FAKE_CODEX_EXIT_CODE ?? 0);
 
 const log = (what) => {
 	if (!LOG) return;
@@ -110,6 +123,7 @@ function startThread(id, params) {
 		if (BAD === "sandbox") result = { ...result, sandbox: "workspace-write" };
 		if (BAD === "effort") result = { ...result, reasoningEffort: 3 };
 	}
+	result = { ...result, ...START_OVER };
 	notify("thread/started", { thread });
 	if (SCENARIO === "wrong-id") return respond(999, result);
 	respond(id, result);
@@ -161,6 +175,7 @@ function startTurn(id, params) {
 		case "reroute":
 			answer();
 			notify("model/rerouted", { threadId, turnId, fromModel: "gpt-host-default", toModel: "gpt-safer", reason: "highRiskCyberActivity" });
+			notify("item/completed", { threadId, turnId, completedAtMs: 2, item: { type: "agentMessage", id: "msg-1", text: "rerouted answer" } });
 			tokenUsage(threadId, turnId, usage(50, 0, 5, 0), usage(50, 0, 5, 0));
 			completed(threadId, turnId);
 			return;
@@ -182,6 +197,8 @@ function startTurn(id, params) {
 			send({ id: 8, method: "item/commandExecution/requestApproval", params: { startedAtMs: 1 } });
 			afterReplies = () => {
 				notify("item/completed", { threadId, turnId, completedAtMs: 2, item: { type: "commandExecution", id: "cmd-1", status: "declined", command: "rm -rf /tmp/fake-target", commandActions: [], cwd } });
+				notify("item/completed", { threadId, turnId, completedAtMs: 3, item: { type: "agentMessage", id: "msg-1", text: "declined and reported" } });
+				tokenUsage(threadId, turnId, usage(30, 0, 3, 0), usage(30, 0, 3, 0));
 				completed(threadId, turnId);
 			};
 			return;
@@ -193,6 +210,44 @@ function startTurn(id, params) {
 			// One write for both, so the host reads the answer and the request in one chunk: the turn has to be admitted
 			// by the time the request ends the run, or there is no turn to interrupt.
 			raw(`${JSON.stringify({ id, result: { turn: { id: turnId, status: "inProgress", items: [], error: null } } })}\n${JSON.stringify({ id: "x-1", method: "fake/surprise", params: {} })}\n`);
+			return;
+		case "retry":
+			answer();
+			notify("error", { threadId, turnId, willRetry: true, error: { message: "stream disconnected, retrying", codexErrorInfo: { httpConnectionFailed: { httpStatusCode: 502 } } } });
+			notify("item/completed", { threadId, turnId, completedAtMs: 2, item: { type: "agentMessage", id: "msg-1", text: "answer after a retry" } });
+			tokenUsage(threadId, turnId, usage(80, 0, 8, 0), usage(80, 0, 8, 0));
+			completed(threadId, turnId);
+			return;
+		case "foreign-final":
+			answer();
+			notify("item/started", { threadId, turnId, startedAtMs: 1, item: { type: "commandExecution", id: "cmd-1", command: "ls -la\nsecond line", status: "inProgress" } });
+			notify("item/completed", { threadId, turnId, completedAtMs: 2, item: { type: "commandExecution", id: "cmd-1", command: "ls -la", status: "completed", exitCode: 0, aggregatedOutput: "file-a\nfile-b" } });
+			notify("item/completed", { threadId, turnId, completedAtMs: 3, item: { type: "agentMessage", id: "msg-1", text: "own final report" } });
+			tokenUsage(threadId, turnId, usage(300, 100, 30, 0), usage(200, 100, 20, 0));
+			// A subagent's thread and another turn of this thread, each with a later final message and its own usage.
+			notify("item/started", { threadId: "thr-sub", turnId: "turn-sub", startedAtMs: 4, item: { type: "commandExecution", id: "cmd-sub", command: "rm -rf subagent", status: "inProgress" } });
+			notify("item/completed", { threadId: "thr-sub", turnId: "turn-sub", completedAtMs: 4, item: { type: "agentMessage", id: "msg-sub", text: "subagent final text" } });
+			tokenUsage("thr-sub", "turn-sub", usage(9_000, 0, 900, 0), usage(9_000, 0, 900, 0));
+			notify("item/completed", { threadId, turnId: "turn-other", completedAtMs: 5, item: { type: "agentMessage", id: "msg-other", text: "foreign turn text" } });
+			tokenUsage(threadId, "turn-other", usage(7_000, 0, 700, 0), usage(7_000, 0, 700, 0));
+			notify("turn/completed", { threadId: "thr-sub", turn: { id: "turn-sub", status: "completed", items: [] } });
+			completed(threadId, turnId);
+			return;
+		case "self-interrupt":
+			// An end the host never asked for: the child interrupts its own turn.
+			answer();
+			notify("item/completed", { threadId, turnId, completedAtMs: 2, item: { type: "agentMessage", id: "msg-1", text: "half an answer" } });
+			completed(threadId, turnId, "interrupted");
+			return;
+		case "no-final":
+			answer();
+			tokenUsage(threadId, turnId, usage(10, 0, 1, 0), usage(10, 0, 1, 0));
+			completed(threadId, turnId);
+			return;
+		case "no-usage":
+			answer();
+			notify("item/completed", { threadId, turnId, completedAtMs: 2, item: { type: "agentMessage", id: "msg-1", text: "an answer with no usage" } });
+			completed(threadId, turnId);
 			return;
 		case "bad-completed":
 			answer();
@@ -252,6 +307,7 @@ function readThread(id, params) {
 			updatedAt: 2,
 			source: "appServer",
 			projectId: "p",
+			...READ_OVER,
 		},
 	};
 	if (SCENARIO === "late-response" && withheld === undefined) {
@@ -349,5 +405,5 @@ process.stdin.on("end", () => {
 		setTimeout(() => {}, KEEPALIVE_MS);
 		return;
 	}
-	process.exit(0);
+	process.exit(EXIT_CODE);
 });
