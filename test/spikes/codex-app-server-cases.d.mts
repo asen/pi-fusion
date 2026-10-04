@@ -50,3 +50,25 @@ export declare function exitCode(statuses: Status[]): 0 | 1 | 2;
 
 export declare function fileDigest(file: string): string;
 export declare function versionFromUserAgent(userAgent: string | undefined): string | undefined;
+
+export declare const USAGE_FIELDS: readonly string[];
+/** A counter as reported: a count, or why it is not one. */
+export type ReportedCount = number | "null" | "absent" | "invalid";
+export type Counters = Record<string, ReportedCount>;
+export interface UsageCounters {
+	total: Counters;
+	last: Counters;
+	modelContextWindow: ReportedCount;
+}
+export declare function reportedCount(holder: unknown, key: string): ReportedCount;
+export declare function usageCounters(params: unknown): UsageCounters;
+export declare function describeCounters(breakdown: Counters): string;
+export declare function usageProblem(updates: UsageCounters[]): string | undefined;
+export interface Additivity {
+	previous: ReportedCount;
+	current: ReportedCount;
+	sumOfLasts: number | "unknown";
+	holds: "yes" | "no" | "unknown";
+}
+export declare function additivity(previousTotal: Counters, currentTotal: Counters, lasts: Counters[]): Record<string, Additivity>;
+export declare function cacheWriteObservation(updates: UsageCounters[]): string;

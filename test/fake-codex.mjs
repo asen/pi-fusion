@@ -249,6 +249,28 @@ function startTurn(id, params) {
 			notify("item/completed", { threadId, turnId, completedAtMs: 2, item: { type: "agentMessage", id: "msg-1", text: "an answer with no usage" } });
 			completed(threadId, turnId);
 			return;
+		case "two-turns": {
+			// One short answer per turn on the same thread, each update's total cumulative for the thread and its last one
+			// response's. Turn 1 reports no cache-write field at all; turn 2 has two responses that report it as 0.
+			answer();
+			const item = (at, type, extra) => notify("item/completed", { threadId, turnId, completedAtMs: at, item: { type, id: `${type}-${turnId}-${at}`, ...extra } });
+			const reasoning = { summary: [], content: [] };
+			if (turnCount === 1) {
+				item(1, "reasoning", reasoning);
+				item(2, "agentMessage", { text: "OK", phase: null });
+				tokenUsage(threadId, turnId, usage(1_000, 0, 50, 10), usage(1_000, 0, 50, 10));
+			} else {
+				const write = (breakdown) => ({ ...breakdown, cacheWriteInputTokens: 0 });
+				item(1, "reasoning", reasoning);
+				item(2, "agentMessage", { text: "working", phase: null });
+				tokenUsage(threadId, turnId, write(usage(2_100, 900, 70, 10)), write(usage(1_100, 900, 20, 0)));
+				item(3, "reasoning", reasoning);
+				item(4, "agentMessage", { text: "OK again", phase: null });
+				tokenUsage(threadId, turnId, write(usage(3_250, 1_900, 100, 15)), write(usage(1_150, 1_000, 30, 5)));
+			}
+			completed(threadId, turnId);
+			return;
+		}
 		case "bad-completed":
 			answer();
 			notify("turn/completed", { threadId, turn: { id: turnId, status: "inProgress", items: [] } });

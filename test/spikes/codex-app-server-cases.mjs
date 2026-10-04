@@ -3,8 +3,8 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 
 /*
- * The pure half of `codex-app-server.mjs`, the stage 1 Codex qualification harness: its command line, its case
- * catalogue and the rules a case's status follows. Node builtins only, and importing it does nothing: no process, no
+ * The pure half of `codex-app-server.mjs`, the Codex qualification harness: its command line, its case catalogue, the
+ * rules a case's status follows and Q14's usage summary. Node builtins only, and importing it does nothing: no process, no
  * `PATH` lookup, no Codex home, configuration or auth read, no production module loaded. `test/codex-harness.test.ts`
  * imports it directly, which is why it is apart from the entry program.
  *
@@ -17,7 +17,7 @@ import * as path from "node:path";
 export const EXIT = Object.freeze({ pass: 0, failure: 1, none: 2 });
 
 /**
- * Every case this stage-1 harness knows. `model` marks a case that starts a turn, which is a provider request on the
+ * Every case this harness knows: stage 1's G1 cases, then Q14, a stage 2 preparation measurement outside G1. `model` marks a case that starts a turn, which is a provider request on the
  * user's own login and quota with a cost Codex does not report; the others start a child and at most a thread. `fake`
  * marks a case the fake app-server can drive end to end; the rest need a native child that really runs a model. `needs`
  * names the option without which a case skips before anything starts, which it then does in either mode.
@@ -31,6 +31,7 @@ export const CASES = Object.freeze([
 	{ id: "Q6", model: true, fake: true, title: "cancellation through the production signal once the primary turn's first command starts (fake: at turn admission): aborted, stop requested, clean owned shutdown" },
 	{ id: "Q7", model: false, fake: true, title: "under the production owned shutdown (SIGTERM to observed descendants first, then stdin end) the root exits by itself: status 0, no root signal, nothing left" },
 	{ id: "Q9", model: false, fake: true, title: "an untrusted fixture cwd started with no request cwd: configuration bytes unchanged, sandbox kept" },
+	{ id: "Q14", model: true, fake: true, title: "usage over two sequential turns of one fresh ask thread: every scoped usage counter, absent fields as absent, total-vs-last additivity observed (stage 2 preparation, not G1)" },
 ]);
 
 /** Named selections. `all` is spelled out on purpose: nothing native runs without a `--case`. */
@@ -227,4 +228,97 @@ export function fileDigest(file) {
 export function versionFromUserAgent(userAgent) {
 	const match = /^[^\s/]+\/(\d+\.\d+\.\d+[0-9A-Za-z.+-]*)/.exec(userAgent ?? "");
 	return match ? match[1] : undefined;
+}
+
+/* ------------------------------------------------------------------------------------------------------------------
+ * Q14: usage counters
+ * ---------------------------------------------------------------------------------------------------------------- */
+
+/** The counters one usage breakdown carries in Codex 0.160.0's shape (source-read), in display order. */
+export const USAGE_FIELDS = Object.freeze(["inputTokens", "cachedInputTokens", "outputTokens", "reasoningOutputTokens", "totalTokens", "cacheWriteInputTokens"]);
+
+/** The counters a usage summary needs as counts. Cache write is not among them: an absent one is shown absent, never 0. */
+const REQUIRED_FIELDS = USAGE_FIELDS.filter((field) => field !== "cacheWriteInputTokens");
+
+const isObject = (value) => value !== null && typeof value === "object" && !Array.isArray(value);
+
+/**
+ * One counter as the child reported it: a count, or `null`, `absent` or `invalid`. Read from the raw params, because
+ * the production reader takes an absent cache write for its declared default of zero, and Q14 must not.
+ */
+export function reportedCount(holder, key) {
+	if (!isObject(holder) || !Object.hasOwn(holder, key)) return "absent";
+	const value = holder[key];
+	if (value === null) return "null";
+	return Number.isSafeInteger(value) && value >= 0 ? value : "invalid";
+}
+
+/** The counters of one thread/tokenUsage/updated: both breakdowns and the window, nothing else read from it. */
+export function usageCounters(params) {
+	const usage = isObject(params) ? params.tokenUsage : undefined;
+	const breakdown = (part) => Object.fromEntries(USAGE_FIELDS.map((field) => [field, reportedCount(isObject(usage) ? usage[part] : undefined, field)]));
+	return { total: breakdown("total"), last: breakdown("last"), modelContextWindow: reportedCount(usage, "modelContextWindow") };
+}
+
+/** A breakdown as one line, every field named and an absent or null one spelled out. */
+export function describeCounters(breakdown) {
+	return USAGE_FIELDS.map((field) => `${field}=${breakdown[field]}`).join(" ");
+}
+
+/**
+ * Why one turn's usage updates cannot be summarized, or `undefined` when they can: at least one update, and its latest
+ * total and last carrying every required field as a count. A null or absent window, or an absent cache write, is shown
+ * as such and does not make a turn unusable.
+ */
+export function usageProblem(updates) {
+	if (updates.length === 0) return "no usage update named this turn";
+	const latest = updates[updates.length - 1];
+	for (const part of ["total", "last"]) {
+		const missing = REQUIRED_FIELDS.filter((field) => typeof latest[part][field] !== "number");
+		if (missing.length > 0) return `the latest update's ${part} has no count for ${missing.map((field) => `${field} (${latest[part][field]})`).join(", ")}`;
+	}
+	return undefined;
+}
+
+/**
+ * Whether the second turn's final cumulative total is the first's plus the sum of every `last` the second turn
+ * reported, field by field: `yes`, `no`, or `unknown` when any value it needs is not a count. An observation of how the
+ * counters behaved, never a policy for summing `last`: a `no` may mean an update re-sent an unchanged total, or that
+ * `total` counts more than the updates show.
+ */
+export function additivity(previousTotal, currentTotal, lasts) {
+	const out = {};
+	for (const field of USAGE_FIELDS) {
+		const values = [previousTotal[field], currentTotal[field], ...lasts.map((last) => last[field])];
+		if (!values.every((value) => typeof value === "number")) {
+			out[field] = { previous: previousTotal[field], current: currentTotal[field], sumOfLasts: "unknown", holds: "unknown" };
+			continue;
+		}
+		const sumOfLasts = lasts.reduce((sum, last) => sum + last[field], 0);
+		out[field] = { previous: previousTotal[field], current: currentTotal[field], sumOfLasts, holds: previousTotal[field] + sumOfLasts === currentTotal[field] ? "yes" : "no" };
+	}
+	return out;
+}
+
+/**
+ * What the reported cache-write counts can and cannot say about their relation to input. Only a positive count is
+ * compared, and only as `cached + cacheWrite <= input` held or not: zero, null or absent counts measure no relation.
+ */
+export function cacheWriteObservation(updates) {
+	const tally = { absent: 0, null: 0, invalid: 0, zero: 0, positive: 0, within: 0 };
+	for (const update of updates) {
+		for (const part of ["total", "last"]) {
+			const breakdown = update[part];
+			const write = breakdown.cacheWriteInputTokens;
+			if (typeof write !== "number") tally[write] += 1;
+			else if (write === 0) tally.zero += 1;
+			else {
+				tally.positive += 1;
+				if (typeof breakdown.inputTokens === "number" && typeof breakdown.cachedInputTokens === "number" && breakdown.cachedInputTokens + write <= breakdown.inputTokens) tally.within += 1;
+			}
+		}
+	}
+	const counts = `over ${updates.length * 2} breakdowns: ${tally.positive} positive, ${tally.zero} zero, ${tally.absent} absent, ${tally.null} null, ${tally.invalid} invalid`;
+	if (tally.positive === 0) return `${counts}; no positive cache write was reported, so this run measures no cache-write vs input relation`;
+	return `${counts}; cached + cacheWrite <= input held in ${tally.within} of ${tally.positive} positive breakdowns (an observation, not proof that cache write is part of input)`;
 }

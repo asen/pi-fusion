@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /*
- * Manual stage 1 qualification harness for the Codex backend, run by hand and one agreed case group at a time. It is
+ * Manual qualification harness for the Codex backend, run by hand and one agreed case group at a time. It is
  * not part of `npm test`: the default glob (`test/*.test.ts`) does not reach this directory, and a native run starts
  * the user's own Codex app-server on the user's own login, configuration and quota.
  *
@@ -8,6 +8,7 @@
  *   node test/spikes/codex-app-server.mjs --run --case Q1,Q2,Q7,Q9            # model-free cases
  *   node test/spikes/codex-app-server.mjs --run --case Q3 --keep              # one model case
  *   node test/spikes/codex-app-server.mjs --run --fake --case Q1,Q2,Q4,Q6,Q7,Q9  # NOT NATIVE
+ *   node test/spikes/codex-app-server.mjs --run --fake --case Q14             # NOT NATIVE
  *
  * Nothing runs without `--run` and an explicit `--case` (`all` is a deliberate value, not a default). `--help`,
  * `--list`, an unknown or malformed argument, a missing `--run` or a missing or unmatched `--case` exit 2 before any
@@ -19,7 +20,8 @@
  * the harness's own: a launch that calls the production `codexLaunch` and keeps its answer, a start that calls the
  * production `startCodexChild` and records what its child answered (the raw notifications included, for command
  * items), `onCall`, and for Q3 alone a contract reader that appends a nonce to the shipped addendum. Model-free cases
- * drive the transport directly with the thread/start body the backend composes. No request names a cwd, a sandbox
+ * drive the transport directly with the thread/start body the backend composes, and so does Q14, which starts two
+ * turns on one thread with the production transport because the backend runs one. No request names a cwd, a sandbox
  * policy or a configuration override, and `fusion.ts` and the host runtime take no part.
  *
  * What it never does. It copies, reads or prints no credential or auth file, logs in to nothing, injects no API key,
@@ -47,7 +49,29 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import { CASES, canonicalPath, caseStatus, composeInstructions, EXIT, exitCode, fileDigest, forcedExitNotice, GROUPS, parseArgs, selectCases, threadParams, USAGE, versionFromUserAgent, WARNING } from "./codex-app-server-cases.mjs";
+import {
+	additivity,
+	CASES,
+	cacheWriteObservation,
+	canonicalPath,
+	caseStatus,
+	composeInstructions,
+	describeCounters,
+	EXIT,
+	exitCode,
+	fileDigest,
+	forcedExitNotice,
+	GROUPS,
+	parseArgs,
+	selectCases,
+	threadParams,
+	USAGE,
+	USAGE_FIELDS,
+	usageCounters,
+	usageProblem,
+	versionFromUserAgent,
+	WARNING,
+} from "./codex-app-server-cases.mjs";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const REPO = path.resolve(HERE, "..", "..");
@@ -60,6 +84,8 @@ const MODEL_CASE_MS = 10 * 60_000;
 const SETTLE_MS = 90_000;
 /** Raw notifications one child's record keeps; past it they are counted and dropped. */
 const NOTIFICATION_CAP = 20_000;
+/** Usage updates Q14 prints per turn; past it they are still counted and summed, and the rest is said. */
+const USAGE_PRINT_CAP = 16;
 
 async function main(cli) {
 	if (cli.unknown.length > 0 || cli.problems.length > 0) {
@@ -78,7 +104,8 @@ async function main(cli) {
 		console.log("groups:");
 		for (const [name, members] of Object.entries(GROUPS)) console.log(`  ${name.padEnd(11)} ${members.join(", ")}`);
 		console.log("\nG1 needs Q1, Q2, Q3, Q4, Q6, Q7 and Q9 to PASS natively; Q3b is optional named-effort evidence and does not block it.");
-		console.log("\nStages 2/3 (Q10+) are not implemented here. Native results so far: docs/codex-backend.md.");
+		console.log("Q14 is stage 2 preparation, a usage measurement outside G1; G2 is not enabled and its other cases (Q10+) are not implemented here.");
+		console.log("\nNative results so far: docs/codex-backend.md.");
 		return EXIT.none;
 	}
 	if (!cli.run) {
@@ -115,7 +142,7 @@ async function loadProduction() {
 async function runSelected(cli, cases) {
 	const fake = cli.fake;
 	const label = fake ? " [FAKE, NOT NATIVE]" : "";
-	console.log(`pi-fusion codex app-server qualification harness, stage 1 (${fake ? "FAKE" : "NATIVE"})`);
+	console.log(`pi-fusion codex app-server qualification harness (${fake ? "FAKE" : "NATIVE"})`);
 	if (fake) console.log("FAKE LAUNCH: test/fake-codex.mjs by path under this node. NOT NATIVE EVIDENCE: nothing below says what a real Codex does.");
 	else console.log(WARNING);
 	console.log(`node ${process.version}, ${process.platform}-${process.arch}, ${new Date().toISOString()}`);
@@ -391,13 +418,13 @@ const roleThreadParams = (mod, role) => threadParams(role, composeInstructions(r
 
 /**
  * One child driven directly through the production transport: launch, handshake, the body, and one host shutdown.
- * Used where a case must not start a turn.
+ * Used where a case must not start a turn, and by Q14, whose two turns on one thread the backend does not run.
  */
-async function withChild(ctx, cwd, body, scenario = "ok") {
+async function withChild(ctx, cwd, body, { scenario = "ok", onNotification } = {}) {
 	const prepared = ctx.launchFor(cwd, scenario);
 	let child;
 	try {
-		child = await ctx.mod.startCodexChild({ launch: prepared.launch, clientInfo: ctx.mod.codexClientInfo(), signal: ctx.abort.signal });
+		child = await ctx.mod.startCodexChild({ launch: prepared.launch, clientInfo: ctx.mod.codexClientInfo(), signal: ctx.abort.signal, ...(onNotification ? { onNotification } : {}) });
 	} catch (error) {
 		const exit = error && error.finalExit ? error.finalExit : undefined;
 		retainUnlessOver(ctx, "child start", exit, "a child that failed to start");
@@ -827,6 +854,116 @@ const RUNNERS = {
 		if (outcome.startError || outcome.thrown) result.fail(`thread/start in the untrusted fixture failed: ${message(outcome.startError ?? outcome.thrown)}`);
 		result.check(!mentionedBefore && !ctx.configMentions(real), "config.toml does not name the fixture before or after (no trust entry written)");
 		result.check(tree(work) === before, "the fixture cwd is unchanged by thread/start");
+		checkShutdown(ctx, result, outcome.exit, "child");
+	},
+
+	Q14: async (ctx, result) => {
+		const work = path.join(ctx.caseDir("Q14"), "work");
+		fs.mkdirSync(work);
+		const role = ctx.mod.codexRole({ role: "ask", mode: "answer" }, undefined, {});
+		// Kept bounded and typed: a usage update's counters and an item's type and id, read through the production
+		// readers, with the ids they name. Nothing of an item's text, a command or the thread's configuration is kept.
+		const seen = { usage: [], items: [], malformedItems: 0, dropped: 0 };
+		const onNotification = (notification) => {
+			if (notification.method !== "thread/tokenUsage/updated" && notification.method !== "item/completed") return;
+			if (seen.usage.length + seen.items.length >= NOTIFICATION_CAP) return void (seen.dropped += 1);
+			if (notification.method === "thread/tokenUsage/updated") {
+				const read = ctx.mod.readTokenUsage(notification.params);
+				if (read.ok) seen.usage.push({ threadId: read.value.threadId, turnId: read.value.turnId, counters: usageCounters(notification.params) });
+				return;
+			}
+			const read = ctx.mod.readItem(notification.params, 64);
+			if (read.ok) seen.items.push({ threadId: read.value.threadId, turnId: read.value.turnId, itemId: read.value.itemId, type: read.value.type });
+			else seen.malformedItems += 1;
+		};
+		const prompts = ["Reply with the single word OK.", "Reply with the single word OK again."];
+		result.fact("limits", `two turns, ${USAGE_PRINT_CAP} usage updates printed per turn, ${NOTIFICATION_CAP} usage and item notifications kept; no item text, prompt reply, command or configuration printed`);
+		if (ctx.fake) result.fact("evidence", "the fake's literal counters: NOT NATIVE, and nothing here says how a real Codex counts usage");
+		const turns = [];
+		const outcome = await withChild(
+			ctx,
+			work,
+			async (child, prepared) => {
+				const start = await child.startThread(roleThreadParams(ctx.mod, role));
+				result.fact("thread/start", describeStart(start));
+				result.fact("sandbox", describeSandbox(start.sandbox));
+				const problem = ctx.mod.threadStartProblem(role, start, canonicalPath(start.cwd), canonicalPath(prepared.expectedCwd));
+				if (!result.check(problem === undefined, `production start checks pass (cwd bound, read-only, approval never)${problem ? `: ${problem}` : ""}`)) return start;
+				for (const [index, text] of prompts.entries()) {
+					const label = `turn ${index + 1}`;
+					const turn = await child.startTurn({ threadId: start.threadId, text });
+					const ended = await bounded(turn.done, MODEL_CASE_MS);
+					if (!ended.ok) {
+						result.unproven(`${label}: did not end inside ${MODEL_CASE_MS}ms; the owned shutdown interrupts it`);
+						return start;
+					}
+					// Recorded before any readback, so a turn that did not complete is still reported as it ended.
+					const entry = { label, turn, done: ended.value, evidence: turn.snapshot() };
+					turns.push(entry);
+					if (ended.value.outcome !== "completed") return start;
+					// The read barrier: what the child sent before answering, late usage included, is applied first.
+					entry.read = await child.readThread(start.threadId);
+					entry.evidence = turn.snapshot();
+				}
+				return start;
+			},
+			{ scenario: "two-turns", onNotification },
+		);
+		if (outcome.startError) result.fail(`the child did not start: ${message(outcome.startError)}`);
+		if (outcome.thrown) result.fail(`a request failed: ${message(outcome.thrown)}`);
+		const threadId = outcome.value?.threadId;
+		const perTurn = turns.map((entry) => ({
+			...entry,
+			updates: seen.usage.filter((update) => update.threadId === threadId && update.turnId === entry.turn.turnId).map((update) => update.counters),
+			items: seen.items.filter((item) => item.threadId === threadId && item.turnId === entry.turn.turnId),
+		}));
+		for (const entry of perTurn) {
+			const { label, done, read, evidence, updates, items } = entry;
+			result.fact(`${label}`, `turn=${entry.turn.turnId} outcome=${done.outcome} completion=${done.completion ? done.completion.status : "none"}${done.failure ? ` failure=${done.failure.kind}` : ""}`);
+			// A protocol failure's message is the transport's fixed text and a reader's fixed reason, never a value from the
+			// child; other kinds may append the child's own text, so only their kind is shown.
+			if (done.failure?.kind === "protocol") {
+				result.fact(`${label}: protocol failure`, done.failure.message);
+				result.fact(`${label}: limit`, "a notification the production reader rejects, a malformed usage update among them, ends the child before the harness's listener runs: its counters are not observable here");
+			}
+			result.check(done.outcome === "completed", `${label}: the child's own turn/completed says completed`);
+			if (read) {
+				result.fact(`${label}: thread/read`, describeRead(read));
+				result.check(read.status.type === "idle", `${label}: the thread reads back idle after the turn`);
+			}
+			result.fact(`${label}: usage updates`, `${updates.length} scoped to this thread and turn (transport: ${evidence.usageUpdates}, of which after completion ${evidence.usageAfterCompletion})`);
+			for (const [at, update] of updates.slice(0, USAGE_PRINT_CAP).entries()) {
+				result.fact(`${label}: update ${at + 1} total`, describeCounters(update.total));
+				result.fact(`${label}: update ${at + 1} last`, `${describeCounters(update.last)} modelContextWindow=${update.modelContextWindow}`);
+			}
+			if (updates.length > USAGE_PRINT_CAP) result.fact(`${label}: updates not printed`, `${updates.length - USAGE_PRINT_CAP} (still counted and summed)`);
+			const distinct = (type) => new Set(items.filter((item) => item.type === type).map((item) => item.itemId)).size;
+			result.fact(`${label}: completed items`, `agentMessage=${distinct("agentMessage")} reasoning=${distinct("reasoning")} (distinct ids; observable item counts, not model responses: the protocol names no response identity)`);
+			const problem = usageProblem(updates);
+			if (problem) result.unproven(`${label}: usage is not usable: ${problem}`);
+			else result.check(true, `${label}: usable usage counters (latest total and last carry every required count)`);
+		}
+		result.fact("malformed items", `${seen.malformedItems} seen by the harness on any thread, ${outcome.exit?.counters.malformedItems ?? "unknown"} by the transport; dropped, never counted as agentMessage or reasoning`);
+		if (seen.dropped > 0) result.fact("notifications dropped past the cap", String(seen.dropped));
+		if (perTurn.length === 2) {
+			const [first, second] = perTurn;
+			result.check(second.turn.threadId === first.turn.threadId && second.turn.turnId !== first.turn.turnId, "two turns admitted on the one owned thread, under distinct turn ids");
+			if (!usageProblem(first.updates) && !usageProblem(second.updates)) {
+				const sums = additivity(first.updates[first.updates.length - 1].total, second.updates[second.updates.length - 1].total, second.updates.map((update) => update.last));
+				for (const field of USAGE_FIELDS) {
+					const entry = sums[field];
+					result.fact(`additivity ${field}`, `turn 2 total ${entry.current} vs turn 1 total ${entry.previous} + turn 2 lasts ${entry.sumOfLasts}: ${entry.holds}`);
+				}
+				result.fact("additivity", "observed, not required: a `no` or `unknown` is evidence of how the counters behaved, not a failure, and no summing policy follows from it");
+			}
+		} else if (!outcome.startError && !outcome.thrown && turns.length < 2 && !result.parts.some((part) => part.status === "unproven" || part.status === "fail")) {
+			result.unproven(`only ${turns.length} of two turns ran`);
+		}
+		const all = perTurn.flatMap((entry) => entry.updates);
+		result.fact("cache write vs input", cacheWriteObservation(all));
+		result.fact("cost", "unknown (Codex reports none; never estimated)");
+		const declined = outcome.exit?.counters.declinedApprovals ?? 0;
+		result.guard(declined === 0, `no approval requested under approval never (declined ${declined})`);
 		checkShutdown(ctx, result, outcome.exit, "child");
 	},
 };

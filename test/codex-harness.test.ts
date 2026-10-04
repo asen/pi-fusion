@@ -8,7 +8,25 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import { type CodexCall, codexRole } from "../extensions/backends/codex-binding.ts";
 import { CODEX_APP_SERVER_ARGS } from "../extensions/backends/codex-launch.ts";
 import { CODEX_CONTRACTS_DIR, createCodexBackend } from "../extensions/backends/codex.ts";
-import { CASES, canonicalPath, caseStatus, composeInstructions, exitCode, forcedExitNotice, GROUPS, parseArgs, selectCases, threadParams, versionFromUserAgent } from "./spikes/codex-app-server-cases.mjs";
+import {
+	additivity,
+	CASES,
+	cacheWriteObservation,
+	canonicalPath,
+	caseStatus,
+	composeInstructions,
+	describeCounters,
+	exitCode,
+	forcedExitNotice,
+	GROUPS,
+	parseArgs,
+	reportedCount,
+	selectCases,
+	threadParams,
+	usageCounters,
+	usageProblem,
+	versionFromUserAgent,
+} from "./spikes/codex-app-server-cases.mjs";
 
 /*
  * The manual Codex qualification harness's own safety, tested without Codex: its pure status rules and command line,
@@ -85,9 +103,12 @@ test("the command line is strict: both spellings, no valueless or repeated flag,
 	assert.equal(parseArgs([]).case, undefined);
 	assert.deepEqual(selectCases("q2,Q1")?.cases?.map((entry) => entry.id), ["Q1", "Q2"]);
 	assert.deepEqual(selectCases("model-free")?.cases?.map((entry) => entry.id), ["Q1", "Q2", "Q7", "Q9"]);
-	assert.deepEqual(selectCases("all")?.cases?.map((entry) => entry.id), ["Q1", "Q2", "Q3", "Q3b", "Q4", "Q6", "Q7", "Q9"]);
+	assert.deepEqual(selectCases("all")?.cases?.map((entry) => entry.id), ["Q1", "Q2", "Q3", "Q3b", "Q4", "Q6", "Q7", "Q9", "Q14"]);
+	assert.deepEqual(selectCases("q14")?.cases?.map((entry) => entry.id), ["Q14"]);
 	assert.deepEqual(Object.keys(GROUPS), ["model-free", "all"]);
-	assert.deepEqual(CASES.filter((entry) => entry.fake).map((entry) => entry.id), ["Q1", "Q2", "Q4", "Q6", "Q7", "Q9"]);
+	assert.ok(!GROUPS["model-free"]!.includes("Q14"), "Q14 starts turns, so the model-free group leaves it out");
+	assert.equal(CASES.find((entry) => entry.id === "Q14")?.model, true);
+	assert.deepEqual(CASES.filter((entry) => entry.fake).map((entry) => entry.id), ["Q1", "Q2", "Q4", "Q6", "Q7", "Q9", "Q14"]);
 	assert.match(selectCases("Q1,nope").error ?? "", /nope/);
 	for (const removed of ["Q5", "Q5b", "Q5c", "Q8", "Q8b"]) assert.match(selectCases(removed).error ?? "", new RegExp(removed), `${removed} is no longer a case`);
 	assert.match(selectCases(undefined).error ?? "", /needs/);
@@ -100,6 +121,66 @@ test("version evidence: a version parsed from the user agent, reported and never
 	assert.equal(versionFromUserAgent("codex_cli_rs/0.161.0-alpha.2"), "0.161.0-alpha.2");
 	assert.equal(versionFromUserAgent("no version here"), undefined);
 	assert.equal(versionFromUserAgent(undefined), undefined);
+});
+
+/* ------------------------------------------------------------------------------------------------------------------
+ * Q14 usage counters
+ * ---------------------------------------------------------------------------------------------------------------- */
+
+const breakdown = (input: number, cached: number, output: number, reasoning: number, write?: number | null) => ({ inputTokens: input, cachedInputTokens: cached, outputTokens: output, reasoningOutputTokens: reasoning, totalTokens: input + output, ...(write === undefined ? {} : { cacheWriteInputTokens: write }) });
+const update = (total: object, last: object, window: unknown = 200_000) => usageCounters({ threadId: "t", turnId: "u", tokenUsage: { total, last, modelContextWindow: window } });
+/** One breakdown as Q14 reads it, so a field left out of the literal is `absent`. */
+const counts = (raw: object) => update(raw, raw).total;
+
+test("Q14 reads every counter as reported: an absent or null field stays absent or null, never zero", () => {
+	assert.equal(reportedCount({ a: 3 }, "a"), 3);
+	assert.equal(reportedCount({ a: 0 }, "a"), 0);
+	assert.equal(reportedCount({}, "a"), "absent");
+	assert.equal(reportedCount({ a: null }, "a"), "null");
+	for (const bad of [-1, 1.5, "3", Number.MAX_SAFE_INTEGER + 1, {}]) assert.equal(reportedCount({ a: bad }, "a"), "invalid");
+	assert.equal(reportedCount(undefined, "a"), "absent");
+	assert.equal(reportedCount(Object.create({ a: 1 }), "a"), "absent", "an inherited key is not reported");
+	const counters = update(breakdown(10, 4, 2, 1), breakdown(10, 4, 2, 1, null), null);
+	assert.equal(counters.total.cacheWriteInputTokens, "absent");
+	assert.equal(counters.last.cacheWriteInputTokens, "null");
+	assert.equal(counters.modelContextWindow, "null");
+	assert.equal(usageCounters({ tokenUsage: { total: breakdown(1, 0, 1, 0), last: breakdown(1, 0, 1, 0) } }).modelContextWindow, "absent");
+	assert.deepEqual(Object.keys(usageCounters({ tokenUsage: { total: { extra: 1, inputTokens: 1 } } }).total), ["inputTokens", "cachedInputTokens", "outputTokens", "reasoningOutputTokens", "totalTokens", "cacheWriteInputTokens"], "only the known counters are read");
+	assert.equal(usageCounters(null).total.inputTokens, "absent");
+	assert.equal(describeCounters(counters.total), "inputTokens=10 cachedInputTokens=4 outputTokens=2 reasoningOutputTokens=1 totalTokens=12 cacheWriteInputTokens=absent");
+});
+
+test("Q14 usage is usable only with an update whose total and last carry every required count; an absent cache write or window does not unmake it", () => {
+	assert.match(usageProblem([]) ?? "", /no usage update/);
+	assert.equal(usageProblem([update(breakdown(10, 0, 1, 0), breakdown(10, 0, 1, 0), null)]), undefined);
+	assert.match(usageProblem([update({ ...breakdown(10, 0, 1, 0), outputTokens: null }, breakdown(10, 0, 1, 0))]) ?? "", /total has no count for outputTokens \(null\)/);
+	const { inputTokens: _input, ...noInput } = breakdown(10, 0, 1, 0);
+	assert.match(usageProblem([update(breakdown(10, 0, 1, 0), noInput)]) ?? "", /last has no count for inputTokens \(absent\)/);
+	assert.equal(usageProblem([update(noInput, noInput), update(breakdown(10, 0, 1, 0), breakdown(10, 0, 1, 0))]), undefined, "the latest update is the one read");
+});
+
+test("Q14 additivity compares the cumulative total with the previous total plus every last, and says unknown rather than reading a missing count as zero", () => {
+	const first = counts(breakdown(1_000, 0, 50, 10));
+	const lasts = [counts(breakdown(1_100, 900, 20, 0, 0)), counts(breakdown(1_150, 1_000, 30, 5, 0))];
+	const sums = additivity(first, counts(breakdown(3_250, 1_900, 100, 15, 0)), lasts);
+	assert.deepEqual(sums.inputTokens, { previous: 1_000, current: 3_250, sumOfLasts: 2_250, holds: "yes" });
+	assert.equal(sums.totalTokens!.holds, "yes");
+	assert.deepEqual(sums.cacheWriteInputTokens, { previous: "absent", current: 0, sumOfLasts: "unknown", holds: "unknown" }, "an absent count in the first total is not taken for zero");
+	// A last repeated by a second update for the same response, or a total that counts more than its responses.
+	const repeated = additivity(first, counts(breakdown(2_100, 900, 70, 10, 0)), [lasts[0]!, lasts[0]!]);
+	assert.equal(repeated.inputTokens!.holds, "no");
+	assert.equal(repeated.inputTokens!.sumOfLasts, 2_200);
+	assert.equal(additivity(first, counts(breakdown(2_100, 900, 70, 10)), [counts({ ...breakdown(1_100, 900, 20, 0), outputTokens: null })]).outputTokens!.holds, "unknown");
+	assert.equal(additivity(first, first, []).inputTokens!.holds, "yes", "a turn with no lasts holds only when the total did not move");
+});
+
+test("Q14 relates cache write to input only from a positive count, and says when the run measures no relation", () => {
+	const none = cacheWriteObservation([update(breakdown(10, 0, 1, 0), breakdown(10, 0, 1, 0)), update(breakdown(20, 5, 2, 0, 0), breakdown(10, 5, 1, 0, null))]);
+	assert.match(none, /over 4 breakdowns: 0 positive, 1 zero, 2 absent, 1 null, 0 invalid/);
+	assert.match(none, /measures no cache-write vs input relation/);
+	const some = cacheWriteObservation([update(breakdown(100, 40, 1, 0, 50), breakdown(100, 40, 1, 0, 70))]);
+	assert.match(some, /2 positive/);
+	assert.match(some, /cached \+ cacheWrite <= input held in 1 of 2 positive breakdowns \(an observation, not proof that cache write is part of input\)/);
 });
 
 /* ------------------------------------------------------------------------------------------------------------------
@@ -160,6 +241,9 @@ test("every guard path exits 2 having loaded no production module, located no co
 			["--bogus"],
 			["--case", "Q1"],
 			["--fake", "--case", "Q1"],
+			["--case", "Q14"],
+			["--fake", "--case", "Q14"],
+			["--list", "--run", "--fake", "--case", "Q14"],
 			["--run"],
 			["--run", "--case"],
 			["--run", "--case", "nope"],
@@ -185,11 +269,14 @@ test("every guard path exits 2 having loaded no production module, located no co
 		const list = harness(box, ["--list"]).stdout;
 		assert.deepEqual(
 			[...list.matchAll(/^ {2}(Q\S+) /gm)].map((match) => match[1]),
-			["Q1", "Q2", "Q3", "Q3b", "Q4", "Q6", "Q7", "Q9"],
-			"--list names the eight cases",
+			["Q1", "Q2", "Q3", "Q3b", "Q4", "Q6", "Q7", "Q9", "Q14"],
+			"--list names the nine cases",
 		);
 		assert.match(list, /Q6 +\[model\] \[fake\][\s\S]*model-free/);
+		assert.match(list, /Q14 +\[model\] \[fake\] usage over two sequential turns/);
+		assert.match(list, /model-free +Q1, Q2, Q7, Q9\n/, "the model-free group lists no model case");
 		assert.match(list, /G1 needs Q1, Q2, Q3, Q4, Q6, Q7 and Q9 to PASS natively; Q3b is optional/);
+		assert.match(list, /Q14 is stage 2 preparation, a usage measurement outside G1; G2 is not enabled/);
 		assert.match(harness(box, ["--run", "--case", "Q1", "--outside-dir", "/dev/shm"]).stdout, /unrecognised argument: --outside-dir/);
 		assert.ok(!fs.existsSync(box.tripped), "no codex ran");
 		assert.ok(!fs.existsSync(box.env.CODEX_HOME!) && !fs.existsSync(box.env.HOME!), "no Codex home or home was created");
@@ -199,17 +286,19 @@ test("every guard path exits 2 having loaded no production module, located no co
 	}
 });
 
-/** Git on the inherited PATH, found the way a shell would, for the fake run's fixture repositories. */
-function gitDirectory(): string | undefined {
+/** A command's directory on the inherited PATH, found the way a shell would: git for the fake run's fixture repositories, ps for the owned cleanup's discovery. */
+function commandDirectory(name: string): string | undefined {
 	for (const entry of (process.env.PATH ?? "").split(path.delimiter)) {
 		if (!entry) continue;
 		try {
-			fs.accessSync(path.join(entry, "git"), fs.constants.X_OK);
+			fs.accessSync(path.join(entry, name), fs.constants.X_OK);
 			return entry;
 		} catch {}
 	}
 	return undefined;
 }
+
+const gitDirectory = (): string | undefined => commandDirectory("git");
 
 test("an explicit --fake run drives the fake by path through the production transport and backend, labelled NOT NATIVE, and removes its root", { timeout: 55_000 }, (t) => {
 	const gitDir = gitDirectory();
@@ -313,6 +402,95 @@ test("the body the model-free cases send is the body createCodexBackend sends, c
 		}
 	} finally {
 		fs.rmSync(root, { recursive: true, force: true });
+	}
+});
+
+test("an explicit --fake Q14 runs two turns on one thread through the production transport, prints every counter, and passes NOT NATIVE", { timeout: 30_000 }, (t) => {
+	const psDir = commandDirectory("ps");
+	if (!psDir) return t.skip("no ps on PATH for the owned cleanup's discovery");
+	const box = sandbox([psDir]);
+	const log = path.join(box.root, "fake-requests.log");
+	try {
+		const ran = harness({ ...box, env: { ...box.env, FAKE_CODEX_LOG: log } }, ["--run", "--fake", "--case", "Q14"], 25_000);
+		const out = ran.stdout;
+		assert.equal(ran.status, 0, `${out}\n${ran.stderr}`);
+		assert.match(out, /NOT NATIVE EVIDENCE/);
+		assert.match(out, /evidence: the fake's literal counters: NOT NATIVE/);
+		assert.match(out, /RESULT Q14: pass \[FAKE, NOT NATIVE\]/);
+		for (const turn of [1, 2]) {
+			assert.match(out, new RegExp(`PASS turn ${turn}: the child's own turn/completed says completed`));
+			assert.match(out, new RegExp(`PASS turn ${turn}: the thread reads back idle after the turn`));
+			assert.match(out, new RegExp(`PASS turn ${turn}: usable usage counters`));
+		}
+		assert.match(out, /turn 1: update 1 total: inputTokens=1000 cachedInputTokens=0 outputTokens=50 reasoningOutputTokens=10 totalTokens=1050 cacheWriteInputTokens=absent/);
+		assert.match(out, /turn 2: usage updates: 2 scoped to this thread and turn/);
+		assert.match(out, /turn 2: update 2 last: .*cacheWriteInputTokens=0 modelContextWindow=200000/);
+		assert.match(out, /turn 1: completed items: agentMessage=1 reasoning=1 .*not model responses/);
+		assert.match(out, /turn 2: completed items: agentMessage=2 reasoning=2/);
+		assert.match(out, /PASS two turns admitted on the one owned thread, under distinct turn ids/);
+		assert.match(out, /additivity inputTokens: turn 2 total 3250 vs turn 1 total 1000 \+ turn 2 lasts 2250: yes/);
+		assert.match(out, /additivity cacheWriteInputTokens: .*: unknown/);
+		assert.match(out, /no positive cache write was reported, so this run measures no cache-write vs input relation/);
+		assert.match(out, /additivity: observed, not required: a `no` or `unknown` is evidence of how the counters behaved/);
+		assert.match(out, /malformed items: 0 seen by the harness on any thread, 0 by the transport/);
+		assert.match(out, /cost: unknown/);
+		assert.match(out, /PASS \(guard\) child: owned shutdown clean/);
+		assert.doesNotMatch(out, /OK again|working/, "no model prose is printed");
+		const sent = fs.readFileSync(log, "utf8").split("\n").filter(Boolean).map((line) => JSON.parse(line)).filter((entry) => entry.in?.method).map((entry) => entry.in);
+		const starts = sent.filter((message) => message.method === "turn/start");
+		assert.equal(starts.length, 2, "the fake was asked for two turns");
+		assert.equal(new Set(starts.map((message) => message.params.threadId)).size, 1, "both on one thread");
+		assert.equal(sent.filter((message) => message.method === "thread/start").length, 1);
+		const modules = loaded(box);
+		assert.ok(modules.some((url) => url.endsWith("/extensions/backends/codex-transport.ts")), "the production transport was loaded");
+		assert.ok(!modules.some((url) => url.endsWith("/extensions/fusion.ts")), "the host runtime takes no part");
+		assert.ok(!fs.existsSync(box.tripped), "no codex ran: the fake was launched by path");
+		assert.ok(!fs.existsSync(box.env.CODEX_HOME!), "the inherited CODEX_HOME was neither created nor used");
+		assert.deepEqual(fs.readdirSync(box.env.TMPDIR!), [], "the fixture root was removed once the child was proved over");
+	} finally {
+		fs.rmSync(box.root, { recursive: true, force: true });
+	}
+});
+
+test("a --fake Q14 whose turns report no usage is UNPROVEN however cleanly its guards hold", { timeout: 30_000 }, (t) => {
+	const psDir = commandDirectory("ps");
+	if (!psDir) return t.skip("no ps on PATH for the owned cleanup's discovery");
+	const box = sandbox([psDir]);
+	try {
+		const ran = harness({ ...box, env: { ...box.env, FAKE_CODEX_SCENARIO: "no-usage" } }, ["--run", "--fake", "--case", "Q14"], 25_000);
+		const out = ran.stdout;
+		assert.equal(ran.status, 1, `${out}\n${ran.stderr}`);
+		assert.match(out, /UNPROVEN turn 1: usage is not usable: no usage update named this turn/);
+		assert.match(out, /PASS \(guard\) child: owned shutdown clean/);
+		assert.match(out, /RESULT Q14: unproven \(turn 1: usage is not usable/);
+		assert.doesNotMatch(out, /additivity inputTokens/, "no additivity is computed from missing usage");
+		assert.ok(!fs.existsSync(box.tripped));
+	} finally {
+		fs.rmSync(box.root, { recursive: true, force: true });
+	}
+});
+
+test("a --fake Q14 whose usage update the production reader rejects (cached input above input) FAILs with the reader's fixed reason and prints no counter from it", { timeout: 30_000 }, (t) => {
+	const psDir = commandDirectory("ps");
+	if (!psDir) return t.skip("no ps on PATH for the owned cleanup's discovery");
+	const box = sandbox([psDir]);
+	try {
+		// The fake's `bad-usage` turn reports inputTokens 10 with cachedInputTokens 20, and nothing after it.
+		const ran = harness({ ...box, env: { ...box.env, FAKE_CODEX_SCENARIO: "bad-usage" } }, ["--run", "--fake", "--case", "Q14"], 25_000);
+		const out = ran.stdout;
+		assert.equal(ran.status, 1, `${out}\n${ran.stderr}`);
+		assert.match(out, /turn 1: turn=\S+ outcome=transport completion=\S+ failure=protocol/);
+		assert.match(out, /turn 1: protocol failure: the codex app-server sent something this transport cannot read: a usage update carries a breakdown that is not one\n/);
+		assert.match(out, /turn 1: limit: a notification the production reader rejects, a malformed usage update among them, ends the child before the harness's listener runs/);
+		assert.match(out, /FAIL turn 1: the child's own turn\/completed says completed/);
+		assert.match(out, /turn 1: usage updates: 0 scoped/);
+		assert.doesNotMatch(out, /update 1 (total|last)|inputTokens=|additivity inputTokens/, "no counter from the rejected update, and no additivity");
+		assert.doesNotMatch(out, /turn 2/, "no second turn after a failed first");
+		assert.match(out, /RESULT Q14: fail/);
+		assert.doesNotMatch(out, /RESULT Q14: (pass|unproven)/);
+		assert.ok(!fs.existsSync(box.tripped));
+	} finally {
+		fs.rmSync(box.root, { recursive: true, force: true });
 	}
 });
 
