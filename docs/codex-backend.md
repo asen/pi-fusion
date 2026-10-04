@@ -1,225 +1,432 @@
 # The Codex backend
 
-**Status: registered and experimental. Stage 1's native gate G1 passed on one Linux x64 host with app-server 0.160; this build's stage 2 runtime — `plan`, `implement` and `ask`, with continuation, fork and steers — is supported experimentally, and its native gate G2 passed on the same host and reported version.** The host registers this build's Codex backend by default beside Claude and Pi: `extensions/backends/codex.ts` composes a run and `codex-outcome.ts` maps its evidence. Nothing routes there unless a call names `backend: "codex"` or your settings put `plan`, `implement` or `ask` on it; builtin routes no role to Codex. G1 covers fresh `implement` and `ask`, the handshake, start and readback checks, cancellation and the owned shutdown on that one reported version and platform only (see [Evidence](#evidence)); other versions and platforms are unmeasured, so treat a run there as a trial of your own install. G2 measured `ask` runs only: a fresh call resumed, a resume refused after its thread moved on, a fork, one steer, and a resume on the recorded same host-default model ([G2 cases](#g2-cases)). `plan` continuation and handoff, `implement` continuations and steers, a model switch and a changed host default are tested only against the deterministic fake, so they remain a trial even on the measured host. **Stage 3, questions through Codex's experimental API, is implemented experimentally, and its native gate G3 passed on the same host and reported version for `ask` runs on the host default** ([G3 cases](#g3-cases), [Questions on Codex](questions.md#on-codex)); `plan` and `implement` questions and the continued-questions fallback are tested only against the deterministic fake.
+**Registered, experimental, and opt-in.** Codex supports `plan`, `implement`, and `ask`; builtin routes no role there. Name `backend: "codex"` or configure a role in [settings](profiles.md). Code defines current behavior; [Evidence](#evidence) records the narrower qualification scope.
+
+## Architecture
+
+```text
+extensions/fusion.ts                   handles, routing, questions, records
+  |
+  +-- codex-binding.ts                 role, selection, contract, sandbox
+  +-- codex.ts                         call order, steer queue, one shutdown
+        +-- codex-launch.ts            host binary/environment/cwd
+        +-- codex-transport.ts         bounded stdio JSON-RPC, owned cleanup
+        |     +-- codex-protocol.ts    strict-minimum readers
+        |     +-- process-tree.ts      process launch/descendant cleanup
+        +-- codex-outcome.ts           checks, usage, disposition, display
+                  |
+                  v
+          host recordDecision          accepts outcome before persistence
+```
+
+Sources: [`codex.ts`](../extensions/backends/codex.ts), [`codex-outcome.ts`](../extensions/backends/codex-outcome.ts), and the [module map](development.md#module-map). There is no Codex SDK or npm dependency. Transport reuses Pi's generic framing/timer helpers, not its backend lifecycle.
+
+`createCodexBackend()` reads, locates, and starts nothing. Binary lookup happens only when a run starts; an absent Codex install does not prevent Fusion, Claude, or Pi from loading.
 
 ## What this build runs
 
-| | Codex |
+| Capability | Behavior |
 | --- | --- |
-| Roles | `plan` and `implement` (`workspace-write` sandbox; `plan` writes only its own notes and scratch files, as its shared contract says on every backend) and `ask`, both modes (`read-only`), approval policy `never` |
-| Unavailable | `ultracode`, `security`, and `fresh` on any role but `plan`; each is refused before anything starts |
-| Sessions | Fresh threads, and (natively measured for `ask` only, G2) a `continue` that resumes the recorded thread or, from another host session, forks it, always from its trusted checkpoint and usage baseline ([Continuation](#continuation-and-fork)). A record with no checkpoint, or a checkpoint with no baseline — every record written before this runtime — is kept for reading, and its refusal names `codex resume <thread id>` |
-| Questions | Experimental, stage 3 (G3 passed natively for `ask` on one host; otherwise fake-tested): `ask_orchestrator` through Codex's experimental API, which every delegated run opts into for its whole connection. A fresh thread registers the tool; a resumed or forked thread keeps the tool Codex restored. A call that cannot be hosted gets `success: false` and the run goes on; any other server request still fails the run ([Questions on Codex](questions.md#on-codex)) |
-| Steers | Measured natively once, for an `ask` run (G2 Q13); otherwise fake-tested. The input is open from admission. A control `message` or `/fusion steer` to a running Codex run is queued and sent once to its admitted turn ([Steers](#steers)); `wait`, `status` and `cancel` work as for any run |
-| Plan | A `plan` call with no handle continues the latest Codex plan run on this branch from its checkpoint and baseline, on its recorded selection; past the context cap or with another model it hands off to a fresh thread ([Plan runs](#plan-runs)) |
-| Reviews | A manual or automatic review runs on Codex when the session's **ask** role is configured there, as a fresh read-only thread; it inherits nothing from the reviewed run, and disabled ask refuses manual review and skips automatic review quietly |
-| Writer slot | `implement` holds the single file-changing slot across Claude, Pi and Codex, like any coding run; `ask` runs beside it |
-| Follow-up | `continue` on a record with a checkpoint and baseline, or a new run carrying the report as context. The stats line, status and dashboard name `codex resume <thread id>`, from the accepted thread only, as an intended manual recovery hint for opening the thread in Codex yourself. It is based on Codex's source and documentation; whether the CLI reopens a thread the app-server created has not been measured natively ([Stages](#stages-and-native-qualification-gates)). An id a shell would not read as one plain word is single-quoted, and one starting with `-` follows `--` |
+| Roles | `plan` and `implement`: `workspace-write`; `ask` in either mode: `read-only`; approval policy `never` |
+| Plan scope | Shared contract permits only its own notes/scratch files, as on every backend |
+| Unavailable | `ultracode`, `security`, `fresh` outside `plan`, or `mode` outside `ask`: refused before admission |
+| Sessions | Fresh threads; resume/fork only with a trusted checkpoint, paired usage baseline, and repeatable selection |
+| Questions | Whole-connection experimental API opt-in; fresh threads register `ask_orchestrator`, continued threads rely on restored tools ([Questions](questions.md#on-codex)) |
+| Controls | `status`, `wait`, `cancel`, and one-shot steers to the admitted turn |
+| Writer slot | `plan`/`implement` hold the single file-changing slot across backends; `ask` may run beside them |
+| Reviews | Fresh configured `ask` run; inherits nothing from its source; disabled ask refuses manual review and quietly skips automatic review |
+| Follow-up | Use `fusion` with `continue`, or start a new run carrying the report as context |
 
-Loading the extension constructs the backend and does nothing else: no binary is looked for, no contract, configuration or home is read, and nothing starts. A machine without `codex` loads Fusion, Claude and Pi as before, and a Codex run there fails with the launch's own sentence about the missing binary.
-
-## The host's own install
-
-A run uses the host's `codex`: `PI_FUSION_CODEX_BIN` (an absolute path) or the first executable `codex` on the inherited `PATH`, located when the run starts ([configuration](configuration.md)). The child gets the host's environment copied unchanged and runs in the host's working directory. It therefore uses the user's own Codex home (`CODEX_HOME`, else `~/.codex`), configuration, profiles and login: Fusion copies, writes and checks no auth or configuration file, and needs no API key of its own. It adds no Codex SDK or npm dependency and downloads or installs no binary; `npm install` is unchanged. The home is predicted only so the handshake can compare it with the one the child reports.
-
-Lookup and launch follow POSIX rules only. Linux x64 is the intended native qualification target; macOS runs the same code and is unqualified. On Windows a Codex run is refused when it starts, because a `codex` on `PATH` there is a `.cmd` shim that needs a shell; loading the extension is unaffected.
-
-The sandbox **mode** is named per thread and checked at start. Everything else about that mode — writable roots, network access, shell environment policy and any other policy the user's configuration sets for `workspace-write` or `read-only` — is inherited and neither set nor checked. Fusion trusts the user's Codex sandbox and permissions as it trusts Claude's and Pi's: it does not re-audit that boundary, and nothing here claims one. The thread/start reader keeps only the reported policy's tag, compared with the role's mode; the rest of the policy is left unread.
-
-That network setting concerns the commands the child runs. Codex's hosted web search, when the user's configuration enables it, is Codex's own provider-side tool and is inherited the same way: Fusion neither enables nor disables it. The shared `ask` contract, like the no-questions addendum that only a run with no question callback gets, tells the child to name its sources or say which fact it could not check. The harness only observes it: the item types recorded by the native Q4 run so far include no hosted search item, which is not evidence that search is disabled.
-
-**The request names no cwd (Q2, Q9).** Neither thread/start nor turn/start names a working directory. Read in the 0.160.0 source, naming one can make Codex record a trust entry for an untrusted writable project in the user's configuration; leaving it out avoids that, and the reported cwd is checked against the launch's realpath instead. On the one measured host, Q2 and Q9 passed: the reported cwd bound by realpath with no request cwd, and an untrusted fixture cwd started with `config.toml` bytes unchanged and the sandbox mode kept ([Evidence](#evidence)). A fallback that names the cwd, and so may write a trust entry into the user's Codex configuration, is not implemented and would need the user's explicit consent first.
-
-## Evidence
-
-Keep these three apart:
-
-| Kind | What it covers |
-| --- | --- |
-| Source inspection | Every app-server shape (initialize, thread/start, turn/start, thread/read, notifications, approvals, the stage 2 thread/resume, thread/fork, thread/turns/list and turn/steer the backend now drives, measured natively by G2 on one host, and stage 3's experimental `capabilities.experimentalApi`, `thread/start` `dynamicTools`, `item/tool/call` request and its result, and the restoring of a thread's dynamic tools on resume and fork, measured natively by G3 on one host) as read in Codex **0.160.0**'s app-server protocol source. That includes the reading that `developerInstructions`, `Thread.model` and `Thread.reasoningEffort` are stable fields there. A later version may change any of it. |
-| Deterministic fake | `test/codex-backend.test.ts` drives the composition against `test/fake-codex.mjs`, a builtins-only node program that speaks literal JSON-RPC. It is launched by path through an injected launch, with no Codex binary, home, auth, `PATH` lookup or model. It also drives resume, fork, their tip and usage-baseline checks, and scripted steers (accepted, refused, unanswered, dropped), and literal `item/tool/call` questions: answered, held before the turn's admission, two at once, refused as foreign or malformed, asked on a resumed or forked thread, answered unavailable without a callback, and cancelled while waiting. Lifecycle cases register this build's backend in a test host over the same fake, for a delegated run and an independently configured reviewer, a fresh run continued in a later fake process that is told the earlier one's turns and total, a failed resume, one host `message` sent as one `turn/steer`, and a question answered once through the host and cancelled while waiting; host controls, records and presentation are otherwise tested with in-memory doubles. A pass shows that this host's sequencing, checks and mapping behave as written against those literals. |
-| Native measurement | **G1 passed for stage 1 on one host.** The [stage 1 harness](#the-stage-1-harness) measured Q1, Q2, Q3, Q4, Q7 and Q9 as of commit `c2f2477`, and Q6 as of commit `cf8f0cd` (2026-10-04), each PASS, on one Linux x64 host running Node 24.18 with the child reporting app-server 0.160 (reported in its user agent, not independently verified). That is the experimental scope: macOS, Windows and other Codex versions are not measured. Q14, a stage 2 preparation measurement of usage counters outside G1, ran once at commit `625061e` (2026-10-04) on the same host and reported version and PASSED; it is not G2. **G2 passed for stage 2 on the same host:** Q10, Q11, Q12, Q13 and Q19 each ran once and PASSED at commit `cff6a9e` (2026-10-04), for `ask` runs on the host-default selection ([G2 cases](#g2-cases)). A `--fake` run of the harness is a deterministic fake, not a measurement. G1, Q14 and G2 ran on connections with no question callback: no `experimentalApi` capability and no dynamic tools. The shipping host passes a callback on every delegated run, so every delegated Codex connection now opts into the experimental API, a fresh thread registers `ask_orchestrator`, and a resumed or forked thread has it only if it was started with it. The earlier passes stand as a historical record of the stable shape they measured. **G3 then passed for stage 3 on the same host:** Q15 and Q16 each ran once and PASSED at commit `84aa4ff` (2026-10-04), for `ask` runs on the host-default selection, in that experimental connection shape ([G3 cases](#g3-cases)). G3 re-measured a fresh call, a resume, a fork and a cancellation in that shape, not every G1 or G2 behavior. |
-
-## Stages and native qualification gates
-
-A native qualification gate is a set of manual, paid runs on the user's own install, each agreed by the user before it runs; it qualifies a stage and does not hold back its implementation. Stage 1 passed its gate (G1) on one host. Stage 2's features are enabled in this build, experimentally, and its gate (G2) passed on the same host. Stage 3 is implemented in this build, experimentally, and its gate (G3) passed on the same host:
-
-| Stage | Scope | State |
-| --- | --- | --- |
-| 1 | Fresh `implement` and `ask` on the app-server's stable methods | Shipped and experimental; its native gate (G1) passed on one Linux x64 host with app-server 0.160 |
-| 2 | Verified continuation and fork from a trusted turn checkpoint, `plan` on Codex, and steers | Supported experimentally for `plan`, `implement` and `ask`: resume, fork, steers and plan continuation and handoff run in this build, tested against the deterministic fake. Its gate G2 (Q10, Q11, Q12, Q13 and Q19) passed on one Linux x64 host with app-server 0.160, for `ask` runs on the host-default selection; `plan` and `implement` continuations, a model switch and a changed default were not measured natively. Q14 (usage counters) was its preparation measurement |
-| 3 | Questions through Codex's experimental API (source-read): the connection's opt-in, `ask_orchestrator` as a fresh thread's dynamic tool, and `item/tool/call` answered on the run's own turns | Implemented experimentally. G3 (Q15 and Q16) passed on one Linux x64 host with app-server 0.160 for `ask` runs on the host default: a question on a fresh thread, one through the tool a resumed and a forked thread restored, and a cancellation while a question waited. `plan` and `implement` questions, the continued-questions fallback and the host's answer and writer races are tested only against fakes; it adds no version, platform or role qualification |
-
-### The stage 1 harness
-
-`test/spikes/codex-app-server.mjs` is the stage 1 manual qualification harness, and also carries stage 2's G2 cases ([below](#g2-cases)) and stage 3's G3 cases ([G3 cases](#g3-cases)). It sits outside the default test glob and runs one agreed case group at a time in the foreground. Running a native case needs the user's own explicit agreement, because it uses the host's `codex`, environment, Codex home, configuration, login, MCP servers, remote-control and multi-agent settings exactly as production does. Turns are provider requests on that login and quota, with a cost Codex does not report (USD unknown), and every thread may leave rollouts, logs or state in the existing Codex home.
-
-```bash
-node test/spikes/codex-app-server.mjs --list                      # catalogue only; exits 2
-node test/spikes/codex-app-server.mjs --run --case model-free     # Q1, Q2, Q7, Q9: no turn
-node test/spikes/codex-app-server.mjs --run --case Q6 --keep      # one model case
-node test/spikes/codex-app-server.mjs --run --case Q2 --model <id>
-node test/spikes/codex-app-server.mjs --run --fake --case Q1,Q2,Q4,Q6,Q7,Q9   # NOT NATIVE
-node test/spikes/codex-app-server.mjs --run --fake --case Q14                  # NOT NATIVE
-node test/spikes/codex-app-server.mjs --run --fake --case Q10,Q11,Q12,Q13,Q19  # G2 cases, NOT NATIVE
-node test/spikes/codex-app-server.mjs --run --fake --case Q15,Q16              # G3 cases, NOT NATIVE
-```
-
-Nothing runs without `--run` and an explicit `--case` (`all` is a deliberate value, never a default). Configuration, shutdown, approval and preflight checks are guards: they can fail a case or leave it unproven, never pass it. A case whose own measurement was skipped, for a missing option or under `--fake`, stays a skip with that reason, and a run with no measured pass exits 2. A second interrupt exits at once, printing the fixture root it leaves behind as uncertain; it cleans up and claims nothing. `--help`, `--list`, an unknown or malformed argument, a missing `--run` or a missing or unmatched `--case` exit 2 before any production module loads: no `PATH` lookup, no Codex home or configuration read, no child. Exit 0 means every selected case passed (annotated skips allowed), 1 that one failed or is unproven, 2 that none ran.
-
-**G1** needs Q1, Q2, Q3, Q4, Q6, Q7 and Q9 to PASS natively. Q3b is optional named-effort evidence and does not block it. The harness does not re-audit the sandbox: that boundary is the user's own configuration, trusted as Claude's and Pi's are.
-
-| Case | Model call | What it records | Native result |
-| --- | --- | --- | --- |
-| Q1 | no | initialize: reported Codex home against the prediction, user agent, platform, Node; a version parsed from the user agent is reported, not independently verified | PASS |
-| Q2 | no | thread/start and thread/read with no request cwd, launched through a symlink: host default for implement and both ask modes, and an explicit model with `--model`; cwd bound by realpath, or the case halts before any turn | PASS; the `--model` given was the host default's own model, so the explicit leg was a named round trip, not a switch to another model |
-| Q3 | yes | implement edits a fixture and writes a nonce sent only in developer instructions; checked by fixture state, unchanged `HEAD` and `git status`, never by the reply. The prompt never asks for a commit. The developer instructions are the shipped contract and addendum with the harness's nonce block appended, so they are not byte for byte what production sends | PASS |
-| Q3b | yes | optional: a named `--effort` that differs from the configured default reads back exactly; skipped without one | not run |
-| Q4 | yes | read-only ask answers from a fixture file: production success, `readOnly` reported, files, `HEAD` and status unchanged. The prompt attempts no write, so this is not a write-denial test. Hosted search items in the turn are counted for the log only, never gating | PASS; its recorded item types included no hosted search item (from the item-type summary, before the search line was added) |
-| Q6 | yes | cancellation once a command item starts: the prompt asks the model to run `sleep 60` once. The harness cancels through the production signal when the first `commandExecution` item starts in the primary thread and admitted turn (under `--fake`, at turn admission). PASS needs the production verdict `aborted` and the child's actual exit report saying the host requested the stop, with the clean-shutdown guard holding. No started command is UNPROVEN. The harness sends no signal and surveys no process: production's owned cleanup is what the guard reads | PASS: cancelled when the first command item started; production verdict `aborted`, the child's own turn completion `interrupted`, one `turn/interrupt` sent by the owned shutdown, and the root exited 0 with no signal, nothing left, discovery ok and pipes closed. The run ended before any readback, so no selection was verified; its thread/start answer named the host default |
-| Q7 | no | under the production owned shutdown (SIGTERM to observed descendants first, then stdin end), the root exits by itself, with and without an open thread: status 0, no root signal. This is that shutdown's outcome, not a proof that ending stdin alone stops the process tree | PASS |
-| Q9 | no | an untrusted fixture cwd with no request cwd: `config.toml` bytes unchanged, no trust entry naming the fixture, sandbox and approval kept | PASS |
-| Q14 | yes | stage 2 preparation, outside G1: two sequential turns on one fresh read-only ask thread through the production transport (the backend runs one turn), each a short reply. After each turn a thread/read is the barrier for late usage. Every `thread/tokenUsage/updated` scoped to the thread and turn that the production reader accepts is printed with each `total` and `last` counter, `cacheWriteInputTokens` and `modelContextWindow`: an absent cache write is shown as absent, never as 0, and a null or absent window as such. An update the reader rejects (a null or non-count counter, cached input above input) ends the child before the harness sees it, so its counters are not observable: the case FAILs with the reader's fixed reason. Completed `agentMessage` and `reasoning` items are counted by distinct id as observable item counts; the protocol names no model response, so they are not response counts, and malformed items are counted apart. Additivity (turn 2's final total against turn 1's plus every turn 2 `last`) is printed field by field as yes, no or unknown: evidence of how the counters behaved, not a gate and not a policy for summing `last`. A positive cache write is compared with input only as an inequality observation, not proof that it is part of input; zero or absent counts measure no relation. PASS needs both turns completed by the child, an idle readback after each, two distinct turns on the one thread, usable counters for each turn and the guards holding. A completed turn with no usable usage is UNPROVEN. No item text, reply, command or configuration is printed | PASS once natively at `625061e`: both turns completed with an idle readback, one scoped usage update each and none after completion; turn 2's `total` equalled turn 1's `total` plus turn 2's `last` in every field, and turn 2's `last` differed from turn 1's; cache write 0 in all four breakdowns; window 258,400; one `agentMessage` and no `reasoning` item per turn. `--fake` passes on literal counters, NOT NATIVE |
-
-Q1, Q2, Q3, Q4, Q7 and Q9 were measured with the harness as of commit `c2f2477`, before the probe-diagnostics commit `5af04e5`, before the cases were trimmed to this list (`89d5e74`) and before the thread/start reader was narrowed to the reported sandbox's tag (`cf8f0cd`), which dropped only diagnostic fields no decision read; the case definitions they ran under match the rows above except where a row says otherwise. Q6 ran once, at `cf8f0cd`. All come from one Linux x64 host running Node 24.18, with the child's user agent reporting app-server 0.160 (reported, not independently verified), under the user's own host-default selection (`gpt-6.1-sol`, provider `openai`, effort `high` as read back by the cases that verified one). They qualify stage 1's fresh `implement` and `ask` on that version and platform, and nothing more: no model switch (Q2's explicit model was the default's own), no named-effort override (Q3b was not run), no hosted search (Q4 observed no search item, which does not show search disabled), no cost in USD, cache-write relationship or context-window figure, no permission or denial guarantee beyond the user's own sandbox configuration, and no continuation, resume, fork, steer or question. An earlier sandbox-probe case, Q5, ran once natively and was UNPROVEN. Its scratch log is kept; its fixtures were removed after a clean owned shutdown, as the log records. That result is evidence neither of success nor of a backend failure, and Q5 is no longer a case or part of G1.
-
-Every case hashes `config.toml` in the predicted home before and after and fails on a change. The harness writes, copies or prints no configuration, credential or environment; beyond the hash it only checks whether `config.toml` names Q9's fixture path, as a yes or no. Selection comes only from its flags, and no model or effort catalogue is guessed. The fixture root is removed only after every child the harness was handed is proved over: a clean actual exit, no leftovers, discovery ok, and closed pipes. Any concern, including a missing exit report, keeps and names it, whichever branch the case left by. `--fake` drives `test/fake-codex.mjs` by path through the production transport and backend; its output is labelled NOT NATIVE and qualifies nothing.
-
-A fallback that names the cwd is considered only if Q2 fails, and only with the user's consent, because it may write a trust entry. Stage 2's gate G2 passed ([G2 cases](#g2-cases)). Q14 is the first stage 2 preparation step, usage measurement before any continuation. It ran natively once, at commit `625061e` on 2026-10-04, on the same Linux x64 host (Node 24.18, the child's user agent reporting app-server 0.160, not independently verified), as exactly two short replies on one fresh read-only ask thread driven through the production transport, and PASSED. The thread/start answer and both readbacks named `gpt-6.1-sol`, `openai`, effort `high`: a diagnostic of that direct-transport run, not a backend-verified call outcome. **Observed:** each turn sent one usage update scoped to it, before its completion. Turn 1's `total` equalled its `last` (input 14,811, cached input 12,288, output 5, reasoning 0, total 14,816). Turn 2's `last` covered its own turn (input 16,070, cached input 12,288, output 5, reasoning 0, total 16,075), and its `total` was cumulative for the thread (input 30,881, cached input 24,576, output 10, reasoning 0, total 30,891), equal to turn 1's `total` plus turn 2's `last` in every field. Cache write was reported as 0 in all four breakdowns, and the window as 258,400. **Read in the 0.160.0 source, separately:** `total` accumulates per thread and is seeded from history on resume or fork, `last` is replaced per response, and an update may be re-sent with unchanged counters, so neither one update per response nor summing `last` per notification is guaranteed; the stable protocol names no response identity, and an `agentMessage` item is not one. **Rule recorded from Q14 and the 0.160.0 source:** a thread's `total` is cumulative, and it is not context occupancy, so one call's usage on a continued thread needs a verified baseline taken from it. Commit `6f2a147` then implemented that rule ([Records and usage](#records-and-usage)), and G2's Q10 (resume) and Q12 (fork) measured it natively on one host. Q14 measured no cache-write vs input relation, because no positive cache write was reported, so that stays unqualified, as do cost and caps; a resumed or forked thread's per-call usage was measured by G2's Q10 and Q12 rather than a case of its own. Whether `codex resume <thread id>` reopens an app-server thread remains a manual, non-gating follow-up. G1 qualifies only stage 1 on the measured target; G2 qualifies stage 2 only as its cases measured it; nothing here claims cost, cache-write or context-window guarantees, and stage 3 stays behind its own gate.
-
-### G2 cases
-
-**G2** needs Q10, Q11, Q12, Q13 and Q19 to PASS natively, run one agreed case at a time in that order and stopping at the first FAIL or UNPROVEN. **G2 PASSED.** Each case ran natively once, in that order, at commit `cff6a9e` on 2026-10-04 (14:56–14:58 UTC), on the same Linux x64 host (Node 24.18, the child's user agent reporting app-server 0.160, not independently verified), with no `--model`, so every call ran the host default, which each settled call verified by readback as `gpt-6.1-sol`, provider `openai`, effort `high`. Each child's root exited 0 with no signal, nothing left, discovery ok and pipes closed; `config.toml` was byte-for-byte unchanged by every case; no backend call requested an approval (the harness's guard on backend calls, not a permissions proof, and not run on Q11's direct child). Every fixture root was kept (`--keep`). These connections had no question callback, so no `experimentalApi` capability and no dynamic tools: G2 measured the stable connection shape, not the opt-in one every delegated run now uses. G3 later measured that opt-in shape only for fresh, resumed and forked `ask` questions and a cancellation while one waited ([G3 cases](#g3-cases)); the G2 behaviors themselves, steering and the moved-tip refusal included, were not re-measured in it. The cases measured `ask` runs only; `plan`, `implement`, a fork from an older checkpoint behind the source's current tip, a model switch, a changed default, hosted search, the cache-write vs input relation, context occupancy and cost in USD were not measured, and the user's sandbox and kernel policy were not audited. Each is a model case: a bounded number of short turns on the user's own login and quota, with USD unknown. They chain production backend calls as the host does: a continuation's session is the backend's own mapping of the earlier outcome's reference, and its role the binding over the earlier verified selection, so the default ask contract, the host-default model unless `--model` names one, and the user's own sandbox apply as in production; nothing re-audits that sandbox. The harness forwards the stage 2 methods the backend drives through its start seam and prints only ids, selection fields, byte counts, counters and answers' tags, never a reply, prompt, steer or instruction text. Under `--fake` a continuation tells the next fake process what the earlier one left (its turns and total, from the record) through the fake's own variables; that is NOT NATIVE and stands in for the persisted thread a real Codex keeps.
-
-| Case | Turns | What it records | Native result |
-| --- | --- | --- | --- |
-| Q10 | 2 | A fresh backend ask settles on its admitted turn and the total at the barrier; a backend resume of that reference then reads the tip, which must be the checkpoint, completed, before its turn, and settles on a new checkpoint and baseline on the same thread with the recorded model, provider and effort pinned in request, turn/start, readback and verified selection. Per-call usage: every core count of the total at or above the baseline, the delta printed field by field, the published in/out/cache read equal to it, context the latest `last.inputTokens` against a positive window or unpublished. With exactly one scoped usage update, the delta is compared with its `last` as an observation, never a summing policy. Reasoning and total deltas are printed and have no published field; cache write is a diagnostic, never gating (Q14b's usage is folded here and in Q12) | PASS: the resume read the recorded checkpoint as the tip, completed, before its turn, and settled on a new checkpoint on the same thread, with model and provider named in thread/resume, effort `high` on turn/start, and readback and verified selection matching. Fresh baseline: input 14,865, cached 12,288, output 5, reasoning 0, total 14,870. Resumed total: 29,749 / 27,008 / 10 / 0 / 29,759, so this call's delta was input 14,884, cached 14,720, output 5, reasoning 0, total 14,889, equal to the published in/out/cache read and to the turn's one scoped update's `last`. Context 14,884 of a 258,400 window. Cache write 0 throughout. The resumed child also sent one usage update not scoped to the new turn and a `thread/goal/cleared` notification; neither was read as this call's usage |
-| Q11 | 2 | A fresh backend ask, then one turn the harness starts itself on its own child through the production transport, resuming the thread with the record's selection and the role's contract, which completes and moves the tip; the backend resume of the original reference must then be refused with the fixed `RESUME_MOVED` before any turn/start (the wrapper counts 0), its tip read naming the extra turn, and settling no checkpoint or baseline. The extra turn's id is printed beside the recorded checkpoint. That the host keeps the earlier record after such a refusal is covered offline by the lifecycle tests, not here | PASS: the extra turn completed under a new turn id; the backend resume's tip read named it, and the resume was refused with `RESUME_MOVED` after thread/resume and the tip read, with 0 turn/start, no checkpoint and no baseline, and a clean exit |
-| Q12 | 2 | A fresh backend ask, then a backend fork of its reference, as the host continues from another host session: thread/fork names the source and its checkpoint as `lastTurnId`, the answer a new thread (and the source as `forkedFromId` when reported), the new thread's tip read completed. Whether that starting tip's id equals the source checkpoint is printed as a fact, never required. Success settles on the new thread's admitted turn and total; usage and pinning are checked as in Q10, against the source baseline | PASS: thread/fork named the source and its checkpoint, which was still the source's current tip (nothing ran on the source after the fresh call, so this is no fork from an older checkpoint); the answer a new thread with `forkedFromId` the source; the new thread's tip read completed, under the same id as the source checkpoint (observed, not required). The fork's total continued from the source: source baseline 14,869 / 12,288 / 5 / 0 / 14,874 (input, cached, output, reasoning, total), fork total 29,757 / 24,576 / 10 / 0 / 29,767, delta 14,888 / 12,288 / 5 / 0 / 14,893, equal to the published counts and to the one scoped update's `last`. Settled on the new thread's own turn with the selection pinned |
-| Q13 | 1 | An ask asked to run `sleep 20` once; one steer pushed into the run's input when the primary turn's first `commandExecution` item starts (under `--fake`, at turn admission), then the turn is waited for, not cancelled. PASS needs the input taking it, exactly one `turn/steer` for the admitted turn, the child accepting it, the run's counts saying one accepted, and a clean completed success with a non-empty report. An item start is not proof the command ran. No command item, or a refused or unanswered steer, is UNPROVEN; nothing is retried, resent or sent to a guessed turn. Whether the reply reflects the steer is an unprinted yes/no, never evidence: acceptance is delivery, not consumption | PASS: the steer was pushed when the first command item started; one `turn/steer` named the admitted turn and the child accepted it; the run's counts were pushed 1, accepted 1, nothing else; the turn completed with a non-empty report and a clean exit. A command item's start is not proof the command ran |
-| Q19 | 2 | A fresh backend ask (`--model` optional), then a resume whose call names no model: the role binding takes the recorded model, provider and effort, and request, readback and verified selection must match the record, with a new checkpoint and baseline. Without `--model`, or with one equal to the host default, this is a **same-model round trip**, labelled so: it does not prove a pin against a changed default or a model switch. No model inventory, configuration override or host configuration change is made to force one | PASS, **same-model round trip only**: run without `--model`, the resume call named no model, and the request, readback and verified selection matched the record (`gpt-6.1-sol`, `openai`, `high`), with a new checkpoint and baseline on the same thread. No changed default or model switch was measured |
-
-### G3 cases
-
-**G3** needs Q15 and Q16 to PASS natively, run one agreed case at a time in that order and stopping at the first FAIL or UNPROVEN. **G3 PASSED.** Each case ran natively once, in that order, at commit `84aa4ff` on 2026-10-04 (16:31–16:32 UTC), on the same Linux x64 host (Node 24.18, the child's user agent reporting app-server 0.160, not independently verified), with no `--model` or `--effort`, under the host default each settled call verified by readback as `gpt-6.1-sol`, provider `openai`, effort `high`. Every child's root exited 0 with no signal, nothing left, discovery ok and pipes closed; `config.toml` was byte-for-byte unchanged by both cases; every fixture root was kept (`--keep`). A scratch observer outside the repository recorded only shapes on the wire: the `experimentalApi` flag, request keys, the dynamic tool's name, type and schema keys, ids, byte counts, and each reply's success flag and content item types. They are the only cases whose backend calls carry a question callback, with the signature the host passes, so only they run the experimental connection shape every delegated run now uses: the `experimentalApi` opt-in at the handshake on every child, and `ask_orchestrator` as a flat dynamic tool on a fresh thread only. G1, Q14 and G2 stand as the record of the stable shape with no callback. The answer a callback gives is made inside it, a new random one for every call, so it is in no prompt, instruction, fixture or fake setting and reaches the model only as the tool result; no question, answer, report or instruction text is printed, only counts, a yes or no for whether the report carries the answer, and the ids, selection and usage facts the G2 cases print. A missing question, a report without its answer, or a model that asked more than once is UNPROVEN, never a pass on completion and shutdown alone; a repeated request id, or child counters that disagree with the callback, is a FAIL.
-
-Native footprint: Q15 runs three completed turns on three owned app-server children, Q16 one cancelled turn on one child. Both use the user's login and quota with USD unknown, may leave rollouts in the existing Codex home, and keep the fixture root on any cleanup concern or with `--keep`.
-
-| Case | Turns | What it records | Native result |
-| --- | --- | --- | --- |
-| Q15 | 3 | Three backend legs with a question callback, each asked to call `ask_orchestrator` once and reply with the answer it receives: a fresh ask, a resume of its reference, and a fork of the resumed reference (its source's current tip, never an older checkpoint) as from another host session. Each leg needs one callback, one question in the child's counters and none refused or repeated, the question taken before its turn completed, and the report carrying that leg's own answer, which only the tool result held; then the settled checks of the G2 cases: reference, checkpoint and baseline at the barrier, per-call usage, published counters and context, a clean owned shutdown, and on resume and fork the tip and the pinned selection. The resume and the fork register no tool, so their answers show Codex restored the fresh thread's tool from history | PASS: every child's `initialize` declared `experimentalApi: true`; only the fresh `thread/start` carried `dynamicTools`, one `function` named `ask_orchestrator` with an object schema requiring `question`, and thread/resume and thread/fork carried none. Each leg got one `item/tool/call` for `ask_orchestrator`, with no namespace, on its own admitted turn before it completed; one callback and one question counted, none refused or repeated; the reply was `success: true` with one `inputText` item; and the report carried that leg's answer, which only the tool result held. So the resumed and the forked thread called a tool they did not register, which Codex restored. The resume read the recorded checkpoint as its tip; the fork, through the resumed checkpoint (the source's current tip), got a new thread whose starting tip had that same id. Selection pinned in request, turn/start, readback and verified selection. Usage, each turn with 2 scoped updates (input / cached / output / reasoning / total): fresh 29,319 / 14,464 / 48 / 0 / 29,367; resume delta 29,569 / 29,056 / 48 / 0 / 29,617; fork delta 29,822 / 14,720 / 51 / 0 / 29,873, each equal to the published counts and none a sum of `last`; context the latest `last` input (14,693, 14,818, 14,946) against a 258,400 window. Cache write 0 throughout |
-| Q16 | 1 | A fresh ask with a callback, asked to call `ask_orchestrator` once and wait. The first question's answer is left pending until its own signal aborts; with that listener in place, the run is cancelled once through the production signal. PASS needs one callback and one question counted, the question's signal aborted, the production verdict `aborted` with no checkpoint or baseline, the child's exit report saying the host requested the stop, and a clean owned shutdown. The child's own turn end is printed as a diagnostic. The one failed tool reply is the transport's and has no counter; the fake tests read it from the request log. No question before the run ended is UNPROVEN. Nothing is retried, steered, replayed or delayed | PASS: one `item/tool/call` on the admitted turn; one callback and one question counted, none refused or repeated; the question's signal aborted and no answer was given; production verdict `aborted` with no checkpoint or baseline; the child's own turn ended `interrupted`; stop requested, root exited 0, clean. The observer saw one reply to that call, `success: false` with one 112-byte `inputText` item, and one `turn/interrupt`; it did not record their relative order, and no acknowledgement of the reply by Codex is measured |
-
-G3 measured questions on fresh, resumed and forked `ask` threads and a cancellation while one waited, in the experimental shape. It did not re-measure steering, a moved-tip refusal or any other G1 or G2 behavior in that shape, and did not measure `plan` or `implement` questions, a fork through an older checkpoint, the host's answer UI, writer slot and lifecycle races (fake-tested), a question left waiting until a timeout or abandoned, other platforms or versions, a provider, model or default switch, the cache-write vs input relation, context occupancy or cost in USD. A continued thread started without the tool is not upgraded: such a continuation runs with the continued-questions fallback, which G3 does not measure. Opting a connection into the experimental API may enable other server features; nothing here claims isolation or an absence of other network or inference activity.
-
-## One call
-
-```text
-session mapped: new, or a codex reference with checkpoint + baseline (else refused, nothing read)
-cancelled? -> nothing read, located or started
-contract, + codex-no-questions addendum with no question callback,
-          or + codex-continued-questions on a resume or fork with one  (unreadable: thrown, before any lookup)
-codexLaunch: host cwd, inherited env, binary located now (failure: thrown as is)
-spawn -> initialize (client pi-fusion, this package's version, capabilities.experimentalApi only with a callback) -> initialized
-  home check: reported Codex home == predicted home (canonical)
-thread/start  { model?, modelProvider?, sandbox, approvalPolicy: never, developerInstructions, dynamicTools: [ask_orchestrator] only with a callback }
- | thread/resume { threadId, the same fields, excludeTurns: true }
- | thread/fork   { threadId, lastTurnId: checkpoint, the same fields, excludeTurns: true }
-  checks: thread id (resume: the recorded one; fork: a new one, forked from the source when reported),
-          cwd == launch cwd (canonical), sandbox tag == role mode,
-          approval policy confirmed exactly as never, named model/provider exact
-thread/turns/list (resume and fork only): latest turn
-  resume: exactly the recorded checkpoint, completed; fork: a completed turn = starting checkpoint
-turn/start    { threadId, input: [text], effort? }
-  steers queued since admission go to this turn: turn/steer { threadId, expectedTurnId, input }, each once
-  item/tool/call ask_orchestrator from this turn -> host question (read loop goes on) -> one tool result
-  turn.done (the admitted turn's own end) -> input closed -> completed? no terminal error?
-thread/read   (barrier: notifications sent before its answer, late usage included, are applied first)
-  checks: final agent message of this turn, usage, total not below the baseline, idle status, cwd, selection
-one shutdown -> outcome mapping
-```
-
-Requests never name a `cwd`, config map, base instructions or an effort on a thread request, or any dynamic tool except the question tool on a fresh thread with a callback. Turn/start names no model, provider, cwd or sandbox policy: the model is bound to the thread. Naming a cwd could make Codex record a trust entry in the user's configuration. Leaving it out avoids that, and the reported cwd is checked against the launch's realpath instead. Nothing rewinds, replays or names a path. Fusion writes no trust entry, configuration or auth file.
-
-A question is the child's `item/tool/call` for `ask_orchestrator`, answered as [Questions on Codex](questions.md#on-codex) describes. Any other server request (another tool, a user-input request, an unknown method) fails the run. Approval requests are declined, and the run lists them as denied tools. With approval policy `never`, none is expected.
-
-## Continuation and fork
-
-Measured natively by G2 (Q10, Q11, Q12, Q19) for `ask` runs on one Linux x64 host with app-server 0.160: a resume at the recorded tip, a resume refused after the tip moved, and a fork whose checkpoint was still the source's current tip. A fork through an older checkpoint behind the source's current tip is supported from the 0.160.0 source (thread/fork's `lastTurnId`) but unmeasured natively, and other roles' continuations are tested only against the deterministic fake.
-
-- **Mapping.** A `continue` maps a Codex record's tagged thread, its checkpoint and its usage baseline; another backend's reference, or one without both checkpoint and baseline, is refused before any contract read, binary lookup or spawn. The model and provider are the recorded ones, and the effort the recorded one, each unless the call overrides model or effort; the provider is always the recorded one.
-- **Resume** loads the recorded thread. Its answer must name that thread and pass the start checks, and its latest listed turn must be exactly the recorded checkpoint with status `completed`; a thread that moved on, ended cold or whose checkpoint is not completed is refused before any turn, and the refusal names a new run without `continue` that carries the earlier report as context, or `fresh: true` for a plan call, whose implicit continuation would otherwise resume the same thread again. The previous record stays the historical authority, but it is not guaranteed resumable: a resume that failed or was cancelled after its turn was admitted can leave that turn past the checkpoint, so every later `continue` of the record is refused the same way. Nothing forks, rewinds or replays to get back to it.
-- **Fork** (a continuation from another host session) copies the thread through its checkpoint. The answer must name a new thread, and when it reports what it was forked from, the source. The new thread's latest listed turn must be `completed`: that turn is the fork's **starting checkpoint**. It is the new thread's own report and is never assumed to be the source's checkpoint: on the measured host Q12's starting tip had the source checkpoint's id, an observation this backend does not rely on. A new thread with no turns, or with a tip that is not completed, is refused before any turn and kept readable under its new id alone.
-- **Settling.** Any success — fresh, resumed or forked — settles on its own admitted turn, completed, as the checkpoint, with the thread's cumulative total read at the post-turn barrier as the baseline: five safe integer counts paired with that checkpoint, never one without the other. A demoted or failed resume settles on nothing. A fork that fails after its starting checkpoint keeps its own new thread at the starting tip it reported, completed, with no baseline, so it is readable only; it is never recorded at the source's checkpoint.
-- **Failure moves no record.** A failed or cancelled resume can still have moved the thread's tip; the previous record stays the historical authority, and nothing rewinds, forks or replays to get back to it automatically. A record written before this runtime, with no checkpoint or no baseline, is never upgraded into a continuable one.
-
-## Plan runs
-
-Unqualified: tested only against the deterministic fake and in-memory doubles; G2 ran no `plan` call.
-
-`plan` runs on Codex under the shared `contracts/plan.md`, followed by the no-questions addendum in a run with no question callback, or by the continued-questions fallback in a continued one with a callback, in the `workspace-write` sandbox. A plan call that names no handle continues the latest Codex plan run on this branch, exactly as a `continue` of it would ([Continuation](#continuation-and-fork)). Reading the record checks only what it holds — its tagged thread, a checkpoint, the baseline paired with it and a repeatable selection — and cannot know where the thread's tip is now. A record missing any of them stays readable but is not continued, and the call stops there rather than walking back to an older plan. A record that passes is resumed in this host session, and only the backend, once running and before any turn, finds a thread that moved past its checkpoint and refuses it; from another host session it is forked from that checkpoint. That is intended to work even after the original thread moved on, because thread/fork takes the checkpoint as `lastTurnId`; forking through an older checkpoint is supported in the 0.160.0 source but unmeasured natively (G2's fork was at the source's current tip). `fresh: true` starts a new plan thread instead, and is the way on after such a refusal: leaving out `continue` alone would resume the same thread again. The recorded selection, provider included, pins the continuation whatever profile is selected since; a call's model or effort overrides only those fields.
-
-A plan call hands off to a fresh thread, carrying the last report as the plan so far, when the call names another model than the run verified, or when the run's context share reaches `PI_FUSION_PLAN_CONTEXT_PCT` ([Records and usage](#records-and-usage) says how it is read; missing or zero context never caps). A cap handoff carries the model and effort the plan run last verified, as on Pi; a model handoff runs the named model at the call's or configured effort. **The provider is not carried.** A fresh thread request names only a model and an effort, so the new thread runs on the provider the host's own Codex configuration chooses then; nothing checks it against the old run's. Pinning the provider holds only for a continued thread.
-
-## Steers
-
-Measured natively once by G2's Q13: one steer accepted for an `ask` run's admitted turn on one host. Everything else here is tested only against the deterministic fake.
-
-A Codex run's input is open from its admission. Messages pushed before its turn is admitted wait. Once the turn is named, each is sent to it in order as one `turn/steer` naming that turn as `expectedTurnId`. Each message gets exactly one attempt: nothing is retried, replayed or sent to a guessed turn. The input closes when the turn ends, when the call ends and on cancellation; a message still queued then is dropped and never sent. At most 32 messages wait at once.
-
-A message the input takes is answered `steer queued for run-N`, saying it goes once to the current turn with no retry and that the turn taking it does not show the child read it. A message it does not take while it stays open — 32 already waiting — is answered at once that the run did not accept it now: nothing was sent, queued or kept for later. A message that meets the input closed is the run ending, reported as for any backend.
-
-The report adds one note when any message was pushed, counting each by outcome:
-
-- **taken into its turn's input**: the child accepted it. This means delivery, not that the model read it.
-- **refused**: the child answered with an error.
-- **sent with no answer**: no answer arrived inside the request bound, or the child ended first, so whether it arrived is unknown. A steer timeout does not end the run.
-- **not sent**: the transport would not send it.
-- **dropped**: still queued when the input closed.
-
-## Selection
-
-The model and effort come from the call, then the selection a continued run recorded, then the session's configuration, then `PI_FUSION_CODEX_<ROLE>_MODEL`/`_EFFORT` (`PLAN`, `IMPLEMENT` or `ASK`); with none of them the host's own Codex configuration chooses, and thread/start names no model, and the run is shown as `host default`, then `host default -> <model>` once the child reports it. The label is never sent as a model. A requested effort is named only on turn/start. A fresh thread names no provider, so it always takes the host's own; a continued thread names the provider its record verified.
-
-The **configured selection** is the thread's own: the model and provider from thread/start, confirmed by the post-turn thread/read.
-
-- A model the readback leaves `null` keeps the start answer's model, with a note. A non-null model that differs fails the run. The provider must match.
-- A **named effort** must read back exactly. If the readback has `null` or no effort, the run fails.
-- An **unnamed effort** is the readback's. If that is null, the start answer's is used with a note. If both are null, no effort is recorded, with a note.
-- `model/rerouted` is **per-turn telemetry**, never the selection. An explicit-model run that Codex rerouted fails. A host-default run is accepted with a note quoting from/to/reason, and its recorded selection stays the configured model.
-
-Notes are appended to the report as `Note: …` lines.
-
-## Success, failure and cleanup
-
-A run succeeds only when all of these hold:
-
-- the admitted turn completed with no terminal error
-- the turn has a non-empty final agent message
-- the turn reported usage before the readback answered, and on a continuation its cumulative total is not below the baseline in any of the five core counts
-- the thread reads back idle, with a verifiable selection
-- the child's one shutdown was clean: no transport failure, an actual clean exit, and no cleanup concern
-
-A retryable error notice is not an end. Failed, self-interrupted, crashed, timed-out (turn/start is never retried) and unsupported-request turns fail. A cancellation interrupts the turn when one is known, then stops the child within bounds.
-
-A cancellation that lands during or after the readback still fails the run as aborted. A selection already verified is kept on that outcome as diagnostic data, not as success: success is `failed()` on the run and the host's `recordDecision`, never the presence of a selection.
-
-A verified success whose shutdown was not clean is demoted. It keeps its thread and verified selection, and the cleanup concerns appear once, in the run's `cleanupNotice`. The composition calls the child's shutdown exactly once. A transport that already finalized itself returns that same report.
-
-## Records and usage
-
-- A success's outcome reference is `{ backend: "codex", sessionId: <thread id>, checkpoint: <its admitted turn id>, baseline: <the thread's total at the barrier> }`; a failure's names the thread alone, except a fork that failed after its starting checkpoint ([Continuation](#continuation-and-fork)). The baseline is the five core counts (input, cached input, output, reasoning output, total) and the cache write as the reader returned it, which reads a cache write the child left out as 0. `codex resume <id>` is named as an intended manual hint for opening the thread, not a natively measured one. A scalar `sessionId` is set as a diagnostic, and the host's writer does not record it for Codex.
-- `modelId` and the selection are the configured model, provider and effort.
-- Tokens are **this call's** share of the thread's final cumulative **total**: on a fresh thread the total itself, and on a continuation the total less the baseline it started from, field by field, never a sum of per-response updates (an update re-sent with the same total counts once). Input already includes cached input; cache read (= cached input) is shown beside it and never added again. If any core count of the total is below the baseline, the call's usage cannot be told: the display shows nothing for that update, and a final total like that fails the run with no checkpoint or baseline.
-- The success gate is the five core counts: the turn's final total must be at or above the baseline in each, and the call's delta is that difference. Cache write is an optional diagnostic and never decides success, a role, a context cap or a record: on a continuation it is the difference only when the baseline recorded one and the total has not fallen below it, and otherwise unobserved, shown as 0 — that 0 is a display, not a native zero. No cost is estimated from it.
-- Context is an estimate: the latest response's input (`last.inputTokens`) against the reported window (`modelContextWindow`), shown, recorded and used for the plan cap's share only when both are positive; otherwise neither is published, the share is unknown, and no cap applies, and a share shown earlier in the run is cleared rather than kept. It is never the thread's cumulative total, never the call's delta, and not a guarantee of exact context occupancy. That reading comes from the 0.160.0 source; Q14 observed `last` and the window natively on fresh turns, and G2's Q10 and Q12 on a resumed and a forked turn.
-- **Cache write vs input is unqualified (Q14).** Whether Codex's cache-write tokens are part of `inputTokens` is not settled by the 0.160.0 source and has not been measured: Q14's one native run reported cache write as 0 throughout, which measures no relation ([Q14](#the-stage-1-harness)). Fusion uses Codex's `inputTokens` unchanged and reports cache write beside it, with no sum or clamp against the input. No lifecycle, budget or context-cap behavior may rely on that relationship until the cache-write relationship is actually measured.
-- Usage covers the **parent thread only**. A subagent's threads are not included, and nothing claims they are. Codex reports no cost, so the cost is **unknown**: no USD figure or estimate is produced, and no zero cost stands in for it.
-- In the host, a Codex run's tokens count toward the session ledger and its dollar estimate leaves it out: no Codex run shows a cost, and `/fusion status`, the widget and the dashboard header add `cost unknown for N codex runs, not in the estimate`. With `PI_FUSION_BUDGET_WARN_USD` or `PI_FUSION_BUDGET_LIMIT_USD` set, the first Codex run admitted in an extension instance says once that Codex spend is outside the estimate. No budget refusal or estimate is specific to Codex; the existing limit refuses Codex runs exactly as any other once the priced Claude/Pi estimate reaches it.
-- The host records the tagged thread reference and the verified selection only. The outcome's scalar `sessionId`, and any flat checkpoint, model or effort, are diagnostics the host never writes for a Codex run; `recordDecision` decides what is kept. A cancelled or failed run that already verified its selection stays a failure: it may be kept for reading with that selection, never read as a success.
+Stats/status/dashboard offer `codex resume <thread id>` from the accepted outcome only. This is an intended manual recovery hint, **not natively measured**. Forks name their own thread. Shell-unsafe ids are single-quoted; ids beginning with `-` follow `--`.
 
 ## Inheritance, not isolation
 
-The child runs the host's `codex` (`PI_FUSION_CODEX_BIN` or `PATH`) with the host's environment copied unchanged. It therefore uses the user's Codex home, configuration, auth, MCP servers, multi-agent features (subagents) and any remote-control settings. Fusion predicts the home only to compare it, and isolates nothing: an MCP server or remote-control setting the user enabled is live in a delegated run, and a subagent's work and spend are outside what Fusion reports. The sandbox is the per-thread mode Codex reports for the role, checked at start; a continuation names the role's mode again and checks the reported tag the same way. There is no historical sandbox record or comparison, so nothing compares it with what an earlier call ran under.
+Source: [`codex-launch.ts`](../extensions/backends/codex-launch.ts).
 
-The live display filters the transport's notifications to the primary thread and its admitted turn. A subagent's or a foreign turn's final text, usage or tool calls never reach the report or the monitor.
+```text
+host install and environment (unchanged)
+  +-- PI_FUSION_CODEX_BIN, else first executable codex on PATH
+  +-- host working directory -> child's process cwd
+  +-- CODEX_HOME, else user's ~/.codex
+        +-- configuration / profiles / login
+        +-- MCP / remote-control / multi-agent settings
+        +-- rollouts, logs and state may remain here
+
+Fusion supplies role sandbox mode + approvalPolicy: never
+Fusion does not isolate or re-audit the inherited configuration
+```
+
+- No install, download, login, credential copy, configuration write, or separate API key. Home prediction is compared with the child's reported home, not created or read by Fusion.
+- Lookup/launch are POSIX-only. Windows refuses when a run starts; macOS executes the same code but is unmeasured. Linux qualification is limited to the host/version in [Evidence](#evidence).
+- Writable roots, network access, shell policy, MCP, remote-control and multi-agent features remain the user's. Enabled servers/features are live; subagent work and spend are outside Fusion's reports.
+- Only the reported sandbox **tag** is checked against the role. Continuations request/check the mode again; no historical sandbox record or comparison exists.
+- Hosted web search is inherited, neither enabled nor disabled by Fusion. Q4 observed no search item; that is not proof that search is disabled. The shared ask contract requires sources or an explicit unchecked fact.
+
+**Requests omit cwd.** In Codex 0.160.0 source, naming a cwd can write a trust entry for an untrusted writable project. Fusion instead binds the process cwd by realpath and checks the reported cwd. Q2/Q9 measured this without changing `config.toml` on one host. A cwd-naming fallback is **not implemented** and would require explicit consent because of that possible trust write.
+
+## One call
+
+Source: [`runCodexCall` / `drive`](../extensions/backends/codex.ts).
+
+```text
+map new/resume/fork intent
+  | invalid continuation -> refuse before contract read, lookup or spawn
+  | already cancelled    -> finish without starting a child
+  v
+read role contract + applicable question addendum
+  -> locate binary / compose launch / read client version
+  -> spawn -> initialize -> initialized -> verify reported home
+  v
+thread/start OR thread/resume OR thread/fork
+  -> verify thread, cwd realpath, sandbox tag, approval, named model/provider
+  -> continuation: thread/turns/list -> verify latest completed tip
+  v
+turn/start (prompt, optional effort)
+  +-- queued steers -> this turn, once each
+  +-- own-turn ask_orchestrator -> host question -> one tool result
+  +-- scoped notifications -> turn evidence, separate from live display
+  v
+turn.done -> close input -> completed result / terminal-error check
+  -> thread/read barrier -> final snapshot + idle/selection/usage checks
+  -> one shutdown -> outcome mapping -> host recordDecision
+```
+
+| Request | Fields Fusion supplies |
+| --- | --- |
+| Thread start | Optional model; sandbox, approval, developer instructions; dynamic question tool only with a callback |
+| Resume | Thread id, recorded provider/selection, role fields, `excludeTurns: true`; no tool registration |
+| Fork | Source thread, checkpoint as `lastTurnId`, recorded provider/selection, role fields, `excludeTurns: true`; no tool registration |
+| Turn start | Thread id, text input, optional effort; no model/provider/cwd/sandbox |
+| Steer | Thread id, admitted turn as `expectedTurnId`, text input |
+
+No request supplies cwd, a config map, base instructions, effort on a thread request, or another dynamic tool. Nothing rewinds or replays; Fusion writes no trust/configuration/auth file.
+
+Approval requests are declined and listed as denied tools. Unsupported server requests fail the run. An unhostable `ask_orchestrator` call instead receives `success: false` and the run may continue; [Questions](questions.md#on-codex) owns that flow.
+
+The live display filters unfiltered transport notifications to the verified primary thread and admitted turn. Foreign/subagent final text, usage and tool calls do not enter its report or monitor.
+
+## Continuation and fork
+
+Sources: [`codexSession`](../extensions/backends/codex-outcome.ts), [`drive`](../extensions/backends/codex.ts), and [host recovery policy](runs.md#recovery-policy).
+
+```text
+record: tagged thread + checkpoint + baseline + selection/provider
+  | missing/incomplete -> readable only; never upgraded or guessed
+  v
+same host session                  another host session
+  thread/resume                      thread/fork through checkpoint
+  latest tip == checkpoint?          different thread id?
+  tip completed?                     latest tip completed?
+    no -> refuse before turn/start     no -> refuse before turn/start
+    yes -> one new turn                yes -> own starting checkpoint
+                                                -> one new turn
+
+success -> own admitted completed turn + cumulative total there
+failure -> resume: previous record unchanged
+           fork: own verified starting tip, no baseline (readable only)
+```
+
+- Mapping rejects another backend's reference or a missing checkpoint/baseline **before** reading contracts, locating a binary, or spawning.
+- Resume needs the exact recorded completed tip. A failed/cancelled admitted turn may move the actual tip even though the previous record remains authoritative. Later resumes then refuse; nothing automatically forks, rewinds, or replays to recover it.
+- Fork must name a new thread and, when reported, the correct source. Its completed starting tip is that new thread's own evidence, never assumed to equal the source checkpoint. A fork without a completed tip remains readable under its new id alone.
+- A failed fork after a verified starting tip keeps that tip without a baseline, so it cannot continue. A success settles checkpoint and baseline together on its own admitted turn.
+- Recovery is a new run without `continue`, carrying the report; `plan` also needs `fresh: true`. Older records without the checkpoint/baseline pair are never upgraded.
+
+Native coverage is in [G2](#g2-cases) and [G3](#g3-cases). Forking through an older checkpoint behind the source's current tip is supported from the inspected source but unmeasured natively.
+
+## Plan runs
+
+Source: host routing/handoff in [`fusion.ts`](../extensions/fusion.ts) and [`handoff.ts`](../extensions/handoff.ts). No native `plan` call was measured.
+
+```text
+plan call without continue
+  +-- fresh: true / no earlier plan -> new thread
+  +-- latest Codex plan
+        +-- unusable record         -> refuse; never choose an older plan
+        +-- different model or cap  -> fresh thread + last report
+        +-- otherwise               -> resume/fork exact recorded checkpoint
+
+explicit continue -> exact named run; warn at cap, never hand off
+```
+
+The role uses `contracts/plan.md` and `workspace-write`. Question addenda follow [Questions](questions.md#on-codex). Reading a record cannot prove its thread is still at the checkpoint; the backend checks the tip before a turn. A continuation refused for an unusable record or moved tip does not trigger a fallback handoff; use `fresh: true`.
+
+A cap handoff carries recorded model and effort unless overridden; a model handoff uses the named model and call/configured effort. **No handoff carries the provider:** a fresh thread uses the host's own Codex provider, unchecked against the earlier run. Only continuations pin it. See [The context cap](runs.md#the-context-cap).
+
+## Steers
+
+Source: [`CodexSteerQueue`](../extensions/backends/codex.ts). Native scope: [G2 Q13](#g2-cases), one `ask` steer on the historical no-callback connection.
+
+```text
+control message / /fusion steer
+  +-- question waiting -> answer, not steer
+  +-- input closed     -> run ending
+  +-- 32 queued        -> refuse now; nothing retained
+  +-- input open       -> queue
+                           -> admitted turn -> one turn/steer attempt
+                           -> close/cancel  -> drop anything unsent
+
+accepted for delivery != model read it != model acted on it
+```
+
+The input opens at admission; messages wait until the turn is named, then send in order. It closes on turn end, call end, or cancellation. No retry, replay, guessed turn, or resend.
+
+| Report count | Meaning |
+| --- | --- |
+| Taken into turn input | Child accepted it; delivery only |
+| Refused | Child answered with an error |
+| Sent with no answer | Delivery is unknown after the request bound/child exit; a steer timeout alone does not end the run |
+| Not sent | Transport would not send it |
+| Dropped | Still queued when input closed |
+
+Controls say **queued**, not read. A full open queue refuses immediately; it keeps nothing for a later retry.
+
+## Selection
+
+Sources: [`codexRole`](../extensions/backends/codex-binding.ts), [`verifySelection`](../extensions/backends/codex-outcome.ts), and [configuration precedence](configuration.md#the-codex-backends-variables).
+
+```text
+model / effort
+  call override
+    -> recorded selection for continuation
+    -> role settings (or captured defaults for another-backend override)
+    -> unset: host's Codex configuration chooses
+
+provider
+  fresh thread / handoff -> host's Codex configuration
+  continuation          -> recorded provider, even with a model override
+```
+
+An omitted model displays `host default`, then `host default -> <model>` after readback; the label is never sent as a model. Requested effort goes only on turn/start. Models/efforts receive lexical binding checks, not a model inventory or pre-admission capability probe.
+
+Configured selection comes from the thread start/resume/fork answer and post-turn thread/read, **not** per-turn reroute telemetry.
+
+| Readback | Decision |
+| --- | --- |
+| Model null | Keep start answer's model, with a note |
+| Model different / provider different | Fail |
+| Named effort missing or different | Fail |
+| Unnamed effort | Readback, else start answer with a note, else none with a note |
+| Explicit-model turn rerouted | Fail |
+| Host-default turn rerouted | Keep configured selection; note from/to/reason |
+
+Notes are appended as `Note: ...` paragraphs.
+
+## Success, failure and cleanup
+
+Sources: [`drive`](../extensions/backends/codex.ts), [`finishCodexRun` / `exitConcerns`](../extensions/backends/codex-outcome.ts).
+
+| Checkpoint in the code path | Checks made |
+| --- | --- |
+| `turn.done` | Admitted turn's completed result and terminal-error count |
+| Post-turn barrier | Non-empty own-turn final message, usable usage, total at/above baseline, cwd, idle state and selection |
+| Outcome mapping | Shutdown report, actual clean exit, transport failure and cleanup concerns |
+
+```text
+verified work + clean shutdown -> success checkpoint + baseline
+verified work + cleanup concern -> failure; thread/selection readable only
+aborted / failed outcome       -> no new successful checkpoint
+                                 (failed fork may keep its starting tip)
+```
+
+Current check gaps, from source inspection (not native measurement):
+
+| Gap | Consequence |
+| --- | --- |
+| Signal abort during shutdown is not rechecked before mapping | A previously successful verdict can still publish a checkpoint |
+| Barrier snapshot's terminal errors and a `completed` result's non-null completion error are not checked | These errors can escape the success gate |
+
+Retryable error notices are not completion. Failed, self-interrupted, crashed, timed-out and unsupported-request turns fail; turn/start is never retried. Cancellation requests interrupt for a known turn and bounded shutdown, not rollback.
+
+Preparation/call composition owns one shutdown. A transport already finalized returns the same memoized report. Outcome mapping alone composes the cleanup notice and demotes unsafe success; verified selection by itself is never success or persistence authority.
+
+Cleanup is **bounded best effort, not isolation**. Discovery failure is sticky; there is no mandatory preflight or background survey. A survivor can keep writing after the writer slot is released. Inspect survivors and working-tree/external effects before retrying. File changes are not undone; see [manual attention](runs.md#aborting-a-run).
+
+## Records and usage
+
+Sources: [`codex-outcome.ts`](../extensions/backends/codex-outcome.ts), shared record grammar in [`types.ts`](../extensions/backends/types.ts), and host [`recordDecision`](../extensions/fusion.ts).
+
+```text
+accepted Codex record
+  reference: backend=codex, sessionId=thread
+             checkpoint=own admitted completed turn
+             baseline=cumulative total at that turn's barrier
+  selection: configured model + provider + optional effort
+
+per-call usage: fresh -> final total
+               continued -> final total - recorded baseline
+context share: latest last.inputTokens / modelContextWindow
+```
+
+- The five core baseline counts are input, cached input, output, reasoning output and total: non-negative safe integers, cached input within input. Checkpoint/baseline are paired; a baseline without a checkpoint is unreadable. Scalar session/checkpoint/model/effort fields are diagnostics, not Codex persistence authority.
+- Usage is never a sum of `last` notifications. Re-emitted totals replace earlier counts. Any core total below its baseline prevents usage publication for that update and fails final verification without a new checkpoint/baseline.
+- Input already includes cached input; cache read is displayed beside it, never added again.
+- Cache write is optional diagnostic data, not a success/budget/cap gate. The reader treats an omitted value as 0. Continued display uses its difference only with a recorded value and non-decreasing total; otherwise displayed 0 means **unobserved**, not a measured zero.
+- **Cache-write vs input remains unqualified:** Q14 reported no positive cache write. Fusion leaves input unchanged and does not sum/clamp cache write against it.
+- Context publishes only with positive latest response input and window; otherwise both clear, the share is unknown and no cap applies. It is neither cumulative total nor per-call delta nor exact occupancy.
+- Usage covers only the parent thread. Subagent usage/spend is outside the report. Cost is **unknown**, never estimated or represented as zero.
+- Tokens count toward the host session ledger; the dollar estimate excludes Codex and says so. The first admitted Codex run warns once when USD controls are configured. Those controls act on priced Claude/Pi totals, not Codex spend; see [Budget](configuration.md#session-usage-and-budget).
+
+## Evidence
+
+Qualification is a record of measurements, not an implementation roadmap. G1/G2/G3 are historical case-group names.
+
+| Kind | Boundary |
+| --- | --- |
+| Source inspection | Codex **0.160.0** app-server shapes, including stable developer instructions/model/effort fields, continuation/steer methods and experimental dynamic tools/restoration; later versions may differ |
+| Deterministic fake/double | Literal JSON-RPC via `test/fake-codex.mjs` and in-memory hosts; verifies sequencing/checks/mapping against scripted shapes, not native semantics. See [test layers](development.md#test-strategy) |
+| Manual native measurement | The cases below on **one Linux x64 host**, Node **24.18**, on **2026-10-04**; child user agent reported app-server **0.160**, not independently verified |
+
+Measured host-default selection: `gpt-6.1-sol`, provider `openai`, effort `high` where verified. Other platforms/versions are unmeasured; no model, provider or changed-default switch was qualified.
+
+| Group | Recorded native coverage | Result / measured commit |
+| --- | --- | --- |
+| [G1](#g1-cases) | Fresh `implement`/`ask`, handshake/start/readback, cancellation and owned shutdown | PASS: Q1/Q2/Q3/Q4/Q7/Q9 at `c2f2477`; Q6 at `cf8f0cd` |
+| [Q14](#q14-usage-measurement) | Two-turn fresh-thread usage observation, outside G1/G2 | PASS once at `625061e` |
+| [G2](#g2-cases) | `ask` resume, moved-tip refusal, current-tip fork, one steer and recorded same-model round trip | PASS: Q10/Q11/Q12/Q13/Q19 at `cff6a9e` |
+| [G3](#g3-cases) | `ask` questions on fresh/resumed/forked threads, and waiting-question cancellation | PASS: Q15/Q16 at `84aa4ff` |
+
+```text
+G1 / Q14 / G2 measurements: no question callback
+  -> stable connection; no experimentalApi or dynamic tools
+
+shipping delegations / G3 measurements: question callback
+  -> whole-connection experimentalApi opt-in
+  -> fresh thread: register ask_orchestrator
+  -> resumed/forked thread: restore tool only if started with it
+```
+
+Earlier passes remain historical evidence of the stable connection. G3 re-measured fresh/resume/fork questions and waiting cancellation, **not** every G1/G2 behavior: steering and moved-tip refusal were not re-measured in the shipping opt-in shape.
+
+Unmeasured natively:
+
+- `plan` calls/handoffs; `implement` continuations, steers and questions; continued-questions fallback; host answer/writer/lifecycle races (fake/double-tested).
+- Fork through an older checkpoint, hosted search, named-effort override (Q3b not run), cache-write/input relationship, exact context occupancy, USD cost, or CLI recovery via `codex resume`.
+- Host answer UI, a question abandoned or held until timeout, other versions/platforms, or provider/model/default switches.
+- Sandbox/kernel policy was not audited. Whole-connection experimental opt-in may enable other features; nothing claims isolation or absence of other network/inference activity.
+
+### Qualification harness
+
+[`test/spikes/codex-app-server.mjs`](../test/spikes/codex-app-server.mjs) owns execution; [`codex-app-server-cases.mjs`](../test/spikes/codex-app-server-cases.mjs) owns CLI/catalogue/verdict helpers. [Development](development.md#codex-app-server) owns commands, consent and evidence-recording instructions.
+
+```text
+missing --run / --case, help/list, malformed/unmatched args
+  -> exit 2 before production imports, lookup, home read or spawn
+
+explicit selected cases
+  -> primary measurements + configuration/shutdown/approval guards
+     guards can fail or leave UNPROVEN; never create PASS
+  -> exit 0: every selected case passed (annotated skips allowed)
+     exit 1: any FAIL or UNPROVEN
+     exit 2: no measured pass
+```
+
+- `all` is explicit, never a default. Missing required case options or measurements skipped under `--fake` stay annotated skips.
+- Native runs need individual agreement: they inherit the user's install/home/login/MCP/remote-control/multi-agent settings and may leave state there. Model turns use that login/quota; USD is unknown.
+- `config.toml` is hashed before/after every case; changes fail. No configuration, credential, environment, prompt, reply or instruction text is printed. Q9 additionally checks whether config names its fixture, as a yes/no.
+- Shutdown guards check actual clean exit, leftovers, discovery and pipes; a failed guard or missing exit report retains/names fixtures, including early-return paths. **Known gap:** `cleanlyOver()` does not check `cleanup.skipped` or `cleanup.deadlineHit` (source inspection), so those concerns alone do not fail its guard.
+- `--keep` retains fixtures on success too. A second interrupt exits immediately, names retained uncertainty, and claims no cleanup.
+- `--fake` launches the builtins-only fake by path through production seams and labels results **NOT NATIVE**. Continued fake processes receive scripted history/totals; they do not demonstrate native persistence.
+
+### G1 cases
+
+| Case | Model turn? | Recorded result and boundary |
+| --- | --- | --- |
+| Q1 | No | PASS: initialize home prediction, reported user agent/platform/Node; version is reported, not independently verified |
+| Q2 | No | PASS: default implement/both ask modes and explicit-model readback; symlink cwd bound by realpath without request cwd. Explicit model was the host default's own, not a model switch |
+| Q3 | Yes | PASS: fixture edit and nonce supplied only in developer instructions; no commit. Checked by fixture/HEAD/status, not reply. Nonce block makes instructions differ from production |
+| Q3b | Yes | NOT RUN: optional named effort different from default; skips without `--effort` |
+| Q4 | Yes | PASS: answer from fixture, readOnly reported, files/HEAD/status unchanged. No write attempted, so not write-denial evidence. No hosted search item observed |
+| Q6 | Yes | PASS: cancelled at first command item start; backend aborted, turn interrupted, one interrupt, clean owned shutdown. Ended before readback: no verified selection. No command item would be UNPROVEN |
+| Q7 | No | PASS: root exited 0 without signal, with/without a thread, under descendant SIGTERM then stdin end. Not proof that stdin end alone stops the tree |
+| Q9 | No | PASS: untrusted fixture, no request cwd, unchanged config bytes, sandbox/approval kept |
+
+G1's earlier cases predate diagnostics `5af04e5`, catalogue trimming `89d5e74`, and sandbox-reader narrowing `cf8f0cd`; narrowing dropped only diagnostic fields no decision read. Case definitions match the recorded rows except where noted. Q6 ran at `cf8f0cd`.
+
+Historical Q5 ran once and was UNPROVEN, neither a success nor backend-failure finding. Its log remains; fixtures were removed after recorded clean shutdown. It is no longer a case or part of G1.
+
+### Q14 usage measurement
+
+PASS once at `625061e`: two short replies on one fresh read-only ask thread through production **transport**, not a two-turn backend call. Start/both readbacks named the host-default selection as diagnostics, not a backend-verified outcome.
+
+```text
+fresh thread -> turn 1 -> thread/read barrier -> total 1
+             -> turn 2 -> thread/read barrier -> total 2 + last 2
+
+observation: total 2 == total 1 + last 2, in every field
+source rule: total is cumulative; last updates can repeat, so never sum them
+```
+
+| Reading | Input | Cached input | Output | Reasoning | Total |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Turn 1 total = last | 14,811 | 12,288 | 5 | 0 | 14,816 |
+| Turn 2 last | 16,070 | 12,288 | 5 | 0 | 16,075 |
+| Turn 2 total | 30,881 | 24,576 | 10 | 0 | 30,891 |
+
+- One scoped usage update per turn, before completion; none afterward. Each turn had one completed `agentMessage`, no `reasoning` item. Cache write was 0 in all four breakdowns; window 258,400. Neither figure is a general guarantee.
+- PASS required two distinct completed turns on one thread, idle readbacks, usable counters and holding guards. Completed turns without usage are UNPROVEN; counters rejected by the production reader fail before they are observable.
+- Harness output preserves absent/null fields, counts items by distinct id (malformed separately), and prints additivity as yes/no/unknown. Items are not model-response identities; additivity is observation, not a gate or summing policy.
+- Positive cache write would record only an inequality observation; zero/absent values measure no relationship to input. This run therefore qualified no cache-write relationship, cost or context cap.
+- Separately, 0.160.0 source says `total` accumulates per thread and is seeded from history on resume/fork, `last` is replaced per response, and unchanged updates can repeat. Commit `6f2a147` implemented baseline-based accounting; G2 Q10/Q12 measured continued per-call usage.
+
+### G2 cases
+
+Each case ran once in Q10/Q11/Q12/Q13/Q19 order, at `cff6a9e` (14:56-14:58 UTC), without `--model`. Backend continuations used the earlier outcome's mapped reference and verified selection, as host calls do.
+
+All roots exited 0 without signal; no leftovers, discovery ok, pipes closed. Every case left config bytes unchanged and kept fixtures (`--keep`). Backend calls requested no approval; Q11's direct child was outside that approval guard. This is not permissions evidence.
+
+| Case | Turns | Recorded result |
+| --- | ---: | --- |
+| Q10 | 2 | PASS: exact completed tip before resume; new checkpoint/baseline on same thread; model/provider/effort pinned in request/start/readback/selection; per-call usage and context matched |
+| Q11 | 2 | PASS: extra direct-transport turn moved tip; original reference refused with `RESUME_MOVED`, zero turn/start, no checkpoint/baseline. Host retention of the earlier record is offline-tested, not measured here |
+| Q12 | 2 | PASS: fork through source's **current** checkpoint; new thread/source confirmed, starting tip completed with source checkpoint's id (observed, not required); own final turn settled with pinned selection |
+| Q13 | 1 | PASS: one steer pushed at first command item, sent once to admitted turn, accepted; pushed/accepted counts 1, all others 0; clean completion/non-empty report. Item start is not proof of command execution; acceptance is not consumption |
+| Q19 | 2 | PASS: resume naming no model pinned recorded selection and settled a new checkpoint/baseline. **Same-model round trip only**; no changed default/model switch |
+
+Core counts below are cumulative totals or field-by-field deltas, never sums of `last`:
+
+| Reading | Input | Cached input | Output | Reasoning | Total |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Q10 fresh baseline | 14,865 | 12,288 | 5 | 0 | 14,870 |
+| Q10 resumed total | 29,749 | 27,008 | 10 | 0 | 29,759 |
+| Q10 resume delta | 14,884 | 14,720 | 5 | 0 | 14,889 |
+| Q12 source baseline | 14,869 | 12,288 | 5 | 0 | 14,874 |
+| Q12 fork total | 29,757 | 24,576 | 10 | 0 | 29,767 |
+| Q12 fork delta | 14,888 | 12,288 | 5 | 0 | 14,893 |
+
+Each continued turn had one scoped usage update: its delta equalled `last` and published input/output/cache read. Reasoning/total deltas have no published field; cache write was diagnostic 0. Context was 14,884 (Q10) or 14,888 (Q12) of 258,400. Q10 also emitted an unscoped usage update and `thread/goal/cleared`; neither counted for the call.
+
+Q13's reply reflecting the steer was an unprinted yes/no, never proof. No trigger, refusal or unanswered steer would be UNPROVEN; no retry. All cases printed ids, selection, byte counts, counters and answer tags, not reply/prompt/steer/instruction text.
+
+### G3 cases
+
+Each case ran once in Q15/Q16 order at `84aa4ff` (16:31-16:32 UTC), without model/effort overrides. All roots exited 0 without signal, no leftovers, discovery ok, pipes closed; config bytes unchanged, fixtures kept.
+
+```text
+Q15: fresh ask -> resume -> fork of resume's current checkpoint
+       each leg: one own-turn question -> callback's new random answer
+                 -> report carries that answer -> verified success
+
+Q16: fresh ask -> first question waits -> production signal cancelled once
+                 -> question signal aborted -> failed tool reply + interrupt
+                 -> aborted, no checkpoint/baseline, clean shutdown
+```
+
+Q15 recorded on the wire:
+
+- Every initialize: `experimentalApi: true`. Only fresh thread/start: one flat `function` tool `ask_orchestrator`, object schema requiring `question`. Resume/fork registered nothing.
+- Each leg: one unnamespaced own-admitted-turn `item/tool/call` before completion, one callback/question, no refusal/repetition; `success: true` with one `inputText` item. Reports carried each callback's own answer, which existed only in the tool result.
+- Resume read the exact checkpoint; fork created a new thread whose starting tip had that source-current-checkpoint id. Request/start/readback/verified selection pinned model/provider/effort.
+- Each leg had two scoped usage updates. Published counts equalled per-call deltas, not a sum of `last`; cache write was 0.
+
+| Q15 leg | Input | Cached input | Output | Reasoning | Total | Latest input / window |
+| --- | ---: | ---: | ---: | ---: | ---: | --- |
+| Fresh | 29,319 | 14,464 | 48 | 0 | 29,367 | 14,693 / 258,400 |
+| Resume delta | 29,569 | 29,056 | 48 | 0 | 29,617 | 14,818 / 258,400 |
+| Fork delta | 29,822 | 14,720 | 51 | 0 | 29,873 | 14,946 / 258,400 |
+
+Q16 recorded one callback/question, aborted question signal, no answer, backend aborted, turn interrupted, stop requested and clean exit. Observer saw one `success: false` reply with a 112-byte `inputText` item and one turn interrupt. Their relative order and Codex's acknowledgement were **not** measured.
+
+The scratch observer recorded shapes/ids/counts/byte lengths only, no question/answer/report/instruction text. Each callback generated its answer internally, not in a prompt, fixture or fake setting. Missing question/answer echo or multiple distinct questions was UNPROVEN; duplicate ids or callback/counter disagreement was FAIL.
+
+Q15 used three completed turns/three owned children; Q16 one cancelled turn/one child, on the user's quota with USD unknown. These passes cover restored tools on one resume/fork and waiting cancellation, not older tool-less threads, host UI/races, steering or moved-tip refusal in the opt-in shape.

@@ -1,6 +1,6 @@
 # Questions a child asks
 
-Every delegated child gets `ask_orchestrator(question)`; on Codex it goes through Codex's experimental API, natively measured for `ask` runs on one host and otherwise tested against a fake ([below](#on-codex)). It asks for a small decision missing from its brief, such as a name or choice between options. The tool call stays open, retaining the child's context, until an answer arrives. Wider scope or an unresolved design decision instead belongs in an implementer's **Escalation** report, which ends the run.
+A child uses `ask_orchestrator(question)` for a small decision missing from its brief. The call stays open, retaining context, until an answer arrives. On Codex, tool availability depends on how the thread was started ([below](#on-codex)). Wider scope or an unresolved design decision belongs in an implementer's **Escalation** report, which ends the run.
 
 ```text
 child asks -> run waiting -> host or user supplies one answer
@@ -56,27 +56,51 @@ Manual Linux cases have measured an answered native question with a steer admitt
 
 ## On Codex
 
-**Experimental: stage 3. Its native gate G3 passed on one Linux x64 host with Codex reporting app-server 0.160, for `ask` runs on the host default: a question on a fresh thread, one through the tool a resumed and a forked thread restored, and a cancellation while a question waited ([G3](codex-backend.md#g3-cases)). `plan` and `implement` questions, the continued-questions fallback and the host's answer races are tested only against fakes.** The shapes are read from Codex 0.160.0's source.
+**Experimental.** Shapes come from Codex 0.160.0 source. Native questions were measured for `ask` only ([G3](codex-backend.md#g3-cases)); `plan`/`implement` questions, the continued-questions fallback and host answer races remain fake-tested.
 
-Every delegated Codex run has a question callback, and that callback is the whole opt-in; there is no separate setting. The run's connection declares `capabilities: { experimentalApi: true }` at `initialize`. That opts the **entire connection** into Codex's experimental API, not only the question tool: running a role on Codex is your consent to it. Only a fresh thread's `thread/start` registers a tool: `ask_orchestrator`, its one dynamic tool, with the same description the Claude and Pi tools carry and one required string `question`. A fresh run's developer instructions are its role contract alone, which tells it to ask.
+Sources: [`codex.ts`](../extensions/backends/codex.ts), [`codex-transport.ts`](../extensions/backends/codex-transport.ts), and the two `contracts/codex-*questions.md` addenda.
 
-A resumed or forked thread gets no tool registration. 0.160.0's stable `thread/resume` and `thread/fork` take none, and Codex restores a thread's dynamic tools from its own history (source-read; G3's Q15 observed it natively on one resume and one fork). A continued thread therefore has the tool only if the thread was first started with it. A thread first started without it has none, and that includes every record written before stage 3 (all G1- and G2-era threads). Nothing can add the tool to such a thread. A continuation's instructions are therefore its role contract followed by `contracts/codex-continued-questions.md`, one fallback paragraph. It says that if `ask_orchestrator` is not among the child's tools, the child must not ask in its output or go on as if answered. Instead it stops and reports the question, its options and its recommendation under **Escalation** (`implement`), **Open questions** (`plan`, `ask` answer) or **Notes** (`ask` review).
+```text
+delegated run -> question callback (no separate setting)
+  -> initialize: capabilities.experimentalApi = true
+     WHOLE connection opts in, not just the question tool
+  -> fresh thread: register ask_orchestrator
+  -> resume/fork: register nothing; Codex restores original tools
 
-An older record stays continuable exactly as before; it is not upgraded. Nothing forks it into a new thread or guesses a reference for one. If such a run needs to ask, start a new run without `continue` (a plan call takes `fresh: true`) that carries its report: that fresh thread registers the tool.
+thread started without tool -> still has no tool; never upgraded
+```
 
-A question arrives as the child's `item/tool/call` request. It is hosted only when it names `ask_orchestrator` with no namespace, comes from this run's own running turn, and carries a non-empty `question`. A request that arrives before the `turn/start` answer has named its turn is held until that answer names it. The question then goes into the host flow above, and the tool result is the answer as its one text item. Several questions at once each go to the host's ordinary queue.
+Running a role on Codex opts into that experimental connection shape. The fresh thread's only dynamic tool has the shared question description and one required string `question`. Stable resume/fork requests cannot add it to an older thread; G3 observed restoration on one resume and one fork.
 
-Some calls are refused with `success: false` and a fixed text, and the run goes on:
+| Run | Developer instructions | Tool availability |
+| --- | --- | --- |
+| Fresh, with callback | Role contract | Register `ask_orchestrator` |
+| Continued, with callback | Role contract + `codex-continued-questions.md` | Only if originally registered |
+| No callback (internal only) | Role contract + `codex-no-questions.md` | No registration or experimental opt-in; restored calls get a fixed refusal |
 
-- another thread's call (a subagent's)
-- a call from another turn or from an ended one
-- a namespaced call
-- a call with an empty question
+Both fallbacks say to stop rather than ask in output or proceed as if answered when no tool is available. Report the question, options and recommendation in:
 
-A call for any other tool still fails the run, like every other unsupported server request.
+| Role/mode | Report section |
+| --- | --- |
+| `implement` | **Escalation** |
+| `plan`, `ask` answer | **Open questions** |
+| `ask` review | **Notes** |
 
-Cancelling a waiting run aborts the question's own signal. Inside the run's single owned shutdown, its call gets one `success: false` reply ahead of the turn interrupt. A turn that ends while a question waits ends that question the same way. A lost answer is never resent and a question is never retried. The backend does not keep or log the answer text.
+Continuation authority is unchanged; adding a callback upgrades no record or thread. If a tool-less thread needs a question, start a new run without `continue`, carrying its report (`plan` needs `fresh: true`).
 
-A Codex run with no callback is an internal case; none ships. It declares no capability and registers no tool. It keeps `contracts/codex-no-questions.md` after its contract, which tells the child to stop when it cannot go on without a decision and to report the question, its options and its recommendation under **Escalation** (`implement`), **Open questions** (`plan`, `ask` answer) or **Notes** (`ask` review). A question call its restored tool still makes gets `success: false` and a fixed text telling the model to report the gap. The run is not failed for it.
+```text
+item/tool/call: ask_orchestrator, no namespace, non-empty question
+  +-- before turn/start answer -> hold until admitted turn is named
+  +-- own live turn            -> host question queue (off read loop)
+  |                               -> one answer as one text tool result
+  +-- foreign/ended turn       -> success: false; run may continue
+  +-- namespace/empty question -> success: false; run may continue
 
-A control `message` while a question waits is the answer. With no question open, a message or `/fusion steer` is a steer (unqualified natively): queued until the turn is admitted and sent to it once, and the turn taking it does not show the child read it ([Codex steers](codex-backend.md#steers)).
+other tool / unsupported server request -> run fails
+```
+
+Several questions use the ordinary host queue. Notifications and turn completion continue to be read while answers wait; each call receives one result. A subagent's question is foreign and refused, not forwarded.
+
+Cancellation aborts the question's signal. Owned shutdown sends one failed tool reply ahead of the turn interrupt; a turn ending with a question open also closes it with a failed reply. This is the code order, not a natively measured ordering/acknowledgement guarantee ([Q16](codex-backend.md#g3-cases)). No lost answer is resent, no question retried, and the backend keeps/logs no answer text.
+
+A control `message` while waiting is the answer. With no question open it is a [Codex steer](codex-backend.md#steers): one attempt to the admitted turn, with delivery not proof of consumption.

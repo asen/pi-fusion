@@ -24,7 +24,18 @@ Disabled roles are not recommended and calls to them refuse. If a design questio
 
 ## Selecting a backend and model
 
-Unless you name overrides, the host leaves `backend`, `model`, and `effort` unset and uses the session's configured settings. Builtin routes enabled roles to Claude; security is assigned to Pi but remains disabled. Once enabled, a security call needs no `backend` because only Pi supports it. Ultracode is Claude-only. Codex supports `plan`, `implement` and `ask` runs, through the host's own Codex install; the backend is **experimental**, with its stage 1 native gate passed for fresh `implement` and `ask` on one Linux x64 host with Codex reporting app-server 0.160 and other platforms and versions unmeasured ([evidence](codex-backend.md#evidence)), and no role routes there unless a call names it or your settings put a role on it ([Codex backend](codex-backend.md)). A Codex run with a trusted checkpoint and usage baseline can be continued, an implicit plan call continues the latest Codex plan run or hands it off as on the other backends, and a running one takes each message as one steer to its turn; all of these are experimental, with the stage 2 native gate passed on the same host for `ask` runs on the host default and plan and implement continuations and a model switch untested natively ([continuation](codex-backend.md#continuation-and-fork), [plan runs](codex-backend.md#plan-runs), [steers](codex-backend.md#steers)). A Codex child can ask a question through Codex's experimental API. That is stage 3, experimental, with its native gate passed on the same host for `ask` runs on the host default and `plan` and `implement` questions tested only against the deterministic fake ([Questions on Codex](questions.md#on-codex)). A follow-up continues the run with `fusion` like any other.
+Unless you name overrides, the host leaves `backend`, `model`, and `effort` unset and uses the session's configured settings.
+
+```text
+builtin
+  +-- plan / implement / ultracode / ask -> Claude
+  +-- security                          -> Pi, disabled
+  +-- no role                           -> Codex
+
+Codex opt-in -> backend: "codex", or role settings/profile
+```
+
+Security needs separate activation and a Pi model; once enabled, its calls need no backend override. Ultracode is Claude-only. Codex supports `plan`, `implement`, and `ask` through your own install and defaults. It is **experimental**, including its whole-connection question API opt-in; see [Codex behavior](codex-backend.md) and [qualification limits](codex-backend.md#evidence).
 
 An explicit other-backend override uses that backend's captured legacy defaults, not the configured backend's model/effort. Pi requires an exact `provider/model-id` and guesses none. Unsupported role/backend combinations refuse before admission, once the enabled-role check permits routing.
 

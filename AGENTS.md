@@ -20,6 +20,7 @@ Tests past 60 seconds are cancelled and named. Browser tests use `PI_FUSION_CHRO
 - Tabs, semicolons, long lines. Put `/** ... */` comments above declarations and explain why, not merely what.
 - Change role behavior in `contracts/*.md`. Shared plan/implement/ask contracts stay vendor-neutral; backend-specific contracts may name their requirements.
 - Keep runtime fixes and documentation consolidation separate. User-facing behavior changes belong in the owning topic page in the same commit.
+- Document current behavior from code, not completed implementation plans. Keep TODOs, open issues, future proposals, and scoped qualification evidence. Prefer ASCII diagrams and short tables/bullets to walls of prose; link to the owning page rather than repeating detail.
 - Commit only when asked: concise imperative subject (up to about 150 characters), no AI or `Co-Authored-By` trailers.
 
 ## Entry point and boundaries
@@ -35,7 +36,7 @@ Load order: internal child marker, required contracts for every backend/ask mode
 - Codex is an app-server client with no SDK or npm dependency: `codex-binding.ts` (imports only `types.ts`), `codex-launch.ts`, `codex-protocol.ts`, `codex-transport.ts`, `codex-outcome.ts`, `codex.ts`. The transport reuses only Pi's generic `LineFramer`/timer helpers; only Codex modules import its protocol/transport, and the host reaches it through `createCodexBackend()` alone, whose construction reads, locates, and starts nothing. The host's `codex` is located only when a run starts.
 - `process-tree.ts` owns launching/cleanup through SDK-neutral options. Owned cleanup and streamed stderr are independent opt-ins; preserve the legacy Claude path.
 
-See [Pi backend](docs/pi-backend.md) for architecture/storage/lifecycle diagrams and limits, and [Codex backend](docs/codex-backend.md) for its stage, checks, and evidence.
+See [Pi backend](docs/pi-backend.md) and [Codex backend](docs/codex-backend.md) for architecture, lifecycle checks, and qualification limits.
 
 ## Mode and configuration invariants
 
@@ -43,7 +44,7 @@ See [Pi backend](docs/pi-backend.md) for architecture/storage/lifecycle diagrams
 - On/off share synchronous implementations. Off refuses every unfinished run (running, waiting, finishing), cancels nothing, respects allow lists/exclusions, and preserves unrelated active tools.
 - Tool activation arms one reminder on the **host's** `agent_settled`: clear before notification, suppress for `/fusion on`, clear on successful off. It is neither child completion nor automatic deactivation.
 - Settings apply only with no unfinished run. Application/admission binding remain synchronous after the last await. Refresh preserves the entire active-tool list; on failure roll settings back and attempt guidance/list restoration, not guaranteed recovery.
-- Builtin disables `security` (Pi-only); enable it through settings/profiles, not a model parameter/variable. Saved profiles keep their enabled settings. Ultracode is Claude-only. Codex supports `plan`/`implement`/`ask` (experimental; native gates passed on one Linux x64 host with app-server 0.160 and the host default: G1 for fresh `implement` and `ask`, G2 and G3 for `ask` only, while `plan`/`implement` continuations, steers and questions are fake-tested only; see [Codex evidence](docs/codex-backend.md#evidence)), and builtin routes nothing there.
+- Builtin disables `security` (Pi-only); enable it through settings/profiles, not a model parameter/variable. Saved profiles keep their enabled settings. Ultracode is Claude-only. Codex supports `plan`/`implement`/`ask` (experimental; see [Codex evidence](docs/codex-backend.md#evidence)), and builtin routes nothing there.
 - Disabled roles refuse fresh calls and continuations before a handle. Role/profile lookups use own properties, never inherited keys.
 - Fresh calls use configured routing unless overridden; another backend uses its captured legacy defaults, not the configured backend's selection. Continuations retain recorded backend/settings unless permitted fields are explicitly overridden.
 - Independent review is a fresh configured `ask` run, inheriting nothing from the source. Disabled ask refuses manual review and quietly skips automatic review.
@@ -56,7 +57,20 @@ See [Pi backend](docs/pi-backend.md) for architecture/storage/lifecycle diagrams
 - Untagged entries are Claude. Claude keeps flat session/checkpoint/model/effort; missing older settings use captured legacy defaults with notice. Pi keeps a structured reference and verified selection.
 - Failed resumes preserve the last successful record. Failed forks can retain their verified starting identity/checkpoint. Unrepeatable Pi handles remain readable but refuse explicit/implicit continuation: retry without `continue` (plan also needs `fresh: true`), never an older-plan/default guess.
 - Pi success requires settled evidence, exact identity/selection, idle state with `pendingMessageCount === 0`, moved leaf, usable per-call usage, and clean reported shutdown. Ordinary tasks cannot invoke internal navigation/fork commands.
-- Codex inherits the host's binary, environment, home, auth, configuration, MCP, remote-control, and multi-agent settings: no isolation, no cwd or trust write, no historical sandbox guard. A continuable record carries its thread, the admitted completed turn as checkpoint paired with the thread's cumulative usage baseline there, and the verified selection with provider; anything less (every Stage 1 record included) stays readable, is never upgraded, and refuses explicit and implicit continuation before any contract read, lookup, or spawn. Resume requires the exact recorded tip; a fork requires a verified different thread id and records its own completed starting tip, never the source's, without a baseline. Per-call usage is the total less the baseline in five core counts. A fresh thread names no provider, so a plan handoff carries model/effort only. Steers are one-shot to the admitted turn: accepted is queued, not consumed; nothing retries or replays. Questions (stage 3, experimental; G3 measured `ask` fresh/resume/fork questions and a waiting-question cancel natively on that one host, while G1/G2 remain the historical record of connections with no callback; [G3](docs/codex-backend.md#g3-cases)): only a run with a question callback opts its whole connection into the experimental API, registers `ask_orchestrator` on a fresh thread (resume/fork register nothing; Codex restores the tool) and drops the no-questions addendum; a resume/fork with one adds the continued-questions fallback, since an older thread may have no tool and is never upgraded. Only calls from its own live turn are asked, each answered once and never on the read loop; any other `ask_orchestrator` call gets `success: false` and does not fail the run. Success requires the admitted turn's completion, a final message, usage at or above the baseline, idle readback, verified selection (per-turn reroutes are telemetry, not selection), and clean shutdown. Cost is unknown and never estimated.
+
+### Codex
+
+- Inherits the host's binary, environment, home, auth, configuration, MCP, remote-control, and multi-agent settings: no isolation, no cwd or trust write, no historical sandbox guard.
+- A continuable record needs the thread, admitted completed turn as checkpoint, cumulative usage baseline there, and verified selection with provider. Incomplete older records stay readable, are never upgraded, and refuse explicit/implicit continuation before any contract read, lookup, or spawn.
+- Resume requires the exact recorded tip. A fork requires a verified different thread id and records its own completed starting tip, never the source's, without a baseline.
+- Per-call usage is the total less the baseline in five core counts. A fresh thread names no provider; a plan handoff carries model/effort only. Cost is unknown and never estimated.
+- Steers are one-shot to the admitted turn: accepted is queued, not consumed; nothing retries or replays.
+- Only a question callback opts the whole connection into the experimental API and drops the no-questions addendum. Fresh threads register `ask_orchestrator`; resumes/forks register nothing and rely on Codex's restored tool. Continued runs with a callback add the fallback because older threads may lack the tool and are never upgraded.
+- Questions come only from the run's own live turn, each answered once and never on the read loop. Other `ask_orchestrator` calls get `success: false` without failing the run. See [Questions](docs/questions.md#on-codex).
+- Success requires admitted-turn completion, a final message, usage at/above the baseline, idle readback, verified selection (reroutes are telemetry, not selection), and clean shutdown.
+
+### Cleanup and hints
+
 - Preparation/task own their child's single stop. Outcome mapping owns cleanup concerns, success demotion, disposition, and the single cleanup notice; add no second stop/warning composer above them.
 - Cleanup is bounded best effort, not isolation. Discovery failure is sticky, including a root never observed alive; uncertainty retains call storage and publishes no new successful checkpoint. No mandatory preflight, background survey, replay/resend, or steer retry.
 - Hints follow the invoking delegation/control pair; both controls manage all runs, Pi and Codex continuation guidance always names `fusion`, user commands stay `/fusion ...`.
