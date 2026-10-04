@@ -331,7 +331,9 @@ function piRecord(base: RunRecord, data: Record<string, unknown>): RunRecord {
  * and repeats only the configured selection, provider included, that its outcome read back. A flat Claude id or
  * checkpoint, a Pi session file or a flat Claude model beside it is another backend's shape mixed into this one, and is
  * refused rather than read as part of the thread. A thread with no trusted checkpoint is kept for reading and points at
- * `codex resume`, never continued from its tip: a continuation restores a checkpoint, and that run settled on none.
+ * `codex resume`, never continued from its tip: a continuation restores a checkpoint, and that run settled on none. A
+ * checkpoint with no usage baseline beside it is kept for reading the same way: a continuation's usage is its thread's
+ * total less that baseline, and nothing here guesses one for a record that never carried it.
  */
 function codexRecord(base: RunRecord, data: Record<string, unknown>): RunRecord {
 	const record: RunRecord = { ...base, backend: "codex" };
@@ -348,6 +350,12 @@ function codexRecord(base: RunRecord, data: Record<string, unknown>): RunRecord 
 		return refused(
 			held,
 			`ran on codex and recorded no trusted checkpoint, so it is kept for reading and not continued; open its thread with ${codexResumeCommand(ref.sessionId)}, and new work needs a new run without continue`,
+		);
+	}
+	if (!ref.baseline) {
+		return refused(
+			held,
+			`ran on codex and recorded its checkpoint with no usage baseline, so it is kept for reading and not continued; open its thread with ${codexResumeCommand(ref.sessionId)}, and new work needs a new run without continue`,
 		);
 	}
 	const selection = resolvedSelectionOf(data.selection, "codex");
@@ -434,13 +442,13 @@ const flatRef = (record: RunRecord): SessionRef | undefined =>
 	(record.backend !== undefined && record.backend !== "claude") || !record.sessionId ? undefined : { backend: "claude", sessionId: record.sessionId, ...(record.checkpoint ? { checkpoint: record.checkpoint } : {}) };
 
 /**
- * The exact thread and checkpoint a Codex continuation restores. A Codex record is never a new run in disguise: one
- * without its tagged thread and trusted checkpoint, which only a record built by hand can be, is refused rather than
- * mapped to a new thread over a child that exists.
+ * The exact thread, checkpoint and usage baseline a Codex continuation restores. A Codex record is never a new run in
+ * disguise: one without its tagged thread, trusted checkpoint and baseline, which only a record built by hand can be, is
+ * refused rather than mapped to a new thread over a child that exists.
  */
 function codexSource(record: RunRecord): SessionRef {
 	const ref = sessionRefOf(record.session, "codex");
-	if (!ref?.checkpoint) throw new Error(`${record.handle} names no codex thread with a trusted checkpoint, so it cannot be continued; start a new run without continue`);
+	if (!ref?.checkpoint || !ref.baseline) throw new Error(`${record.handle} names no codex thread with a trusted checkpoint and its usage baseline, so it cannot be continued; start a new run without continue`);
 	return ref;
 }
 
@@ -579,11 +587,13 @@ function piDecision(call: RecordCall, outcome: RunOutcome, entry: Record<string,
 }
 
 /**
- * The Codex entry a finished run writes, under the Pi rules with two differences. A successful call needs its tagged
+ * The Codex entry a finished run writes, under the Pi rules with three differences. A successful call needs its tagged
  * thread and the configured selection it read back, provider included; a new call needs no checkpoint, and a thread
  * that settled on none is recorded for reading and the read side refuses to continue it, while a resume or a fork,
- * which restored a trusted checkpoint, must report the one it settled on. And a thread's identity is its id alone, so a
- * resume must report the thread it resumed and a fork one that is not the thread it forked. Flat Claude fields in the
+ * which restored a trusted checkpoint, must report the one it settled on and the usage baseline it had there. A thread's
+ * identity is its id alone, so a resume must report the thread it resumed and a fork one that is not the thread it
+ * forked. And a fork that failed keeps the point its own new thread reported, or none, rather than the source's: a new
+ * thread's tip need not be the checkpoint it forked at, and no failed call names a baseline. Flat Claude fields in the
  * outcome are another backend's identity and fail the run rather than stand in for a thread it did not report.
  */
 function codexDecision(call: RecordCall, outcome: RunOutcome, entry: Record<string, unknown>): RecordDecision {
@@ -605,6 +615,8 @@ function codexDecision(call: RecordCall, outcome: RunOutcome, entry: Record<stri
 		// must report the one it settled on: recording it without one would replace a continuable record with one that
 		// is only readable, so it fails and the prior record stays authoritative instead.
 		if (intent.kind !== "new" && !ref.checkpoint) return postcondition(handle, "continued its thread and succeeded without reporting the checkpoint it settled on");
+		// The baseline is what the next call's usage is measured from, and only a continuation's backend is held to one yet.
+		if (intent.kind !== "new" && !ref.baseline) return postcondition(handle, "continued its thread and succeeded without reporting the usage baseline at the checkpoint it settled on");
 		entry.session = { ...ref };
 		entry.selection = selection;
 		if (outcome.contextTokens && outcome.contextWindow) {
@@ -620,13 +632,16 @@ function codexDecision(call: RecordCall, outcome: RunOutcome, entry: Record<stri
 	}
 	if (intent.kind === "resume") return { keep: true };
 	if (intent.kind === "fork") {
-		const at = source?.checkpoint;
-		if (!at || ref.checkpoint !== at) return postcondition(handle, "forked and failed without keeping the checkpoint it forked at");
-		// As on Pi: the fork's own thread is kept at the point it forked at, and its selection only when it read one back.
+		// A failed call settled on no usage this host could trust, so a baseline here would be a claim of one it never had.
+		if (ref.baseline) return postcondition(handle, "forked and failed and claimed a usage baseline, which only a settled call has");
+		// The fork's own thread is kept at the point it reported, which is not checked against the source's checkpoint: a
+		// new thread's starting tip may differ from it. With no baseline the read side keeps the record for reading only,
+		// and its selection only when it read one back.
 		entry.session = { ...ref };
 		if (selection) entry.selection = selection;
 		return { entry };
 	}
+	// A baseline needs a checkpoint, so a reference reaching here with one also claims a checkpoint and is refused with it.
 	if (ref.checkpoint) return postcondition(handle, "failed and claimed a trusted checkpoint, which only a settled call or a fork has");
 	entry.session = { ...ref };
 	if (selection) entry.selection = selection;

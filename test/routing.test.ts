@@ -34,9 +34,9 @@ const entry = (data: Record<string, unknown>) => ({ type: "custom", customType: 
 const PI_REF: PiSessionRef = { backend: "pi", sessionId: "pi-1", sessionFile: "/sessions/pi-1.jsonl", checkpoint: "entry-9" };
 const PI_SELECTION: ResolvedSelection = { model: "deepseek/deepseek-chat", effort: "medium" };
 
-const CODEX_REF = { backend: "codex", sessionId: "thread-1", checkpoint: "turn-2" } as const;
+const CODEX_REF = { backend: "codex", sessionId: "thread-1", checkpoint: "turn-2", baseline: { inputTokens: 30, cachedInputTokens: 20, outputTokens: 4, reasoningOutputTokens: 1, totalTokens: 34 } } as const;
 
-/** A codex entry a later codex binding could continue: its tagged thread, a trusted checkpoint and the configured selection. */
+/** A codex entry a later codex binding could continue: its tagged thread, a trusted checkpoint with its usage baseline and the configured selection. */
 const codexEntry = (data: Record<string, unknown> = {}) => ({
 	run: "run-1",
 	role: "implement",
@@ -900,6 +900,8 @@ test("a codex record is refused before this build's codex backend runs anything:
 		"run-1 ran on codex and recorded no trusted checkpoint, so it is kept for reading and not continued; open its thread with codex resume thread-1, and new work needs a new run without continue",
 		"a thread with no trusted checkpoint, which is every thread this build's codex runs settle on, is refused for reading before the backend is asked",
 	);
+	const { baseline, ...unmeasured } = CODEX_REF;
+	assert.match((await call(ext, "fusion", { continue: "run-1", task: "x" }, makeCtx([entry(codexEntry({ session: unmeasured }))]))).error ?? "", /^run-1 ran on codex and recorded its checkpoint with no usage baseline, so it is kept for reading/, "a checkpoint with no baseline is refused for reading too");
 	// A record with a checkpoint no codex run of this build writes still goes nowhere: the backend maps no resume.
 	assert.equal((await call(ext, "fusion", { continue: "run-1", task: "x" }, makeCtx([entry(codexEntry())]))).error, CODEX_FRESH_ONLY);
 	assert.equal((await call(ext, "fusion", { continue: "run-1", task: "x" }, makeCtx([entry(codexEntry())], "host-2"))).error, CODEX_FRESH_ONLY, "nor a fork, which another host session's continuation is");
@@ -998,7 +1000,7 @@ test("a codex record routes through fusion alone, on the selection and provider 
 	for (const tool of ["claude_control", "fusion_control"]) {
 		const ended = await call(ext, tool, { action: "message", run: "run-1", message: "more" }, makeCtx(branch));
 		assert.match(ended.text ?? "", /Continue it with fusion and continue run-1, or take no action\.$/, tool);
-		const { checkpoint, ...bare } = CODEX_REF;
+		const { checkpoint, baseline, ...bare } = CODEX_REF;
 		const readable = await call(ext, tool, { action: "message", run: "run-1", message: "more" }, makeCtx([entry(codexEntry({ session: bare }))]));
 		assert.match(readable.text ?? "", /open its thread with codex resume thread-1, and new work needs a new run without continue\.$/, tool);
 		assert.doesNotMatch(readable.text ?? "", /claude --resume/, tool);

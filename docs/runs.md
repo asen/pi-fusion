@@ -75,22 +75,22 @@ A host fork copies no child immediately. On first use, Claude resumes with `--fo
 | --- | --- |
 | Claude | Flat session id, last assistant-message UUID checkpoint, and admitted model/effort, defaults included |
 | Pi | Structured session id, absolute transcript file, trusted checkpoint where available, and actual model/thinking selection |
-| Codex | Tagged thread id, trusted checkpoint where available, and the configured model and provider read back from the child, with its effort when it names one |
+| Codex | Tagged thread id, trusted checkpoint where available with the thread's cumulative usage baseline at that completed turn (five counts, plus a cache write only when reported), and the configured model and provider read back from the child, with its effort when it names one |
 | Older untagged entry | Claude, preserving compatibility with entries written before backend tags |
 
 Older Claude records missing model/effort use the legacy defaults captured when this extension instance loaded, **not** the current profile, and the result says so. A Claude entry without a checkpoint resumes the whole session. Very old plan entries under `consolidator` keys with generation `g` read as handle `run-<g+1>`.
 
-Unknown backend tags, mixed/incomplete session formats, and Pi or Codex records without a trusted checkpoint or repeatable selection are kept for reading, not guessed into a continuation. A Codex record is read only from its tagged thread reference and its selection only with a provider; flat Claude ids, checkpoints, models, or a Pi session file in a Codex entry refuse it. Every Codex run this build makes settles on no checkpoint, so its record is kept for reading only; a hand-built Codex record with a checkpoint binds its recorded model and provider and is then refused by the backend, which runs fresh threads only. A refused latest plan stops implicit continuation; Fusion does not walk back to an older usable plan or hand off to escape the refusal.
+Unknown backend tags, mixed/incomplete session formats, and Pi or Codex records without a trusted checkpoint or repeatable selection are kept for reading, not guessed into a continuation. A Codex record is read only from its tagged thread reference and its selection only with a provider; flat Claude ids, checkpoints, models, or a Pi session file in a Codex entry refuse it. A Codex checkpoint is continuable only with its usage baseline: a record with a checkpoint and no baseline, which includes every older stage 1 reference, is kept for reading and its refusal names `codex resume <thread id>`; a baseline without a checkpoint, or one that is not exactly those non-negative whole counts with cached input within input, makes the reference unreadable. Every Codex run this build makes settles on no checkpoint, so its record is kept for reading only; a hand-built Codex record with a checkpoint and baseline binds its recorded model and provider and is then refused by the backend, which runs fresh threads only. A refused latest plan stops implicit continuation; Fusion does not walk back to an older usable plan or hand off to escape the refusal.
 
 ### Recovery policy
 
 | Ending | What the next call can do |
 | --- | --- |
 | Resume failed/cancelled | No new branch record; the previous successful checkpoint stays authoritative |
-| Fork failed after a verified new identity | Keep that fork at its starting checkpoint, avoiding a second fork; without verified selection it is readable but cannot continue |
+| Fork failed after a verified new identity | Keep that fork at its starting checkpoint, avoiding a second fork; without verified selection it is readable but cannot continue. A Codex fork keeps the starting checkpoint its new thread reported, or none, never the source's, and no baseline, so it is readable only; a failed fork claiming a baseline fails |
 | First Pi call established a session but no trusted checkpoint | Read the session, but refuse continuation rather than replay the failed prompt |
 | First Codex call (no `continue`, no host fork) reported its thread but no trusted checkpoint, successful or not | Keep the thread for reading and refuse continuation; the refusal names `codex resume <thread id>`, and new work needs a new run |
-| Codex resume/fork succeeded without a trusted checkpoint | Fail the run and record nothing; the previous record stays authoritative |
+| Codex resume/fork succeeded without a trusted checkpoint and its usage baseline | Fail the run and record nothing; the previous record stays authoritative |
 | First Pi or Codex call established no verified session | Keep handle/failure, refuse explicit **and** implicit continuation; start a new role call without `continue` (`plan` also takes `fresh: true`) |
 | Claude call failed before reporting a session | Keep handle; continuation can start a new Claude session |
 | Outcome claims an impossible identity or incomplete success | Fail the run and publish no identity to branch/history; any previous record remains unchanged |

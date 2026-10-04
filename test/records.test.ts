@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import * as path from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
-import type { CodexSessionRef, PiSessionRef, SessionIntent } from "../extensions/backends/types.ts";
+import type { CodexSessionRef, CodexUsageBaseline, PiSessionRef, SessionIntent } from "../extensions/backends/types.ts";
 import { intentFor, nextSession, type RecordCall, recordDecision, type RunOutcome, type RunRecord, runRecords } from "../extensions/fusion.ts";
 import { canChangeFiles, isKnownRole, roleSpec } from "../extensions/roles.ts";
 
@@ -190,7 +190,12 @@ test("an entry naming a backend this host does not know keeps its handle and is 
 	}
 });
 
-const CODEX_REF: CodexSessionRef = { backend: "codex", sessionId: "thread-1", checkpoint: "turn-2" };
+/** The thread's cumulative usage at its checkpoint, as a settled call reports it: no cache write reported, so none here. */
+const BASELINE: CodexUsageBaseline = { inputTokens: 14_811, cachedInputTokens: 12_288, outputTokens: 5, reasoningOutputTokens: 0, totalTokens: 14_816 };
+const CODEX_REF: CodexSessionRef = { backend: "codex", sessionId: "thread-1", checkpoint: "turn-2", baseline: BASELINE };
+/** The same thread at the same checkpoint with no baseline beside it: what a record from before baselines carries. */
+const UNMEASURED: CodexSessionRef = { backend: "codex", sessionId: "thread-1", checkpoint: "turn-2" };
+const BARE: CodexSessionRef = { backend: "codex", sessionId: "thread-1" };
 const CODEX_SELECTION = { model: "gpt-5-codex", provider: "openai" };
 
 const codexEntry = (data: Record<string, unknown> = {}) => ({
@@ -219,17 +224,29 @@ test("a codex entry with its thread, a trusted checkpoint and a configured selec
 	// The intent names exactly the recorded thread and checkpoint: resumed in its own host session, forked in another.
 	assert.deepEqual(intentFor(record, "host-1"), { kind: "resume", ref: CODEX_REF });
 	assert.deepEqual(intentFor(record, "host-2"), { kind: "fork", from: CODEX_REF });
+	// A cache write the child reported is kept as reported, zero included; one it did not report is never read as zero.
+	const written = { ...BASELINE, cacheWriteInputTokens: 0 };
+	assert.deepEqual(only(codexEntry({ session: { ...CODEX_REF, baseline: written } })).session, { ...CODEX_REF, baseline: written });
+	assert.equal(Object.hasOwn((only(codexEntry()).session as CodexSessionRef).baseline ?? {}, "cacheWriteInputTokens"), false, "an unreported cache write stays absent");
+	// A baseline is rebuilt from its own counts: a field it does not know is not carried, and an inherited one is not read.
+	const extra = only(codexEntry({ session: { ...CODEX_REF, baseline: { ...BASELINE, cacheWriteInputTokens: 7, note: "kept nowhere" } } }));
+	assert.deepEqual(extra.session, { ...CODEX_REF, baseline: { ...BASELINE, cacheWriteInputTokens: 7 } });
+	assert.ok(!JSON.stringify(extra).includes("kept nowhere"));
+	const inherited = only(codexEntry({ session: Object.assign(Object.create({ baseline: BASELINE }), UNMEASURED) }));
+	assert.deepEqual(inherited.session, UNMEASURED, "a baseline on the prototype is no baseline");
+	assert.match(inherited.refusal ?? "", /recorded its checkpoint with no usage baseline/);
+	const inheritedCount = only(codexEntry({ session: { ...CODEX_REF, baseline: Object.assign(Object.create({ totalTokens: 14_816 }), { ...BASELINE, totalTokens: undefined }) } }));
+	assert.equal(inheritedCount.session, undefined, "a count on the prototype is no count, so that baseline is not one");
 	// A codex record built without its thread is not a new run in disguise.
 	assert.throws(() => intentFor({ handle: "run-4", role: "implement", backend: "codex" }, "host-1"), /^Error: run-4 names no codex thread with a trusted checkpoint/);
-	const { checkpoint, ...bare } = CODEX_REF;
-	assert.throws(() => intentFor({ handle: "run-4", role: "implement", backend: "codex", session: bare }, "host-1"), /names no codex thread with a trusted checkpoint/);
+	assert.throws(() => intentFor({ handle: "run-4", role: "implement", backend: "codex", session: BARE }, "host-1"), /names no codex thread with a trusted checkpoint/);
+	assert.throws(() => intentFor({ handle: "run-4", role: "implement", backend: "codex", session: UNMEASURED, selection: CODEX_SELECTION }, "host-1"), /^Error: run-4 names no codex thread with a trusted checkpoint and its usage baseline/, "nor is a hand-built one with no baseline");
 	assert.throws(() => intentFor({ handle: "run-4", role: "implement", backend: "codex", sessionId: "s-1", checkpoint: "c-1" }, "host-1"), /names no codex thread/, "a flat id is never a codex thread");
 });
 
 test("a codex thread with no trusted checkpoint is kept for reading, and every continuation of it points at codex resume", () => {
-	const { checkpoint, ...bare } = CODEX_REF;
-	const record = only(codexEntry({ session: bare }));
-	assert.deepEqual(record.session, bare, "the thread this host owns is still named");
+	const record = only(codexEntry({ session: BARE }));
+	assert.deepEqual(record.session, BARE, "the thread this host owns is still named");
 	assert.equal(record.selection, undefined);
 	assert.equal(
 		record.refusal,
@@ -239,8 +256,23 @@ test("a codex thread with no trusted checkpoint is kept for reading, and every c
 	assert.throws(() => intentFor(record, "host-2"), /recorded no trusted checkpoint/, "a forked host session is refused the same way");
 });
 
+test("a codex checkpoint recorded with no usage baseline is kept for reading, and every continuation of it points at codex resume", () => {
+	const record = only(codexEntry({ session: { ...UNMEASURED } }));
+	assert.deepEqual(record.session, UNMEASURED, "the reference is valid and the thread still named");
+	assert.equal(record.selection, undefined, "a record kept for reading repeats no selection");
+	assert.equal(
+		record.refusal,
+		"run-4 ran on codex and recorded its checkpoint with no usage baseline, so it is kept for reading and not continued; open its thread with codex resume thread-1, and new work needs a new run without continue",
+	);
+	assert.throws(() => intentFor(record, "host-1"), (error: Error) => error.message === record.refusal);
+	assert.throws(() => intentFor(record, "host-2"), (error: Error) => error.message === record.refusal, "a forked host session is refused the same way");
+	// The hint names the thread as one literal shell argument, as every codex resume hint does.
+	assert.match(only(codexEntry({ session: { ...UNMEASURED, sessionId: "-x y" } })).refusal ?? "", /open its thread with codex resume -- '-x y', and new work/);
+});
+
 test("a codex entry is identified by its tagged thread alone: missing, malformed, mixed and cross-backend shapes keep the handle and continue nothing", () => {
-	const { checkpoint, ...bare } = CODEX_REF;
+	const bare = BARE;
+	const { inputTokens, ...noInput } = BASELINE;
 	const cases: Array<[Record<string, unknown>, RegExp, boolean]> = [
 		[{ session: undefined, selection: undefined }, /^run-4 ran on codex and recorded no verified thread, so it cannot be continued; start a new run without continue$/, false],
 		[{ session: undefined, sessionId: "thread-1", checkpoint: "turn-2" }, /^run-4 records its codex run in sessionId, checkpoint rather than in a thread reference/, false],
@@ -251,6 +283,16 @@ test("a codex entry is identified by its tagged thread alone: missing, malformed
 		[{ session: { ...CODEX_REF, sessionId: "" } }, /has an incomplete or mismatched codex thread reference/, false],
 		[{ session: { ...CODEX_REF, checkpoint: "" } }, /has an incomplete or mismatched codex thread reference/, false],
 		[{ session: "thread-1" }, /has an incomplete or mismatched codex thread reference/, false],
+		// A baseline is exactly five counts paired with a checkpoint: anything else drops the whole reference, never just the baseline.
+		[{ session: { ...BARE, baseline: BASELINE } }, /has an incomplete or mismatched codex thread reference/, false],
+		[{ session: { ...CODEX_REF, baseline: noInput } }, /has an incomplete or mismatched codex thread reference/, false],
+		[{ session: { ...CODEX_REF, baseline: { ...BASELINE, outputTokens: 1.5 } } }, /has an incomplete or mismatched codex thread reference/, false],
+		[{ session: { ...CODEX_REF, baseline: { ...BASELINE, reasoningOutputTokens: -1 } } }, /has an incomplete or mismatched codex thread reference/, false],
+		[{ session: { ...CODEX_REF, baseline: { ...BASELINE, totalTokens: 2 ** 53 } } }, /has an incomplete or mismatched codex thread reference/, false],
+		[{ session: { ...CODEX_REF, baseline: { ...BASELINE, cachedInputTokens: BASELINE.inputTokens + 1 } } }, /has an incomplete or mismatched codex thread reference/, false],
+		[{ session: { ...CODEX_REF, baseline: { ...BASELINE, cacheWriteInputTokens: "0" } } }, /has an incomplete or mismatched codex thread reference/, false],
+		[{ session: { ...CODEX_REF, baseline: null } }, /has an incomplete or mismatched codex thread reference/, false],
+		[{ session: { ...CODEX_REF, baseline: [] } }, /has an incomplete or mismatched codex thread reference/, false],
 		[{ sessionId: "thread-1" }, /carries both a codex thread reference and sessionId/, true],
 		[{ checkpoint: "turn-2" }, /carries both a codex thread reference and checkpoint/, true],
 		[{ sessionFile: "/sessions/pi-1.jsonl" }, /carries both a codex thread reference and sessionFile/, true],
@@ -262,6 +304,7 @@ test("a codex entry is identified by its tagged thread alone: missing, malformed
 		[{ selection: { ...CODEX_SELECTION, effort: "very high" } }, /recorded no codex model and provider this host can repeat/, true],
 		[{ selection: { ...CODEX_SELECTION, provider: "" } }, /recorded no codex model and provider this host can repeat/, true],
 		[{ session: bare, selection: { model: "gpt-5-codex" } }, /recorded no trusted checkpoint/, true],
+		[{ session: UNMEASURED, selection: { model: "gpt-5-codex" } }, /recorded its checkpoint with no usage baseline/, true],
 	];
 	for (const [over, expected, held] of cases) {
 		const records = runRecords([entry({ ...codexEntry(), ...over })]);
@@ -467,10 +510,13 @@ const codexCall = (over: Partial<RecordCall> = {}): RecordCall => ({ handle: "ru
 const CODEX_ENTRY = { run: "run-1", role: "implement", backend: "codex", hostSessionId: "host-1" };
 const CODEX_RESUME: SessionIntent = { kind: "resume", ref: CODEX_REF };
 const CODEX_FORK: SessionIntent = { kind: "fork", from: CODEX_REF };
-const CODEX_FORKED: CodexSessionRef = { backend: "codex", sessionId: "thread-2", checkpoint: CODEX_REF.checkpoint };
+/** A fork's own new thread at the starting tip it reported: no baseline, since only a settled call has one. */
+const CODEX_FORKED: CodexSessionRef = { backend: "codex", sessionId: "thread-2", checkpoint: "turn-2" };
+/** The cumulative usage a continuation settled at, which the child seeded from the thread it continued. */
+const LATER: CodexUsageBaseline = { inputTokens: 30_881, cachedInputTokens: 24_576, outputTokens: 10, reasoningOutputTokens: 0, totalTokens: 30_891, cacheWriteInputTokens: 0 };
 
 test("a successful codex run records its thread and configured selection, with a checkpoint when it settled on one", () => {
-	const { checkpoint, ...bare } = CODEX_REF;
+	const bare = BARE;
 	const withEffort = { ...CODEX_SELECTION, effort: "xhigh" };
 	assert.deepEqual(recordDecision(codexCall(), outcome({ session: CODEX_REF, selection: withEffort, contextTokens: 10, contextWindow: 100 })), {
 		entry: { ...CODEX_ENTRY, session: CODEX_REF, selection: withEffort, contextTokens: 10, contextWindow: 100 },
@@ -479,17 +525,30 @@ test("a successful codex run records its thread and configured selection, with a
 	assert.deepEqual(recordDecision(codexCall({ mode: "review", role: "ask" }), outcome({ session: CODEX_REF, selection: CODEX_SELECTION })), {
 		entry: { ...CODEX_ENTRY, role: "ask", mode: "review", session: CODEX_REF, selection: CODEX_SELECTION },
 	});
-	// A resume reports the thread it resumed, at the checkpoint it settled on.
-	assert.deepEqual(recordDecision(codexCall({ intent: CODEX_RESUME }), outcome({ session: { ...CODEX_REF, checkpoint: "turn-3" }, selection: CODEX_SELECTION })), {
-		entry: { ...CODEX_ENTRY, session: { ...CODEX_REF, checkpoint: "turn-3" }, selection: CODEX_SELECTION },
+	// A new thread may still settle on a checkpoint with no baseline: it is recorded as the child reported it, for reading.
+	assert.deepEqual(recordDecision(codexCall(), outcome({ session: UNMEASURED, selection: CODEX_SELECTION })), { entry: { ...CODEX_ENTRY, session: UNMEASURED, selection: CODEX_SELECTION } });
+	// A resume reports the thread it resumed, at the checkpoint it settled on and the baseline it had there, as reported.
+	assert.deepEqual(recordDecision(codexCall({ intent: CODEX_RESUME }), outcome({ session: { ...CODEX_REF, checkpoint: "turn-3", baseline: LATER }, selection: CODEX_SELECTION })), {
+		entry: { ...CODEX_ENTRY, session: { ...CODEX_REF, checkpoint: "turn-3", baseline: LATER }, selection: CODEX_SELECTION },
 	});
-	assert.deepEqual(recordDecision(codexCall({ intent: CODEX_FORK }), outcome({ session: { ...CODEX_FORKED, checkpoint: "turn-3" }, selection: CODEX_SELECTION })), {
-		entry: { ...CODEX_ENTRY, session: { ...CODEX_FORKED, checkpoint: "turn-3" }, selection: CODEX_SELECTION },
+	assert.deepEqual(recordDecision(codexCall({ intent: CODEX_FORK }), outcome({ session: { ...CODEX_FORKED, checkpoint: "turn-3", baseline: LATER }, selection: CODEX_SELECTION })), {
+		entry: { ...CODEX_ENTRY, session: { ...CODEX_FORKED, checkpoint: "turn-3", baseline: LATER }, selection: CODEX_SELECTION },
 	});
+	// What a continuation recorded reads back whole, and the next continuation restores exactly that thread, checkpoint and baseline.
+	const resumed = recordDecision(codexCall({ intent: CODEX_RESUME }), outcome({ session: { ...CODEX_REF, checkpoint: "turn-3", baseline: { ...LATER, note: "dropped" } as CodexUsageBaseline }, selection: CODEX_SELECTION }));
+	assert.ok("entry" in resumed);
+	assert.deepEqual(resumed.entry.session, { ...CODEX_REF, checkpoint: "turn-3", baseline: LATER }, "a field no baseline has is not recorded");
+	const continued = only(resumed.entry as Record<string, unknown>);
+	assert.equal(continued.refusal, undefined);
+	assert.deepEqual(intentFor(continued, "host-1"), { kind: "resume", ref: { ...CODEX_REF, checkpoint: "turn-3", baseline: LATER } });
+	assert.deepEqual(intentFor(continued, "host-2"), { kind: "fork", from: { ...CODEX_REF, checkpoint: "turn-3", baseline: LATER } });
 	// What a successful entry says reads back as the record it meant: continued with a checkpoint, kept for reading without one.
 	const settled = recordDecision(codexCall({ handle: "run-2" }), outcome({ session: CODEX_REF, selection: withEffort }));
 	assert.ok("entry" in settled);
 	assert.deepEqual(only(settled.entry as Record<string, unknown>), { handle: "run-2", role: "implement", backend: "codex", hostSessionId: "host-1", session: CODEX_REF, selection: withEffort });
+	const unmeasured = recordDecision(codexCall(), outcome({ session: UNMEASURED, selection: CODEX_SELECTION }));
+	assert.ok("entry" in unmeasured);
+	assert.match(only(unmeasured.entry as Record<string, unknown>).refusal ?? "", /^run-1 ran on codex and recorded its checkpoint with no usage baseline.*codex resume thread-1/);
 	const unsettled = recordDecision(codexCall(), outcome({ session: bare, selection: CODEX_SELECTION }));
 	assert.ok("entry" in unsettled);
 	const readable = only(unsettled.entry as Record<string, unknown>);
@@ -517,11 +576,18 @@ test("a codex outcome that claims a thread or a selection the run cannot have ha
 		[codexCall({ intent: CODEX_RESUME }), outcome({ ok: false, session: { ...CODEX_REF, sessionId: "thread-9" } }), /resumed one thread and reported another/],
 		[codexCall({ intent: CODEX_FORK }), outcome({ session: CODEX_REF, selection: CODEX_SELECTION }), /forked its thread and reported the thread it forked from/],
 		// Only a new thread may succeed without a checkpoint: a continuation that settled on none fails, and its prior record stays.
-		[codexCall({ intent: CODEX_RESUME }), outcome({ session: { ...CODEX_REF, checkpoint: undefined }, selection: CODEX_SELECTION }), /continued its thread and succeeded without reporting the checkpoint it settled on/],
+		[codexCall({ intent: CODEX_RESUME }), outcome({ session: BARE, selection: CODEX_SELECTION }), /continued its thread and succeeded without reporting the checkpoint it settled on/],
 		[codexCall({ intent: CODEX_FORK }), outcome({ session: { ...CODEX_FORKED, checkpoint: undefined }, selection: CODEX_SELECTION }), /continued its thread and succeeded without reporting the checkpoint it settled on/],
-		[codexCall({ intent: CODEX_FORK }), outcome({ ok: false, session: { ...CODEX_FORKED, checkpoint: "turn-9" } }), /forked and failed without keeping the checkpoint it forked at/],
-		[codexCall({ intent: CODEX_FORK }), outcome({ ok: false, session: { ...CODEX_FORKED, checkpoint: undefined } }), /forked and failed without keeping the checkpoint it forked at/],
+		// And a continuation that settled on a checkpoint with no baseline would leave a record nothing can account for.
+		[codexCall({ intent: CODEX_RESUME }), outcome({ session: { ...UNMEASURED, checkpoint: "turn-3" }, selection: CODEX_SELECTION }), /continued its thread and succeeded without reporting the usage baseline at the checkpoint it settled on/],
+		[codexCall({ intent: CODEX_FORK }), outcome({ session: { ...CODEX_FORKED, checkpoint: "turn-3" }, selection: CODEX_SELECTION }), /continued its thread and succeeded without reporting the usage baseline at the checkpoint it settled on/],
+		// A baseline with no checkpoint, or one that is not five counts, is no thread reference at all.
+		[codexCall({ intent: CODEX_RESUME }), outcome({ session: { ...BARE, baseline: LATER }, selection: CODEX_SELECTION }), /reported a session reference that is not a codex thread/],
+		[codexCall({ intent: CODEX_RESUME }), outcome({ session: { ...CODEX_REF, baseline: { ...LATER, totalTokens: -1 } }, selection: CODEX_SELECTION }), /reported a session reference that is not a codex thread/],
+		// A failed call settled on no usage, so a fork or a new thread that failed and claims a baseline is refused.
+		[codexCall({ intent: CODEX_FORK }), outcome({ ok: false, session: { ...CODEX_FORKED, baseline: LATER }, selection: CODEX_SELECTION }), /forked and failed and claimed a usage baseline, which only a settled call has/],
 		[codexCall(), outcome({ ok: false, session: CODEX_REF, selection: CODEX_SELECTION }), /failed and claimed a trusted checkpoint/],
+		[codexCall(), outcome({ ok: false, session: UNMEASURED, selection: CODEX_SELECTION }), /failed and claimed a trusted checkpoint/],
 		[codexCall({ intent: RESUME }), outcome({ session: CODEX_REF, selection: CODEX_SELECTION }), /was started from a pi session, which no codex run can continue/],
 		[codexCall({ intent: { kind: "fork", from: { backend: "claude", sessionId: "s-1" } } }), outcome({ ok: false }), /was started from a claude session, which no codex run can continue/],
 	];
@@ -535,7 +601,7 @@ test("a codex outcome that claims a thread or a selection the run cannot have ha
 });
 
 test("a codex run that failed records only what the recovery policy trusts", () => {
-	const { checkpoint, ...bare } = CODEX_REF;
+	const bare = BARE;
 	// A first call that failed with a thread keeps it without a checkpoint, for reading only.
 	assert.deepEqual(recordDecision(codexCall(), outcome({ ok: false, session: bare, selection: CODEX_SELECTION })), { entry: { ...CODEX_ENTRY, session: bare, selection: CODEX_SELECTION } });
 	assert.deepEqual(recordDecision(codexCall(), outcome({ ok: false, session: bare, selection: { model: "gpt-5-codex" } })), { entry: { ...CODEX_ENTRY, session: bare } }, "an unusable selection is dropped");
@@ -545,17 +611,33 @@ test("a codex run that failed records only what the recovery policy trusts", () 
 	assert.deepEqual(recordDecision(codexCall({ prior: { handle: "run-1", role: "implement", backend: "codex" } }), outcome({ ok: false })), { keep: true });
 	// A failed continuation records nothing at all, so the last successful record of the handle stays authoritative.
 	assert.deepEqual(recordDecision(codexCall({ intent: CODEX_RESUME }), outcome({ ok: false, session: { ...CODEX_REF, checkpoint: "turn-3" }, selection: CODEX_SELECTION })), { keep: true });
+	assert.deepEqual(recordDecision(codexCall({ intent: CODEX_RESUME }), outcome({ ok: false, session: { ...UNMEASURED, checkpoint: "turn-3" } })), { keep: true });
 	assert.deepEqual(recordDecision(codexCall({ intent: CODEX_RESUME }), outcome({ ok: false })), { keep: true });
+	// So the branch still holds the earlier entry, whose checkpoint and baseline the next continuation restores unchanged.
+	const prior = only({ ...CODEX_ENTRY, session: { ...CODEX_REF }, selection: { ...CODEX_SELECTION } });
+	assert.deepEqual(intentFor(prior, "host-1"), { kind: "resume", ref: CODEX_REF });
 	assert.deepEqual(recordDecision(codexCall({ intent: CODEX_FORK }), outcome({ ok: false })), { keep: true }, "a fork cancelled before it existed leaves the source record");
-	// A fork that failed after its thread existed keeps that thread at the checkpoint it forked at, selection only when read back.
+	// A fork that failed after its thread existed keeps that thread at the tip it reported, selection only when read back.
 	assert.deepEqual(recordDecision(codexCall({ intent: CODEX_FORK }), outcome({ ok: false, session: CODEX_FORKED, selection: CODEX_SELECTION })), { entry: { ...CODEX_ENTRY, session: CODEX_FORKED, selection: CODEX_SELECTION } });
 	const fork = recordDecision(codexCall({ intent: CODEX_FORK }), outcome({ ok: false, session: CODEX_FORKED }));
 	assert.deepEqual(fork, { entry: { ...CODEX_ENTRY, session: CODEX_FORKED } });
 	assert.ok("entry" in fork);
 	const record = only(fork.entry as Record<string, unknown>);
 	assert.deepEqual(record.session, CODEX_FORKED, "the fork this host owns is still named");
-	assert.match(record.refusal ?? "", /^run-1 recorded no codex model and provider this host can repeat.*codex resume thread-2/);
-	assert.throws(() => intentFor(record, "host-1"), /recorded no codex model and provider/);
+	assert.match(record.refusal ?? "", /^run-1 ran on codex and recorded its checkpoint with no usage baseline.*codex resume thread-2/);
+	assert.throws(() => intentFor(record, "host-1"), /recorded its checkpoint with no usage baseline/);
+	// The new thread's starting tip need not be the source's checkpoint: it is recorded as reported, never checked against or replaced by it.
+	const elsewhere = recordDecision(codexCall({ intent: CODEX_FORK }), outcome({ ok: false, session: { ...CODEX_FORKED, checkpoint: "turn-9" }, selection: CODEX_SELECTION }));
+	assert.deepEqual(elsewhere, { entry: { ...CODEX_ENTRY, session: { ...CODEX_FORKED, checkpoint: "turn-9" }, selection: CODEX_SELECTION } });
+	assert.ok("entry" in elsewhere);
+	const readable = only(elsewhere.entry as Record<string, unknown>);
+	assert.deepEqual(readable.session, { ...CODEX_FORKED, checkpoint: "turn-9" });
+	assert.match(readable.refusal ?? "", /^run-1 ran on codex and recorded its checkpoint with no usage baseline.*codex resume thread-2/);
+	// And a fork whose new thread reported no checkpoint at all is kept with none, for reading.
+	const untipped = recordDecision(codexCall({ intent: CODEX_FORK }), outcome({ ok: false, session: { backend: "codex", sessionId: "thread-2" } }));
+	assert.deepEqual(untipped, { entry: { ...CODEX_ENTRY, session: { backend: "codex", sessionId: "thread-2" } } });
+	assert.ok("entry" in untipped);
+	assert.match(only(untipped.entry as Record<string, unknown>).refusal ?? "", /^run-1 ran on codex and recorded no trusted checkpoint.*codex resume thread-2/);
 });
 
 test("a claude entry that keeps its identity only in a session reference is refused, never read as a run with none", () => {

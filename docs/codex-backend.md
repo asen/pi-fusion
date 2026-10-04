@@ -45,7 +45,7 @@ Stage 1 is what this build ships. Later stages are planned, not shipped, and eac
 | Stage | Scope | State |
 | --- | --- | --- |
 | 1 | Fresh `implement` and `ask` on the app-server's stable methods | Shipped and experimental; its native gate (G1) passed on one Linux x64 host with app-server 0.160 |
-| 2 | Verified continuation and fork from a trusted turn checkpoint, `plan` on Codex, and steers | Not shipped: resume, fork, `plan` and steers are refused today. Its gate G2 is not enabled; its first preparation measurement, Q14 (usage counters), ran natively once and passed, which qualifies no stage 2 behavior. The transport has source-read foundations for thread/resume, thread/fork, thread/turns/list and turn/steer, tested only against the deterministic fake; no backend or host path calls them |
+| 2 | Verified continuation and fork from a trusted turn checkpoint, `plan` on Codex, and steers | Not shipped: resume, fork, `plan` and steers are refused today. Its gate G2 is not enabled; its first preparation measurement, Q14 (usage counters), ran natively once and passed, which qualifies no stage 2 behavior. The transport has source-read foundations for thread/resume, thread/fork, thread/turns/list and turn/steer, tested only against the deterministic fake; no backend or host path calls them. The host's record format pairs a continuable checkpoint with a cumulative usage baseline and refuses a checkpoint without one; that is offline record validation, not G2 qualification, and no backend reports a baseline yet |
 | 3 | Questions through Codex's experimental question surfaces, which 0.160.0 gates behind its experimental API (source-read) | Not shipped: a Codex child has no question tool |
 
 ### The stage 1 harness
@@ -136,7 +136,7 @@ A verified success whose shutdown was not clean is demoted. It keeps its thread 
 
 ## Records and usage
 
-- The outcome reference is `{ backend: "codex", sessionId: <thread id> }` with **no checkpoint**. The record is kept for reading, and a follow-up is a new run. `codex resume <id>` is named as an intended manual hint for opening the thread, not a natively measured one. A scalar `sessionId` is set as a diagnostic, and the host's writer does not record it for Codex.
+- The outcome reference is `{ backend: "codex", sessionId: <thread id> }` with **no checkpoint** and no usage baseline. The record is kept for reading, and a follow-up is a new run. `codex resume <id>` is named as an intended manual hint for opening the thread, not a natively measured one. A scalar `sessionId` is set as a diagnostic, and the host's writer does not record it for Codex.
 - `modelId` and the selection are the configured model, provider and effort.
 - Tokens are the fresh thread's final cumulative **total**: input (which already includes cached input), output, cache read (= cached input, shown and never added again) and cache write as reported. Context is the latest response's input, and the window appears only when the child reports one. With no window, no share is shown or guessed.
 - **Cache write vs input is unqualified (Q14).** Whether Codex's cache-write tokens are part of `inputTokens` is not settled by the 0.160.0 source and has not been measured: Q14's one native run reported cache write as 0 throughout, which measures no relation ([Q14](#the-stage-1-harness)). Fusion uses Codex's `inputTokens` unchanged and reports cache write beside it, with no sum, subtraction or clamp. No lifecycle, budget or context-cap behavior may rely on that relationship until the cache-write relationship is actually measured.

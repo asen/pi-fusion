@@ -30,11 +30,31 @@ export interface PiSessionRef {
 	checkpoint?: string;
 }
 
-/** A Codex thread: an id alone, like Claude's, so a reference carrying a Pi session file is not one of these. */
+/**
+ * The cumulative usage a Codex thread had reported when it settled on its checkpoint: the thread's own `total`, which
+ * the child seeds from history on a resume or a fork, so one later call's usage is its total less this one and never
+ * a sum of the per-response updates. It is paired with the checkpoint and means nothing without it. A cache write the
+ * child did not report is left out rather than read as zero, because an absent count is unobserved, not none.
+ */
+export interface CodexUsageBaseline {
+	inputTokens: number;
+	cachedInputTokens: number;
+	outputTokens: number;
+	reasoningOutputTokens: number;
+	totalTokens: number;
+	cacheWriteInputTokens?: number;
+}
+
+/**
+ * A Codex thread: an id alone, like Claude's, so a reference carrying a Pi session file is not one of these. A
+ * checkpoint a continuation may restore comes with the usage baseline the thread had at it; one without is kept for
+ * reading only, which is what every thread this host recorded before baselines existed is.
+ */
 export interface CodexSessionRef {
 	backend: "codex";
 	sessionId: string;
 	checkpoint?: string;
+	baseline?: CodexUsageBaseline;
 }
 
 export type SessionRef = ClaudeSessionRef | PiSessionRef | CodexSessionRef;
@@ -92,7 +112,8 @@ export const isPiModel = (value: unknown): boolean => piModelParts(value) !== un
  * A session reference read back from a record or an outcome, or undefined when the value is not one this host may
  * act on. A Pi reference without its session file is such a value: the file is half of the identity, not a detail.
  * A Codex reference is only ever one that says so: an untagged value is Claude's, never read as a Codex thread, and a
- * Codex reference carrying a session file is a mixed one that names no session this host could resume.
+ * Codex reference carrying a session file is a mixed one that names no session this host could resume. A Codex
+ * reference with a malformed usage baseline, or with a baseline and no checkpoint, is not one either.
  */
 export function sessionRefOf(value: unknown, backend: "claude"): ClaudeSessionRef | undefined;
 export function sessionRefOf(value: unknown, backend: "pi"): PiSessionRef | undefined;
@@ -115,12 +136,42 @@ export function sessionRefOf(value: unknown, backend?: BackendName): SessionRef 
 			const sessionFile = named(data.sessionFile);
 			return sessionFile ? { backend: "pi", sessionId, sessionFile, ...at } : undefined;
 		}
-		case "codex":
+		case "codex": {
 			if (data.backend !== "codex" || data.sessionFile !== undefined) return undefined;
-			return { backend: "codex", sessionId, ...at };
+			// A baseline is read from the reference's own fields alone, so one a prototype carries is no baseline at all. A
+			// present one that is not exactly a baseline, or one with no checkpoint to pair it with, names no thread this
+			// host could account for, and the whole reference goes rather than a reference with its baseline dropped.
+			const given = Object.hasOwn(data, "baseline") ? data.baseline : undefined;
+			if (given === undefined) return { backend: "codex", sessionId, ...at };
+			const baseline = codexBaselineOf(given);
+			return baseline && checkpoint !== undefined ? { backend: "codex", sessionId, checkpoint, baseline } : undefined;
+		}
 		default:
 			return unknownBackend(tag);
 	}
+}
+
+/** A token count as a baseline holds it: a whole number of tokens, none below zero and none past exact arithmetic. */
+const isCount = (value: unknown): value is number => typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
+
+/**
+ * A Codex usage baseline rebuilt from a value's own fields, or undefined when it is not one: the five counts every
+ * baseline carries, with the cached input inside the input it is a part of, and the cache write only where it was
+ * reported. A field this does not know is not carried over, and an inherited one is not read.
+ */
+function codexBaselineOf(value: unknown): CodexUsageBaseline | undefined {
+	if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+	const own = (key: string): unknown => (Object.hasOwn(value, key) ? (value as Record<string, unknown>)[key] : undefined);
+	const inputTokens = own("inputTokens");
+	const cachedInputTokens = own("cachedInputTokens");
+	const outputTokens = own("outputTokens");
+	const reasoningOutputTokens = own("reasoningOutputTokens");
+	const totalTokens = own("totalTokens");
+	const cacheWriteInputTokens = own("cacheWriteInputTokens");
+	if (!isCount(inputTokens) || !isCount(cachedInputTokens) || !isCount(outputTokens) || !isCount(reasoningOutputTokens) || !isCount(totalTokens)) return undefined;
+	if (cachedInputTokens > inputTokens) return undefined;
+	if (cacheWriteInputTokens !== undefined && !isCount(cacheWriteInputTokens)) return undefined;
+	return { inputTokens, cachedInputTokens, outputTokens, reasoningOutputTokens, totalTokens, ...(cacheWriteInputTokens === undefined ? {} : { cacheWriteInputTokens }) };
 }
 
 /** The end of a dispatch over every backend name: a name added to the list and left out of a dispatch fails to compile. */
