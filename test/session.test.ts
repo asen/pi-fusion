@@ -8,7 +8,7 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import fusion, { nextSession, runRecords } from "../extensions/fusion.ts";
 import { planContextPct, planProblems } from "../extensions/handoff.ts";
 import { memoryProfileStore } from "../extensions/profile-store.ts";
-import { piTripwire } from "./tripwire.ts";
+import { tripwires } from "./tripwire.ts";
 import { toolList, turnOn } from "./host-tools.ts";
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -57,8 +57,8 @@ function makeExtension(): Extension {
 		},
 		registerMessageRenderer: () => {},
 	} as unknown as ExtensionAPI;
-	// Nothing here runs a pi child, so the tripwire stands where this build registers its pi backend.
-	fusion(api, { backends: { ...piTripwire() }, profiles: memoryProfileStore() });
+	// Nothing here runs a pi or codex child, so the tripwires stand where those backends would be registered.
+	fusion(api, { backends: { ...tripwires() }, profiles: memoryProfileStore() });
 	void turnOn(ext.tools.get("fusion_activate"));
 	return ext;
 }

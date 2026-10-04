@@ -13,7 +13,7 @@ import { memoryProfileStore, type ProfileStore } from "../extensions/profile-sto
 import { History, type HistoryRecord } from "../extensions/history.ts";
 import { type FakeBackend, fakeBackend, type FakeScript } from "./fake-pi-backend.ts";
 import { securityProfiles, toolList, turnOn } from "./host-tools.ts";
-import { piTripwire } from "./tripwire.ts";
+import { codexTripwire, tripwireReaches, tripwires } from "./tripwire.ts";
 
 /**
  * The shared run lifecycle, driven end to end against backends injected in memory: the registered tools, the host
@@ -100,9 +100,9 @@ function makeHost(options: HostOptions = {}) {
 		sendMessage: (message: unknown, opts: unknown) => sent.push([message, opts]),
 		registerMessageRenderer: () => {},
 	} as unknown as ExtensionAPI;
-	// The tripwire under whatever the case registered: a host here that named only claude still gets no pi backend it
-	// could run, and a case that injects one of its own puts it over this.
-	fusion(api, { backends: { ...piTripwire(), ...options.backends }, profiles: options.profiles ?? memoryProfileStore() });
+	// The tripwires under whatever the case registered: a host here that named only claude still gets no pi or codex
+	// backend it could run, and a case that injects one of its own puts it over these.
+	fusion(api, { backends: { ...tripwires(), ...options.backends }, profiles: options.profiles ?? memoryProfileStore() });
 	const sessionManager: Record<string, unknown> = { getSessionId: () => options.sessionId ?? "host-1", getBranch: () => branch };
 	if (options.sessionFile !== undefined) sessionManager.getSessionFile = () => options.sessionFile;
 	const editors: Array<{ title: string; prefill?: string }> = [];
@@ -1955,7 +1955,8 @@ test("an ask reviewer configured on a backend this host did not register is refu
 	]);
 	await withEnv({ ...securityEnv(), PI_FUSION_HISTORY: "1", PI_FUSION_HISTORY_DIR: dir }, async () => {
 		const claude = fakeBackend({ name: "claude" });
-		const host = makeSecurityHost({ backends: { pi: undefined, claude: claude.backend }, sessionFile, profiles: profileWith({ ask: { enabled: true, backend: "pi", model: PI_MODEL } }) });
+		// Codex left out as well, so the backends the refusal offers instead are the one this host registered.
+		const host = makeSecurityHost({ backends: { pi: undefined, codex: undefined, claude: claude.backend }, sessionFile, profiles: profileWith({ ask: { enabled: true, backend: "pi", model: PI_MODEL } }) });
 		await host.command("review run-1");
 		assert.deepEqual(host.notices, [
 			"the pi backend is not available in this build: run-2 would review run-1, and this pi-fusion runs claude only. Nothing was started and nothing was recorded. Take the work to claude with a role it runs, or do it yourself; no configuration makes pi available here.",
@@ -1966,25 +1967,16 @@ test("an ask reviewer configured on a backend this host did not register is refu
 	});
 });
 
-/** A codex backend a host registered, which this build has no binding for: every entry point records a reach and throws. */
-function codexTripwire(): { backend: HostBackend; reaches: string[] } {
-	const reaches: string[] = [];
-	const reach = (what: string): never => {
-		reaches.push(what);
-		throw new Error(`the registered codex backend was asked for ${what}`);
-	};
-	return { reaches, backend: { name: "codex", control: () => reach("control"), session: () => reach("session"), run: async () => reach("run") } };
-}
-
 const NO_CODEX_BINDING = "cannot be bound for the codex backend: this build has no codex binding";
 
 test("a registered codex backend is still refused at its binding: a direct call and a configured one take no handle, session or run", async () => {
-	const codex = codexTripwire();
+	// The shared codex tripwire, named here although every host takes it: this case is about a registered codex backend
+	// that this build has no binding for, and each of its entry points records a reach and throws.
 	const claude = fakeBackend({ name: "claude" });
-	const host = makeHost({ backends: { claude: claude.backend, codex: codex.backend }, profiles: profileWith({ implement: { enabled: true, backend: "codex" } }) });
+	const host = makeHost({ backends: { claude: claude.backend, ...codexTripwire() }, profiles: profileWith({ implement: { enabled: true, backend: "codex" } }) });
 	assert.equal((await host.fusion({ role: "ask", task: "x", backend: "codex" })).error, `role ask ${NO_CODEX_BINDING}`, "a call naming codex is refused by the binding, not by availability");
 	assert.equal((await host.fusion({ role: "implement", task: "x" })).error, `role implement ${NO_CODEX_BINDING}`, "and so is a role the profile puts on codex");
-	assert.deepEqual(codex.reaches, [], "no control, session or run was asked of the codex backend");
+	assert.deepEqual(tripwireReaches("codex"), [], "no control, session or run was asked of the codex backend");
 	assert.deepEqual(claude.starts, [], "and no claude child stood in for it");
 	assert.deepEqual(host.entries(), [], "nothing was recorded");
 	assert.equal((await host.fusion({ role: "implement", task: "x", backend: "claude" })).error, undefined);
@@ -1996,14 +1988,13 @@ test("a manual review by an ask role configured on a registered codex backend is
 	await withEnv(securityEnv(), async () => {
 		const pi = fakeBackend({ scripts: [{ pending: true }, {}] });
 		const claude = fakeBackend({ name: "claude" });
-		const codex = codexTripwire();
-		const host = makeSecurityHost({ backends: { ...both(pi, claude), codex: codex.backend }, cwd: dir, profiles: profileWith({ ask: { enabled: true, backend: "codex" } }) });
+		const host = makeSecurityHost({ backends: { ...both(pi, claude), ...codexTripwire() }, cwd: dir, profiles: profileWith({ ask: { enabled: true, backend: "codex" } }) });
 		const done = await runThatChanged(host, pi, dir, { role: "security", task: "audit the token check" });
 		assert.equal(done.error, undefined);
 		host.notices.length = 0;
 		await host.command("review run-1");
 		assert.deepEqual(host.notices, [`run-2 would review run-1, and its reviewer could not be bound: role ask ${NO_CODEX_BINDING}`]);
-		assert.deepEqual(codex.reaches, [], "no control, session or run was asked of the codex backend");
+		assert.deepEqual(tripwireReaches("codex"), [], "no control, session or run was asked of the codex backend");
 		assert.equal(pi.starts.length, 1, "no reviewer was started");
 		assert.deepEqual(claude.starts, [], "and no claude child stood in for it");
 		assert.equal(host.entries().length, 1, "nothing was recorded for a handle nothing took");

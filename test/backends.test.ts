@@ -1,14 +1,17 @@
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import * as fs from "node:fs";
+import * as os from "node:os";
 import * as path from "node:path";
 import test from "node:test";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import ts from "typescript";
 import { claudeBackend, type Role } from "../extensions/backends/claude.ts";
 import { hostBackend, isPiModel, keptRef, keptSelection, piModelParts, resolvedSelectionOf, sessionRefOf } from "../extensions/backends/types.ts";
 import { ASK_MODES, type AskMode, type ChildRun as ExportedChildRun, failed, ROLE_NAMES } from "../extensions/fusion.ts";
 import { ChildTree } from "../extensions/process-tree.ts";
 import { canChangeFiles, isReviewable, KNOWN_ROLE_NAMES, ROLE_SPECS, runsOn } from "../extensions/roles.ts";
+import { CODEX_VARIABLES, PRODUCTION_DEFAULT_VARIABLES, productionDefaults, tripwires } from "./tripwire.ts";
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
@@ -205,9 +208,11 @@ const REGISTRATIONS_TOTAL = 10;
 
 test("every Fusion registration in the suite names the backends it takes, and the registrations are the ones pinned here", () => {
 	// A registration that names neither marker would run with the pi backend this build registers, which is a real
-	// harness: a case that routed to it would start a child instead of failing in a way a test can read. So every
-	// registration has to say which of the two it is, and a bare one that somebody adds later fails here.
-	const TRIPWIRE = "piTripwire";
+	// harness, and with whatever codex backend a later build registers: a case that routed to one would start a child
+	// instead of failing in a way a test can read. So every registration has to say which of the two it is, and a bare
+	// one that somebody adds later fails here. The marker is the combined `tripwires()`: a registration that names only
+	// the pi tripwire leaves codex unfenced, and is no more acceptable than a bare one.
+	const TRIPWIRE = "tripwires";
 	const DEFAULTS = "productionDefaults";
 	const defaults: string[] = [];
 	const counted: Record<string, number> = {};
@@ -215,7 +220,7 @@ test("every Fusion registration in the suite names the backends it takes, and th
 		const where = relative(file);
 		for (const call of fusionRegistrations(fs.readFileSync(file, "utf8"))) {
 			counted[where] = (counted[where] ?? 0) + 1;
-			const tripwire = call.includes(TRIPWIRE);
+			const tripwire = /\.\.\.tripwires\(\)/.test(call);
 			const production = call.includes(DEFAULTS);
 			assert.ok(tripwire || production, `${where} registers the extension without naming ${TRIPWIRE} or ${DEFAULTS}: ${call}`);
 			assert.ok(!(tripwire && production), `${where} registers the extension naming both ${TRIPWIRE} and ${DEFAULTS}, which cannot both be what it takes: ${call}`);
@@ -229,6 +234,97 @@ test("every Fusion registration in the suite names the backends it takes, and th
 		"the total is pinned beside the map so a count moved from one file to another still has to be looked at",
 	);
 	assert.deepEqual(defaults, ["test/extension.test.ts", "test/routing.test.ts"], "exactly two cases read this build's own pi registration, and every other one keeps the tripwire in its place");
+});
+
+/** The source of `test/tripwire.ts`, parsed, and the one function in it a registration audit reads by name. */
+function tripwireFunction(name: string): ts.FunctionDeclaration {
+	const source = fs.readFileSync(path.join(repoRoot, "test", "tripwire.ts"), "utf8");
+	const file = ts.createSourceFile("tripwire.ts", source, ts.ScriptTarget.Latest, true);
+	const found = file.statements.find((statement): statement is ts.FunctionDeclaration => ts.isFunctionDeclaration(statement) && statement.name?.text === name);
+	assert.ok(found?.body, `test/tripwire.ts declares no function ${name}`);
+	return found;
+}
+
+test("the production-default registration keeps the codex tripwire, because no missing-model refusal would stop a codex call there", () => {
+	// A codex role runs on the host's own default model when it names none, so the binding's missing-model refusal that
+	// keeps the two production-default cases away from a real pi child has no codex counterpart. What keeps them away
+	// from a production codex backend, whether this build registers one yet or not, is the tripwire, and it is read
+	// here out of the source: every value the function returns registers the codex tripwire and nothing over it.
+	const returns: ts.ReturnStatement[] = [];
+	const visit = (node: ts.Node): void => {
+		if (ts.isReturnStatement(node)) returns.push(node);
+		else if (!ts.isFunctionLike(node)) ts.forEachChild(node, visit);
+	};
+	ts.forEachChild(tripwireFunction("productionDefaults").body!, visit);
+	assert.equal(returns.length, 1, "productionDefaults returns one value, so one is all this has to read");
+	const returned = returns[0]!.expression;
+	assert.ok(returned && ts.isObjectLiteralExpression(returned), "productionDefaults returns an object literal this can read");
+	const backends = returned.properties.find((property) => ts.isPropertyAssignment(property) && property.name.getText() === "backends");
+	assert.ok(backends && ts.isPropertyAssignment(backends) && ts.isObjectLiteralExpression(backends.initializer), "productionDefaults registers no backends of its own, so nothing fences codex");
+	assert.deepEqual(
+		backends.initializer.properties.map((property) => property.getText()),
+		["...codexTripwire()"],
+		"productionDefaults registers the codex tripwire and nothing else: no pi tripwire, which would hide the binding these cases read, and nothing over codex",
+	);
+
+	// And what it returns, with every variable it refuses cleared for the call: this build's own claude and pi, which
+	// it leaves alone, and the codex tripwire. No entry point of it is called, so nothing here is a reach.
+	const kept = PRODUCTION_DEFAULT_VARIABLES.map((name) => [name, process.env[name]] as const);
+	for (const [name] of kept) delete process.env[name];
+	try {
+		const registered = productionDefaults().backends ?? {};
+		assert.deepEqual(Object.keys(registered), ["codex"]);
+		assert.equal(registered.codex?.name, "codex");
+	} finally {
+		for (const [name, value] of kept) if (value !== undefined) process.env[name] = value;
+	}
+	// The variables it refuses include every codex one a later launch would read: both selection variables of each
+	// role codex runs, and the binary override.
+	assert.deepEqual(CODEX_VARIABLES, ["PI_FUSION_CODEX_IMPLEMENT_MODEL", "PI_FUSION_CODEX_IMPLEMENT_EFFORT", "PI_FUSION_CODEX_ASK_MODEL", "PI_FUSION_CODEX_ASK_EFFORT", "PI_FUSION_CODEX_BIN"]);
+	for (const name of CODEX_VARIABLES) assert.ok(PRODUCTION_DEFAULT_VARIABLES.includes(name), `${name} is not refused by a production-default registration`);
+	const previous = process.env.PI_FUSION_CODEX_BIN;
+	process.env.PI_FUSION_CODEX_BIN = "/nowhere/codex";
+	try {
+		assert.throws(() => productionDefaults(), /PI_FUSION_CODEX_BIN is still set/);
+	} finally {
+		if (previous === undefined) delete process.env.PI_FUSION_CODEX_BIN;
+		else process.env.PI_FUSION_CODEX_BIN = previous;
+	}
+});
+
+test("the combined tripwires fence pi and codex, each under its own name", () => {
+	const fenced = tripwires();
+	assert.deepEqual(Object.keys(fenced), ["pi", "codex"]);
+	assert.deepEqual([fenced.pi.name, fenced.codex.name], ["pi", "codex"], "a backend registered under another name than its own is refused at registration");
+});
+
+test("a reach of either tripwire that a case swallowed still fails its file, and a file that reached neither passes", () => {
+	// Each probe is a test file of its own, run by a node process of its own, so the reach it makes on purpose fails
+	// that process's hook and not this suite's. The probes import the tripwires and call one entry point: nothing in
+	// them registers the extension or starts a child of any harness.
+	const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fusion-tripwire-"));
+	const module = pathToFileURL(path.join(repoRoot, "test", "tripwire.ts")).href;
+	const env = { ...process.env };
+	// The runner marks the files it starts; a probe that inherited the mark would report to a parent that is not there.
+	delete env.NODE_TEST_CONTEXT;
+	delete env.PI_FUSION_CHILD;
+	const probe = (name: string, body: string): { status: number | null; output: string } => {
+		const file = path.join(dir, `${name}.test.ts`);
+		fs.writeFileSync(file, `import test from "node:test";\nimport { tripwires } from ${JSON.stringify(module)};\ntest(${JSON.stringify(name)}, async () => {\n${body}\n});\n`);
+		const ran = spawnSync(process.execPath, ["--test", file], { cwd: dir, env, encoding: "utf8", timeout: 30_000 });
+		return { status: ran.status, output: `${ran.stdout}${ran.stderr}` };
+	};
+	try {
+		const clean = probe("clean", "\ttripwires();");
+		assert.equal(clean.status, 0, `a file that reached no tripwire failed:\n${clean.output}`);
+		for (const backend of ["pi", "codex"]) {
+			const reached = probe(`${backend}-reach`, `\tawait tripwires().${backend}.run({} as never).catch(() => {});`);
+			assert.equal(reached.status, 1, `a swallowed ${backend} reach did not fail its file:\n${reached.output}`);
+			assert.match(reached.output, new RegExp(`a case reached the ${backend} backend tripwire`), `the ${backend} probe failed for another reason:\n${reached.output}`);
+		}
+	} finally {
+		fs.rmSync(dir, { recursive: true, force: true });
+	}
 });
 
 test("a pi model is a provider and a model id split at the first slash, so a provider's own slashes survive", () => {

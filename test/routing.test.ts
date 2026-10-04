@@ -6,14 +6,14 @@ import test, { after } from "node:test";
 import { fileURLToPath } from "node:url";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { type PiRole, piModelVariable, piRole } from "../extensions/backends/pi-binding.ts";
-import type { Backend, ChildControl, ChildRun, HostBackend, PiSessionRef, ResolvedSelection, SessionIntent } from "../extensions/backends/types.ts";
+import type { Backend, BackendName, ChildControl, ChildRun, HostBackend, PiSessionRef, ResolvedSelection, SessionIntent } from "../extensions/backends/types.ts";
 import { hostBackend } from "../extensions/backends/types.ts";
 import fusion, { builtinConfiguration, claudeCall, claudeRoute, type FusionParams, fusionCall, fusionRoute, ROLE_NAMES, roleFor, type RunRecords, runRecords } from "../extensions/fusion.ts";
 import { KNOWN_ROLE_NAMES, roleSpec } from "../extensions/roles.ts";
 import { History } from "../extensions/history.ts";
 import { memoryProfileStore, type ProfileStore } from "../extensions/profile-store.ts";
 import { builtinSettings, captureBaseline, serializeDocument } from "../extensions/profiles.ts";
-import { PI_SELECTION_VARIABLES, piTripwire, productionDefaults } from "./tripwire.ts";
+import { PRODUCTION_DEFAULT_VARIABLES, productionDefaults, tripwires } from "./tripwire.ts";
 import { securityProfiles, toolList, turnOn } from "./host-tools.ts";
 
 const tempDirs: string[] = [];
@@ -448,13 +448,12 @@ function recorder(): { ext: Extension; api: ExtensionAPI } {
 }
 
 /**
- * The extension as every case here registers it: the tripwire in place of the pi backend this build registers by
- * default, with the backends the case named over it. A case that wants the defaults themselves says so with
+ * The extension as every case here registers it: the tripwires in place of the pi and codex backends, with the backends the case named over it. A case that wants the defaults themselves says so with
  * `defaultExtension`, and there is exactly one of those in this file.
  */
-const makeExtension = (backends: Partial<Record<"claude" | "pi", HostBackend>> = {}, profiles: ProfileStore = memoryProfileStore()): Extension => {
+const makeExtension = (backends: Partial<Record<BackendName, HostBackend>> = {}, profiles: ProfileStore = memoryProfileStore()): Extension => {
 	const { ext, api } = recorder();
-	fusion(api, { backends: { ...piTripwire(), ...backends }, profiles });
+	fusion(api, { backends: { ...tripwires(), ...backends }, profiles });
 	void turnOn(ext.tools.get("fusion_activate"));
 	return ext;
 };
@@ -665,12 +664,12 @@ test("a blank pi model or effort the call names is refused, and no recorded or c
 });
 
 test("the pi backend this build registers is reached through its binding, which refuses a call nothing configured a model for", async () => {
-	// One of exactly two registrations in the suite that take the production defaults on purpose, with the tripwire left
-	// out: what this case reads is that registration itself. No child may start here, and nothing stops one but the
-	// binding, so every variable a pi role could resolve a model from is deleted first — `productionDefaults` refuses
+	// One of exactly two registrations in the suite that take the production defaults on purpose, with the pi tripwire
+	// left out: what this case reads is that registration itself. No child may start here, and nothing stops one but the
+	// binding, so every variable a pi role could resolve a model from, and every codex one, is deleted first — `productionDefaults` refuses
 	// the registration outright if one is still set. The refusal below is then the binding's own and not this process's
 	// environment, and it lands before the backend is asked for a session, a control or a run.
-	const kept = PI_SELECTION_VARIABLES.map((name) => [name, process.env[name]] as const);
+	const kept = PRODUCTION_DEFAULT_VARIABLES.map((name) => [name, process.env[name]] as const);
 	for (const [name] of kept) delete process.env[name];
 	try {
 		const ext = defaultExtension();
@@ -697,8 +696,9 @@ test("the pi backend this build registers is reached through its binding, which 
 });
 
 test("a backend a host left out is refused without asking the user to configure it", async () => {
-	// An explicit undefined over this build's own default, which is the one way a host registers no pi backend at all.
-	const ext = makeExtension({ pi: undefined });
+	// An explicit undefined over this build's own default, which is the one way a host registers no pi backend at all;
+	// codex is left out the same way, so the backends left to offer are the ones this case means.
+	const ext = makeExtension({ pi: undefined, codex: undefined });
 	const refused = await call(ext, "fusion", { role: "implement", task: "x", backend: "pi" }, makeCtx());
 	assert.match(refused.error ?? "", /the pi backend is not available in this build/i);
 	assert.match(refused.error ?? "", /Nothing was started and nothing was recorded/);
@@ -740,7 +740,8 @@ test("a codex call goes nowhere in this build: named or configured, it is refuse
 			throw new Error("no child may start");
 		},
 	};
-	const ext = makeExtension({ claude }, profiles);
+	// Codex left out over its tripwire, which is how this build stands: it registers no codex backend.
+	const ext = makeExtension({ claude, codex: undefined }, profiles);
 	const unavailable =
 		"the codex backend is not available in this build: run-1 would run role implement on it, and this pi-fusion runs claude, pi only. Nothing was started and nothing was recorded. Take the work to claude, pi with a role it runs, or do it yourself; no configuration makes codex available here.";
 	assert.equal((await call(ext, "fusion", { role: "implement", task: "x", backend: "codex" }, makeCtx())).error, unavailable);
@@ -752,9 +753,9 @@ test("a codex call goes nowhere in this build: named or configured, it is refuse
 });
 
 test("a host that left out every backend says so, rather than offering an empty list of harnesses", async () => {
-	// Both keys overridden with nothing, which is a host that registered no backend at all. The sentence that names
+	// Every key overridden with nothing, which is a host that registered no backend at all. The sentence that names
 	// where the work goes instead has nowhere to point, so it is replaced rather than composed around an empty list.
-	const ext = makeExtension({ claude: undefined, pi: undefined });
+	const ext = makeExtension({ claude: undefined, pi: undefined, codex: undefined });
 	const refused = await call(ext, "fusion", { role: "implement", task: "x" }, makeCtx());
 	assert.equal(
 		refused.error,

@@ -63,7 +63,7 @@ See [Pi backend](docs/pi-backend.md) for architecture/storage/lifecycle diagrams
 
 The default suite starts no real Claude/Pi child or paid model request. Preserve that boundary:
 
-- Extension hosts inject `piTripwire()` and `memoryProfileStore()`. The two `productionDefaults()` registrations test missing-model refusals before any backend entry point. Own Pi doubles spread over the tripwire: `{ ...piTripwire(), pi: own }`.
+- Extension hosts inject `tripwires()` (Pi and Codex) and `memoryProfileStore()`. The two `productionDefaults()` registrations test Pi missing-model refusals before any backend entry point and still inject the Codex tripwire, since Codex's host-default model leaves no such refusal. Own doubles spread over the tripwires: `{ ...tripwires(), pi: own }`.
 - Activate through the registered tool, never a default-on option; explicitly enable security in its cases.
 - `fake-claude.mjs` uses real SDK objects around fake protocol; `fake-pi.mjs` speaks native RPC without SDK; `fake-pi-backend.ts` is an in-memory lifecycle backend. These test different layers.
 - Pi stage tests use doubles/fenced fake subprocesses. The bootstrap suite's two unfenced calls inspect public exports/accessors only: no real session/model runtime.
