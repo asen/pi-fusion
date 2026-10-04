@@ -625,11 +625,11 @@ test("a cleanup that produced no report is one fixed sentence, with no exit, no 
 
 test("a response is read by the envelope the native protocol declares, and its data is left opaque", () => {
 	const queue = { steering: ["one"], followUp: [] };
-	const accepted: RpcResponse = { id: "pi-fusion-1", type: "response", command: "prompt", success: true };
+	const accepted: RpcResponse = { id: "pi-fusion-1", type: "response", command: "prompt", success: true, data: { disposition: "started" } };
 	const cleared: RpcResponse = { id: "pi-fusion-2", type: "response", command: "clear_queue", success: true, data: queue };
 	const refused: RpcResponse = { id: "pi-fusion-3", type: "response", command: "set_model", success: false, error: "Model not found: invalid/model" };
 
-	assert.deepEqual(accept(accepted), { id: "pi-fusion-1", command: "prompt", success: true });
+	assert.deepEqual(accept(accepted), { id: "pi-fusion-1", command: "prompt", success: true, data: { disposition: "started" } });
 	const answered = accept(cleared);
 	assert.equal(answered.data, queue, "what a command answered with is the bridge's to read, and is not copied or checked here");
 	assert.deepEqual(accept(refused), { id: "pi-fusion-3", command: "set_model", success: false, error: "Model not found: invalid/model" });

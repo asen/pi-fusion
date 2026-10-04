@@ -30,7 +30,7 @@ Off is refused while a run is running, waiting for an answer, or finishing its r
 
 ### Requirements
 
-- Pi with the required extension/public SDK APIs. Tests pin 0.85.1; [manual qualification](docs/pi-backend.md#evidence-and-limits) also covers 1.0.1, not every newer release. Incompatible child APIs refuse startup.
+- Pi with the required extension/public SDK APIs. Tests pin 1.0.2; [manual qualification](docs/pi-backend.md#evidence-and-limits) covers 0.85.1 and 1.0.1 only. Incompatible child APIs refuse startup.
 - `npm install` installs the Claude Agent SDK and its bundled Claude Code binary (about 200 MB). A separate `claude` executable on `PATH` is not required.
 - For Claude children, Claude Code authentication on this machine and access to the configured models. Children use that account's capacity; the SDK's dollar estimate is not a subscription charge. See Anthropic's [subscription guidance](https://support.claude.com/en/articles/15036540-use-the-claude-agent-sdk-with-your-claude-plan).
 - For Pi children, an importable npm installation of Pi, `node` on `PATH`, and a configured/authenticated provider and model. A compiled Pi binary cannot supply the package a child imports. See [Pi backend requirements and limits](docs/pi-backend.md).
