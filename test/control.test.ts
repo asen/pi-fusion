@@ -7,10 +7,11 @@ import * as path from "node:path";
 import test, { afterEach } from "node:test";
 import { fileURLToPath } from "node:url";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import fusion, { builtinConfiguration, parseFusion } from "../extensions/fusion.ts";
+import fusion, { builtinConfiguration, type FusionOptions, parseFusion } from "../extensions/fusion.ts";
 import { memoryProfileStore } from "../extensions/profile-store.ts";
 import { settingsTable } from "../extensions/profiles.ts";
 import { HISTORY_VERSION } from "../extensions/history.ts";
+import { fakeBackend } from "./fake-pi-backend.ts";
 import { toolList, turnOn } from "./host-tools.ts";
 import { tripwires } from "./tripwire.ts";
 
@@ -50,7 +51,8 @@ type WaitFactory = (tui: { requestRender: () => void }, theme: any, keybindings:
 type Renderer = (message: any, options: { expanded: boolean; outputPad: number }, theme: any) => { render: (width: number) => string[] } | undefined;
 
 const USAGE =
-	"Usage: /fusion dashboard | /fusion dashboard stop | /fusion status [run-N] | /fusion cancel run-N | /fusion wait run-N | /fusion steer run-N <text> | /fusion answer [run-N] [text] | /fusion review run-N | /fusion on | /fusion off | /fusion config | /fusion profile [list | use <name> | save <name> | default <name>]";
+	"Usage: /fusion dashboard | /fusion dashboard stop | /fusion dashboard limit [N] | /fusion status [run-N] | /fusion cancel run-N | /fusion wait run-N | /fusion steer run-N <text> | /fusion answer [run-N] [text] | /fusion review run-N | /fusion on | /fusion off | /fusion config | /fusion profile [list | use <name> | save <name> | default <name>]";
+const DASHBOARD_LIMIT_USAGE = "Usage: /fusion dashboard limit [N]; N must be a positive decimal safe integer";
 const PROFILE_USAGE = "Usage: /fusion profile [list | use <name> | save <name> | default <name>]; builtin names the built-in configuration for use and default";
 const STATUS_HEADER = ["fusion: on", "profile: builtin", "", ...settingsTable(builtinConfiguration().roles), "", ""].join("\n");
 const ESC = "\u001b";
@@ -78,7 +80,7 @@ afterEach(async () => {
 	}
 });
 
-function makeHost(cwd = repoRoot, mode: "tui" | "print" = "print", session: { id?: string; file?: string } = {}) {
+function makeHost(cwd = repoRoot, mode: "tui" | "print" = "print", session: { id?: string; file?: string } = {}, backends: FusionOptions["backends"] = {}) {
 	const tools = new Map<string, Tool>();
 	const commands = new Map<string, Command>();
 	const handlers = new Map<string, (event: any, ctx: any) => Promise<unknown> | unknown>();
@@ -103,9 +105,8 @@ function makeHost(cwd = repoRoot, mode: "tui" | "print" = "print", session: { id
 		sendMessage: (message: unknown, options: unknown) => sent.push([message, options]),
 		registerMessageRenderer: (customType: string, renderer: Renderer) => renderers.set(customType, renderer),
 	} as unknown as ExtensionAPI;
-	// Every run of this file is a claude one, and the tripwires are what keep the pi and codex backends out of reach of
-	// a case that routed to one by accident.
-	fusion(api, { backends: { ...tripwires() }, profiles: memoryProfileStore() });
+	// These cases run only claude, through its fake protocol or an in-memory backend; accidental pi and codex routing stays fenced.
+	fusion(api, { backends: { ...tripwires(), ...backends }, profiles: memoryProfileStore() });
 	const theme = { fg: (_color: string, text: string) => text, bold: (text: string) => text, dim: (text: string) => text };
 	const ui = {
 		setStatus(_key: string, _text: string | undefined) {},
@@ -608,6 +609,10 @@ test("parseFusion reads every /fusion form and answers anything else with the us
 		["dashboard", { kind: "dashboard" }],
 		["  dashboard  ", { kind: "dashboard" }],
 		["dashboard stop", { kind: "dashboard-stop" }],
+		["dashboard limit", { kind: "dashboard-limit" }],
+		["dashboard limit 200", { kind: "dashboard-limit", limit: 200 }],
+		["  dashboard\tlimit   1  ", { kind: "dashboard-limit", limit: 1 }],
+		["dashboard limit 9007199254740991", { kind: "dashboard-limit", limit: Number.MAX_SAFE_INTEGER }],
 		["status", { kind: "status" }],
 		["status run-2", { kind: "status", handle: "run-2" }],
 		["cancel run-1", { kind: "cancel", handle: "run-1" }],
@@ -661,6 +666,9 @@ test("parseFusion reads every /fusion form and answers anything else with the us
 		["profile use -x", { kind: "usage", message: `profile name "-x" must start with a letter or digit and use only letters, digits, dots, dashes and underscores, at most 64 characters. ${PROFILE_USAGE}` }],
 	] as const) {
 		assert.deepEqual(parseFusion(args), expected, JSON.stringify(args));
+	}
+	for (const args of ["dashboard limit 0", "dashboard limit -1", "dashboard limit 1.5", "dashboard limit 1e2", "dashboard limit Infinity", "dashboard limit NaN", "dashboard limit 0x20", "dashboard limit 9007199254740992", "dashboard limit 200oops", "dashboard limit 200 now"]) {
+		assert.deepEqual(parseFusion(args), { kind: "usage", message: DASHBOARD_LIMIT_USAGE }, args);
 	}
 });
 
@@ -1117,6 +1125,7 @@ test("/fusion completes the first word, and then the runs each command can still
 	assert.deepEqual(host.completions(""), [
 		{ value: "dashboard", label: "dashboard" },
 		{ value: "dashboard stop", label: "dashboard stop" },
+		{ value: "dashboard limit", label: "dashboard limit" },
 		{ value: "status", label: "status" },
 		{ value: "cancel", label: "cancel" },
 		{ value: "steer", label: "steer" },
@@ -1137,6 +1146,7 @@ test("/fusion completes the first word, and then the runs each command can still
 		{ value: "off", label: "off" },
 	]);
 	assert.deepEqual(host.completions("of"), [{ value: "off", label: "off" }]);
+	assert.deepEqual(host.completions("dashboard l"), [{ value: "dashboard limit", label: "dashboard limit" }]);
 	assert.equal(host.completions("status "), null, "nothing has run yet");
 	await withScenario("hang", () => host.claude({ role: "implement", task: "long work", background: true }));
 	await withScenario("question", () => host.claude({ role: "ask", task: "q" }));
@@ -1154,6 +1164,129 @@ test("/fusion completes the first word, and then the runs each command can still
 	await host.control({ action: "cancel", run: "run-1" });
 	await host.control({ action: "cancel", run: "run-2" });
 });
+
+/** The retention variable belongs to each new extension instance, and the test must leave the caller's environment alone. */
+async function withDashboardLimit<T>(limit: string | undefined, body: () => Promise<T>): Promise<T> {
+	const previous = process.env.PI_FUSION_DASHBOARD_MAX_RUNS;
+	if (limit === undefined) delete process.env.PI_FUSION_DASHBOARD_MAX_RUNS;
+	else process.env.PI_FUSION_DASHBOARD_MAX_RUNS = limit;
+	try {
+		return await body();
+	} finally {
+		if (previous === undefined) delete process.env.PI_FUSION_DASHBOARD_MAX_RUNS;
+		else process.env.PI_FUSION_DASHBOARD_MAX_RUNS = previous;
+	}
+}
+
+const limitNotice = (limit: number) => [`fusion: dashboard run limit is ${limit}; active runs are never evicted`, "info"];
+
+test("dashboard limits start at 30, work while off without a server, and reject invalid runtime changes", () =>
+	withDashboardLimit(undefined, async () => {
+		const host = makeHost();
+		await host.command("off");
+		host.notices.length = 0;
+		await host.command("dashboard limit");
+		assert.deepEqual(host.notices, [limitNotice(30)]);
+		host.notices.length = 0;
+		await host.command("dashboard limit 200");
+		assert.deepEqual(host.notices, [limitNotice(200)]);
+		for (const args of ["dashboard limit 0", "dashboard limit -1", "dashboard limit 1.5", "dashboard limit 1e2", "dashboard limit 0x20", "dashboard limit Infinity", "dashboard limit 9007199254740992", "dashboard limit 200 now"]) {
+			host.notices.length = 0;
+			await host.command(args);
+			assert.deepEqual(host.notices, [[DASHBOARD_LIMIT_USAGE, "warning"]], args);
+			await host.command("dashboard limit");
+			assert.deepEqual(host.notices.at(-1), limitNotice(200), "a refusal leaves the target unchanged");
+		}
+		host.notices.length = 0;
+		await host.command("dashboard stop");
+		assert.deepEqual(host.notices, [["fusion: the dashboard is not running", "info"]], "inspection and changes never start a server");
+		assert.deepEqual(host.activeTools, ["read", "bash", "fusion_activate"], "retention commands do not activate Fusion");
+		assert.deepEqual(host.sent, []);
+		assert.deepEqual(host.branch, []);
+	}));
+
+test("the dashboard environment limit is captured at load and a runtime override belongs only to that instance", () =>
+	withDashboardLimit("200", async () => {
+		const host = makeHost();
+		process.env.PI_FUSION_DASHBOARD_MAX_RUNS = "7";
+		await host.command("dashboard limit");
+		assert.deepEqual(host.notices, [limitNotice(200)], "later environment changes do not reach the store");
+		host.notices.length = 0;
+		await host.command("dashboard limit 50");
+		await host.command("dashboard limit");
+		assert.deepEqual(host.notices, [limitNotice(50), limitNotice(50)]);
+		const next = makeHost();
+		await next.command("dashboard limit");
+		assert.deepEqual(next.notices, [limitNotice(7)], "a replaced instance reads the environment, not the earlier override");
+	}));
+
+test("an invalid dashboard environment limit warns once and keeps 30", () =>
+	withDashboardLimit("0", async () => {
+		const host = makeHost();
+		await host.command("dashboard limit");
+		assert.deepEqual(host.notices, [
+			["fusion: PI_FUSION_DASHBOARD_MAX_RUNS=0 is not a positive decimal safe integer; the dashboard run limit stays at 30", "warning"],
+			limitNotice(30),
+		]);
+		host.notices.length = 0;
+		await host.command("dashboard limit");
+		assert.deepEqual(host.notices, [limitNotice(30)]);
+	}));
+
+test("runtime limits change the already-open dashboard, prune immediately, and do not recover evicted runs", () =>
+	withDashboardLimit(undefined, async () => {
+		const backend = fakeBackend({ name: "claude" });
+		const host = makeHost(repoRoot, "print", {}, { claude: backend.backend });
+		for (let i = 0; i < 35; i++) await host.claude({ role: "ask", task: "read the code" });
+		await host.command("dashboard");
+		const url = dashboardUrl(host);
+		const runs = async () => (await payload(`${url}api/runs`)).runs as Array<{ handle: string }>;
+		const initial = await runs();
+		assert.equal(initial.length, 30);
+		assert.ok(initial.some((run) => run.handle === "run-6"));
+		assert.ok(!initial.some((run) => run.handle === "run-1"));
+		await host.command("dashboard limit 200");
+		for (let i = 0; i < 5; i++) await host.claude({ role: "ask", task: "read more code" });
+		const raised = await runs();
+		assert.equal(raised.length, 35);
+		assert.ok(raised.some((run) => run.handle === "run-6"));
+		assert.ok(!raised.some((run) => run.handle === "run-1"), "evicted data is not recovered");
+		await host.command("dashboard limit 2");
+		assert.deepEqual((await runs()).map((run) => run.handle).sort(), ["run-39", "run-40"]);
+		await host.command("status run-6");
+		assert.match(host.notices.at(-1)![0], /^run-6 · ask · opus · done/, "eviction changes monitoring, not the host's run records");
+		await host.command("dashboard stop");
+		host.notices.length = 0;
+		await host.command("dashboard");
+		assert.equal((await payload(`${dashboardUrl(host)}api/runs`)).runs.length, 2);
+		host.notices.length = 0;
+		await host.command("dashboard limit");
+		assert.deepEqual(host.notices, [limitNotice(2)], "stopping the server does not reset its instance's retention limit");
+	}));
+
+test("a runtime reduction leaves running and waiting children alone and converges when they finish", () =>
+	withDashboardLimit("200", async () => {
+		const backend = fakeBackend({ name: "claude", scripts: [{ pending: true }] });
+		const host = makeHost(repoRoot, "print", {}, { claude: backend.backend });
+		await host.claude({ role: "ask", task: "long work", background: true });
+		await backend.started();
+		backend.script({ questions: ["Which name?"] });
+		await host.claude({ role: "ask", task: "ask a question" });
+		backend.script({});
+		await host.claude({ role: "ask", task: "finished work" });
+		await host.command("dashboard");
+		const url = dashboardUrl(host);
+		await host.command("dashboard limit 1");
+		const runs = (await payload(`${url}api/runs`)).runs as Array<{ handle: string; status: string }>;
+		assert.deepEqual(runs.map((run) => [run.handle, run.status]).sort(), [["run-1", "running"], ["run-2", "waiting"]]);
+		backend.starts[0]!.release();
+		await host.control({ action: "wait", run: "run-1" });
+		assert.deepEqual((await payload(`${url}api/runs`)).runs.map((run: any) => run.handle), ["run-2"]);
+		await host.control({ action: "message", run: "run-2", message: "Use foo" });
+		await host.control({ action: "wait", run: "run-2" });
+		assert.deepEqual(backend.starts[1]!.answers, ["Use foo"], "the waiting run is still answerable");
+		assert.equal((await payload(`${url}api/runs`)).runs[0].status, "done");
+	}));
 
 /** Runs the body with the budget variables set, as a Pi session that started with them in its environment does. */
 async function withBudget<T>(vars: Record<string, string>, body: () => Promise<T>): Promise<T> {

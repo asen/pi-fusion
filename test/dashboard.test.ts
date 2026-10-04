@@ -9,6 +9,8 @@ import { fileURLToPath } from "node:url";
 import * as vm from "node:vm";
 import {
 	type Dashboard,
+	dashboardMaxRuns,
+	dashboardProblems,
 	CALL_CAP_BYTES,
 	FAILURE_CAP_BYTES,
 	type LogEntry,
@@ -22,6 +24,7 @@ import {
 	MAX_THINKING_BLOCKS,
 	MAX_STRING_CHARS,
 	MAX_TASKS_PER_RUN,
+	parseRunLimit,
 	type RunDetail,
 	type RunStatus,
 	RunStore,
@@ -55,6 +58,30 @@ const detailOf = (store: RunStore, id = "run-1") => {
 	assert.ok(detail, `no detail for ${id}`);
 	return detail;
 };
+
+test("dashboard retention defaults to 30 and accepts positive decimal safe integers", () => {
+	assert.equal(MAX_RUNS, 30, "the built-in default has not changed");
+	for (const value of [undefined, "", " \t "]) {
+		const env = { PI_FUSION_DASHBOARD_MAX_RUNS: value };
+		assert.equal(dashboardMaxRuns(env), 30);
+		assert.deepEqual(dashboardProblems(env), []);
+	}
+	for (const [text, limit] of [["1", 1], ["30", 30], [" 200 ", 200], ["0200", 200], [String(Number.MAX_SAFE_INTEGER), Number.MAX_SAFE_INTEGER]] as const) {
+		const env = { PI_FUSION_DASHBOARD_MAX_RUNS: text };
+		assert.equal(parseRunLimit(text), limit, text);
+		assert.equal(dashboardMaxRuns(env), limit, text);
+		assert.deepEqual(dashboardProblems(env), [], text);
+	}
+});
+
+test("unusable dashboard limits retain the default and explain the bad environment value", () => {
+	for (const text of ["0", "-1", "1.5", "1e2", "0x20", "Infinity", "NaN", "1,000", "200oops", "9007199254740992", "+200", "1_000", "200\n10"]) {
+		const env = { PI_FUSION_DASHBOARD_MAX_RUNS: ` ${text} ` };
+		assert.equal(parseRunLimit(text), undefined, text);
+		assert.equal(dashboardMaxRuns(env), MAX_RUNS, text);
+		assert.deepEqual(dashboardProblems(env), [`PI_FUSION_DASHBOARD_MAX_RUNS=${text} is not a positive decimal safe integer; the dashboard run limit stays at 30`], text);
+	}
+});
 
 test("a started run is running with its role, model and title and zero counters", () => {
 	const { store } = makeStore();
@@ -615,6 +642,76 @@ test("a run that stays running is never evicted, even past the cap", () => {
 	assert.equal(store.summaries().length, MAX_RUNS + 5);
 });
 
+test("each store owns its limit, with 30 left as the default", () => {
+	const store = new RunStore(() => START, 200);
+	const other = new RunStore();
+	assert.equal(store.maxRuns, 200);
+	assert.equal(other.maxRuns, 30);
+	store.setMaxRuns(2);
+	assert.equal(store.maxRuns, 2);
+	assert.equal(other.maxRuns, 30);
+});
+
+test("a bad numeric limit changes neither the target nor retained data", () => {
+	const { store } = started();
+	for (const limit of [0, -1, 1.5, Number.NaN, Number.POSITIVE_INFINITY, Number.MAX_SAFE_INTEGER + 1]) {
+		assert.throws(() => store.setMaxRuns(limit), /must be a positive safe integer/);
+		assert.throws(() => new RunStore(Date.now, limit), /must be a positive safe integer/);
+		assert.equal(store.maxRuns, 30);
+		assert.equal(store.summaries().length, 1);
+	}
+});
+
+test("lowering the limit immediately evicts the oldest finished runs of every terminal status", () => {
+	const { store, tick } = makeStore();
+	for (const [i, status] of (["done", "failed", "aborted", "cancelled"] as const).entries()) {
+		store.start({ id: `run-${i}`, role: "ask", model: "opus" });
+		store.finish(`run-${i}`, { status });
+		tick();
+	}
+	store.start({ id: "keep-running", role: "ask", model: "opus" });
+	store.setMaxRuns(2);
+	assert.deepEqual(store.summaries().map((run) => run.id), ["keep-running", "run-3"]);
+	assert.equal(store.detail("run-0"), undefined);
+});
+
+test("raising the limit keeps more subsequent runs but does not recover evicted data", () => {
+	let clock = START;
+	const store = new RunStore(() => clock++, 2);
+	for (let i = 1; i <= 3; i++) {
+		store.start({ id: `run-${i}`, role: "ask", model: "opus" });
+		store.finish(`run-${i}`, { status: "done", text: `report ${i}` });
+	}
+	store.setMaxRuns(4);
+	assert.equal(store.detail("run-1"), undefined);
+	assert.equal(store.summaries().length, 2);
+	for (let i = 4; i <= 5; i++) {
+		store.start({ id: `run-${i}`, role: "ask", model: "opus" });
+		store.finish(`run-${i}`, { status: "done", text: `report ${i}` });
+	}
+	assert.deepEqual(store.summaries().map((run) => run.id), ["run-5", "run-4", "run-3", "run-2"]);
+	assert.equal(detailOf(store, "run-2").text, "report 2");
+});
+
+test("lowered limits protect running and waiting runs and are enforced as those runs finish", () => {
+	const { store, tick } = makeStore();
+	store.start({ id: "running", role: "ask", model: "opus" });
+	tick();
+	store.start({ id: "waiting", role: "ask", model: "opus" });
+	store.question("waiting", "Which name?");
+	tick();
+	store.start({ id: "finished", role: "ask", model: "opus" });
+	store.finish("finished", { status: "done" });
+	store.setMaxRuns(1);
+	assert.deepEqual(store.summaries().map((run) => run.id), ["waiting", "running"]);
+	assert.equal(detailOf(store, "waiting").question, "Which name?");
+	store.finish("running", { status: "cancelled" });
+	assert.equal(store.detail("running"), undefined, "the store converges without needing another run to start");
+	store.question("waiting", undefined);
+	store.finish("waiting", { status: "done" });
+	assert.deepEqual(store.summaries().map((run) => run.id), ["waiting"]);
+});
+
 test("unknown ids are ignored", () => {
 	const { store } = started();
 	store.progress("nope", { toolCalls: 9, tokensIn: 9, tokensOut: 9 });
@@ -731,6 +828,15 @@ test("restored runs count towards the cap as the finished runs they are", () => 
 	assert.ok(ids.includes("keep-running"), "a live run outlives the restored ones");
 	assert.ok(!ids.includes("held-0"));
 	assert.ok(ids.includes(`held-${MAX_RUNS + 4}`));
+});
+
+test("restored runs obey the configured limit and an immediate runtime reduction", () => {
+	const store = new RunStore(() => START, 2);
+	for (let i = 0; i < 3; i++) store.restore({ ...restored, id: `held-${i}`, startedAt: START + i });
+	assert.deepEqual(store.summaries().map((run) => run.id), ["held-2", "held-1"]);
+	store.setMaxRuns(1);
+	assert.deepEqual(store.summaries().map((run) => run.id), ["held-2"]);
+	assert.equal(detailOf(store, "held-2").restored, true);
 });
 
 test("summaries are newest first", () => {

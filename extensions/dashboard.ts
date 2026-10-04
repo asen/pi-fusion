@@ -8,6 +8,7 @@ import type { UsageTotals } from "./budget.ts";
 import type { ChangedFile } from "./changes.ts";
 import type { RunOrigin } from "./fusion.ts";
 
+/** The default retention target; running and waiting runs may exceed it. */
 export const MAX_RUNS = 30;
 export const MAX_LOG_PER_RUN = 100;
 export const MAX_TASKS_PER_RUN = 100;
@@ -29,6 +30,26 @@ export const MAX_MODELS = 20;
 export const MAX_FILES = 500;
 export const MAX_THINKING_BLOCKS = 5;
 export const THINKING_CAP_BYTES = 16_384;
+
+/** Decimal integers only, so a typo cannot silently become a fractional, rounded or unbounded retention target. */
+export function parseRunLimit(text: string): number | undefined {
+	const trimmed = text.trim();
+	if (!/^\d+$/.test(trimmed)) return undefined;
+	const value = Number(trimmed);
+	return Number.isSafeInteger(value) && value > 0 ? value : undefined;
+}
+
+/** Captured by the host at extension load, not read by the store each time it evicts. */
+export function dashboardMaxRuns(env: NodeJS.ProcessEnv = process.env): number {
+	return parseRunLimit(env.PI_FUSION_DASHBOARD_MAX_RUNS ?? "") ?? MAX_RUNS;
+}
+
+/** A bad variable keeps the default rather than disabling retention, and deserves one startup warning. */
+export function dashboardProblems(env: NodeJS.ProcessEnv = process.env): string[] {
+	const set = (env.PI_FUSION_DASHBOARD_MAX_RUNS ?? "").trim();
+	if (set === "" || parseRunLimit(set) !== undefined) return [];
+	return [`PI_FUSION_DASHBOARD_MAX_RUNS=${set} is not a positive decimal safe integer; the dashboard run limit stays at ${MAX_RUNS}`];
+}
 
 export type RunStatus = "running" | "waiting" | "done" | "failed" | "aborted" | "cancelled";
 export type TaskStatus = "running" | "completed" | "failed" | "stopped";
@@ -480,9 +501,22 @@ function sessionOf(session: RunSession): RunSession {
 export class RunStore {
 	private readonly runs = new Map<string, StoredRun>();
 	private readonly clock: () => number;
+	private runLimit = MAX_RUNS;
 
-	constructor(now: () => number = Date.now) {
+	constructor(now: () => number = Date.now, maxRuns: number = MAX_RUNS) {
 		this.clock = now;
+		this.setMaxRuns(maxRuns);
+	}
+
+	get maxRuns(): number {
+		return this.runLimit;
+	}
+
+	/** Lowering the target releases finished data immediately; live work is protected even above the target. */
+	setMaxRuns(maxRuns: number): void {
+		if (!Number.isSafeInteger(maxRuns) || maxRuns <= 0) throw new Error("the dashboard run limit must be a positive safe integer");
+		this.runLimit = maxRuns;
+		this.evict();
 	}
 
 	start(input: RunStart): void {
@@ -790,6 +824,8 @@ export class RunStore {
 		if (stopped > 0) this.record(run, at, "task", `${stopped} task${stopped === 1 ? "" : "s"} stopped with the run`);
 		this.record(run, at, "run", run.failure ? `${outcome.status}: ${run.failure}` : outcome.status);
 		this.mark(run);
+		// A lowered limit may have been exceeded solely by live runs; finishing makes this run eligible for eviction.
+		this.evict();
 	}
 
 	summaries(): RunSummary[] {
@@ -909,7 +945,7 @@ export class RunStore {
 
 	private evict(): void {
 		for (const [id, run] of this.runs) {
-			if (this.runs.size <= MAX_RUNS) return;
+			if (this.runs.size <= this.runLimit) return;
 			if (run.status !== "running" && run.status !== "waiting") this.runs.delete(id);
 		}
 	}

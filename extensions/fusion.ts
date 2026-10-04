@@ -52,7 +52,7 @@ import {
 import { budgetConfig, budgetProblems, type CallUsage, Ledger } from "./budget.ts";
 import { bodyLines, Card, CARD_FILES, CARD_QUESTION_CHARS, type CardDetails, cardDetails, type CardMode, type CardTheme, headerLine, plainText, resultText, unpricedText, type WidgetRun, widgetLines } from "./cards.ts";
 import { type ChangedFile, changedFiles, type Snapshot, snapshot } from "./changes.ts";
-import { type Dashboard, RunStore, startDashboard } from "./dashboard.ts";
+import { type Dashboard, dashboardMaxRuns, dashboardProblems, parseRunLimit, RunStore, startDashboard } from "./dashboard.ts";
 import { contextShare, continueNote, handoffBlocked, handoffNote, handoffPrompt, handoffShare, planContextPct, planProblems, sharePercent, type HandoffReason } from "./handoff.ts";
 import { History, type HistoryRecord, historyDir, historyEnabled } from "./history.ts";
 import { hostProfileStore, type ProfileStore } from "./profile-store.ts";
@@ -1385,9 +1385,10 @@ function handleNumber(handle: string): number {
 	return Number(HANDLE.exec(handle)?.[1] ?? 0);
 }
 
-const FUSION_ARGS = ["dashboard", "dashboard stop", "status", "cancel", "steer", "wait", "answer", "review", "on", "off", "config", "profile", "profile list", "profile use", "profile save", "profile default"];
+const FUSION_ARGS = ["dashboard", "dashboard stop", "dashboard limit", "status", "cancel", "steer", "wait", "answer", "review", "on", "off", "config", "profile", "profile list", "profile use", "profile save", "profile default"];
 const USAGE =
-	"Usage: /fusion dashboard | /fusion dashboard stop | /fusion status [run-N] | /fusion cancel run-N | /fusion wait run-N | /fusion steer run-N <text> | /fusion answer [run-N] [text] | /fusion review run-N | /fusion on | /fusion off | /fusion config | /fusion profile [list | use <name> | save <name> | default <name>]";
+	"Usage: /fusion dashboard | /fusion dashboard stop | /fusion dashboard limit [N] | /fusion status [run-N] | /fusion cancel run-N | /fusion wait run-N | /fusion steer run-N <text> | /fusion answer [run-N] [text] | /fusion review run-N | /fusion on | /fusion off | /fusion config | /fusion profile [list | use <name> | save <name> | default <name>]";
+const DASHBOARD_LIMIT_USAGE = "Usage: /fusion dashboard limit [N]; N must be a positive decimal safe integer";
 const PROFILE_USAGE = "Usage: /fusion profile [list | use <name> | save <name> | default <name>]; builtin names the built-in configuration for use and default";
 /** A /fusion profile argument list that names a profile, as far as it is typed, for completion. */
 const PROFILE_ARG = /^profile\s+(use|save|default)\s+(\S*)$/;
@@ -1399,6 +1400,7 @@ const BROWSER_OPENER: Record<string, string> = { darwin: "open", linux: "xdg-ope
 export type FusionCommand =
 	| { kind: "dashboard" }
 	| { kind: "dashboard-stop" }
+	| { kind: "dashboard-limit"; limit?: number }
 	| { kind: "on" }
 	| { kind: "off" }
 	| { kind: "status"; handle?: string }
@@ -1421,6 +1423,11 @@ export function parseFusion(args: string): FusionCommand {
 	const [first, second] = tokens;
 	if (first === "dashboard") {
 		if (tokens.length === 1) return { kind: "dashboard" };
+		if (second === "limit") {
+			if (tokens.length === 2) return { kind: "dashboard-limit" };
+			const limit = tokens.length === 3 ? parseRunLimit(tokens[2]!) : undefined;
+			return limit === undefined ? { kind: "usage", message: DASHBOARD_LIMIT_USAGE } : { kind: "dashboard-limit", limit };
+		}
 		return tokens.length === 2 && second === "stop" ? { kind: "dashboard-stop" } : usage;
 	}
 	if (first === "config") return tokens.length === 1 ? { kind: "config" } : usage;
@@ -1795,13 +1802,13 @@ export default function fusion(pi: ExtensionAPI, options: FusionOptions = {}) {
 		return undefined;
 	};
 
-	const store = new RunStore();
+	const store = new RunStore(Date.now, dashboardMaxRuns());
 	const ledger = new Ledger(budgetConfig());
-	/** The variables that are set and name nothing their control can use, read where the ledger reads them: when Pi loads this. */
-	const budgetTrouble = [...budgetProblems(), ...planProblems()];
+	/** The variables that are set and name nothing their control can use, captured when Pi loads this. */
+	const variableTrouble = [...budgetProblems(), ...planProblems(), ...dashboardProblems()];
 	/** The share of its window, as a percentage, past which a plan run is handed off to a fresh one. */
 	const planPct = planContextPct();
-	let budgetNoted = false;
+	let variablesNoted = false;
 	/** Whether an implement, ultracode or security run that changed files gets an independent review without being asked. */
 	const autoReview = process.env.PI_FUSION_AUTO_REVIEW?.trim() === "1";
 	/** Whether this Pi session keeps its runs on disk, so a later process on the same host session can show them. */
@@ -1841,11 +1848,11 @@ export default function fusion(pi: ExtensionAPI, options: FusionOptions = {}) {
 		);
 	};
 
-	/** Says once, on the first call of the process, that a budget variable turned its control off instead of setting it. */
-	const noteBudget = (ctx: any): void => {
-		if (budgetNoted || !budgetTrouble.length) return;
-		budgetNoted = true;
-		for (const trouble of budgetTrouble) record(() => ctx.ui.notify(`fusion: ${trouble}`, "warning"));
+	/** Says once, on the first delegation/control/command, that a variable could not configure its control. */
+	const noteVariables = (ctx: any): void => {
+		if (variablesNoted || !variableTrouble.length) return;
+		variablesNoted = true;
+		for (const trouble of variableTrouble) record(() => ctx.ui.notify(plainText(`fusion: ${trouble}`), "warning"));
 	};
 
 	/**
@@ -3135,7 +3142,7 @@ export default function fusion(pi: ExtensionAPI, options: FusionOptions = {}) {
 	};
 
 	pi.registerCommand("fusion", {
-		description: "Open or close the pi-fusion dashboard, check, cancel, steer, answer, review and wait for this session's runs, turn fusion on or off, or configure roles and profiles",
+		description: "Open or close the pi-fusion dashboard or set its run limit, check, cancel, steer, answer, review and wait for this session's runs, turn fusion on or off, or configure roles and profiles",
 		getArgumentCompletions: (prefix: string) => {
 			const profile = PROFILE_ARG.exec(prefix);
 			if (profile) {
@@ -3156,7 +3163,7 @@ export default function fusion(pi: ExtensionAPI, options: FusionOptions = {}) {
 		async handler(args, ctx) {
 			ui = ctx.ui;
 			ensureHistory(ctx);
-			noteBudget(ctx);
+			noteVariables(ctx);
 			/** Every notice /fusion shows: a child's report, activity, question or changed path reaches most of them. */
 			const notice = (text: string, level: "info" | "warning" | "error") => ctx.ui.notify(plainText(text), level);
 			mask();
@@ -3180,6 +3187,12 @@ export default function fusion(pi: ExtensionAPI, options: FusionOptions = {}) {
 				if (outcome.kind === "already") notice("fusion is already on", "info");
 				else if (outcome.kind === "failed") notice(`fusion stays off: the host's tool list did not change: ${outcome.reason}`, "error");
 				else notice("fusion is on", "info");
+				return;
+			}
+			// Retention is independent of role settings and may change with Fusion off or runs still unfinished.
+			if (command.kind === "dashboard-limit") {
+				if (command.limit !== undefined) store.setMaxRuns(command.limit);
+				notice(`fusion: dashboard run limit is ${store.maxRuns}; active runs are never evicted`, "info");
 				return;
 			}
 			// A command that starts a review or applies settings reads the configuration, so it waits for the default
@@ -3472,7 +3485,7 @@ export default function fusion(pi: ExtensionAPI, options: FusionOptions = {}) {
 		if (!initialized) await initialize();
 		noteProfiles(ctx);
 		ensureHistory(ctx);
-		noteBudget(ctx);
+		noteVariables(ctx);
 		// A run whose state has just turned terminal records its branch entry when its end path lands; a continue reads it.
 		const finishing = params.continue === undefined ? undefined : runs.get(params.continue);
 		if (finishing && !isActive(finishing) && !finishing.finished) await finishing.ended;
@@ -3709,7 +3722,7 @@ export default function fusion(pi: ExtensionAPI, options: FusionOptions = {}) {
 		mask();
 		ui = ctx.ui;
 		ensureHistory(ctx);
-		noteBudget(ctx);
+		noteVariables(ctx);
 		const reply = (text: string, details: Record<string, unknown> = {}) => ({ content: [{ type: "text" as const, text }], details: { ...details, ...(details.question === undefined ? {} : { control: tool }) } });
 		if (!(CONTROL_ACTIONS as readonly string[]).includes(params.action)) {
 			throw new Error(`unknown action ${params.action}; use one of ${CONTROL_ACTIONS.join(", ")}`);

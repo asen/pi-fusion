@@ -59,7 +59,20 @@ Reviews show links on both the review and reviewed run. Cleanup/cancellation war
 
 Reports render headings, paragraphs, lists, tables, code, quotes, and emphasis by building DOM nodes, **never by parsing child text as HTML**. Links show text and a URL tooltip but do not navigate. Raw shows original text; Copy works for reports, prompts, and session hints. Section badges open Report at Escalation, Review, or Open questions.
 
-The store targets 30 runs, evicting oldest finished work first, never active runs. Other limits:
+The store defaults to **30 runs**, evicting oldest finished work first, never running or waiting runs. Set `PI_FUSION_DASHBOARD_MAX_RUNS=200` before starting Pi to choose a different startup target. It is captured once when the extension instance loads. Unset/blank values keep 30; invalid values keep 30 and warn once on the first delegation, control, or `/fusion` command.
+
+Inspect or change the target at runtime:
+
+```text
+/fusion dashboard limit
+/fusion dashboard limit 200
+```
+
+Both settings accept positive decimal safe integers (1–9007199254740991); zero does not disable retention. The command works with Fusion off, while children run, and without opening the dashboard. Lowering the target immediately evicts eligible finished runs; running and waiting runs can exceed it, and the store trims again as they finish. Raising it retains more subsequent runs, but does not recover already-evicted data. Neither operation changes continuation records, disk history, or per-run caps.
+
+The command override is memory-only, belongs to this extension instance, and is not saved in profiles. Stopping/reopening the dashboard preserves it; a reload or session replacement reads the environment again. Larger targets retain more potentially sensitive output in host memory and increase the summaries the browser polls/renders.
+
+Other limits:
 
 | Data | Cap |
 | --- | --- |

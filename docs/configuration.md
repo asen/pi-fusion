@@ -21,6 +21,7 @@ Use [profiles and role settings](profiles.md) for session configuration; environ
 | `PI_FUSION_CLAUDE_BIN` | Unset; use the SDK's bundled binary. Set a path to another executable; `.js`, `.mjs`, and `.cjs` paths run under Node |
 | `PI_FUSION_CODEX_BIN` | Unset; use the first executable `codex` on the inherited `PATH` (empty/relative entries resolve against the host cwd). Set an absolute path to a regular file; `.js`, `.mjs`, and `.cjs` paths run under the host's own Node executable (`process.execPath`), others must be executable. Read only when a Codex run starts, never at load: a missing `codex` fails that run and nothing else. Windows is refused |
 | `PI_FUSION_DASHBOARD_OPEN` | Unset; `0` shows the dashboard URL without opening a browser |
+| `PI_FUSION_DASHBOARD_MAX_RUNS` | `30`; positive decimal safe integer run-retention target, captured at extension load; override with `/fusion dashboard limit N`. See [Dashboard](dashboard.md#rendering-and-retained-data) |
 | `PI_FUSION_WIDGET` | Unset; `0` hides the run widget, not the footer status |
 | `PI_FUSION_BUDGET_WARN_USD` | Unset; amount or comma-separated amounts, e.g. `5,20`, warning once at each threshold |
 | `PI_FUSION_BUDGET_LIMIT_USD` | Unset; amount at/above which no new run, continuation, or review starts; cancels nothing |
