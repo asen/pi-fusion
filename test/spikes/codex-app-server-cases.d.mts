@@ -97,3 +97,10 @@ export interface SteerCounts {
 	dropped: number;
 }
 export declare function steerProof(input: { pushed: boolean; queued: boolean; calls: SteerCall[]; turn: { threadId: string; turnId: string } | undefined; report: SteerCounts | undefined }): { status: Status; why: string };
+
+export interface QuestionCounters {
+	questions: number;
+	refusedQuestions: number;
+	duplicateServerRequests: number;
+}
+export declare function questionProof(input: { callbacks: number; counters: QuestionCounters | undefined; echoed: boolean }): { status: Status; why: string };

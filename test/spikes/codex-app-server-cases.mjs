@@ -18,7 +18,8 @@ export const EXIT = Object.freeze({ pass: 0, failure: 1, none: 2 });
 
 /**
  * Every case this harness knows: stage 1's G1 cases, then stage 2's G2 cases (Q10 to Q13 and Q19) and Q14, a stage 2
- * preparation measurement outside G2's gate. `model` marks a case that starts a turn, which is a provider request on the
+ * preparation measurement outside G2's gate, and stage 3's G3 cases (Q15, Q16), the only ones whose runs carry a
+ * question callback and so the experimental connection shape. `model` marks a case that starts a turn, which is a provider request on the
  * user's own login and quota with a cost Codex does not report; the others start a child and at most a thread. `fake`
  * marks a case the fake app-server can drive end to end; the rest need a native child that really runs a model. `needs`
  * names the option without which a case skips before anything starts, which it then does in either mode.
@@ -37,6 +38,8 @@ export const CASES = Object.freeze([
 	{ id: "Q12", model: true, fake: true, title: "G2: a fresh backend ask, then a backend fork of its reference: a new thread at a completed starting tip, a new checkpoint and baseline, per-call usage against the source baseline" },
 	{ id: "Q13", model: true, fake: true, title: "G2: one steer pushed when the primary turn's first command starts (fake: at turn admission), accepted by the child for that admitted turn, then a clean completion" },
 	{ id: "Q14", model: true, fake: true, title: "usage over two sequential turns of one fresh ask thread: every scoped usage counter, absent fields as absent, total-vs-last additivity observed (stage 2 preparation, not G1)" },
+	{ id: "Q15", model: true, fake: true, title: "G3: a question on a fresh thread, then on its resume and a fork of that resume, each answered by the callback with a new synthetic answer the report must carry; tool registered on the fresh thread only" },
+	{ id: "Q16", model: true, fake: true, title: "G3: cancellation while the first question waits: the question's signal aborts, one failed tool reply, aborted with no checkpoint, clean owned shutdown" },
 	{ id: "Q19", model: true, fake: true, title: "G2: a fresh backend ask (--model optional), then a resume naming no model: the recorded model, provider and effort pinned in request and readback (a same-model round trip unless measured otherwise)" },
 ]);
 
@@ -392,4 +395,25 @@ export function steerProof({ pushed, queued, calls, turn, report }) {
 	if (call.outcome !== "accepted") return { status: "unproven", why: `the child did not accept the steer (${call.outcome})` };
 	if (!report || report.accepted !== 1 || report.rejected + report.unconfirmed + report.unsent + report.dropped !== 0) return { status: "unproven", why: `the run's steer counts do not say one accepted: ${JSON.stringify(report)}` };
 	return { status: "pass", why: "one steer, sent once to the admitted turn, accepted by the child" };
+}
+
+/* ------------------------------------------------------------------------------------------------------------------
+ * G3: question verdicts
+ * ---------------------------------------------------------------------------------------------------------------- */
+
+/**
+ * One Q15 leg's question verdict from the callback's own count, the child's question counters and whether the report
+ * carries this leg's answer, never from the report's other prose. A repeated request id, or counters that disagree with
+ * the callback, is a failure of the bridge. More than one distinct question is the model asking again, which the host
+ * can answer, so it is unproven rather than failed, as are no callback, no counters, a refused call or no echo.
+ */
+export function questionProof({ callbacks, counters, echoed }) {
+	if (counters !== undefined && counters.duplicateServerRequests > 0) return { status: "fail", why: `${counters.duplicateServerRequests} server request ids were asked again` };
+	if (counters !== undefined && counters.questions !== callbacks) return { status: "fail", why: `${callbacks} question callbacks, but the child's counters say ${counters.questions} questions were asked` };
+	if (callbacks === 0) return { status: "unproven", why: "no question reached the callback" };
+	if (counters === undefined) return { status: "unproven", why: "no exit report carries the child's question counters" };
+	if (callbacks > 1) return { status: "unproven", why: `the model asked more than once (${callbacks} distinct questions) where one was asked for` };
+	if (counters.refusedQuestions > 0) return { status: "unproven", why: `${counters.refusedQuestions} question calls were refused beside the one asked` };
+	if (!echoed) return { status: "unproven", why: "the report does not carry this leg's answer" };
+	return { status: "pass", why: "one question, asked once through the callback, its answer carried by the report" };
 }

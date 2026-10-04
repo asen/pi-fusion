@@ -10,6 +10,7 @@
  *   node test/spikes/codex-app-server.mjs --run --fake --case Q1,Q2,Q4,Q6,Q7,Q9  # NOT NATIVE
  *   node test/spikes/codex-app-server.mjs --run --fake --case Q14             # NOT NATIVE
  *   node test/spikes/codex-app-server.mjs --run --fake --case Q10,Q11,Q12,Q13,Q19  # G2 cases, NOT NATIVE
+ *   node test/spikes/codex-app-server.mjs --run --fake --case Q15,Q16          # G3 cases, NOT NATIVE
  *
  * Nothing runs without `--run` and an explicit `--case` (`all` is a deliberate value, not a default). `--help`,
  * `--list`, an unknown or malformed argument, a missing `--run` or a missing or unmatched `--case` exit 2 before any
@@ -30,6 +31,11 @@
  * selection. The start seam forwards the stage 2 methods too (thread/resume, thread/fork, the latest-turn read, a
  * steer) and keeps only safe facts of them: ids, selection fields, byte counts and answers' tags. Q11 alone adds one
  * direct-transport turn between two backend calls, to move the thread's tip with a turn that really completed.
+ *
+ * G3's cases (Q15, Q16) are the only ones whose backend calls carry a question callback, with the signature the host
+ * passes, so only they run the experimental connection shape every delegated run now uses: the opt-in at the
+ * handshake and the question tool on a fresh thread, both the transport's. Every earlier case runs with none. An answer
+ * is made inside the callback, a new random one per call, and never printed; nor is a question or a report.
  *
  * What it never does. It copies, reads or prints no credential or auth file, logs in to nothing, injects no API key,
  * prints no environment, and writes no Codex configuration. `config.toml` in the predicted Codex home is hashed in
@@ -76,6 +82,7 @@ import {
 	GROUPS,
 	parseArgs,
 	publishedUsageProblems,
+	questionProof,
 	selectCases,
 	steerProof,
 	threadParams,
@@ -118,7 +125,8 @@ async function main(cli) {
 		console.log("groups:");
 		for (const [name, members] of Object.entries(GROUPS)) console.log(`  ${name.padEnd(11)} ${members.join(", ")}`);
 		console.log("\nG1 needs Q1, Q2, Q3, Q4, Q6, Q7 and Q9 to PASS natively; Q3b is optional named-effort evidence and does not block it.");
-		console.log("G2 needs Q10, Q11, Q12, Q13 and Q19 to PASS natively, one agreed case at a time; none has run natively, so G2 is pending.");
+		console.log("G2 needed Q10, Q11, Q12, Q13 and Q19 to PASS natively, and they did, once each on one host, on connections with no question callback.");
+		console.log("G3 needs Q15 and Q16 to PASS natively, one agreed case at a time; neither has run natively, so G3 is pending.");
 		console.log("Q14 is stage 2 preparation, a usage measurement outside G1 and G2; Q14b's per-call usage is folded into Q10 and Q12.");
 		console.log("\nNative results so far: docs/codex-backend.md.");
 		return EXIT.none;
@@ -486,11 +494,15 @@ async function preflightStart(ctx, result, cwd, call) {
  * the earlier run verified, through `codexRole`. The child the backend is handed forwards every method it drives and
  * keeps, of the stage 2 ones, only safe facts: the request's ids and selection fields, the latest-turn answers, and
  * each steer's key, byte count and outcome. `fakeExtra` is a fake child's cross-process history, never native.
+ *
+ * `onQuestion`, when given, becomes the run's own question callback, `(question, signal)` as the host passes one, and
+ * is handed the run's controller and record beside them; the record counts its calls and whether the turn it came on
+ * had already completed. With none, the run has no callback, as every case before G3's.
  */
-async function backendRun(ctx, result, { call, prompt, cwd, leg, scenario = "ok", intent = { kind: "new" }, recorded, fakeExtra, readContract, onNotification, onTurn, deadlineMs = MODEL_CASE_MS, allowAborted = false }) {
+async function backendRun(ctx, result, { call, prompt, cwd, leg, scenario = "ok", intent = { kind: "new" }, recorded, fakeExtra, readContract, onNotification, onTurn, onQuestion, deadlineMs = MODEL_CASE_MS, allowAborted = false }) {
 	const { mod } = ctx;
 	if (leg !== undefined) result.fact("call", leg);
-	const record = { notifications: [], dropped: 0, methods: [], tips: [], steers: [], turnStarts: 0 };
+	const record = { notifications: [], dropped: 0, methods: [], tips: [], steers: [], turnStarts: 0, questions: 0, questionAfterCompletion: false };
 	const env = ctx.fake ? ctx.fakeEnv(scenario, fakeExtra) : undefined;
 	const controller = new AbortController();
 	const backend = mod.createCodexBackend({
@@ -517,7 +529,16 @@ async function backendRun(ctx, result, { call, prompt, cwd, leg, scenario = "ok"
 		deadlineHit = true;
 		controller.abort();
 	}, deadlineMs);
-	const running = backend.run({ role, prompt, cwd, session, signal: controller.signal, input: record.input, onProgress: () => {}, onEvent: () => {} });
+	const ask =
+		onQuestion === undefined
+			? undefined
+			: (question, signal) => {
+					record.questions += 1;
+					// The turn/start answer may not have reached the record yet: a question held for it is asked as it lands.
+					if (record.turn?.snapshot().completion !== undefined) record.questionAfterCompletion = true;
+					return onQuestion(question, signal, controller, record);
+				};
+	const running = backend.run({ role, prompt, cwd, session, signal: controller.signal, input: record.input, ...(ask === undefined ? {} : { onQuestion: ask }), onProgress: () => {}, onEvent: () => {} });
 	let settled = await bounded(running, deadlineMs + SETTLE_MS);
 	clearTimeout(timer);
 	ctx.abort.signal.removeEventListener("abort", cancel);
@@ -570,6 +591,7 @@ async function startObserved(mod, record, options, hooks) {
 	}
 	record.child = child;
 	record.initialize = child.initialize;
+	record.questionCallback = typeof options.onQuestion === "function";
 	return {
 		get pid() {
 			return child.pid;
@@ -663,6 +685,10 @@ function describeRun(ctx, result, record) {
 	for (const steer of record.steers) result.fact("turn/steer sent", `thread=${steer.threadId} expectedTurnId=${steer.turnId} input=${steer.bytes}B outcome=${steer.outcome}`);
 	if (record.read) result.fact("thread/read answer", describeRead(record.read));
 	result.fact("request order", record.methods.length === 0 ? "none" : record.methods.join(" > "));
+	if (record.questionCallback !== undefined) {
+		const counters = record.exit?.counters;
+		result.fact("question callback", `${record.questionCallback ? "handed to the start (the transport opts in)" : "none (no opt-in, no tool)"}; callbacks=${record.questions} child questions=${counters?.questions ?? "unknown"} refused=${counters?.refusedQuestions ?? "unknown"} repeatedRequestIds=${counters?.duplicateServerRequests ?? "unknown"}`);
+	}
 	if (run.selection) result.fact("verified selection", JSON.stringify(run.selection));
 	if (run.session) result.fact("outcome reference", describeRef(run.session));
 	const evidence = record.evidence;
@@ -780,6 +806,49 @@ function checkPinned(result, label, record, selection) {
 	result.check(read !== undefined && (read.model === selection.model || read.model === null) && read.modelProvider === selection.provider && (selection.effort === undefined || read.reasoningEffort === selection.effort), `${label}: the readback matches the recorded model, provider and effort (a null model kept as the start answer's)`);
 	const verified = record.run.selection;
 	result.check(verified?.model === selection.model && verified?.provider === selection.provider && verified?.effort === selection.effort, `${label}: the verified selection is the recorded one`);
+}
+
+/* ------------------------------------------------------------------------------------------------------------------
+ * G3: questions through the run's own callback
+ * ---------------------------------------------------------------------------------------------------------------- */
+
+/** What Q15 asks a model for. The answer it must report is made only later, inside the callback, and is in no prompt. */
+const QUESTION_PROMPT = "Call the ask_orchestrator tool exactly once to ask the orchestrator which code word to use, wait for its answer, then reply with exactly the answer you received and nothing else.";
+
+/**
+ * One Q15 leg's question checks: the callback handed to the start, one question through it and none refused or
+ * repeated, the question taken before its turn completed, and the report carrying this leg's own answer. The answer
+ * itself is never printed. True when the question part passed, so a case chains the next leg only onto one that did.
+ */
+function checkQuestionLeg(result, label, record, answer) {
+	result.check(record.questionCallback === true, `${label}: the start seam was handed the run's question callback`);
+	if (answer !== undefined) result.guard(![record.turnParams?.text, record.threadParams?.developerInstructions].some((text) => text?.includes(answer)), `${label}: the answer was made in the callback and is in no prompt or instruction`);
+	if (record.questions > 0) result.check(!record.questionAfterCompletion, `${label}: the question came while the admitted turn had not completed`);
+	const echoed = answer !== undefined && record.run.text.includes(answer);
+	result.fact(`${label}: the report carries this leg's answer`, `${echoed} (the answer is only in the tool result, so this shows the result was read; never printed)`);
+	const proof = questionProof({ callbacks: record.questions, counters: record.exit?.counters, echoed });
+	result.add(proof.status, `${label}: question: ${proof.why}`);
+	return proof.status === "pass";
+}
+
+/** One Q15 leg: a backend call whose callback answers its question with a new synthetic answer, made only then. */
+async function questionLeg(ctx, result, label, work, options) {
+	const made = {};
+	const record = await backendRun(ctx, result, {
+		leg: label,
+		call: { role: "ask", mode: "answer" },
+		prompt: QUESTION_PROMPT,
+		cwd: work,
+		onQuestion: async () => {
+			made.answer = token("Q15", "answer");
+			return made.answer;
+		},
+		...options,
+	});
+	if (!record.run) return undefined;
+	const asked = checkQuestionLeg(result, label, record, made.answer);
+	const settled = checkSettled(ctx, result, label, record, options.intent === undefined ? undefined : (options.intent.ref ?? options.intent.from).baseline);
+	return asked && settled ? record : undefined;
 }
 
 /* ------------------------------------------------------------------------------------------------------------------
@@ -1276,6 +1345,74 @@ const RUNNERS = {
 		result.check(record.evidence?.completion?.status === "completed", "the admitted turn's own completion says completed");
 		result.check(record.run.text.trim() !== "", "the report is non-empty (its text is not printed)");
 		result.fact("the report mentions the steer's word", `${record.run.text.includes(marker)} (model prose: supporting only; acceptance is the child's answer, not consumption)`);
+	},
+
+	Q15: async (ctx, result) => {
+		const work = path.join(ctx.caseDir("Q15"), "work");
+		fs.mkdirSync(work);
+		const spec = ctx.mod.CODEX_QUESTION_TOOL_SPEC;
+		result.fact("limits", "three backend calls on three owned children, one question and one short reply each; no question, answer, report or instruction text printed");
+		result.fact("question tool", `${spec.type} ${spec.name}, input ${spec.inputSchema.type} requiring ${spec.inputSchema.required.join(", ")}: registered by the transport on a fresh thread of a child with a callback, and on no continued one (the wire is the transport's; this harness sees the requests the backend made)`);
+		// The fake's thread/start reports an effort here, so the continuations have one to pin, as the host default does natively.
+		const fresh = await questionLeg(ctx, result, "fresh", work, { scenario: "question", fakeExtra: { FAKE_CODEX_START: JSON.stringify({ reasoningEffort: "medium" }) } });
+		if (!fresh) return;
+		const first = sourceOf(fresh);
+		const resumed = await questionLeg(ctx, result, "resume", work, { recorded: first.selection, intent: { kind: "resume", ref: first.ref }, scenario: "question-inherited", fakeExtra: fakeHistory([first.ref.checkpoint], first.ref.baseline, "b-") });
+		if (!resumed) return;
+		const tip = resumed.tips[0]?.tip;
+		result.check(resumed.threadMethod === "thread/resume" && resumed.threadParams?.threadId === first.ref.sessionId && tip !== undefined && !tip.none && tip.turnId === first.ref.checkpoint && tip.status === "completed", "resume: thread/resume of the recorded thread, its tip the recorded checkpoint, completed");
+		checkPinned(result, "resume", resumed, first.selection);
+		// The fork is through the resumed reference's checkpoint, the source thread's current tip: no older checkpoint.
+		const second = sourceOf(resumed);
+		result.fact("intent", "fork of the resumed reference, as the host continues it from another host session");
+		const forked = await questionLeg(ctx, result, "fork", work, { recorded: second.selection, intent: { kind: "fork", from: second.ref }, scenario: "question-inherited", fakeExtra: fakeHistory([first.ref.checkpoint, second.ref.checkpoint], second.ref.baseline, "f-") });
+		if (!forked) return;
+		const start = forked.tips[0]?.tip;
+		result.check(forked.threadMethod === "thread/fork" && forked.threadParams?.threadId === second.ref.sessionId && forked.threadParams?.lastTurnId === second.ref.checkpoint, "fork: thread/fork named the resumed thread and its current checkpoint");
+		result.check(forked.thread?.threadId !== second.ref.sessionId && (forked.thread?.forkedFromId === undefined || forked.thread.forkedFromId === second.ref.sessionId) && start !== undefined && !start.none && start.status === "completed", "fork: a new thread, forked from the source when reported, at a completed starting tip");
+		checkPinned(result, "fork", forked, second.selection);
+	},
+
+	Q16: async (ctx, result) => {
+		const work = path.join(ctx.caseDir("Q16"), "work");
+		fs.mkdirSync(work);
+		const state = { callbacks: 0, aborted: false, cancels: 0 };
+		result.fact("limits", "one backend call on one owned child, cancelled while its first question waits; no answer is given, and nothing is retried, steered or replayed");
+		const record = await backendRun(ctx, result, {
+			call: { role: "ask", mode: "answer" },
+			prompt: "Call the ask_orchestrator tool exactly once to ask the orchestrator which code word to use, and wait for its answer before you reply.",
+			cwd: work,
+			scenario: "question-cancel",
+			allowAborted: true,
+			...(ctx.fake ? { deadlineMs: 30_000 } : {}),
+			// The answer stays pending until the question's own signal aborts. The listener is in place before the one cancel,
+			// which goes through the production signal once the callback has handed back its pending answer.
+			onQuestion: (_question, signal, controller) =>
+				new Promise((_resolve, reject) => {
+					state.callbacks += 1;
+					const ended = () => {
+						state.aborted = true;
+						reject(new Error("the question was ended"));
+					};
+					if (signal.aborted) return ended();
+					signal.addEventListener("abort", ended, { once: true });
+					if (state.cancels === 0) {
+						state.cancels += 1;
+						queueMicrotask(() => controller.abort());
+					}
+				}),
+		});
+		if (!record.run) return;
+		result.fact("child's own turn completion", `${record.evidence?.completion ? record.evidence.completion.status : "none (the transport ended the turn)"} (a diagnostic, never a successful outcome)`);
+		if (state.callbacks === 0) return result.unproven("the run ended before any question reached the callback, so no waiting question was cancelled");
+		const counters = record.exit?.counters;
+		result.check(state.callbacks === 1 && counters?.questions === 1 && counters.refusedQuestions === 0 && counters.duplicateServerRequests === 0, "one question, asked once through the callback, none refused or repeated");
+		result.check(state.cancels === 1, "the run was cancelled once, through the production signal");
+		result.check(state.aborted, "the waiting question's own signal aborted, so no answer was given");
+		result.fact("the question's reply", "the transport's one success: false reply, which no counter separates; the fake tests read it from the request log");
+		result.check(record.run.stopReason === "aborted", "production verdict: aborted");
+		result.check(record.run.session?.checkpoint === undefined && record.run.session?.baseline === undefined, "the cancelled run settles no checkpoint and no baseline");
+		result.check(record.exit?.stopRequested === true, "the child's actual exit report says the host requested the stop");
 	},
 
 	Q19: async (ctx, result) => {

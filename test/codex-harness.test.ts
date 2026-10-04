@@ -8,6 +8,7 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import { type CodexCall, codexRole } from "../extensions/backends/codex-binding.ts";
 import { CODEX_APP_SERVER_ARGS } from "../extensions/backends/codex-launch.ts";
 import { CODEX_CONTRACTS_DIR, createCodexBackend } from "../extensions/backends/codex.ts";
+import { CODEX_QUESTION_DESCRIPTION } from "../extensions/backends/codex-transport.ts";
 import {
 	additivity,
 	CASES,
@@ -23,6 +24,7 @@ import {
 	GROUPS,
 	parseArgs,
 	publishedUsageProblems,
+	questionProof,
 	reportedCount,
 	selectCases,
 	steerProof,
@@ -107,9 +109,10 @@ test("the command line is strict: both spellings, no valueless or repeated flag,
 	assert.equal(parseArgs([]).case, undefined);
 	assert.deepEqual(selectCases("q2,Q1")?.cases?.map((entry) => entry.id), ["Q1", "Q2"]);
 	assert.deepEqual(selectCases("model-free")?.cases?.map((entry) => entry.id), ["Q1", "Q2", "Q7", "Q9"]);
-	assert.deepEqual(selectCases("all")?.cases?.map((entry) => entry.id), ["Q1", "Q2", "Q3", "Q3b", "Q4", "Q6", "Q7", "Q9", "Q10", "Q11", "Q12", "Q13", "Q14", "Q19"]);
+	assert.deepEqual(selectCases("all")?.cases?.map((entry) => entry.id), ["Q1", "Q2", "Q3", "Q3b", "Q4", "Q6", "Q7", "Q9", "Q10", "Q11", "Q12", "Q13", "Q14", "Q15", "Q16", "Q19"]);
+	assert.deepEqual(selectCases("q16,Q15")?.cases?.map((entry) => entry.id), ["Q15", "Q16"], "G3's cases in catalogue order");
 	assert.deepEqual(selectCases("q19,Q13,q10,Q12,Q11")?.cases?.map((entry) => entry.id), ["Q10", "Q11", "Q12", "Q13", "Q19"], "G2's cases in catalogue order");
-	for (const id of ["Q10", "Q11", "Q12", "Q13", "Q19"]) {
+	for (const id of ["Q10", "Q11", "Q12", "Q13", "Q15", "Q16", "Q19"]) {
 		const entry = CASES.find((candidate) => candidate.id === id);
 		assert.ok(entry?.model && entry.fake && entry.needs === undefined, `${id} starts turns, runs under --fake and needs no option`);
 		assert.ok(!GROUPS["model-free"]!.includes(id), `${id} is not model-free`);
@@ -119,7 +122,7 @@ test("the command line is strict: both spellings, no valueless or repeated flag,
 	assert.deepEqual(Object.keys(GROUPS), ["model-free", "all"]);
 	assert.ok(!GROUPS["model-free"]!.includes("Q14"), "Q14 starts turns, so the model-free group leaves it out");
 	assert.equal(CASES.find((entry) => entry.id === "Q14")?.model, true);
-	assert.deepEqual(CASES.filter((entry) => entry.fake).map((entry) => entry.id), ["Q1", "Q2", "Q4", "Q6", "Q7", "Q9", "Q10", "Q11", "Q12", "Q13", "Q14", "Q19"]);
+	assert.deepEqual(CASES.filter((entry) => entry.fake).map((entry) => entry.id), ["Q1", "Q2", "Q4", "Q6", "Q7", "Q9", "Q10", "Q11", "Q12", "Q13", "Q14", "Q15", "Q16", "Q19"]);
 	assert.match(selectCases("Q1,nope").error ?? "", /nope/);
 	for (const removed of ["Q5", "Q5b", "Q5c", "Q8", "Q8b"]) assert.match(selectCases(removed).error ?? "", new RegExp(removed), `${removed} is no longer a case`);
 	assert.match(selectCases(undefined).error ?? "", /needs/);
@@ -238,6 +241,19 @@ test("G2 steer verdict: only one accepted turn/steer for the admitted turn passe
 	assert.equal(steerProof({ pushed: true, queued: true, calls: one(), turn, report: counts({ dropped: 1 }) }).status, "unproven", "the counts must say one accepted and nothing else");
 });
 
+test("G3 question verdict: one callback, one asked, none refused or repeated, and the report carrying the answer pass; a repeated request id or a counter mismatch fails; a second question, no callback, counters or echo is unproven", () => {
+	const counters = (over: object = {}) => ({ questions: 1, refusedQuestions: 0, duplicateServerRequests: 0, ...over });
+	assert.equal(questionProof({ callbacks: 1, counters: counters(), echoed: true }).status, "pass");
+	assert.deepEqual(questionProof({ callbacks: 0, counters: counters({ questions: 0 }), echoed: false }), { status: "unproven", why: "no question reached the callback" });
+	assert.equal(questionProof({ callbacks: 1, counters: counters(), echoed: false }).status, "unproven", "an answer the report does not carry proves nothing was read");
+	assert.equal(questionProof({ callbacks: 1, counters: undefined, echoed: true }).status, "unproven");
+	assert.equal(questionProof({ callbacks: 1, counters: counters({ refusedQuestions: 5 }), echoed: true }).status, "unproven", "refused foreign calls beside the asked one");
+	assert.deepEqual(questionProof({ callbacks: 2, counters: counters({ questions: 2 }), echoed: true }), { status: "unproven", why: "the model asked more than once (2 distinct questions) where one was asked for" }, "a model that asks twice is not a broken bridge");
+	assert.equal(questionProof({ callbacks: 1, counters: counters({ questions: 2 }), echoed: true }).status, "fail");
+	assert.equal(questionProof({ callbacks: 1, counters: counters({ duplicateServerRequests: 1 }), echoed: true }).status, "fail");
+	assert.equal(questionProof({ callbacks: 1, counters: counters({ questions: 0 }), echoed: true }).status, "fail", "a callback the child's counters do not account for");
+});
+
 /* ------------------------------------------------------------------------------------------------------------------
  * the harness as a program
  * ---------------------------------------------------------------------------------------------------------------- */
@@ -303,6 +319,10 @@ test("every guard path exits 2 having loaded no production module, located no co
 			["--fake", "--case", "Q10,Q11,Q12,Q13,Q19"],
 			["--help", "--run", "--fake", "--case", "Q13"],
 			["--run", "--case", "Q19", "--model"],
+			["--case", "Q15,Q16"],
+			["--fake", "--case", "Q15,Q16"],
+			["--list", "--run", "--fake", "--case", "Q15,Q16"],
+			["--run", "--case", "Q17"],
 			["--run", "--case", "Q14b"],
 			["--run"],
 			["--run", "--case"],
@@ -329,15 +349,17 @@ test("every guard path exits 2 having loaded no production module, located no co
 		const list = harness(box, ["--list"]).stdout;
 		assert.deepEqual(
 			[...list.matchAll(/^ {2}(Q\S+) /gm)].map((match) => match[1]),
-			["Q1", "Q2", "Q3", "Q3b", "Q4", "Q6", "Q7", "Q9", "Q10", "Q11", "Q12", "Q13", "Q14", "Q19"],
-			"--list names the fourteen cases",
+			["Q1", "Q2", "Q3", "Q3b", "Q4", "Q6", "Q7", "Q9", "Q10", "Q11", "Q12", "Q13", "Q14", "Q15", "Q16", "Q19"],
+			"--list names the sixteen cases",
 		);
 		assert.match(list, /Q6 +\[model\] \[fake\][\s\S]*model-free/);
 		assert.match(list, /Q14 +\[model\] \[fake\] usage over two sequential turns/);
 		assert.match(list, /model-free +Q1, Q2, Q7, Q9\n/, "the model-free group lists no model case");
 		assert.match(list, /G1 needs Q1, Q2, Q3, Q4, Q6, Q7 and Q9 to PASS natively; Q3b is optional/);
 		for (const id of ["Q10", "Q11", "Q12", "Q13", "Q19"]) assert.match(list, new RegExp(`\n {2}${id} +\\[model\\] \\[fake\\] G2: `));
-		assert.match(list, /G2 needs Q10, Q11, Q12, Q13 and Q19 to PASS natively, one agreed case at a time; none has run natively, so G2 is pending/);
+		for (const id of ["Q15", "Q16"]) assert.match(list, new RegExp(`\n {2}${id} +\\[model\\] \\[fake\\] G3: `));
+		assert.match(list, /G2 needed Q10, Q11, Q12, Q13 and Q19 to PASS natively, and they did, once each on one host, on connections with no question callback/);
+		assert.match(list, /G3 needs Q15 and Q16 to PASS natively, one agreed case at a time; neither has run natively, so G3 is pending/);
 		assert.match(list, /Q14 is stage 2 preparation, a usage measurement outside G1 and G2; Q14b's per-call usage is folded into Q10 and Q12/);
 		assert.match(harness(box, ["--run", "--case", "Q1", "--outside-dir", "/dev/shm"]).stdout, /unrecognised argument: --outside-dir/);
 		assert.ok(!fs.existsSync(box.tripped), "no codex ran");
@@ -711,6 +733,142 @@ test("a --fake Q13 whose one steer the child refuses is UNPROVEN however cleanly
 		assert.match(out, /PASS \(guard\) child: owned shutdown clean/);
 		assert.match(out, /RESULT Q13: unproven/);
 		assert.equal(fakeRequests(log).flat().filter((request) => request.method === "turn/steer").length, 1, "the refused steer was not resent");
+		assert.ok(!fs.existsSync(box.tripped));
+	} finally {
+		fs.rmSync(box.root, { recursive: true, force: true });
+	}
+});
+
+/* ------------------------------------------------------------------------------------------------------------------
+ * G3's cases under --fake
+ * ---------------------------------------------------------------------------------------------------------------- */
+
+type Message = { id?: string | number; method?: string; params?: Record<string, unknown>; result?: { success?: unknown; contentItems?: { type?: unknown; text?: unknown }[] } };
+
+/** Every message each fake child read, in order, requests, notifications and replies alike, each child's apart by its `argv` line. */
+function fakeMessages(log: string): Message[][] {
+	const children: Message[][] = [];
+	for (const line of fs.readFileSync(log, "utf8").split("\n").filter(Boolean)) {
+		const entry = JSON.parse(line);
+		if (entry.argv) children.push([]);
+		else if (entry.in) children.at(-1)!.push(entry.in);
+	}
+	return children;
+}
+
+/** The answer shape Q15's callback makes, so a test can check a reply without naming the answer. */
+const SYNTHETIC = /^pfq-q15-answer-[0-9a-f]{12}$/;
+
+test("--fake G3 cases each pass on their own: the opt-in on every child, the tool on the fresh thread only, one correlated reply per question, NOT NATIVE", { timeout: 30_000 }, (t) => {
+	const psDir = commandDirectory("ps");
+	if (!psDir) return t.skip("no ps on PATH for the owned cleanup's discovery");
+	const box = sandbox([psDir]);
+	const log = path.join(box.root, "fake-requests.log");
+	try {
+		for (const id of ["Q15", "Q16"]) {
+			fs.rmSync(log, { force: true });
+			fs.rmSync(box.resolved, { force: true });
+			const ran = harness({ ...box, env: { ...box.env, FAKE_CODEX_LOG: log } }, ["--run", "--fake", "--case", id], 25_000);
+			const out = ran.stdout;
+			assert.equal(ran.status, 0, `${id}\n${out}\n${ran.stderr}`);
+			assert.match(out, new RegExp(`RESULT ${id}: pass \\[FAKE, NOT NATIVE\\]`));
+			assert.doesNotMatch(out, /\n {4}(FAIL|UNPROVEN)/, `${id}: nothing failed or was unproven`);
+			assertFakeOnly(box, out);
+			assert.doesNotMatch(out, /pfq-q15-answer|answer received|Which name should/, "no answer, question or report text is printed");
+			const children = fakeMessages(log);
+			for (const child of children) {
+				const init = child.find((message) => message.method === "initialize")!;
+				assert.deepEqual(init.params!.capabilities, { experimentalApi: true }, "every child of a run with a callback opts in");
+			}
+			const opened = children.map((child) => child.find((message) => message.method === "thread/start" || message.method === "thread/resume" || message.method === "thread/fork")!);
+			// Each question's one reply answers the server request's own id, never the call id inside it.
+			const replies = children.map((child) => {
+				const asked = new Set(["21"]);
+				return child.filter((message) => message.method === undefined && message.id !== undefined && asked.has(String(message.id)));
+			});
+			for (const [at, child] of children.entries()) assert.equal(child.filter((message) => message.method === undefined && message.id !== undefined).length, 1, `child ${at + 1}: one reply, to its one question`);
+			if (id === "Q15") {
+				assert.deepEqual(
+					opened.map((message) => message.method),
+					["thread/start", "thread/resume", "thread/fork"],
+				);
+				assert.deepEqual(opened[0]!.params!.dynamicTools, [{ type: "function", name: "ask_orchestrator", description: CODEX_QUESTION_DESCRIPTION, inputSchema: { type: "object", properties: { question: { type: "string" } }, required: ["question"] } }], "the fresh thread registers the flat question tool");
+				assert.ok(!("dynamicTools" in opened[1]!.params!) && !("dynamicTools" in opened[2]!.params!), "a resumed or forked thread registers nothing");
+				assert.deepEqual([opened[2]!.params!.threadId, opened[2]!.params!.lastTurnId], ["thr-1", "b-turn-1"], "the fork is through the resumed reference's checkpoint");
+				const answers = replies.map((reply) => {
+					assert.equal(reply.length, 1);
+					const result = reply[0]!.result!;
+					assert.equal(result.success, true);
+					assert.equal(result.contentItems!.length, 1);
+					assert.equal(result.contentItems![0]!.type, "inputText");
+					const text = String(result.contentItems![0]!.text);
+					assert.ok(SYNTHETIC.test(text), "the reply carries one synthetic answer");
+					return text;
+				});
+				assert.equal(new Set(answers).size, 3, "every leg answered with an answer of its own");
+				for (const child of children) {
+					for (const message of child.filter((entry) => entry.method !== undefined)) assert.ok(!answers.some((answer) => JSON.stringify(message).includes(answer)), `no ${message.method} the host sent carries an answer`);
+				}
+				assert.ok(!answers.some((answer) => out.includes(answer)), "no answer reaches stdout");
+			}
+			if (id === "Q16") {
+				assert.equal(children.length, 1);
+				assert.ok("dynamicTools" in opened[0]!.params!);
+				const child = children[0]!;
+				const reply = replies[0]![0]!;
+				assert.equal(reply.result!.success, false, "the waiting question ends with one failed tool reply");
+				assert.deepEqual(reply.result!.contentItems!.map((item) => item.type), ["inputText"]);
+				const interrupts = child.filter((message) => message.method === "turn/interrupt");
+				assert.equal(interrupts.length, 1, "the turn is interrupted once");
+				assert.ok(child.indexOf(reply) < child.indexOf(interrupts[0]!), "the question's reply goes out ahead of the interrupt");
+				assert.match(out, /PASS the waiting question's own signal aborted/);
+				assert.match(out, /PASS \(guard\) child: owned shutdown clean \(clean actual exit, no leftovers, discovery ok, pipes closed, a requested abort allowed\)/);
+			}
+		}
+	} finally {
+		fs.rmSync(box.root, { recursive: true, force: true });
+	}
+});
+
+test("--fake G3 cases pass together, NOT NATIVE", { timeout: 30_000 }, (t) => {
+	const psDir = commandDirectory("ps");
+	if (!psDir) return t.skip("no ps on PATH for the owned cleanup's discovery");
+	const box = sandbox([psDir]);
+	try {
+		const ran = harness(box, ["--run", "--fake", "--case", "Q15,Q16"], 25_000);
+		const out = ran.stdout;
+		assert.equal(ran.status, 0, `${out}\n${ran.stderr}`);
+		for (const id of ["Q15", "Q16"]) assert.match(out, new RegExp(`RESULT ${id}: pass`));
+		assertFakeOnly(box, out);
+		for (const leg of ["fresh", "resume", "fork"]) {
+			assert.match(out, new RegExp(`PASS ${leg}: question: one question, asked once through the callback, its answer carried by the report`));
+			assert.match(out, new RegExp(`PASS ${leg}: the published in/out/cacheRead are this call's delta`));
+		}
+		assert.match(out, /PASS fork: thread\/fork named the resumed thread and its current checkpoint/);
+		assert.match(out, /PASS resume: the verified selection is the recorded one/);
+		assert.match(out, /question callback: handed to the start \(the transport opts in\); callbacks=1 child questions=1 refused=0 repeatedRequestIds=0/);
+		assert.doesNotMatch(out, /pfq-q15-answer|answer received/);
+	} finally {
+		fs.rmSync(box.root, { recursive: true, force: true });
+	}
+});
+
+test("--fake G3 cases whose child never asks are UNPROVEN however cleanly they complete", { timeout: 30_000 }, (t) => {
+	const psDir = commandDirectory("ps");
+	if (!psDir) return t.skip("no ps on PATH for the owned cleanup's discovery");
+	const box = sandbox([psDir]);
+	try {
+		// The fake's own override: every child runs its plain answer, which completes with no question call.
+		const ran = harness({ ...box, env: { ...box.env, FAKE_CODEX_SCENARIO: "ok" } }, ["--run", "--fake", "--case", "Q15,Q16"], 25_000);
+		const out = ran.stdout;
+		assert.equal(ran.status, 1, `${out}\n${ran.stderr}`);
+		assert.match(out, /UNPROVEN fresh: question: no question reached the callback/);
+		assert.match(out, /PASS fresh: production verdict: success/, "the completion held, and did not pass the case");
+		assert.doesNotMatch(out, /call: resume/, "no continuation is chained onto an unproven leg");
+		assert.match(out, /RESULT Q15: unproven/);
+		assert.match(out, /UNPROVEN the run ended before any question reached the callback/);
+		assert.match(out, /RESULT Q16: unproven/);
+		assert.match(out, /PASS \(guard\) child: owned shutdown clean/);
 		assert.ok(!fs.existsSync(box.tripped));
 	} finally {
 		fs.rmSync(box.root, { recursive: true, force: true });
