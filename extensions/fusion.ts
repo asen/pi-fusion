@@ -340,7 +340,7 @@ function codexRecord(base: RunRecord, data: Record<string, unknown>): RunRecord 
 	const loose = ["sessionId", "checkpoint", "sessionFile", "model", "effort"].filter((field) => data[field] !== undefined);
 	if (data.session === undefined) {
 		if (loose.length) return refused(record, `records its codex run in ${loose.join(", ")} rather than in a thread reference; it cannot be continued, so start a new run`);
-		return refused(record, "ran on codex and recorded no verified thread, so it cannot be continued; start a new run without continue");
+		return refused(record, "ran on codex and recorded no verified thread, so it cannot be continued; start a new run without continue (a plan call takes fresh true)");
 	}
 	const ref = sessionRefOf(data.session, "codex");
 	if (!ref) return refused(record, "has an incomplete or mismatched codex thread reference; it cannot be continued, so start a new run");
@@ -349,20 +349,20 @@ function codexRecord(base: RunRecord, data: Record<string, unknown>): RunRecord 
 	if (!ref.checkpoint) {
 		return refused(
 			held,
-			`ran on codex and recorded no trusted checkpoint, so it is kept for reading and not continued; open its thread with ${codexResumeCommand(ref.sessionId)}, and new work needs a new run without continue`,
+			`ran on codex and recorded no trusted checkpoint, so it is kept for reading and not continued; open its thread with ${codexResumeCommand(ref.sessionId)}, and new work needs a new run without continue (a plan call takes fresh true)`,
 		);
 	}
 	if (!ref.baseline) {
 		return refused(
 			held,
-			`ran on codex and recorded its checkpoint with no usage baseline, so it is kept for reading and not continued; open its thread with ${codexResumeCommand(ref.sessionId)}, and new work needs a new run without continue`,
+			`ran on codex and recorded its checkpoint with no usage baseline, so it is kept for reading and not continued; open its thread with ${codexResumeCommand(ref.sessionId)}, and new work needs a new run without continue (a plan call takes fresh true)`,
 		);
 	}
 	const selection = resolvedSelectionOf(data.selection, "codex");
 	if (!selection) {
 		return refused(
 			held,
-			`recorded no codex model and provider this host can repeat, so it is kept for reading and not continued against whatever is configured now; open its thread with ${codexResumeCommand(ref.sessionId)}, and new work needs a new run without continue`,
+			`recorded no codex model and provider this host can repeat, so it is kept for reading and not continued against whatever is configured now; open its thread with ${codexResumeCommand(ref.sessionId)}, and new work needs a new run without continue (a plan call takes fresh true)`,
 		);
 	}
 	return {
@@ -833,9 +833,10 @@ export function fusionRoute(params: FusionParams, records: RunRecords, planPct: 
 		const mode = params.mode ?? record.mode;
 		const call = { ...params, role: record.role, ...(mode ? { mode } : {}) };
 		checkParams(backend, call);
-		// A Claude run keeps the model and effort it was admitted with unless the call names others. A Pi run's selection
-		// is its record's own, and its binding repeats that rather than reading one off the configuration. A Pi record
-		// without a verified session and selection was refused above, so no continuation guesses fallback defaults.
+		// A Claude run keeps the model and effort it was admitted with unless the call names others. A Pi or Codex run's
+		// selection is its record's own, and its binding repeats that rather than reading one off the configuration. A Pi
+		// or Codex record without a verified session or thread, checkpoint and selection was refused above, so no
+		// continuation guesses fallback defaults.
 		const kept = backend === "claude" ? claudeKept(record, params, config) : { defaults: {} };
 		return { backend, role: record.role, handle: record.handle, record, call, ...kept };
 	}
@@ -855,8 +856,8 @@ export function fusionRoute(params: FusionParams, records: RunRecords, planPct: 
 	// A latest plan record this host refuses stops the call: an implicit plan call never walks back to an older run.
 	if (last.refusal) throw new Error(last.refusal);
 	// What the last plan run actually ran on, in its own backend's terms: Claude keeps its model flat, and an older
-	// record that kept none ran on the legacy default, while a Pi run is only ever on the selection it recorded. A
-	// configured default is not what the run ran on, so it never stands in here and never reads as a change of model.
+	// record that kept none ran on the legacy default, while a Pi or Codex run is only ever on the selection it recorded.
+	// A configured default is not what the run ran on, so it never stands in here and never reads as a change of model.
 	const lastModel = backend === "claude" ? (last.model ?? config.baseline.plan.claude?.model) : last.selection?.model;
 	const named = params.model?.trim();
 	// Another model is not a continuation: the run holds its agreement in a context this call would not be reading.
@@ -869,8 +870,10 @@ export function fusionRoute(params: FusionParams, records: RunRecords, planPct: 
 		return { backend, role, handle: last.handle, record: last, call, ...kept };
 	}
 	// A cap hands off to a fresh run that keeps the planner's model, because that model is the run's and not the call's.
-	// On Claude the effort is the call's or the role's default, as it always was. On Pi the model and the level the run
-	// recorded go together, because a level chosen for another model may be one this model does not offer.
+	// On Claude the effort is the call's or the role's default, as it always was. On Pi and Codex the model and the level
+	// the run recorded go together, because a level chosen for another model may be one this model does not offer. A
+	// Codex run's provider is not carried: a fresh thread names only a model and an effort, so it runs on the provider
+	// the host's own Codex configuration chooses now, and nothing here checks it against the one the run recorded.
 	const carried: RouteDefaults =
 		backend === "claude"
 			? { ...fresh, ...(lastModel ? { model: lastModel } : {}) }
@@ -1142,9 +1145,9 @@ interface LiveRun {
 	state: RunState;
 	input: ChildControl;
 	/**
-	 * Whether the child's input was open when the run was admitted. A backend whose child takes no steer at all, which a
-	 * Codex one is, hands over an input closed from the start; one that closes later, as a Claude or Pi child's does as it
-	 * ends, was steerable, and a steer that meets it closed is a run ending rather than one that never took any.
+	 * Whether the child's input was open when the run was admitted. A backend whose child takes no steer at all hands
+	 * over an input closed from the start; one that closes later, as a Claude, Pi or Codex child's does as it ends, was
+	 * steerable, and a steer that meets it closed is a run ending rather than one that never took any.
 	 */
 	steerable: boolean;
 	controller: AbortController;
@@ -1537,12 +1540,26 @@ const guidelines = (tool: string, control: string, roles: RoleSettings, options:
 };
 
 /**
- * What a run on Codex is not, said wherever a role goes there: its child has no question tool and takes no steer, so a
- * brief has to settle everything, and a follow-up is a new run rather than a continuation. Both tools carry it, each in
- * its own name, and it sends the work to fusion, the one tool that runs Codex.
+ * What a steer a run's input took is said to be. Taken is not read: a Claude or Pi child reads it when it next takes
+ * input, and a Codex run sends it once to its current turn, whose taking it is queued input, never a delivery anyone
+ * confirmed, and whose report counts what became of it.
  */
-const codexGuideline = (tool: string, roles: readonly KnownRoleName[]): string =>
-	`${roles.map((role, at) => `${at ? "role" : "Role"} ${role}`).join(" and ")} ${roles.length === 1 ? "runs" : "run"} on codex in this session${tool === TOOL_NAME ? "" : `, which fusion runs and ${tool} does not`}. A codex child cannot ask you a question and takes no message while it runs: put every decision it needs in the task. When it still lacks one it stops and reports it, under Escalation for role implement, Open questions for role ask and Notes for role ask with mode review. Follow up on a codex run, or retry one, with a new fusion run that carries its report as context, not with continue.`;
+const steerTaken = (run: { handle: string; backend: BackendName }): string =>
+	run.backend === "codex"
+		? `steer queued for ${run.handle}: it goes once, with no retry, to the run's current turn, and the turn taking it does not show the child read it; the run's report counts what became of it`
+		: `steer sent to ${run.handle}; the child reads it when it next takes input`;
+
+/**
+ * What a run on Codex is, said wherever a role goes there: its child has no question tool, so a brief has to settle
+ * everything; a message to it is one steer its current turn may take, never a delivery anyone confirmed; and it is
+ * continued as any run is, but only from the exact turn its record names. Both tools carry it, each in its own name,
+ * and it sends the work to fusion, the one tool that runs Codex.
+ */
+const codexGuideline = (tool: string, roles: readonly KnownRoleName[]): string => {
+	const named = roles.map((role, at) => `${at ? "role" : "Role"} ${role}`);
+	const list = named.length === 1 ? named[0]! : `${named.slice(0, -1).join(", ")} and ${named.at(-1)!}`;
+	return `${list} ${roles.length === 1 ? "runs" : "run"} on codex in this session${tool === TOOL_NAME ? "" : `, which fusion runs and ${tool} does not`}. A codex child cannot ask you a question: put every decision it needs in the task. When it still lacks one it stops and reports it, under Escalation for role implement, Open questions for role plan and role ask, and Notes for role ask with mode review. A message to a running codex run is one steer to its current turn, sent once and never retried: a steer the turn took is queued input, not proof the child read it, and the run's report counts what became of each. Continue a codex run with fusion and continue, as any run: it goes on only from the exact turn its record names, and a thread that has moved since is refused rather than continued from wherever it is now.`;
+};
 
 /**
  * The one guideline the compatibility tool cannot carry, because it advertises no backend parameter at all: which
@@ -1644,7 +1661,7 @@ export default function fusion(pi: ExtensionAPI, options: FusionOptions = {}) {
 	}
 	// Constructing a Pi or a Codex backend takes nothing: neither factory reads a file, resolves a path, looks for a
 	// binary or starts anything, so a host that never delegates to one pays for its line and no more, and a machine with
-	// no `codex` installed loads this extension, Claude and Pi as before. The Codex backend is experimental and fresh-only.
+	// no `codex` installed loads this extension, Claude and Pi as before. The Codex backend is experimental.
 	// The host's own registrations are spread last and as they are: a key it set to undefined is a backend it left out,
 	// never one this build's default stands in for, and only its own keys are read, never inherited ones.
 	const backends: Partial<Record<BackendName, HostBackend>> = { claude: hostBackend(claudeBackend), pi: hostBackend(createPiBackend()), codex: hostBackend(createCodexBackend()), ...options.backends };
@@ -3349,10 +3366,17 @@ export default function fusion(pi: ExtensionAPI, options: FusionOptions = {}) {
 					return;
 				}
 				if (!run.input.push(command.text)) {
-					notice(`${run.handle} no longer takes input`, "warning");
+					// An input that is still open and took nothing is full, or refused this text: the run goes on, and the
+					// steer is not queued anywhere, so nothing sends it later. A closed one is the run ending.
+					notice(
+						run.input.open
+							? `${run.handle} did not accept the steer now: its input took no more, as a full one does; nothing was sent, and nothing sends it later`
+							: `${run.handle} no longer takes input; nothing was sent`,
+						"warning",
+					);
 					return;
 				}
-				notice(`steer sent to ${run.handle}; the child reads it when it next takes input`, "info");
+				notice(steerTaken(run), "info");
 				send(
 					{
 						customType: NOTICE_TYPE,
@@ -3546,7 +3570,7 @@ export default function fusion(pi: ExtensionAPI, options: FusionOptions = {}) {
 		name: TOOL_NAME,
 		executionMode: "sequential" as const,
 		label: "Fusion",
-		description: `Delegate work to a child: a headless coding session in this working directory, run through one of this build's backends. The role picks the job. plan: a planner on the configured model, or the model you name, which can read the code, run commands and write scratch files, challenges a goal and your proposed plan and consolidates it into an agreed, numbered task list with acceptance criteria. A plan call continues the last plan run of the backend it routes to, so follow-ups can refer to the earlier agreement, until that run's context passes its cap or the call names another model, when the call starts a fresh plan run carrying the agreed plan and says so; fresh starts a new plan run. implement: implements one clear, bounded task with full tools and reports what changed and how it was verified. If the task needs a broader scope or a design decision, it stops and reports under Escalation instead of widening the task. ultracode: Claude Code with ultracode on orchestrates Claude Opus 5 agents at xhigh effort, one agent at a time, to implement, verify and review a task, several tasks in dependency order, or a whole agreed plan. It is slower and costlier than implement; use it only when the user asks for it. ask: read-only tools (on claude: Read, Bash, Grep, Glob, WebSearch, WebFetch) answer a question about the code with file and line references, or with mode review give an independent review of a change, findings ranked by severity. It has no edit or write tool, and its contract forbids changing files through a shell. security: investigates one scoped security concern, area or change on the user's own Pi provider configuration, with the same tools as role implement. It confirms a finding where it can, reports each with a severity and with whether it is confirmed or inferred, and never puts a secret in its report by value. Its task says whether fixes are authorized: with none it reports findings and changes no application code, and with one it writes the smallest fix that closes a finding and verifies it. Ask for it only when the user asks for a security investigation, audit or fix. ${configurationText(configuration.roles)} A disabled role is refused whether a call starts or continues it. backend picks the harness a child runs in: leave backend unset unless the user names one, and a fresh run goes to the backend the configuration above names for its role, on that role's configured model and effort. A call that names the other backend runs there on that backend's own defaults, never on the settings configured for the role's other backend. backend pi runs plan, implement, ask and security on the user's own Pi provider configuration, under the same contracts as the claude roles, security's own contract included; role ultracode runs on the claude backend alone, and role security on the pi backend alone, so a call that names it goes to pi whether or not it names a backend and naming claude for it is refused before anything starts. On pi the tools are Pi's own and are not the claude lists above: roles plan, implement and security run with read, bash, edit, write, grep, find and ls, role ask runs with read, bash, grep, find and ls and has no web search or web fetch tool at all, and every pi role also gets ask_orchestrator, which is how a pi child asks you a question. A pi call's model is a provider and a model id, such as deepseek/deepseek-chat, taken from the call's model parameter, then the selection the run it continues actually ran with, then this session's configuration for that role, which by default comes from PI_FUSION_PI_<ROLE>_MODEL; a pi call with none of those is refused before anything starts, because nothing here resolves a pi model for you. backend codex is experimental: it runs implement, in a workspace-write sandbox, and ask, read-only, as fresh runs under the same contracts, through the user's own codex install, configuration and login, with no plan, ultracode or security role and no fresh parameter; its model and effort are single tokens from the call, then this session's configuration, which by default comes from PI_FUSION_CODEX_<ROLE>_MODEL and _EFFORT, and otherwise the host's own codex default. A codex child gets no ask_orchestrator and takes no message while it runs, so it reports a missing decision instead of asking, and a codex run cannot be continued: a follow-up is a new run that carries its report as context, and its stats line names the codex resume command that reopens its thread. Every run gets a handle such as run-3, shown in the stats line. continue with a handle sends the task as a follow-up to that run: the child keeps its context from the run's last successful call, across a resume of this session, /tree and forks, stays on the backend it ran on, and keeps the model and effort that run was started with unless the call names others, whatever profile is selected since. Calls run one at a time: Pi serializes any turn that contains one. Returns the child's report, or with background true the handle at once and the report later as a message; manage a background run with fusion_control. If the child asks a question, the call returns the question at once and the run waits in the background until you answer it with fusion_control message. Only one run that can change files is active at a time, waiting included; ask runs can go next to it. The claude tool is this same delegation forced to the claude backend, kept for compatibility, and fusion_control and claude_control both act on every run.`,
+		description: `Delegate work to a child: a headless coding session in this working directory, run through one of this build's backends. The role picks the job. plan: a planner on the configured model, or the model you name, which can read the code, run commands and write scratch files, challenges a goal and your proposed plan and consolidates it into an agreed, numbered task list with acceptance criteria. A plan call continues the last plan run of the backend it routes to, so follow-ups can refer to the earlier agreement, until that run's context passes its cap or the call names another model, when the call starts a fresh plan run carrying the agreed plan and says so; fresh starts a new plan run. implement: implements one clear, bounded task with full tools and reports what changed and how it was verified. If the task needs a broader scope or a design decision, it stops and reports under Escalation instead of widening the task. ultracode: Claude Code with ultracode on orchestrates Claude Opus 5 agents at xhigh effort, one agent at a time, to implement, verify and review a task, several tasks in dependency order, or a whole agreed plan. It is slower and costlier than implement; use it only when the user asks for it. ask: read-only tools (on claude: Read, Bash, Grep, Glob, WebSearch, WebFetch) answer a question about the code with file and line references, or with mode review give an independent review of a change, findings ranked by severity. It has no edit or write tool, and its contract forbids changing files through a shell. security: investigates one scoped security concern, area or change on the user's own Pi provider configuration, with the same tools as role implement. It confirms a finding where it can, reports each with a severity and with whether it is confirmed or inferred, and never puts a secret in its report by value. Its task says whether fixes are authorized: with none it reports findings and changes no application code, and with one it writes the smallest fix that closes a finding and verifies it. Ask for it only when the user asks for a security investigation, audit or fix. ${configurationText(configuration.roles)} A disabled role is refused whether a call starts or continues it. backend picks the harness a child runs in: leave backend unset unless the user names one, and a fresh run goes to the backend the configuration above names for its role, on that role's configured model and effort. A call that names the other backend runs there on that backend's own defaults, never on the settings configured for the role's other backend. backend pi runs plan, implement, ask and security on the user's own Pi provider configuration, under the same contracts as the claude roles, security's own contract included; role ultracode runs on the claude backend alone, and role security on the pi backend alone, so a call that names it goes to pi whether or not it names a backend and naming claude for it is refused before anything starts. On pi the tools are Pi's own and are not the claude lists above: roles plan, implement and security run with read, bash, edit, write, grep, find and ls, role ask runs with read, bash, grep, find and ls and has no web search or web fetch tool at all, and every pi role also gets ask_orchestrator, which is how a pi child asks you a question. A pi call's model is a provider and a model id, such as deepseek/deepseek-chat, taken from the call's model parameter, then the selection the run it continues actually ran with, then this session's configuration for that role, which by default comes from PI_FUSION_PI_<ROLE>_MODEL; a pi call with none of those is refused before anything starts, because nothing here resolves a pi model for you. backend codex is experimental: it runs plan and implement in a workspace-write sandbox, and ask read-only, under the same contracts, through the user's own codex install, configuration and login, with no ultracode or security role; its model and effort are single tokens from the call, then the selection the run it continues actually ran with, then this session's configuration, which by default comes from PI_FUSION_CODEX_<ROLE>_MODEL and _EFFORT, and otherwise the host's own codex default. A codex child gets no ask_orchestrator, so it reports a missing decision instead of asking. A message to a running codex run is sent once to its current turn, with no retry, and a turn that took it has queued it, which does not show the child read it. A codex run is continued like any other, but only from the exact turn its record names: in the Pi session that recorded it its thread is resumed, and refused if it has moved past that turn; in another one it is forked from that turn into a new thread. A codex plan handoff carries the model and effort the plan run recorded and not its provider, so the fresh thread runs on the provider the host's own codex configuration chooses. A codex run's stats line names the codex resume command that reopens its thread. Every run gets a handle such as run-3, shown in the stats line. continue with a handle sends the task as a follow-up to that run: the child keeps its context from the run's last successful call, across a resume of this session, /tree and forks, stays on the backend it ran on, and keeps the model and effort that run was started with unless the call names others, whatever profile is selected since. Calls run one at a time: Pi serializes any turn that contains one. Returns the child's report, or with background true the handle at once and the report later as a message; manage a background run with fusion_control. If the child asks a question, the call returns the question at once and the run waits in the background until you answer it with fusion_control message. Only one run that can change files is active at a time, waiting included; ask runs can go next to it. The claude tool is this same delegation forced to the claude backend, kept for compatibility, and fusion_control and claude_control both act on every run.`,
 		promptSnippet:
 			"Delegate planning (plan), bounded implementation (implement), implementation the user asks ultracode for (ultracode), read-only questions and reviews (ask) or a scoped security investigation or fix the user asked for (security) to a coding child",
 		promptGuidelines: [
@@ -3568,13 +3592,13 @@ export default function fusion(pi: ExtensionAPI, options: FusionOptions = {}) {
 			backend: Type.Optional(
 				stringEnum(
 					BACKEND_NAMES,
-					"The harness the child runs in: claude, which runs every role but security, or pi, which runs plan, implement, ask and security on the user's own Pi provider configuration and needs a provider and model id from the call's model parameter or this session's configuration. codex runs fresh implement and ask runs through the user's own codex install, experimentally; a codex run cannot be continued. Leave it unset to run the role on the backend this session's configuration names for it, and name one only when the user asks for it; role security goes to pi whether or not this names it, because no other harness runs it, and naming claude for it is refused. With continue it must name the backend that run is on, if it names one at all.",
+					"The harness the child runs in: claude, which runs every role but security, or pi, which runs plan, implement, ask and security on the user's own Pi provider configuration and needs a provider and model id from the call's model parameter or this session's configuration. codex runs plan, implement and ask through the user's own codex install, experimentally. Leave it unset to run the role on the backend this session's configuration names for it, and name one only when the user asks for it; role security goes to pi whether or not this names it, because no other harness runs it, and naming claude for it is refused. With continue it must name the backend that run is on, if it names one at all.",
 				),
 			),
 			model: Type.Optional(
 				Type.String({
 					description:
-						"A model instead of the role's configured one: on the claude backend a Claude Code alias or id, for plan, implement and ask only; on the pi backend a provider and model id such as deepseek/deepseek-chat, which every pi role takes; on the codex backend a model id with no whitespace, for implement and ask, which left unset runs on the host's own codex default. A run keeps its model for later calls that name no model. A plan call that names another model than the plan run is on starts a fresh plan run carrying the agreed plan.",
+						"A model instead of the role's configured one: on the claude backend a Claude Code alias or id, for plan, implement and ask only; on the pi backend a provider and model id such as deepseek/deepseek-chat, which every pi role takes; on the codex backend a model id with no whitespace, for plan, implement and ask, which left unset runs on the host's own codex default. A run keeps its model for later calls that name no model. A plan call that names another model than the plan run is on starts a fresh plan run carrying the agreed plan.",
 				}),
 			),
 			effort: Type.Optional(
@@ -3582,7 +3606,7 @@ export default function fusion(pi: ExtensionAPI, options: FusionOptions = {}) {
 				// list this host could advertise. The binding the call routes to checks the value, before anything starts.
 				Type.String({
 					description:
-						"The child's effort instead of the role's configured one, for plan, implement, ask and security, checked by the backend the call routes to before anything starts: on the claude backend one of low, medium, high, xhigh or max, for plan, implement and ask; on the pi backend one of the thinking levels off, minimal, low, medium, high, xhigh or max, for every pi role; on the codex backend one level with no whitespace, for implement and ask, which the binding accepts as written and the codex model or server may still refuse when the run starts. Left unset, the role's configured effort applies, or on pi and codex the child's or host's own default when none is configured.",
+						"The child's effort instead of the role's configured one, for plan, implement, ask and security, checked by the backend the call routes to before anything starts: on the claude backend one of low, medium, high, xhigh or max, for plan, implement and ask; on the pi backend one of the thinking levels off, minimal, low, medium, high, xhigh or max, for every pi role; on the codex backend one level with no whitespace, for plan, implement and ask, which the binding accepts as written and the codex model or server may still refuse when the run starts. Left unset, the role's configured effort applies, or on pi and codex the child's or host's own default when none is configured.",
 				}),
 			),
 		}),
@@ -3752,16 +3776,25 @@ export default function fusion(pi: ExtensionAPI, options: FusionOptions = {}) {
 					{ ...runDetails(run), handle, state: run.state, sent: "none", answeredBy: "user" },
 				);
 			}
-			// A child that never took a steer is said to be one at once: waiting for its end would hold the host for the whole
-			// run only to report a message that was never going to be sent.
+			// A child whose input was closed from its admission is said to be one at once: waiting for its end would hold the
+			// host for the whole run only to report a message that was never going to be sent.
 			if (run.state === "running" && !run.steerable) {
 				return reply(
 					`${handle} (${run.role.name}) runs on the ${run.backend} backend, whose child takes no steer while it runs. The message was not sent. Wait for its report with ${tool} wait, or stop it with ${tool} cancel; to follow up, start a new fusion run that carries its report as context.`,
 					{ ...runDetails(run), handle, state: run.state, sent: "none" },
 				);
 			}
-			if (run.state === "running" && run.input.push(params.message!)) {
-				return reply(`steer sent to ${handle}; the child reads it when it next takes input`, { ...runDetails(run), handle, state: run.state, sent: "steer" });
+			if (run.state === "running") {
+				if (run.input.push(params.message!)) return reply(steerTaken(run), { ...runDetails(run), handle, state: run.state, sent: "steer" });
+				// An input still open that took nothing is full, or refused this text, and the run goes on: say so now rather
+				// than hold the host until the run ends. Nothing queues the message or sends it later. A closed input is the
+				// run ending, and the wait below reports how it ended.
+				if (run.input.open) {
+					return reply(
+						`${handle} (${run.role.name}) is running and did not accept the message now: its input took no more, as a full one does. The message was not sent, and nothing sends it later. Send it again with ${tool} message once the run has taken what it holds, wait for its report with ${tool} wait, or stop it with ${tool} cancel.`,
+						{ ...runDetails(run), handle, state: run.state, sent: "none" },
+					);
+				}
 			}
 			await run.ended;
 			const text = summary(run);
@@ -3798,7 +3831,7 @@ export default function fusion(pi: ExtensionAPI, options: FusionOptions = {}) {
 		executionMode: "sequential",
 		label: "Fusion control",
 		description:
-			"Act on the runs of this Pi session, whatever started them, by handle. A run is running, waiting (its child asked a question and waits for the answer), or has ended. status: without run, list every run with role, model, state, elapsed time and open question; with run, add its current activity, tool call count and, for a run that can change files, the work tree changes seen so far. wait: block until the run ends and return its report, or until it asks a question and return the question; Esc stops the wait, not the run. message: to a waiting run, the answer to its question; to a running child, a steer it reads when it next takes input, except a codex child, which takes none and is said to at once; to a run that has ended it sends nothing and returns the run's state and a summary of its report, so you can decide to continue the run with fusion or take no action. cancel: stop the run.",
+			"Act on the runs of this Pi session, whatever started them, by handle. A run is running, waiting (its child asked a question and waits for the answer), or has ended. status: without run, list every run with role, model, state, elapsed time and open question; with run, add its current activity, tool call count and, for a run that can change files, the work tree changes seen so far. wait: block until the run ends and return its report, or until it asks a question and return the question; Esc stops the wait, not the run. message: to a waiting run, the answer to its question; to a running child, a steer it reads when it next takes input (on codex, sent once to the run's current turn with no retry, where being taken does not show the child read it); a message a running child's input does not accept now, closed or full, is not sent, and the reply says so; to a run that has ended it sends nothing and returns the run's state and a summary of its report, so you can decide to continue the run with fusion or take no action. cancel: stop the run.",
 		promptSnippet: "Check, wait for, answer, steer or cancel a run by its handle",
 		parameters: Type.Object({
 			action: stringEnum(CONTROL_ACTIONS, "status, wait, message or cancel."),
@@ -3819,7 +3852,7 @@ export default function fusion(pi: ExtensionAPI, options: FusionOptions = {}) {
 		executionMode: "sequential",
 		label: "Claude control",
 		description:
-			"Act on the runs of this Pi session by handle, whichever tool started them and whichever backend runs them. A run is running, waiting (its child asked a question and waits for the answer), or has ended. status: without run, list every run with role, model, state, elapsed time and open question; with run, add its current activity, tool call count and, for a run that can change files, the work tree changes seen so far. wait: block until the run ends and return its report, or until it asks a question and return the question; Esc stops the wait, not the run. message: to a waiting run, the answer to its question; to a running child, a steer it reads when it next takes input, except a codex child, which takes none and is said to at once; to a run that has ended it sends nothing and returns the run's state and a summary of its report, so you can decide to continue the run with claude (fusion for a Pi run) or take no action. cancel: stop the run.",
+			"Act on the runs of this Pi session by handle, whichever tool started them and whichever backend runs them. A run is running, waiting (its child asked a question and waits for the answer), or has ended. status: without run, list every run with role, model, state, elapsed time and open question; with run, add its current activity, tool call count and, for a run that can change files, the work tree changes seen so far. wait: block until the run ends and return its report, or until it asks a question and return the question; Esc stops the wait, not the run. message: to a waiting run, the answer to its question; to a running child, a steer it reads when it next takes input (on codex, sent once to the run's current turn with no retry, where being taken does not show the child read it); a message a running child's input does not accept now, closed or full, is not sent, and the reply says so; to a run that has ended it sends nothing and returns the run's state and a summary of its report, so you can decide to continue the run with claude (fusion for a Pi run) or take no action. cancel: stop the run.",
 		promptSnippet: "Check, wait for, answer, steer or cancel a run by its handle",
 		parameters: Type.Object({
 			action: stringEnum(CONTROL_ACTIONS, "status, wait, message or cancel."),

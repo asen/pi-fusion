@@ -423,7 +423,7 @@ test("the production-default registration keeps the codex tripwire, because no m
 	}
 	// The variables it refuses include every codex one a later launch would read: both selection variables of each
 	// role codex runs, and the binary override.
-	assert.deepEqual(CODEX_VARIABLES, ["PI_FUSION_CODEX_IMPLEMENT_MODEL", "PI_FUSION_CODEX_IMPLEMENT_EFFORT", "PI_FUSION_CODEX_ASK_MODEL", "PI_FUSION_CODEX_ASK_EFFORT", "PI_FUSION_CODEX_BIN"]);
+	assert.deepEqual(CODEX_VARIABLES, ["PI_FUSION_CODEX_PLAN_MODEL", "PI_FUSION_CODEX_PLAN_EFFORT", "PI_FUSION_CODEX_IMPLEMENT_MODEL", "PI_FUSION_CODEX_IMPLEMENT_EFFORT", "PI_FUSION_CODEX_ASK_MODEL", "PI_FUSION_CODEX_ASK_EFFORT", "PI_FUSION_CODEX_BIN"]);
 	for (const name of CODEX_VARIABLES) assert.ok(PRODUCTION_DEFAULT_VARIABLES.includes(name), `${name} is not refused by a production-default registration`);
 	const previous = process.env.PI_FUSION_CODEX_BIN;
 	process.env.PI_FUSION_CODEX_BIN = "/nowhere/codex";
@@ -620,8 +620,9 @@ test("every role a record may name has capabilities, and the host advertises the
 	assert.equal(runsOn("security", "pi"), true, "and the backend it does run on binds it");
 	assert.deepEqual([...ROLE_SPECS.implement.backends].sort(), ["claude", "codex", "pi"]);
 	assert.deepEqual([...ROLE_SPECS.ask.backends].sort(), ["claude", "codex", "pi"]);
-	assert.deepEqual([...ROLE_SPECS.plan.backends].sort(), ["claude", "pi"], "codex runs no plan until its checkpoints are qualified");
-	for (const role of ["plan", "ultracode", "security"]) assert.equal(runsOn(role, "codex"), false, role);
+	assert.deepEqual([...ROLE_SPECS.plan.backends].sort(), ["claude", "codex", "pi"], "codex runs plan beside claude and pi, continued from its recorded checkpoint");
+	assert.equal(runsOn("plan", "codex"), true);
+	for (const role of ["ultracode", "security"]) assert.equal(runsOn(role, "codex"), false, role);
 	assert.equal(canChangeFiles("ask"), false);
 	assert.equal(canChangeFiles("nobody"), true, "a role nothing knows is treated as one that can change files");
 	assert.equal(isReviewable("nobody"), false);

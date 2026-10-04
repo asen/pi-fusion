@@ -9,7 +9,7 @@ import { type BackendName, BACKEND_NAMES } from "./backends/types.ts";
 
 /**
  * Every role a record may name, which is every role a backend of this build runs: `security` runs on Pi and nowhere
- * else, and Codex runs `implement` and `ask` alone until its checkpoints are qualified for a plan run to continue.
+ * else, `ultracode` on Claude alone, and Codex runs `plan`, `implement` and `ask`.
  */
 export const KNOWN_ROLE_NAMES = ["plan", "implement", "ultracode", "ask", "security"] as const;
 export type KnownRoleName = (typeof KNOWN_ROLE_NAMES)[number];
@@ -26,7 +26,7 @@ export interface RoleSpec {
 
 export const ROLE_SPECS: Record<KnownRoleName, RoleSpec> = {
 	// plan writes its own notes and files, so it keeps the file-changing classification it has always had.
-	plan: { name: "plan", backends: ["claude", "pi"], canChangeFiles: true, reviewable: false },
+	plan: { name: "plan", backends: ["claude", "pi", "codex"], canChangeFiles: true, reviewable: false },
 	implement: { name: "implement", backends: BACKEND_NAMES, canChangeFiles: true, reviewable: true },
 	ultracode: { name: "ultracode", backends: ["claude"], canChangeFiles: true, reviewable: true },
 	ask: { name: "ask", backends: BACKEND_NAMES, canChangeFiles: false, reviewable: false },

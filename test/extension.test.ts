@@ -630,7 +630,7 @@ test("the load-time contract check covers every contract any backend's roles nam
 	}
 	for (const name of PI_CONTRACT_FILES) assert.ok(fs.existsSync(path.join(repoRoot, "contracts", name)), `this install ships no contracts/${name}`);
 	// Codex names the shared contracts and one addendum of its own, which is checked at load like any other contract.
-	assert.deepEqual([...CODEX_CONTRACT_FILES].sort(), ["ask-answer.md", "ask-review.md", "codex-no-questions.md", "implement.md"]);
+	assert.deepEqual([...CODEX_CONTRACT_FILES].sort(), ["ask-answer.md", "ask-review.md", "codex-no-questions.md", "implement.md", "plan.md"]);
 	for (const role of CODEX_ROLE_NAMES) {
 		for (const mode of role === "ask" ? CODEX_MODES : [undefined]) {
 			const bound = codexRole({ role, ...(mode === undefined ? {} : { mode }) }, undefined, {} as NodeJS.ProcessEnv);

@@ -70,7 +70,7 @@ export function captureBaseline(env: NodeJS.ProcessEnv = process.env): Baseline 
 	const pi = (role: string): Selection => variables("PI_FUSION_PI", role);
 	const codex = (role: string): Selection => variables("PI_FUSION_CODEX", role);
 	return {
-		plan: { claude: { model: trimmed(env, "PI_FUSION_PLAN_MODEL") ?? "fable", effort: "xhigh" }, pi: pi("plan") },
+		plan: { claude: { model: trimmed(env, "PI_FUSION_PLAN_MODEL") ?? "fable", effort: "xhigh" }, pi: pi("plan"), codex: codex("plan") },
 		implement: { claude: { model: trimmed(env, "PI_FUSION_IMPLEMENT_MODEL") ?? "opus", effort: trimmed(env, "PI_FUSION_IMPLEMENT_EFFORT") ?? "high" }, pi: pi("implement"), codex: codex("implement") },
 		ultracode: { claude: { model: trimmed(env, "PI_FUSION_ULTRACODE_MODEL") ?? "fable", effort: ULTRACODE_EFFORT } },
 		ask: { claude: { model: trimmed(env, "PI_FUSION_ASK_MODEL") ?? "opus", effort: trimmed(env, "PI_FUSION_ASK_EFFORT") ?? "high" }, pi: pi("ask"), codex: codex("ask") },

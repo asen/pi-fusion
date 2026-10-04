@@ -19,7 +19,7 @@ User commands act on the same runs as either control tool. Run-changing `steer`,
 
 Status offers continuation only for a usable record. A Pi transcript path appears only after the host accepts the outcome: not for a live run or a rejected result, and a fork names its new child file. Claude hints use `claude --resume <session id>`. See [Records](runs.md#backends-in-a-record).
 
-“Steer sent” means accepted for delivery, not consumed or acted on by the model. Ordinary editor text goes to the host, not automatically to the child. `/fusion steer` logs the instruction to the host as well; nothing automatically resends an unread child steer.
+“Steer sent” means accepted for delivery, not consumed or acted on by the model; on Codex the notice says `steer queued for run-N` and that it goes once to the current turn, with no retry. A child whose input is still open but takes no more, as a full Codex queue does, gets `run-N did not accept the steer now`; one whose input has closed gets `run-N no longer takes input`. Neither sends, queues or retries anything, and neither is logged to the host. Ordinary editor text goes to the host, not automatically to the child. `/fusion steer` logs an accepted instruction to the host as well; nothing automatically resends an unread child steer.
 
 A clean cancel notifies `run-N cancelled`. If stopping the Pi child left a cleanup concern or retained storage, the notice is a warning, for example:
 

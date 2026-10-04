@@ -28,7 +28,7 @@ export type CodexSession = { kind: "new" } | { kind: "resume"; id: string; at: s
 /** Why a continuation never reaches a Codex child: its reference is another backend's, or no codex thread at all. */
 export const CODEX_FOREIGN_SESSION = "the codex backend continues only a codex thread, and this run's reference names another backend's session or no codex thread at all";
 /** Why a codex thread with no trusted checkpoint, or none with its usage baseline, is never continued. */
-export const CODEX_NO_CHECKPOINT = "the codex backend continues a thread only from a trusted checkpoint and the usage baseline recorded with it, and this reference carries no such pair; start a new run without continue that carries the earlier report as context";
+export const CODEX_NO_CHECKPOINT = "the codex backend continues a thread only from a trusted checkpoint and the usage baseline recorded with it, and this reference carries no such pair; start a new run without continue that carries the earlier report as context (a plan call takes fresh true)";
 
 /**
  * The session an intent becomes, or a refusal made before any binary lookup, contract read or spawn. A continuation's
@@ -82,8 +82,8 @@ export const TERMINAL_ERROR = "the codex turn reported a terminal error and stil
  * past it. The record stays what it was, and nothing here forks, rewinds or replays to get back to it, so the way on is
  * a new run.
  */
-export const RESUME_MOVED = "the codex thread's latest turn is not the checkpoint this run continues from, so no turn was started; start a new run without continue that carries the earlier report as context";
-export const RESUME_UNSETTLED = "the codex thread's checkpoint turn is not completed, so no turn was started; start a new run without continue that carries the earlier report as context";
+export const RESUME_MOVED = "the codex thread's latest turn is not the checkpoint this run continues from, so no turn was started; start a new run without continue that carries the earlier report as context (a plan call takes fresh true)";
+export const RESUME_UNSETTLED = "the codex thread's checkpoint turn is not completed, so no turn was started; start a new run without continue that carries the earlier report as context (a plan call takes fresh true)";
 export const FORK_SAME_THREAD = "the codex child answered the fork with the thread it was asked to fork from, so no turn was started";
 export const FORK_WRONG_SOURCE = "the codex child reported its forked thread as forked from another thread than the one this run forked, so no turn was started";
 export const FORK_NO_TIP = "the codex forked thread reported no turns, so it has no starting checkpoint and no turn was started";

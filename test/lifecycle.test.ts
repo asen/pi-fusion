@@ -9,6 +9,7 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { createCodexBackend } from "../extensions/backends/codex.ts";
 import { CODEX_APP_SERVER_ARGS } from "../extensions/backends/codex-launch.ts";
+import { RESUME_MOVED } from "../extensions/backends/codex-outcome.ts";
 import { type BackendName, type HostBackend, hostBackend, type SessionIntent } from "../extensions/backends/types.ts";
 import fusion from "../extensions/fusion.ts";
 import { memoryProfileStore, type ProfileStore } from "../extensions/profile-store.ts";
@@ -2060,8 +2061,11 @@ test("a manual review by an ask role configured on codex is bound read-only on i
 
 const OFF_REFUSAL = "fusion is off; turn it on with /fusion on, or ask for Fusion by name";
 
-test("a running codex run takes no steer: both control tools and /fusion steer say so at once, and status, wait and cancel act on it as on any run", async () => {
-	// An own in-memory double over the shared codex tripwire, with the input closed from the start as a codex child's is.
+/** What a host is told when a codex run's input took its steer: queued for the turn, never said to be read. */
+const CODEX_QUEUED = "steer queued for run-1: it goes once, with no retry, to the run's current turn, and the turn taking it does not show the child read it; the run's report counts what became of it";
+
+test("a running codex run takes a steer from both control tools and /fusion steer, said to be queued for its turn and not read, and status, wait and cancel act on it as on any run", async () => {
+	// An own in-memory double over the shared codex tripwire, its input open from admission as this build's codex backend's is.
 	const verified = { model: "gpt-5.5", provider: "openai" };
 	const codex = fakeBackend({
 		name: "codex",
@@ -2071,20 +2075,16 @@ test("a running codex run takes no steer: both control tools and /fusion steer s
 	const started = await host.fusion({ role: "implement", task: "long work", backend: "codex", background: true });
 	assert.equal(started.text, "run-1 started in the background; you get the report when it ends");
 	const running = await codex.started();
-	// The reply comes while the run is still running: nothing waits for its end to say no steer was sent.
 	for (const [tool, control] of [["fusion_control", host.control], ["claude_control", host.claudeControl]] as const) {
-		const refused = await control({ action: "message", run: "run-1", message: "also fix the typo" });
-		assert.equal(
-			refused.text,
-			`run-1 (implement) runs on the codex backend, whose child takes no steer while it runs. The message was not sent. Wait for its report with ${tool} wait, or stop it with ${tool} cancel; to follow up, start a new fusion run that carries its report as context.`,
-		);
-		assert.deepEqual([refused.details.state, refused.details.sent], ["running", "none"], tool);
+		const queued = await control({ action: "message", run: "run-1", message: `from ${tool}` });
+		assert.equal(queued.text, CODEX_QUEUED, tool);
+		assert.deepEqual([queued.details.state, queued.details.sent], ["running", "steer"], tool);
 	}
 	host.notices.length = 0;
 	await host.command("steer run-1 also fix the typo");
-	assert.deepEqual(host.notices, ["run-1 runs on the codex backend, whose child takes no steer while it runs; nothing was sent. Wait for it with /fusion wait run-1 or stop it with /fusion cancel run-1"]);
-	assert.deepEqual(running.steers, [], "nothing reached the child");
-	assert.equal(host.sent.filter(([message]) => message.details?.kind === "steer").length, 0, "and no notice told the host a steer was sent");
+	assert.deepEqual(host.notices, [CODEX_QUEUED]);
+	assert.deepEqual(running.steers, ["from fusion_control", "from claude_control", "also fix the typo"], "each message reached the run's input once, in order");
+	assert.equal(host.sent.filter(([message]) => message.details?.kind === "steer").length, 1, "the user's steer is told to the host once");
 	assert.match((await host.control({ action: "status", run: "run-1" })).text ?? "", /^run-1 · implement · host default · running · background · /);
 
 	const waiting = host.control({ action: "wait", run: "run-1" });
@@ -2103,9 +2103,104 @@ test("a running codex run takes no steer: both control tools and /fusion steer s
 	assert.match(await statusOf(host, "run-2"), /^run-2 · implement · host default -> gpt-5\.5 · cancelled · background/);
 	assert.equal(
 		(await host.fusion({ continue: "run-2", task: "go on" })).error,
-		"run-2 ran on codex and recorded no trusted checkpoint, so it is kept for reading and not continued; open its thread with codex resume thread-2, and new work needs a new run without continue",
+		"run-2 ran on codex and recorded no trusted checkpoint, so it is kept for reading and not continued; open its thread with codex resume thread-2, and new work needs a new run without continue (a plan call takes fresh true)",
 	);
 	assert.equal(codex.starts.length, 2, "nothing continued the cancelled thread");
+});
+
+test("a run whose input was closed from its admission takes no steer: both control tools and /fusion steer say so at once, by its input and not its backend's name", async () => {
+	// The double's input is closed on purpose: no backend of this build hands over such an input, and the host reads the
+	// input's own state rather than a backend name to say so.
+	const codex = fakeBackend({ name: "codex", steers: false, scripts: [codexScript("thread-1", { pending: true })] });
+	const host = makeHost({ backends: { codex: codex.backend } });
+	await host.fusion({ role: "implement", task: "long work", backend: "codex", background: true });
+	const running = await codex.started();
+	for (const [tool, control] of [["fusion_control", host.control], ["claude_control", host.claudeControl]] as const) {
+		const refused = await control({ action: "message", run: "run-1", message: "also fix the typo" });
+		assert.equal(
+			refused.text,
+			`run-1 (implement) runs on the codex backend, whose child takes no steer while it runs. The message was not sent. Wait for its report with ${tool} wait, or stop it with ${tool} cancel; to follow up, start a new fusion run that carries its report as context.`,
+		);
+		assert.deepEqual([refused.details.state, refused.details.sent], ["running", "none"], tool);
+	}
+	host.notices.length = 0;
+	await host.command("steer run-1 also fix the typo");
+	assert.deepEqual(host.notices, ["run-1 runs on the codex backend, whose child takes no steer while it runs; nothing was sent. Wait for it with /fusion wait run-1 or stop it with /fusion cancel run-1"]);
+	assert.deepEqual(running.steers, [], "nothing reached the child");
+	assert.equal(host.sent.filter(([message]) => message.details?.kind === "steer").length, 0, "and no notice told the host a steer was sent");
+	running.release();
+	await ended(host, "run-1");
+});
+
+test("a running child whose open input takes no more says at once that the message was not accepted, and nothing is queued, retried or told as sent", async () => {
+	const codex = fakeBackend({ name: "codex", steerCapacity: 1, scripts: [codexScript("thread-1", { pending: true })] });
+	const host = makeHost({ backends: { codex: codex.backend } });
+	await host.fusion({ role: "implement", task: "long work", backend: "codex", background: true });
+	const running = await codex.started();
+	assert.equal((await host.control({ action: "message", run: "run-1", message: "first" })).text, CODEX_QUEUED);
+	// The reply comes while the run is still running: nothing waits for its end to say the message was not taken.
+	for (const [tool, control] of [["fusion_control", host.control], ["claude_control", host.claudeControl]] as const) {
+		const full = await control({ action: "message", run: "run-1", message: "second" });
+		assert.equal(
+			full.text,
+			`run-1 (implement) is running and did not accept the message now: its input took no more, as a full one does. The message was not sent, and nothing sends it later. Send it again with ${tool} message once the run has taken what it holds, wait for its report with ${tool} wait, or stop it with ${tool} cancel.`,
+		);
+		assert.deepEqual([full.details.state, full.details.sent], ["running", "none"], tool);
+	}
+	host.notices.length = 0;
+	await host.command("steer run-1 third");
+	assert.deepEqual(host.notices, ["run-1 did not accept the steer now: its input took no more, as a full one does; nothing was sent, and nothing sends it later"]);
+	assert.deepEqual(running.steers, ["first"], "only the steer the input took reached it");
+	assert.equal(host.sent.filter(([message]) => message.details?.kind === "steer").length, 0, "no refused steer was told to the host as sent");
+	running.release();
+	await ended(host, "run-1");
+	assert.equal(running.steers.length, 1, "and nothing resent the refused ones");
+});
+
+test("a codex plan run is continued implicitly from its recorded checkpoint, and a cap handoff starts a fresh thread on its model and effort with no provider", async () => {
+	// An own in-memory double over the shared codex tripwire: what each scripted run reports is what a correct codex
+	// child would, a thread at a settled checkpoint with its usage baseline and the selection read back.
+	const selection = { model: "gpt-5.5", provider: "openai", effort: "high" };
+	const first = { inputTokens: 1_200, cachedInputTokens: 400, outputTokens: 130, reasoningOutputTokens: 25, totalTokens: 1_330 };
+	const second = { inputTokens: 3_000, cachedInputTokens: 1_000, outputTokens: 300, reasoningOutputTokens: 50, totalTokens: 3_300 };
+	const codex = fakeBackend({
+		name: "codex",
+		scripts: [
+			codexScript("thread-1", { text: "## Agreed plan\n1. do the thing", session: { backend: "codex", sessionId: "thread-1", checkpoint: "turn-1", baseline: first }, selection, contextTokens: 1_000, contextWindow: 100_000 }),
+			codexScript("thread-1", { text: "## Agreed plan\n1. do the thing\n2. and the next", session: { backend: "codex", sessionId: "thread-1", checkpoint: "turn-2", baseline: second }, selection, contextTokens: 50_000, contextWindow: 100_000 }),
+			codexScript("thread-2", { session: { backend: "codex", sessionId: "thread-2", checkpoint: "turn-1", baseline: first }, selection: { model: "gpt-5.5", provider: "azure", effort: "high" } }),
+		],
+	});
+	const host = makeHost({ backends: { codex: codex.backend }, profiles: profileWith({ plan: { enabled: true, backend: "codex" } }) });
+	assert.equal((await host.fusion({ role: "plan", task: "agree a plan", effort: "high" })).error, undefined);
+	await ended(host, "run-1");
+	assert.deepEqual(codex.starts[0]!.role, { name: "plan", effort: "high", contract: "plan.md", addendum: "codex-no-questions.md", sandboxMode: "workspace-write", approvalPolicy: "never" });
+	assert.deepEqual(host.entries()[0], { run: "run-1", role: "plan", backend: "codex", hostSessionId: "host-1", session: { backend: "codex", sessionId: "thread-1", checkpoint: "turn-1", baseline: first }, selection, contextTokens: 1_000, contextWindow: 100_000 });
+
+	// A plan call with no handle continues the latest codex plan run, resuming its thread at the recorded checkpoint on the
+	// recorded selection, provider included.
+	const continued = await host.fusion({ role: "plan", task: "and the next step?" });
+	assert.equal(continued.error, undefined);
+	await ended(host, "run-1");
+	const resumed = codex.starts[1]!;
+	assert.deepEqual(resumed.intent, { kind: "resume", ref: { backend: "codex", sessionId: "thread-1", checkpoint: "turn-1", baseline: first } });
+	assert.deepEqual(resumed.role, { name: "plan", model: "gpt-5.5", provider: "openai", effort: "high", contract: "plan.md", addendum: "codex-no-questions.md", sandboxMode: "workspace-write", approvalPolicy: "never" });
+	assert.equal(resumed.prompt, "and the next step?", "a continuation is no handoff and carries no earlier report");
+	assert.deepEqual(host.entries()[1]!.session, { backend: "codex", sessionId: "thread-1", checkpoint: "turn-2", baseline: second });
+
+	// Past the cap — the latest response's input against the window, 50% here — the next plan call starts a fresh thread
+	// carrying the last report, on the model and effort the run verified and with no provider: the host's own is used.
+	const handed = await host.fusion({ role: "plan", task: "and after that?" });
+	assert.equal(handed.error, undefined);
+	assert.match(handed.text ?? "", /^run-2 is a fresh plan run: run-1's context had reached 50% of its window/);
+	const fresh = codex.starts[2]!;
+	assert.deepEqual(fresh.intent, { kind: "new" });
+	assert.deepEqual(fresh.role, { name: "plan", model: "gpt-5.5", effort: "high", contract: "plan.md", addendum: "codex-no-questions.md", sandboxMode: "workspace-write", approvalPolicy: "never" });
+	assert.match(fresh.prompt, /## Agreed plan\n1\. do the thing\n2\. and the next/, "the fresh run carries the replaced run's last report as the plan so far");
+	await ended(host, "run-2");
+	// What the fresh thread read back is what it records, provider included: nothing pinned the old one.
+	assert.deepEqual(host.entries()[2]!.selection, { model: "gpt-5.5", provider: "azure", effort: "high" });
+	assert.deepEqual(tripwireReaches("codex"), []);
 });
 
 test("a codex outcome's scalar session id and flat checkpoint are diagnostics: after wait the record keeps the tagged thread and selection alone, readable and checkpointless", async () => {
@@ -2125,7 +2220,7 @@ test("a codex outcome's scalar session id and flat checkpoint are diagnostics: a
 		assert.doesNotMatch(text ?? "", /codex-scalar|codex-flat-checkpoint|claude --resume/);
 	}
 	// Kept for reading, and continued through neither tool pair; each names fusion or the thread to reopen.
-	const refusal = "run-1 ran on codex and recorded no trusted checkpoint, so it is kept for reading and not continued; open its thread with codex resume thread-1, and new work needs a new run without continue";
+	const refusal = "run-1 ran on codex and recorded no trusted checkpoint, so it is kept for reading and not continued; open its thread with codex resume thread-1, and new work needs a new run without continue (a plan call takes fresh true)";
 	assert.equal((await host.fusion({ continue: "run-1", task: "more" })).error, refusal);
 	assert.equal((await host.claude({ continue: "run-1", task: "more" })).error, "run-1 ran on the codex backend, which the claude tool does not run; continue it with fusion and continue run-1");
 	for (const control of [host.control, host.claudeControl]) {
@@ -2345,10 +2440,40 @@ test("a codex run continued through the host over the literal fake resumes its t
 	// A thread that moved past its recorded checkpoint is refused before any turn, and the good record stays authoritative.
 	Object.assign(env, { FAKE_CODEX_SCENARIO: "resume-moved", FAKE_CODEX_HISTORY: JSON.stringify({ turns: [{ id: "b-turn-1", status: "completed" }], seed: second }), FAKE_CODEX_PREFIX: "c-" });
 	const moved = await host.fusion({ continue: "run-1", task: "again" });
-	assert.match(moved.text ?? moved.error ?? "", /the codex thread's latest turn is not the checkpoint this run continues from, so no turn was started; start a new run without continue that carries the earlier report as context/);
+	assert.ok((moved.text ?? moved.error ?? "").includes(RESUME_MOVED), moved.text ?? moved.error);
 	await ended(host, "run-1");
 	assert.equal(host.entries().length, 2, "a failed resume records nothing");
 	assert.deepEqual(host.entries()[1]!.session, { backend: "codex", sessionId: "thr-1", checkpoint: "b-turn-1", baseline: second });
+	assert.deepEqual(tripwireReaches("codex"), []);
+});
+
+test("an implicit codex plan call whose thread moved past its checkpoint is refused with the fresh true way on over the literal fake, and fresh true starts a new thread", async () => {
+	const dir = gitRepo("codex-plan-moved");
+	const home = path.join(tempDir("codex-plan-moved-home"), "codex-home");
+	const env: Record<string, string> = { FAKE_CODEX_SCENARIO: "resume-ok" };
+	const host = makeHost({ backends: { codex: literalCodex(home, env) }, cwd: dir, profiles: profileWith({ plan: { enabled: true, backend: "codex" } }) });
+	assert.equal((await host.fusion({ role: "plan", task: "agree a plan" })).error, undefined);
+	await ended(host, "run-1");
+	const first = { inputTokens: 400, cachedInputTokens: 300, outputTokens: 20, reasoningOutputTokens: 5, totalTokens: 420, cacheWriteInputTokens: 0 };
+	assert.deepEqual(host.entries()[0]!.session, { backend: "codex", sessionId: "thr-1", checkpoint: "turn-1", baseline: first });
+
+	// The next plan call names no handle, so it resumes run-1's thread; the thread moved on, and the refusal names the way
+	// on for a plan call, since leaving out continue alone would resume the same thread again.
+	Object.assign(env, { FAKE_CODEX_SCENARIO: "resume-moved", FAKE_CODEX_HISTORY: JSON.stringify({ turns: [{ id: "turn-1", status: "completed" }], seed: first }), FAKE_CODEX_PREFIX: "b-" });
+	const moved = await host.fusion({ role: "plan", task: "and the next step?" });
+	const said = moved.text ?? moved.error ?? "";
+	assert.ok(said.includes(RESUME_MOVED), said);
+	assert.match(RESUME_MOVED, /\(a plan call takes fresh true\)$/);
+	await ended(host, "run-1");
+	assert.equal(host.entries().length, 1, "a failed resume records nothing, and run-1's record stays the authority");
+
+	// fresh true starts a new plan thread rather than resuming run-1's.
+	for (const key of ["FAKE_CODEX_HISTORY", "FAKE_CODEX_PREFIX"]) delete env[key];
+	env.FAKE_CODEX_SCENARIO = "resume-ok";
+	const fresh = await host.fusion({ role: "plan", task: "start the plan again", fresh: true });
+	assert.equal(fresh.error, undefined);
+	await ended(host, "run-2");
+	assert.deepEqual([host.entries()[1]!.run, host.entries()[1]!.role], ["run-2", "plan"]);
 	assert.deepEqual(tripwireReaches("codex"), []);
 });
 
@@ -2360,7 +2485,7 @@ test("a host message to a running codex run is one turn/steer to its admitted tu
 	assert.equal((await host.fusion({ role: "ask", task: "long question", backend: "codex", background: true })).error, undefined);
 	// Whether the turn is admitted yet or not, the message is taken: it waits for the turn and is then sent to it once.
 	const sent = await host.control({ action: "message", run: "run-1", message: "focus on the parser" });
-	assert.equal(sent.text, "steer sent to run-1; the child reads it when it next takes input");
+	assert.equal(sent.text, CODEX_QUEUED);
 	const report = await ended(host, "run-1");
 	assert.match(report, /\n\nsteered answer\n\n(Note: [^\n]*\n\n)?Note: of the 1 message sent to this codex run while it ran, 1 taken into its turn's input, which does not show the model read it\. None was sent twice\.\n/);
 	const steers = fs.readFileSync(log, "utf8").split("\n").filter(Boolean).map((line) => JSON.parse(line)).filter((entry) => entry.in?.method === "turn/steer");

@@ -733,7 +733,7 @@ for (const [what, scenario, intent, env, message] of RESUME_REFUSALS) {
 			if (typeof message === "string") {
 				assert.equal(outcome.run.errorMessage, message);
 				// A thread no longer at its checkpoint is not continued another way: the refusal says what to do instead.
-				assert.match(message, /; start a new run without continue that carries the earlier report as context$/);
+				assert.match(message, /; start a new run without continue that carries the earlier report as context \(a plan call takes fresh true\)$/);
 			} else assert.match(outcome.run.errorMessage ?? "", message);
 			assert.equal(sent(fixture, "turn/start").length, 0, "no turn was started");
 			assert.equal(outcome.run.session?.checkpoint, undefined);

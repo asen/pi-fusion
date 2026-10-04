@@ -250,7 +250,7 @@ test("a codex thread with no trusted checkpoint is kept for reading, and every c
 	assert.equal(record.selection, undefined);
 	assert.equal(
 		record.refusal,
-		"run-4 ran on codex and recorded no trusted checkpoint, so it is kept for reading and not continued; open its thread with codex resume thread-1, and new work needs a new run without continue",
+		"run-4 ran on codex and recorded no trusted checkpoint, so it is kept for reading and not continued; open its thread with codex resume thread-1, and new work needs a new run without continue (a plan call takes fresh true)",
 	);
 	assert.throws(() => intentFor(record, "host-1"), /recorded no trusted checkpoint/);
 	assert.throws(() => intentFor(record, "host-2"), /recorded no trusted checkpoint/, "a forked host session is refused the same way");
@@ -262,7 +262,7 @@ test("a codex checkpoint recorded with no usage baseline is kept for reading, an
 	assert.equal(record.selection, undefined, "a record kept for reading repeats no selection");
 	assert.equal(
 		record.refusal,
-		"run-4 ran on codex and recorded its checkpoint with no usage baseline, so it is kept for reading and not continued; open its thread with codex resume thread-1, and new work needs a new run without continue",
+		"run-4 ran on codex and recorded its checkpoint with no usage baseline, so it is kept for reading and not continued; open its thread with codex resume thread-1, and new work needs a new run without continue (a plan call takes fresh true)",
 	);
 	assert.throws(() => intentFor(record, "host-1"), (error: Error) => error.message === record.refusal);
 	assert.throws(() => intentFor(record, "host-2"), (error: Error) => error.message === record.refusal, "a forked host session is refused the same way");
@@ -274,7 +274,7 @@ test("a codex entry is identified by its tagged thread alone: missing, malformed
 	const bare = BARE;
 	const { inputTokens, ...noInput } = BASELINE;
 	const cases: Array<[Record<string, unknown>, RegExp, boolean]> = [
-		[{ session: undefined, selection: undefined }, /^run-4 ran on codex and recorded no verified thread, so it cannot be continued; start a new run without continue$/, false],
+		[{ session: undefined, selection: undefined }, /^run-4 ran on codex and recorded no verified thread, so it cannot be continued; start a new run without continue \(a plan call takes fresh true\)$/, false],
 		[{ session: undefined, sessionId: "thread-1", checkpoint: "turn-2" }, /^run-4 records its codex run in sessionId, checkpoint rather than in a thread reference/, false],
 		[{ session: undefined, model: "gpt-5-codex", effort: "high" }, /^run-4 records its codex run in model, effort rather than in a thread reference/, false],
 		[{ session: { sessionId: "thread-1", checkpoint: "turn-2" } }, /has an incomplete or mismatched codex thread reference/, false],
@@ -607,7 +607,7 @@ test("a codex run that failed records only what the recovery policy trusts", () 
 	assert.deepEqual(recordDecision(codexCall(), outcome({ ok: false, session: bare, selection: { model: "gpt-5-codex" } })), { entry: { ...CODEX_ENTRY, session: bare } }, "an unusable selection is dropped");
 	// A failure before any thread exists records the handle alone, and only when the branch holds nothing for it yet.
 	assert.deepEqual(recordDecision(codexCall(), outcome({ ok: false })), { entry: CODEX_ENTRY });
-	assert.deepEqual(only({ ...CODEX_ENTRY }).refusal, "run-1 ran on codex and recorded no verified thread, so it cannot be continued; start a new run without continue");
+	assert.deepEqual(only({ ...CODEX_ENTRY }).refusal, "run-1 ran on codex and recorded no verified thread, so it cannot be continued; start a new run without continue (a plan call takes fresh true)");
 	assert.deepEqual(recordDecision(codexCall({ prior: { handle: "run-1", role: "implement", backend: "codex" } }), outcome({ ok: false })), { keep: true });
 	// A failed continuation records nothing at all, so the last successful record of the handle stays authoritative.
 	assert.deepEqual(recordDecision(codexCall({ intent: CODEX_RESUME }), outcome({ ok: false, session: { ...CODEX_REF, checkpoint: "turn-3" }, selection: CODEX_SELECTION })), { keep: true });

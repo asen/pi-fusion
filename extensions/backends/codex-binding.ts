@@ -9,10 +9,10 @@ import { isCodexToken, type ResolvedSelection } from "./types.ts";
  */
 
 /**
- * The roles this build binds on Codex. `plan` is not one: a plan run is continued by default, and a Codex checkpoint
- * is not yet qualified for that. `ultracode` is Claude's and `security` is Pi's.
+ * The roles this build binds on Codex. A plan run is continued by default, from the exact checkpoint and usage baseline
+ * its record carries, as any continued Codex run is. `ultracode` is Claude's and `security` is Pi's.
  */
-export const CODEX_ROLE_NAMES = ["implement", "ask"] as const;
+export const CODEX_ROLE_NAMES = ["plan", "implement", "ask"] as const;
 export type CodexRoleName = (typeof CODEX_ROLE_NAMES)[number];
 
 export const CODEX_MODES = ["answer", "review"] as const;
@@ -24,7 +24,10 @@ export type CodexMode = (typeof CODEX_MODES)[number];
  */
 export const CODEX_HOST_DEFAULT = "host default";
 
-/** The Codex sandbox each role is started in: an ask run reads, an implement run writes inside its workspace. */
+/**
+ * The Codex sandbox each role is started in: an ask run reads, and a plan or implement run writes inside its workspace,
+ * a plan run for its own notes and scratch files, as it does on every backend.
+ */
 export type CodexSandboxMode = "read-only" | "workspace-write";
 
 /**
@@ -38,7 +41,7 @@ export interface CodexRole {
 	provider?: string;
 	effort?: string;
 	contract: string;
-	/** Appended after the role's contract: a Codex child has no question tool and takes no steer, and this says what it does instead. */
+	/** Appended after the role's contract: a Codex child has no question tool, and this says what it does instead. */
 	addendum: string;
 	mode?: CodexMode;
 	sandboxMode: CodexSandboxMode;
@@ -46,10 +49,10 @@ export interface CodexRole {
 	approvalPolicy: "never";
 }
 
-const CODEX_SANDBOX: Record<CodexRoleName, CodexSandboxMode> = { implement: "workspace-write", ask: "read-only" };
+const CODEX_SANDBOX: Record<CodexRoleName, CodexSandboxMode> = { plan: "workspace-write", implement: "workspace-write", ask: "read-only" };
 
 /** The contracts a Codex role runs under: the shared prose every backend's roles run under, and the addendum after it. */
-const CODEX_CONTRACTS: Record<CodexRoleName, string> = { implement: "implement.md", ask: "ask-answer.md" };
+const CODEX_CONTRACTS: Record<CodexRoleName, string> = { plan: "plan.md", implement: "implement.md", ask: "ask-answer.md" };
 const CODEX_ASK_CONTRACTS: Record<CodexMode, string> = { answer: "ask-answer.md", review: "ask-review.md" };
 const CODEX_ADDENDUM = "codex-no-questions.md";
 
@@ -60,12 +63,12 @@ const CODEX_ADDENDUM = "codex-no-questions.md";
  */
 export const CODEX_CONTRACT_FILES: readonly string[] = [...new Set([...Object.values(CODEX_CONTRACTS), ...Object.values(CODEX_ASK_CONTRACTS), CODEX_ADDENDUM])];
 
-/** The call parameters each Codex role takes. No role takes `fresh`, which is a plan call's alone. */
+/** The call parameters each Codex role takes: `fresh` is a plan call's alone, as it is on every backend. */
 const CODEX_ROLE_PARAMETERS: Record<"fresh" | "mode" | "model" | "effort", readonly CodexRoleName[]> = {
-	fresh: [],
+	fresh: ["plan"],
 	mode: ["ask"],
-	model: ["implement", "ask"],
-	effort: ["implement", "ask"],
+	model: ["plan", "implement", "ask"],
+	effort: ["plan", "implement", "ask"],
 };
 
 /** What a call asks of a Codex role: the role it names, an ask run's mode, and the selection it overrides. */
