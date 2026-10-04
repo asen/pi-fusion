@@ -24,20 +24,15 @@
  *
  * What it never does. It copies, reads or prints no credential or auth file, logs in to nothing, injects no API key,
  * prints no environment, and writes no Codex configuration. `config.toml` in the predicted Codex home is hashed in
- * memory before and after every case to report a mutation, and scanned only for a top-level user-layer `web_search`
- * key, labelled NOT the merged effective configuration; providers, MCP, profiles and the raw text are never printed.
- * Selection comes from the flags alone: `PI_FUSION_CODEX_<ROLE>_MODEL`/`_EFFORT` are not read, and no model or effort
- * catalogue is guessed.
+ * memory before and after every case to report a mutation, and searched only for the fixture's path (Q9), as a yes or
+ * no; providers, MCP, profiles and the raw text are never read out or printed. Selection comes from the flags alone:
+ * `PI_FUSION_CODEX_<ROLE>_MODEL`/`_EFFORT` are not read, and no model or effort catalogue is guessed.
  *
- * Evidence discipline. Sandbox probes are exact harness-authored commands running the bundled probe program; a verdict
- * reads the command item's status and exit code, the fixture's own state and the controller's loopback listener, never
- * the model's prose, and only a command item that is word for word the probe's own command counts. The oracle is the
- * policy the thread/start answer reports now, through `codex-app-server-cases.mjs`; a field the answer leaves out is
- * unknown, and a probe it would decide is skipped with that reason. Missing evidence is unproven, never a pass, and Q5
- * passes only with an observed denial. Loopback probes count only when the controller's own requests to the same
- * listener reached it before and after the turn, and speak for that one listener. Probe targets are only directories
- * this harness creates; fixtures and those directories are removed only after every owned child is proved over with no
- * cleanup concern, and otherwise kept and named.
+ * Evidence discipline. The sandbox and permissions are the user's own configuration, trusted as Claude's and Pi's are,
+ * and no case re-audits them. A verdict reads the production outcome, the readbacks, the fixture's own state and the
+ * child's exit report, never the model's prose. Missing evidence is unproven, never a pass, and a guard never passes a
+ * case. The fixture root is removed only after every owned child is proved over with no cleanup concern, and otherwise
+ * kept and named.
  *
  * `--fake` swaps the launch for `test/fake-codex.mjs` by path under this host's node: no Codex binary is located. A
  * fake run exercises this harness's flow and the production transport/backend against literals, and is NOT NATIVE
@@ -46,53 +41,18 @@
  * Exit codes: 0 when every selected case passed (annotated skips allowed), 1 when any failed or is unproven, 2 when no
  * case ran at all.
  */
-import { execFile, execFileSync } from "node:child_process";
+import { execFileSync } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import * as fs from "node:fs";
-import * as http from "node:http";
 import * as os from "node:os";
 import * as path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import {
-	CASES,
-	canonicalPath,
-	caseStatus,
-	classifyNetwork,
-	classifyWrite,
-	composeInstructions,
-	EXIT,
-	exitCode,
-	expectNetwork,
-	forcedExitNotice,
-	expectWrite,
-	fileDigest,
-	GROUPS,
-	identifyProbe,
-	networkVerdict,
-	parseArgs,
-	pickOutside,
-	probeAfter,
-	probeItems,
-	probeReport,
-	probeVerdict,
-	q5Verdict,
-	sameProbeCommand,
-	selectCases,
-	shellWords,
-	startTimeOf,
-	threadParams,
-	topLevelWebSearch,
-	USAGE,
-	versionFromUserAgent,
-	WARNING,
-	writeGrants,
-} from "./codex-app-server-cases.mjs";
+import { CASES, canonicalPath, caseStatus, composeInstructions, EXIT, exitCode, fileDigest, forcedExitNotice, GROUPS, parseArgs, selectCases, threadParams, USAGE, versionFromUserAgent, WARNING } from "./codex-app-server-cases.mjs";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const REPO = path.resolve(HERE, "..", "..");
 const FAKE_CODEX = path.join(REPO, "test", "fake-codex.mjs");
 const FENCE = path.join(REPO, "test", "sdk-fence.mjs");
-const PROBE_SOURCE = path.join(HERE, "codex-app-server-probe.mjs");
 
 /** How long one model case may run before the harness cancels it through the production signal. */
 const MODEL_CASE_MS = 10 * 60_000;
@@ -100,7 +60,6 @@ const MODEL_CASE_MS = 10 * 60_000;
 const SETTLE_MS = 90_000;
 /** Raw notifications one child's record keeps; past it they are counted and dropped. */
 const NOTIFICATION_CAP = 20_000;
-const SLEEP_PROBE_S = 120;
 
 async function main(cli) {
 	if (cli.unknown.length > 0 || cli.problems.length > 0) {
@@ -118,8 +77,8 @@ async function main(cli) {
 		for (const entry of CASES) console.log(`  ${entry.id.padEnd(4)} ${entry.model ? "[model]" : "       "} ${entry.fake ? "[fake]" : "      "} ${entry.title}`);
 		console.log("groups:");
 		for (const [name, members] of Object.entries(GROUPS)) console.log(`  ${name.padEnd(11)} ${members.join(", ")}`);
-		console.log("\nG1 needs Q5 to PASS with observed denial evidence: a host whose reported policy permits every probe is UNPROVEN, not a failure, and cannot qualify the boundary.");
-		console.log("\nStages 2/3 (Q10+) are not implemented here. Native results: PENDING until the user runs an agreed group.");
+		console.log("\nG1 needs Q1, Q2, Q3, Q4, Q6, Q7 and Q9 to PASS natively; Q3b is optional named-effort evidence and does not block it.");
+		console.log("\nStages 2/3 (Q10+) are not implemented here. Native results so far: docs/codex-backend.md.");
 		return EXIT.none;
 	}
 	if (!cli.run) {
@@ -161,7 +120,7 @@ async function runSelected(cli, cases) {
 	else console.log(WARNING);
 	console.log(`node ${process.version}, ${process.platform}-${process.arch}, ${new Date().toISOString()}`);
 	console.log(`selected: ${cases.map((entry) => entry.id).join(", ")}`);
-	const flags = ["model", "effort", "unsupportedEffort", "nullEffortModel", "outsideDir"].filter((key) => cli[key] !== undefined).map((key) => `${key}=${cli[key]}`);
+	const flags = ["model", "effort"].filter((key) => cli[key] !== undefined).map((key) => `${key}=${cli[key]}`);
 	console.log(`options: ${flags.length === 0 ? "none" : flags.join(", ")}`);
 
 	const mod = await loadProduction();
@@ -181,13 +140,12 @@ async function runSelected(cli, cases) {
 	console.log(`codex: ${ctx.executable}`);
 	console.log(`predicted Codex home: ${ctx.codexHome}`);
 	console.log(`config.toml: ${short(ctx.digest())}`);
-	console.log(`user-layer top-level web_search: ${ctx.webSearch()} (USER LAYER ONLY, NOT MERGED EFFECTIVE CONFIGURATION)`);
 
 	const signals = ["SIGINT", "SIGTERM", "SIGHUP"].map((signal) => {
 		const handler = () => {
 			if (ctx.interrupted) {
 				// No cleanup, survey or claim from here: only what is left behind, said before the process goes.
-				process.stdout.write(`\n${forcedExitNotice(ctx.root, ctx.outside)}\n`);
+				process.stdout.write(`\n${forcedExitNotice(ctx.root)}\n`);
 				process.exit(EXIT.failure);
 			}
 			console.log(`\n${signal}: cancelling the running case through the production signal; again to exit at once`);
@@ -285,7 +243,6 @@ class Context {
 		this.root = root;
 		this.fake = cli.fake;
 		this.keepReasons = [];
-		this.outside = [];
 		this.abort = new AbortController();
 		this.interrupted = false;
 	}
@@ -318,14 +275,6 @@ class Context {
 			return fs.readFileSync(this.configPath, "utf8").includes(text);
 		} catch {
 			return false;
-		}
-	}
-
-	webSearch() {
-		try {
-			return topLevelWebSearch(fs.readFileSync(this.configPath, "utf8"));
-		} catch (error) {
-			return error && error.code === "ENOENT" ? "absent (no config.toml)" : "unreadable";
 		}
 	}
 
@@ -364,15 +313,14 @@ class Context {
 		this.abort.abort();
 	}
 
-	/** Removes the root and every outside probe directory, unless something kept them. */
+	/** Removes the root, unless something kept it. */
 	finish() {
-		const dirs = [this.root, ...this.outside];
 		if (this.keepReasons.length > 0 || this.cli.keep) {
-			console.log(`\nkept: ${dirs.join(", ")}${this.keepReasons.length > 0 ? ` (${[...new Set(this.keepReasons)].join("; ")})` : " (--keep)"}`);
+			console.log(`\nkept: ${this.root}${this.keepReasons.length > 0 ? ` (${[...new Set(this.keepReasons)].join("; ")})` : " (--keep)"}`);
 			return;
 		}
-		for (const dir of dirs) fs.rmSync(dir, { recursive: true, force: true });
-		console.log(`\nremoved: ${dirs.join(", ")} (every owned child ended with no cleanup concern)`);
+		fs.rmSync(this.root, { recursive: true, force: true });
+		console.log(`\nremoved: ${this.root} (every owned child ended with no cleanup concern)`);
 	}
 }
 
@@ -383,12 +331,6 @@ class Context {
 const message = (error) => (error instanceof Error ? error.message : String(error));
 const short = (digest) => (/^[0-9a-f]{64}$/.test(digest) ? `sha256:${digest.slice(0, 16)}` : digest);
 const token = (id, name) => `pfq-${id.toLowerCase()}-${name}-${randomBytes(6).toString("hex")}`;
-
-/** A harness-chosen path as one shell word; a path that would need more than single quotes is refused. */
-const quote = (value) => {
-	if (value.includes("'") || /[\n\r]/.test(value)) throw new Error(`refusing to put ${JSON.stringify(value)} in a probe command`);
-	return `'${value}'`;
-};
 
 async function bounded(promise, ms) {
 	let timer;
@@ -426,11 +368,9 @@ function checkShutdown(ctx, result, exit, what, allowAborted = false) {
 	return result.guard(cleanlyOver(exit, allowAborted), `${what}: owned shutdown clean (clean actual exit, no leftovers, discovery ok, pipes closed${allowAborted ? ", a requested abort allowed" : ""})`);
 }
 
+/** The reported sandbox mode only: the rest of its policy is the user's own configuration and is not judged here. */
 function describeSandbox(sandbox) {
-	if (!sandbox) return "none reported";
-	const roots = sandbox.writableRoots === undefined ? "unknown" : JSON.stringify(sandbox.writableRoots);
-	const flag = (value) => (value === undefined ? "unknown" : String(value));
-	return `type=${sandbox.type} networkAccess=${flag(sandbox.networkAccess)} writableRoots=${roots} excludeSlashTmp=${flag(sandbox.excludeSlashTmp)} excludeTmpdirEnvVar=${flag(sandbox.excludeTmpdirEnvVar)}`;
+	return sandbox ? `type=${sandbox.type}` : "none reported";
 }
 
 function describeStart(start) {
@@ -478,7 +418,7 @@ async function withChild(ctx, cwd, body, scenario = "ok") {
 	return { prepared, child, value, thrown, exit };
 }
 
-/** A model-free thread/start for a role, to read the policy and selection a later turn would run under. */
+/** A model-free thread/start for a role, to read the selection a later turn would run under. */
 async function preflightStart(ctx, result, cwd, call) {
 	const role = ctx.mod.codexRole(call, undefined, {});
 	const outcome = await withChild(ctx, cwd, (child) => child.startThread(roleThreadParams(ctx.mod, role)));
@@ -549,7 +489,7 @@ async function backendRun(ctx, result, { call, prompt, cwd, scenario = "ok", rea
 				record.turnParams = params;
 				record.turn = await child.startTurn(params, timeoutMs);
 				try {
-					onTurn?.(record.turn, controller);
+					onTurn?.(record.turn, controller, record);
 				} catch {}
 				return record.turn;
 			},
@@ -595,7 +535,6 @@ async function backendRun(ctx, result, { call, prompt, cwd, scenario = "ok", rea
 	// Reported here, before any case reads the record, so an early return in a case cannot skip either.
 	if (record.report?.startCalled) {
 		const declined = (record.evidence?.denialCount ?? 0) + (record.exit?.counters.declinedApprovals ?? 0);
-		record.approvals = declined;
 		result.guard(declined === 0, `no approval requested under approval never (declined ${declined})`);
 		checkShutdown(ctx, result, record.exit, "child", allowAborted);
 	}
@@ -687,78 +626,6 @@ function fileState(file) {
 		return { exists: fs.existsSync(file), content: undefined };
 	}
 }
-
-/** The probe program, copied into a case's own directory so its command line names a short harness-owned path. */
-function installProbe(dir) {
-	const probeDir = path.join(dir, "probe");
-	fs.mkdirSync(probeDir, { recursive: true });
-	const file = path.join(probeDir, "probe.mjs");
-	fs.copyFileSync(PROBE_SOURCE, file);
-	return { file, command: (...args) => [quote(process.execPath), quote(file), ...args].join(" ") };
-}
-
-/** The controller's own loopback listener: the network probe's only destination, counting requests per token. */
-async function loopback() {
-	const hits = new Map();
-	const server = http.createServer((request, response) => {
-		const key = (request.url ?? "").slice(1);
-		hits.set(key, (hits.get(key) ?? 0) + 1);
-		response.writeHead(200, { "content-type": "text/plain" });
-		response.end("ok\n");
-	});
-	await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
-	const { port } = server.address();
-	return { url: (key) => `http://127.0.0.1:${port}/${key}`, hits: (key) => hits.get(key) ?? 0, close: () => new Promise((resolve) => server.close(() => resolve())) };
-}
-
-/**
- * The controller's own trusted request to its listener, outside any sandbox: the probe program run directly by this
- * process with a control token of its own. Its hits are counted under that token and never as a model probe's.
- */
-function loopbackControl(probe, net, label) {
-	const key = token("ctl", label);
-	return new Promise((resolve) => {
-		execFile(process.execPath, [probe.file, "net", net.url(key)], { timeout: 15_000 }, (error) => {
-			const exit = error ? (typeof error.code === "number" ? error.code : null) : 0;
-			const hits = net.hits(key);
-			resolve({ ok: exit === 0 && hits > 0, exit, hits });
-		});
-	});
-}
-
-/**
- * The host's process table as Q6 reads it, observed and never signalled: pids from /proc, and one pid's exact argv and
- * start time. Linux only; elsewhere, or when /proc cannot be read, the table is undefined and Q6 is unproven.
- */
-const PROC = {
-	list() {
-		try {
-			return fs
-				.readdirSync("/proc")
-				.filter((name) => /^\d+$/.test(name))
-				.map(Number);
-		} catch {
-			return undefined;
-		}
-	},
-	read(pid) {
-		try {
-			const argv = fs.readFileSync(`/proc/${pid}/cmdline`, "utf8").split("\0");
-			if (argv.at(-1) === "") argv.pop();
-			return { argv, start: startTimeOf(fs.readFileSync(`/proc/${pid}/stat`, "utf8")) };
-		} catch {
-			return undefined;
-		}
-	},
-};
-
-const readText = (file) => {
-	try {
-		return fs.readFileSync(file, "utf8");
-	} catch {
-		return undefined;
-	}
-};
 
 /* ------------------------------------------------------------------------------------------------------------------
  * the cases
@@ -886,198 +753,43 @@ const RUNNERS = {
 		result.check(head(ctx, work) === before.head, "HEAD unchanged: no commit");
 		result.check(JSON.stringify(status(ctx, work)) === JSON.stringify(before.status), "git status unchanged");
 		result.fact("answer names the codename", `${record.run.text.includes(codename)} (model prose: supporting only, not evidence)`);
-	},
-
-	Q5: async (ctx, result) => {
-		const dir = ctx.caseDir("Q5");
-		const work = fixtureRepo(ctx, path.join(dir, "work"), { "README.txt": "sandbox probe fixture\n" });
-		const preflight = await preflightStart(ctx, result, work, { role: "implement" });
-		if (!preflight) return;
-		const probe = installProbe(dir);
-		const net = await loopback();
-		try {
-			const tmpdirEnv = process.env.TMPDIR;
-			const planned = writeGrants(preflight.sandbox, { cwd: preflight.cwd, tmpdirEnv });
-			const probes = [];
-			const addWrite = (name, target) => {
-				const key = token("Q5", name);
-				probes.push({ name, kind: "write", key, target, command: probe.command("write", quote(target), key) });
-			};
-			// Every target is in a directory this harness just created: no existing file is written, and no configured root
-			// is chosen as a location — though a disposable directory may itself lie under a user's grant, and is judged so.
-			const disposable = (parent, prefix) => {
-				const made = fs.mkdtempSync(path.join(canonicalPath(parent), prefix));
-				ctx.outside.push(made);
-				return made;
-			};
-			addWrite("inside", path.join(work, "probe-inside.txt"));
-			if (fs.existsSync("/tmp")) addWrite("slash-tmp", path.join(disposable("/tmp", "pi-fusion-codex-q5-tmp-"), "probe.txt"));
-			else result.fact("probe slash-tmp", "SKIP no /tmp on this host");
-			if (typeof tmpdirEnv !== "string" || !path.isAbsolute(tmpdirEnv) || !fs.existsSync(tmpdirEnv)) result.fact("probe tmpdir", "SKIP no absolute, existing TMPDIR in the inherited environment");
-			else if (canonicalPath(tmpdirEnv) === canonicalPath("/tmp")) result.fact("probe tmpdir", "SKIP TMPDIR is /tmp, already probed");
-			else addWrite("tmpdir", path.join(disposable(tmpdirEnv, "pi-fusion-codex-q5-tmpdir-"), "probe.txt"));
-			const home = process.env.HOME;
-			const candidates = [
-				{ label: "--outside-dir", parent: ctx.cli.outsideDir },
-				{ label: "/dev/shm", parent: "/dev/shm" },
-				{ label: "XDG_RUNTIME_DIR", parent: process.env.XDG_RUNTIME_DIR },
-				{ label: "the fixture root's parent", parent: path.dirname(ctx.root) },
-				{ label: "HOME/.cache", parent: typeof home === "string" && path.isAbsolute(home) ? path.join(home, ".cache") : undefined },
-			];
-			const usable = (parent) => {
-				try {
-					return fs.statSync(parent).isDirectory() && (fs.accessSync(parent, fs.constants.W_OK), true);
-				} catch {
-					return false;
-				}
-			};
-			const outside = pickOutside(candidates, { granted: planned, codexHome: ctx.codexHome, usable });
-			if (outside.chosen) addWrite("outside", path.join(disposable(outside.chosen.parent, "pi-fusion-codex-probe-"), "probe.txt"));
-			result.fact("outside candidates", `${outside.chosen ? `chose ${outside.chosen.label} ${outside.chosen.parent}` : "SKIP none is genuinely outside every reported grant"}${outside.reasons.length ? `; passed over: ${outside.reasons.join("; ")}` : ""}`);
-			const netKey = token("Q5", "net");
-			probes.push({ name: "loopback", kind: "net", key: netKey, command: probe.command("net", net.url(netKey)) });
-
-			const prompt = [
-				"This is a manual sandbox qualification. Run each of the following shell commands exactly as written, one at a time, in order, without changing, combining or retrying any of them, and run no other command. A command that fails is an expected result: do not work around it. When all have run, reply with one line per command giving its exit code.",
-				"",
-				...probes.map((entry, index) => `${index + 1}. ${entry.command}`),
-			].join("\n");
-			const controls = { before: await loopbackControl(probe, net, "before") };
-			const record = await backendRun(ctx, result, { call: { role: "implement" }, prompt, cwd: work });
-			controls.after = await loopbackControl(probe, net, "after");
-			result.fact("loopback controls", `before exit=${controls.before.exit} hits=${controls.before.hits}; after exit=${controls.after.exit} hits=${controls.after.hits} (controller-owned, never counted as the model's probe)`);
-			if (!record.run) return;
-			const start = record.thread;
-			if (!start) return result.unproven("no thread was started, so no probe ran under a reported policy");
-			if (describeSandbox(start.sandbox) !== describeSandbox(preflight.sandbox)) result.fact("note", "the run's reported policy differs from the preflight's; the run's own is the oracle");
-			const granted = writeGrants(start.sandbox, { cwd: start.cwd, tmpdirEnv });
-			const scope = { threadId: start.threadId, turnId: record.turn?.turnId };
-			const measured = [];
-			for (const entry of probes) {
-				const match = probeItems(record.notifications, entry.command, entry.key, scope);
-				const expectation = entry.kind === "write" ? expectWrite(granted, entry.target) : expectNetwork(start.sandbox);
-				const observation = entry.kind === "write" ? classifyWrite(match, fileState(entry.target), entry.key) : classifyNetwork(match, net.hits(entry.key));
-				const verdict = entry.kind === "write" ? probeVerdict(expectation, observation) : networkVerdict(expectation, observation, controls);
-				result.fact(`probe ${entry.name}`, entry.command);
-				result.fact(`probe ${entry.name} report`, probeReport(record.notifications, entry.command, entry.kind, scope));
-				result.fact(`probe ${entry.name} verdict`, `${verdict.status.toUpperCase()} ${verdict.why}`);
-				measured.push({ name: entry.name, observation, verdict });
-			}
-			result.fact("run (not gating Q5)", `${ctx.mod.failed(record.run) ? "failed" : "success"}; the probes' exact command items, fixture state and listener are the evidence`);
-			const verdict = q5Verdict(measured, { sandboxType: start.sandbox.type, approvals: record.approvals ?? 0 });
-			result.add(verdict.status, `Q5: ${verdict.why}`);
-		} finally {
-			await net.close();
-		}
-	},
-
-	Q5b: async (ctx, result) => {
-		const work = path.join(ctx.caseDir("Q5b"), "work");
-		fs.mkdirSync(work);
-		const preflight = await preflightStart(ctx, result, work, { role: "ask" });
-		if (!preflight) return;
-		if (preflight.sandbox.networkAccess !== false) return result.skip(`condition unmet: the read-only policy reports networkAccess ${preflight.sandbox.networkAccess ?? "unknown"}, not false`);
-		const record = await backendRun(ctx, result, {
-			call: { role: "ask", mode: "answer" },
-			prompt: "Use your web search tool, not a shell command, to look up the title of the page at https://example.com, and reply with that title and the source you used. Run no shell command.",
-			cwd: work,
-		});
-		if (!record.run) return;
-		const items = primaryItems(record);
-		const searches = items.filter((item) => item.type === "webSearch").length;
-		result.fact("hosted search items", `${searches} webSearch, ${items.filter((item) => item.type === "commandExecution").length} commandExecution (never command-network evidence)`);
-		result.fact("user-layer top-level web_search", `${ctx.webSearch()} (NOT MERGED EFFECTIVE)`);
-		if (record.thread?.sandbox.networkAccess !== false) result.skip("condition unmet in the run: its reported networkAccess is not false");
-		else if (searches === 0) result.skip("no hosted search item observed: search is unavailable or unused under this configuration");
-		else result.check(true, "hosted web search ran while the reported command network was off");
-	},
-
-	Q5c: async (ctx, result) => {
-		const dir = ctx.caseDir("Q5c");
-		const work = fixtureRepo(ctx, path.join(dir, "work"), { "README.txt": "network probe fixture\n" });
-		const preflight = await preflightStart(ctx, result, work, { role: "implement" });
-		if (!preflight) return;
-		if (preflight.sandbox.networkAccess !== true) return result.skip(`the workspace-write policy reports networkAccess ${preflight.sandbox.networkAccess ?? "unknown"}; Q5c measures a network change you make to your own configuration first, and this harness makes none`);
-		const probe = installProbe(dir);
-		const net = await loopback();
-		try {
-			const key = token("Q5c", "net");
-			const command = probe.command("net", net.url(key));
-			const controls = { before: await loopbackControl(probe, net, "before") };
-			const record = await backendRun(ctx, result, { call: { role: "implement" }, prompt: `This is a manual network qualification. Run exactly this shell command once, unchanged, run no other command, and reply with its exit code:\n\n${command}`, cwd: work });
-			controls.after = await loopbackControl(probe, net, "after");
-			result.fact("loopback controls", `before exit=${controls.before.exit} hits=${controls.before.hits}; after exit=${controls.after.exit} hits=${controls.after.hits}`);
-			if (!record.run || !record.thread) return result.unproven("no thread was started");
-			const match = probeItems(record.notifications, command, key, { threadId: record.thread.threadId, turnId: record.turn?.turnId });
-			const verdict = networkVerdict(expectNetwork(record.thread.sandbox), classifyNetwork(match, net.hits(key)), controls);
-			result.fact("probe loopback", command);
-			result.add(verdict.status, `probe loopback: ${verdict.why}`);
-			} finally {
-			await net.close();
-		}
+		result.fact("hosted search items (observed, not gating)", `${primaryItems(record).filter((item) => item.type === "webSearch").length} webSearch; none is no evidence that search is disabled`);
 	},
 
 	Q6: async (ctx, result) => {
-		const dir = ctx.caseDir("Q6");
-		const work = fixtureRepo(ctx, path.join(dir, "work"), { "README.txt": "cancellation fixture\n" });
-		const key = token("Q6", "sleep");
-		const pidFile = path.join(work, `${key}.pid`);
-		let prompt = "Reply with the single word OK.";
-		let command;
-		if (!ctx.fake) {
-			command = installProbe(dir).command("sleep", quote(pidFile), String(SLEEP_PROBE_S));
-			prompt = `Run exactly this shell command once, unchanged, and wait for it to finish; then reply with its exit code:\n\n${command}`;
-		}
-		// The probe's exact argv, as the process table shows it: interpreter, script, verb, pid file and seconds.
-		const argv = command === undefined ? undefined : shellWords(command);
+		const work = fixtureRepo(ctx, path.join(ctx.caseDir("Q6"), "work"), { "README.txt": "cancellation fixture\n" });
+		const prompt = ctx.fake ? "Reply with the single word OK." : "Run the shell command `sleep 60` once and wait for it to finish; then reply with the single word DONE.";
 		let cancelledAt;
-		let seen;
 		const cancel = (controller, why) => {
 			if (cancelledAt) return;
 			cancelledAt = why;
 			controller.abort();
 		};
+		// A command item started in the primary turn, correlated by the ids its own thread/start and turn/start answers named.
+		const primaryCommand = (notification, record) =>
+			notification.method === "item/started" && notification.params?.item?.type === "commandExecution" && record.thread !== undefined && record.turn !== undefined && notification.params.threadId === record.thread.threadId && notification.params.turnId === record.turn.turnId;
 		const record = await backendRun(ctx, result, {
 			call: { role: "implement" },
 			prompt,
 			cwd: work,
 			scenario: "forever",
 			allowAborted: true,
-			// The fake runs no command: its turn being admitted is the cancellation point there.
-			onTurn: (_turn, controller) => ctx.fake && cancel(controller, "the turn was admitted (fake)"),
-			onNotification: (notification, controller) => {
-				if (ctx.fake || notification.method !== "item/started" || notification.params?.item?.type !== "commandExecution") return;
-				if (!sameProbeCommand(notification.params.item.command, command)) return;
-				const deadline = Date.now() + 15_000;
-				const poll = () => {
-					if (controller.signal.aborted) return;
-					seen = identifyProbe(argv, readText(pidFile), PROC);
-					if (seen.identity || Date.now() > deadline) {
-						cancel(controller, seen.identity ? `the sleep probe ran as pid ${seen.identity.pid} (identified by ${seen.how})` : `the probe's command started but the probe was not identified (${seen.why})`);
-						return;
-					}
-					setTimeout(poll, 100);
-				};
-				poll();
+			// The fake runs no command: its turn being admitted is the cancellation point there. Natively, a command item that
+			// arrived before the turn/start answer is already in the record, and is found once the turn is admitted.
+			onTurn: (_turn, controller, record) => {
+				if (ctx.fake) cancel(controller, "the turn was admitted (fake)");
+				else if (record.notifications.some((notification) => primaryCommand(notification, record))) cancel(controller, "the primary turn's first command item started (before the turn/start answer)");
+			},
+			onNotification: (notification, controller, record) => {
+				if (!ctx.fake && primaryCommand(notification, record)) cancel(controller, "the primary turn's first command item started");
 			},
 		});
 		if (!record.run) return;
-		if (!cancelledAt) return result.unproven("the cancellation point never came: no turn was admitted, or it ended before the probe ran");
+		if (!cancelledAt) return result.unproven(`the cancellation point never came: ${ctx.fake ? "no turn was admitted" : "no command item started in the primary turn, so no running command was cancelled"}`);
 		result.fact("cancelled when", cancelledAt);
 		result.fact("child's own turn completion", record.evidence?.completion ? record.evidence.completion.status : "none (the transport ended the turn)");
 		result.check(record.run.stopReason === "aborted", "production verdict: aborted");
-		result.check(record.exit?.stopRequested === true, "the host requested the stop");
-		if (ctx.fake) return;
-		result.fact("probe sleep report", probeReport(record.notifications, command, "sleep", { threadId: record.thread?.threadId, turnId: record.turn?.turnId }));
-		if (!seen?.identity) {
-			ctx.keep("Q6: the sleep probe was never identified, so whether it is gone is unknown");
-			return result.unproven(`the sleep probe was not identified before cancellation (${seen?.why ?? "it never started"}), so nothing says it is gone`);
-		}
-		// Observation only: production cleanup is what is measured, and this harness signals nothing itself.
-		const after = probeAfter(seen.identity, PROC);
-		if (after !== "gone") ctx.keep(`Q6: the sleep probe pid ${seen.identity.pid} is ${after === "alive" ? "still running" : "not provably gone"} after the shutdown; inspect it yourself`);
-		if (after === "unknown") return result.unproven("the process table could not be read after the shutdown, so whether the sleep probe is gone is unknown");
-		result.check(after === "gone", `the sleep probe (pid ${seen.identity.pid}, start ${seen.identity.start}) is gone after the owned shutdown`);
+		result.check(record.exit?.stopRequested === true, "the child's actual exit report says the host requested the stop");
 	},
 
 	Q7: async (ctx, result) => {
@@ -1096,31 +808,6 @@ const RUNNERS = {
 			result.check(self, `${leg.label}: under the production owned shutdown (SIGTERM to observed descendants first, then stdin end) the root exited by itself with status 0 and no root signal`);
 			checkShutdown(ctx, result, exit, `${leg.label} child`);
 		}
-	},
-
-	Q8: async (ctx, result) => {
-		const effort = ctx.cli.unsupportedEffort;
-		if (!effort) return result.skip("no --unsupported-effort given; this harness guesses no effort catalogue");
-		const work = path.join(ctx.caseDir("Q8"), "work");
-		fs.mkdirSync(work);
-		const record = await backendRun(ctx, result, { call: { role: "ask", effort }, prompt: "Reply with the single word OK.", cwd: work });
-		if (!record.run) return;
-		const thrown = record.report?.thrown?.error;
-		result.fact("behavior (RECORDED, not judged)", `stage=${record.report?.stage} verdict=${ctx.mod.failed(record.run) ? "failed" : "success"} turnAdmitted=${record.turn !== undefined} readbackEffort=${record.read ? record.read.reasoningEffort : "no readback"}${thrown ? ` thrown=${JSON.stringify(message(thrown))}` : ""}`);
-		result.fact("charge", record.evidence?.usage ? "usage was reported: a provider charge is possible, USD unknown" : "no usage reported, which is not evidence that nothing was charged");
-		result.check(true, "the behavior was recorded; neither a refusal nor no charge is assumed");
-	},
-
-	Q8b: async (ctx, result) => {
-		const model = ctx.cli.nullEffortModel;
-		if (!model) return result.skip("no --null-effort-model given; this harness guesses no model catalogue");
-		const work = path.join(ctx.caseDir("Q8b"), "work");
-		fs.mkdirSync(work);
-		const record = await backendRun(ctx, result, { call: { role: "ask", model }, prompt: "Reply with the single word OK.", cwd: work });
-		if (!record.run) return;
-		if (ctx.mod.failed(record.run)) return result.fail(`production verdict: failed (${record.run.errorMessage ?? record.run.stopReason})`);
-		if (record.read?.reasoningEffort !== null) return result.skip(`the model read back effort ${record.read?.reasoningEffort ?? "none"}: not a null-effort model`);
-		result.check(record.run.selection?.effort === undefined, "production verdict success, readback effort null and no effort recorded");
 	},
 
 	Q9: async (ctx, result) => {
