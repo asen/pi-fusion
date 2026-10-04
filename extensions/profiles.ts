@@ -12,6 +12,9 @@ import { KNOWN_ROLE_NAMES, type KnownRoleName, ROLE_SPECS } from "./roles.ts";
 /** Claude Code's effort levels, which every Claude role but ultracode takes. */
 export const CLAUDE_EFFORTS = ["low", "medium", "high", "xhigh", "max"] as const;
 
+/** Static Claude picker shortcuts, not an allowlist or an availability check: any other alias or id can still be typed. */
+export const CLAUDE_MODEL_SUGGESTIONS = ["opus", "opus[1m]", "fable", "claude-opus-5-5", "claude-opus-5-5[1m]", "claude-fable-5-1"] as const;
+
 /** Static Codex picker shortcuts, not an allowlist or an availability check: custom providers may use other ids. */
 export const CODEX_MODEL_SUGGESTIONS = ["gpt-6.1-sol", "gpt-6-astra", "gpt-6-luna", "gpt-6-sol"] as const;
 

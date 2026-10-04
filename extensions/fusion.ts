@@ -62,6 +62,7 @@ import {
 	builtinSettings,
 	CLAUDE_EFFORTS,
 	captureBaseline,
+	CLAUDE_MODEL_SUGGESTIONS,
 	CODEX_MODEL_SUGGESTIONS,
 	copySettings,
 	effortShown,
@@ -2922,10 +2923,15 @@ export default function fusion(pi: ExtensionAPI, options: FusionOptions = {}) {
 		notice(`fusion uses profile ${name} in this session${disabledText(next.roles)}`, "info");
 	};
 
-	/** The model a role's setting takes in the editor: one of the host's available models or one typed, or none for Pi and Codex. */
+	/** The model a role's setting takes in the editor: a static shortcut, one of the host's available models or one typed, or none for Pi and Codex. */
 	const pickModel = async (ctx: any, role: KnownRoleName, setting: RoleSetting): Promise<string | null | undefined> => {
 		if (setting.backend === "claude") {
-			const typed = await ctx.ui.input(`Claude model for ${role}: an alias or id`, setting.model ?? "");
+			const TYPE = "Type a Claude alias or id…";
+			const choice = await ctx.ui.select(`Claude model for ${role}`, [...CLAUDE_MODEL_SUGGESTIONS, TYPE]);
+			if (choice === undefined) return undefined;
+			if (choice !== TYPE) return choice;
+			// An editor, not an input: an input's second argument is only a placeholder, and the current model is to be edited.
+			const typed = await ctx.ui.editor(`Claude model for ${role}: an alias or id`, setting.model ?? "");
 			return typed?.trim() || undefined;
 		}
 		if (setting.backend === "codex") {
@@ -3066,7 +3072,8 @@ export default function fusion(pi: ExtensionAPI, options: FusionOptions = {}) {
 	): Promise<void> => {
 		const dialogs = ctx.hasUI !== false && typeof ctx.ui?.select === "function";
 		if (command.kind === "config") {
-			if (dialogs) await editConfiguration(ctx, notice);
+			// The editor's Claude model field edits the current model in place, which only the host's editor dialog can do.
+			if (dialogs && typeof ctx.ui.editor === "function") await editConfiguration(ctx, notice);
 			else notice((await configurationLines()).join("\n"), "info");
 			return;
 		}

@@ -4,7 +4,8 @@ import * as os from "node:os";
 import * as path from "node:path";
 import test, { after } from "node:test";
 import { fileURLToPath } from "node:url";
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { type ExtensionAPI, ExtensionEditorComponent, initTheme } from "@earendil-works/pi-coding-agent";
+import { KeybindingsManager, type TUI, TUI_KEYBINDINGS } from "@earendil-works/pi-tui";
 import type { PiRole } from "../extensions/backends/pi-binding.ts";
 import type { BackendName, HostBackend } from "../extensions/backends/types.ts";
 import fusion, { builtinConfiguration, type Configuration, claudeRoute, fusionCall, fusionRoute, roleFor, type RunRecords, runRecords } from "../extensions/fusion.ts";
@@ -13,6 +14,7 @@ import {
 	BUILTIN,
 	builtinSettings,
 	captureBaseline,
+	CLAUDE_MODEL_SUGGESTIONS,
 	CODEX_MODEL_SUGGESTIONS,
 	copySettings,
 	nameProblem,
@@ -448,6 +450,8 @@ interface SdkHostOptions {
 	/** The answers the host's select and input dialogs give, in order; a function picks one of the options offered. */
 	dialogs?: Array<string | undefined | ((options: string[]) => string | undefined | Promise<string | undefined>)>;
 	ui?: boolean;
+	/** False leaves the editor dialog out while select and input stay, as a host without one would. */
+	editor?: boolean;
 	modelRegistry?: unknown;
 	/** What the host has active before this extension registers anything; read and bash by default. */
 	initial?: string[];
@@ -471,6 +475,10 @@ function sdkHost(options: SdkHostOptions = {}) {
 	const registrations: string[] = [];
 	const dialogs = [...(options.dialogs ?? [])];
 	const titles: string[] = [];
+	/** What each input dialog was given as its placeholder, which is never text the user edits. */
+	const placeholders: Array<string | undefined> = [];
+	/** What each editor dialog was prefilled with: text the user edits and submits. */
+	const editorPrefills: Array<string | undefined> = [];
 	const offered = (name: string) => options.allowed === undefined || options.allowed.includes(name);
 	const api = {
 		registerTool: (tool: Tool) => {
@@ -513,10 +521,20 @@ function sdkHost(options: SdkHostOptions = {}) {
 						titles.push(title);
 						return answer(choices);
 					},
-					input: async (title: string) => {
+					input: async (title: string, placeholder?: string) => {
 						titles.push(title);
+						placeholders.push(placeholder);
 						return answer([]);
 					},
+					...(options.editor === false
+						? {}
+						: {
+								editor: async (title: string, prefill?: string) => {
+									titles.push(title);
+									editorPrefills.push(prefill);
+									return answer([]);
+								},
+							}),
 				}),
 	};
 	const ctx = {
@@ -541,6 +559,8 @@ function sdkHost(options: SdkHostOptions = {}) {
 		registrations,
 		notices,
 		titles,
+		placeholders,
+		editorPrefills,
 		branch,
 		dialogs,
 		start: async () => handlers.get("session_start")!({ type: "session_start", reason: "startup" }, ctx),
@@ -926,6 +946,128 @@ test("closing the codex model picker or leaving its manual input empty keeps the
 	}
 });
 
+/** The Claude picker's options, written out rather than read from the constant so a reorder or rename is caught. */
+const CLAUDE_PICKER = ["opus", "opus[1m]", "fable", "claude-opus-5-5", "claude-opus-5-5[1m]", "claude-fable-5-1", "Type a Claude alias or id…"];
+
+/** A Claude role on a model no shortcut names, at a non-default effort except for ultracode, whose one level is fixed. */
+const claudeRole = (role: "plan" | "implement" | "ultracode" | "ask") => settings({ [role]: { enabled: true, backend: "claude", model: "custom-alias", effort: role === "ultracode" ? "ultracode" : "low" } });
+
+/** How the fusion tool describes a Claude role on a model, ending where the role's text does so a longer id cannot match. */
+const claudeText = (role: string, model: string) => `${role} runs on claude with model ${model}${role === "ultracode" ? ";" : " at effort low;"}`;
+
+test("the claude shortcuts are exactly the static models the picker lists, in its order", () => {
+	assert.deepEqual([...CLAUDE_MODEL_SUGGESTIONS], CLAUDE_PICKER.slice(0, -1));
+});
+
+test("the editor selects each static claude model for every claude role without manual input or an effort change, and profiles keep the exact string", async () => {
+	for (const role of ["plan", "implement", "ultracode", "ask"] as const) {
+		for (const model of CLAUDE_PICKER.slice(0, -1)) {
+			const roles = claudeRole(role);
+			const store = memoryProfileStore(document({ claude: roles }, "claude"));
+			const host = sdkHost({
+				profiles: store,
+				dialogs: [
+					(options) => options.find((option) => option.startsWith(`${role} `)),
+					"model: custom-alias",
+					(options) => {
+						assert.deepEqual(options, CLAUDE_PICKER);
+						return model;
+					},
+					"Back",
+					"Apply",
+				],
+			});
+			await host.start();
+			await host.command("config");
+			assert.equal(host.last(), "fusion settings applied to this session; disabled: security; save them with /fusion profile save <name>");
+			assert.ok(host.tools.get("fusion")!.description.includes(claudeText(role, model)));
+			assert.ok(host.titles.includes(`Claude model for ${role}`));
+			assert.ok(!host.titles.includes(`Claude model for ${role}: an alias or id`), "a shortcut does not open the manual editor");
+			assert.deepEqual(host.editorPrefills, [], "a shortcut opens no editor");
+			assert.deepEqual(host.placeholders, [], "a shortcut opens no input");
+			assert.equal(host.dialogs.length, 0);
+			await host.command("profile save selected");
+			assert.deepEqual((await store.read()).profiles.selected, { ...roles, [role]: { ...roles[role], model } });
+			const reloaded = sdkHost({ profiles: store });
+			await reloaded.start();
+			await reloaded.command("profile use selected");
+			assert.ok(reloaded.tools.get("fusion")!.description.includes(claudeText(role, model)));
+		}
+	}
+});
+
+test("the claude manual editor holds the current model as editable text and keeps any typed alias or id, trimmed, through save and reload", async () => {
+	for (const role of ["plan", "implement", "ultracode", "ask"] as const) {
+		const roles = claudeRole(role);
+		const store = memoryProfileStore(document({ claude: roles }, "claude"));
+		const host = sdkHost({
+			profiles: store,
+			dialogs: [(options) => options.find((option) => option.startsWith(`${role} `)), "model: custom-alias", "Type a Claude alias or id…", "  claude-sonnet-5[1m]  ", "Back", "Apply"],
+		});
+		await host.start();
+		await host.command("config");
+		assert.equal(host.last(), "fusion settings applied to this session; disabled: security; save them with /fusion profile save <name>");
+		assert.ok(host.titles.includes(`Claude model for ${role}: an alias or id`));
+		assert.deepEqual(host.editorPrefills, ["custom-alias"], "the editor holds the current model");
+		assert.deepEqual(host.placeholders, [], "no input opens, whose argument would only be a placeholder");
+		assert.ok(host.tools.get("fusion")!.description.includes(claudeText(role, "claude-sonnet-5[1m]")));
+		assert.equal(host.dialogs.length, 0);
+		await host.command("profile save typed");
+		assert.deepEqual((await store.read()).profiles.typed, { ...roles, [role]: { ...roles[role], model: "claude-sonnet-5[1m]" } });
+		const reloaded = sdkHost({ profiles: store });
+		await reloaded.start();
+		await reloaded.command("profile use typed");
+		assert.ok(reloaded.tools.get("fusion")!.description.includes(claudeText(role, "claude-sonnet-5[1m]")));
+	}
+});
+
+test("closing the claude model picker, cancelling its manual editor or leaving it blank keeps the current model", async () => {
+	for (const answers of [[undefined], ["Type a Claude alias or id…", undefined], ["Type a Claude alias or id…", ""], ["Type a Claude alias or id…", "   "]]) {
+		const host = sdkHost({
+			profiles: memoryProfileStore(document({ claude: claudeRole("ask") }, "claude")),
+			dialogs: [(options) => options.find((option) => option.startsWith("ask ")), "model: custom-alias", ...answers, "Back", "Apply"],
+		});
+		await host.start();
+		await host.command("config");
+		assert.equal(host.last(), "fusion config: nothing changed");
+		assert.deepEqual(host.editorPrefills, answers.length === 1 ? [] : ["custom-alias"]);
+		assert.deepEqual(host.placeholders, []);
+		assert.ok(host.tools.get("fusion")!.description.includes(claudeText("ask", "custom-alias")));
+		assert.equal(host.dialogs.length, 0);
+	}
+});
+
+test("pi's own extension editor holds the prefilled model as editable text: enter keeps it, an edit changes it, escape cancels and clearing submits nothing", () => {
+	// The built-in dark theme, read from the installed package, with no watcher; nothing here opens a terminal or a session.
+	initTheme("dark", false);
+	const tui = { requestRender() {}, terminal: { rows: 24, columns: 80 } } as unknown as TUI;
+	// Pi's app manager is not exported; the component asks it only whether a key is the external-editor one, which none here is.
+	const keybindings = new KeybindingsManager(TUI_KEYBINDINGS) as unknown as ConstructorParameters<typeof ExtensionEditorComponent>[1];
+	const edit = (keys: string[]) => {
+		const results: Array<string | undefined> = [];
+		const editor = new ExtensionEditorComponent(tui, keybindings, "Claude model for plan: an alias or id", "custom-alias", (value) => results.push(value), () => results.push(undefined));
+		editor.focused = true;
+		editor.render(80);
+		for (const key of keys) editor.handleInput(key);
+		return results;
+	};
+	assert.deepEqual(edit(["\r"]), ["custom-alias"]);
+	assert.deepEqual(edit(["\x7f", "\x7f", "\x7f", "\x7f", "\x7f", "o", "p", "u", "s", "\r"]), ["custom-opus"]);
+	assert.deepEqual(edit(["\x1b"]), [undefined]);
+	assert.deepEqual(edit(["\x15", "\r"]), [""]);
+});
+
+test("a host with dialogs but no editor shows the configuration instead of editing it, and still offers the profile chooser", async () => {
+	const host = sdkHost({ editor: false, dialogs: [undefined] });
+	await host.start();
+	await host.command("config");
+	assert.deepEqual(host.titles, [], "no dialog opens");
+	assert.match(host.last() ?? "", /^fusion configuration: builtin · new sessions start with builtin\n/);
+	await host.command("profile");
+	assert.deepEqual(host.titles, ["fusion profile: load one into this session"]);
+	assert.equal(host.last(), "fusion profile: nothing changed");
+});
+
 test("the editor puts a role on codex with the host's defaults, offers codex levels as suggestions, and keeps a typed model", async () => {
 	const row = (role: string) => (options: string[]) => options.find((option) => option.startsWith(`${role} `));
 	const host = sdkHost({
@@ -1005,6 +1147,7 @@ test("an empty answer changes nothing, and a backend changed and changed back st
 		dialogs: [
 			(options) => options.find((option) => option.startsWith("ask ")),
 			"model: opus",
+			"Type a Claude alias or id…",
 			"",
 			"Back",
 			"Apply",
