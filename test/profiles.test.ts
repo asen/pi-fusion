@@ -638,15 +638,15 @@ test("mixed-profile guidance recommends each role's configured backend", async (
 	}
 });
 
-test("roles configured on codex are described as runs that cannot ask, take one unconfirmed steer per message and continue from their exact turn, in each tool's own name", async () => {
+test("roles configured on codex are described as runs that can ask experimentally, take one unconfirmed steer per message and continue from their exact turn, in each tool's own name", async () => {
 	const codexRoles = settings({ plan: { enabled: true, backend: "codex" }, implement: { enabled: true, backend: "codex" }, ask: { enabled: true, backend: "codex", model: "gpt-5-codex", effort: "high" } });
 	const host = sdkHost({ profiles: memoryProfileStore(document({ work: codexRoles }, "work")) });
 	await host.start();
 	const fusionGuidance = host.tools.get("fusion")!.promptGuidelines!;
 	const codexLine = fusionGuidance.find((guideline) => guideline.startsWith("Role plan, role implement and role ask run on codex in this session."));
 	assert.ok(codexLine, "the fusion guidance does not say what a codex run is");
-	assert.match(codexLine, /A codex child cannot ask you a question: put every decision it needs in the task\./);
-	assert.match(codexLine, /under Escalation for role implement, Open questions for role plan and role ask, and Notes for role ask with mode review\./, "a review report has no Open questions section, so its missing decision goes under Notes");
+	assert.match(codexLine, /A codex child can ask you a question, experimentally, and waits for your answer as any child does\./);
+	assert.doesNotMatch(codexLine, /cannot ask/, "a codex child is no longer described as one that cannot ask");
 	assert.match(codexLine, /one steer to its current turn, sent once and never retried: a steer the turn took is queued input, not proof the child read it/);
 	assert.match(codexLine, /Continue a codex run with fusion and continue, as any run: it goes on only from the exact turn its record names/);
 	assert.doesNotMatch(codexLine, /takes no message|not with continue|cannot be continued/, "a codex run is no longer described as fresh-only or unsteerable");
@@ -660,7 +660,8 @@ test("roles configured on codex are described as runs that cannot ask, take one 
 	assert.match(description, /plan runs on codex with the host's default codex model; implement runs on codex with the host's default codex model; .*ask runs on codex with model gpt-5-codex at effort high/);
 	assert.match(description, /backend codex is experimental: it runs plan and implement in a workspace-write sandbox, and ask read-only, under the same contracts/);
 	assert.match(description, /with no ultracode or security role;/);
-	assert.match(description, /A codex child gets no ask_orchestrator, so it reports a missing decision instead of asking\./);
+	assert.match(description, /A codex child also gets ask_orchestrator, through codex's experimental API, and asks you a question as a pi child does\./);
+	assert.doesNotMatch(description, /codex child gets no ask_orchestrator/);
 	assert.match(description, /A message to a running codex run is sent once to its current turn, with no retry, and a turn that took it has queued it, which does not show the child read it\./);
 	assert.match(description, /A codex run is continued like any other, but only from the exact turn its record names: in the Pi session that recorded it its thread is resumed, and refused if it has moved past that turn; in another one it is forked from that turn into a new thread\./);
 	assert.match(description, /A codex plan handoff carries the model and effort the plan run recorded and not its provider, so the fresh thread runs on the provider the host's own codex configuration chooses\./);

@@ -123,7 +123,7 @@ test("a value no codex child could take is refused with the setting it came from
 });
 
 test("every contract a codex role runs under is a shipped file, and the addendum says how a codex child does without questions", () => {
-	assert.deepEqual([...CODEX_CONTRACT_FILES].sort(), ["ask-answer.md", "ask-review.md", "codex-no-questions.md", "implement.md", "plan.md"]);
+	assert.deepEqual([...CODEX_CONTRACT_FILES].sort(), ["ask-answer.md", "ask-review.md", "codex-continued-questions.md", "codex-no-questions.md", "implement.md", "plan.md"]);
 	for (const name of CODEX_CONTRACT_FILES) assert.ok(fs.existsSync(path.join(repoRoot, "contracts", name)), `contracts/${name} is not shipped`);
 	const addendum = fs.readFileSync(path.join(repoRoot, "contracts", "codex-no-questions.md"), "utf8");
 	assert.match(addendum, /no ask_orchestrator tool/);
@@ -149,4 +149,9 @@ test("every contract a codex role runs under is a shipped file, and the addendum
 	assert.match(addendum, /Hosted web search is Codex's own tool/);
 	assert.match(addendum, /only when the host's Codex configuration allows it/);
 	assert.match(addendum, /name each source/);
+	// A continuation that can ask may still have no tool: the fallback sends the gap to the same sections as the addendum.
+	const continued = fs.readFileSync(path.join(repoRoot, "contracts", "codex-continued-questions.md"), "utf8");
+	assert.match(continued, /If ask_orchestrator is not among your tools, do not ask in your output/);
+	assert.match(continued, /under Escalation for an implement report, under Open questions for a plan or an ask answer, and under Notes for an ask review/);
+	assert.equal(continued.trim().split("\n").length, 1, "one paragraph");
 });

@@ -25,7 +25,7 @@ All four workflow tools use sequential execution. Pi serializes tool calls in a 
 
 ## Child tools and settings
 
-Every child runs in the host's working directory. Claude and Pi append the role contract to their own system prompt; Codex receives it, followed by `contracts/codex-no-questions.md`, as the thread's developer instructions. Tool lists differ:
+Every child runs in the host's working directory. Claude and Pi append the role contract to their own system prompt; Codex receives it as the thread's developer instructions, followed by `contracts/codex-no-questions.md` in a run with no question callback, or by `contracts/codex-continued-questions.md` in a resumed or forked run with one. Tool lists differ:
 
 | Role | Claude Code tools | Pi tools |
 | --- | --- | --- |

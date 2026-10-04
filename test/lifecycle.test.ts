@@ -10,6 +10,7 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { createCodexBackend } from "../extensions/backends/codex.ts";
 import { CODEX_APP_SERVER_ARGS } from "../extensions/backends/codex-launch.ts";
 import { RESUME_MOVED } from "../extensions/backends/codex-outcome.ts";
+import { CODEX_QUESTION_UNANSWERED } from "../extensions/backends/codex-transport.ts";
 import { type BackendName, type HostBackend, hostBackend, type SessionIntent } from "../extensions/backends/types.ts";
 import fusion from "../extensions/fusion.ts";
 import { memoryProfileStore, type ProfileStore } from "../extensions/profile-store.ts";
@@ -2494,6 +2495,75 @@ test("a host message to a running codex run is one turn/steer to its admitted tu
 	const late = await host.control({ action: "message", run: "run-1", message: "and more" });
 	assert.match(late.text ?? "", /^run-1 \(ask\) has ended: done\. The message was not sent\./);
 	assert.equal(fs.readFileSync(log, "utf8").split("\n").filter((line) => line.includes('"turn/steer"')).length, 1);
+});
+
+/** Every line the literal fake read, parsed, oldest first. */
+const fakeLog = (log: string): Array<Record<string, any>> =>
+	fs
+		.readFileSync(log, "utf8")
+		.split("\n")
+		.filter(Boolean)
+		.map((line) => JSON.parse(line))
+		.filter((entry) => entry.in !== undefined)
+		.map((entry) => entry.in);
+
+test("a codex child's question waits through the host over the literal fake: the writer slot is held, off and /tree wait, and one answer wins without becoming a steer", async () => {
+	const dir = gitRepo("codex-question");
+	const root = tempDir("codex-question-home");
+	const log = path.join(root, "requests.log");
+	const host = makeHost({ backends: { codex: literalCodex(path.join(root, "codex-home"), { FAKE_CODEX_SCENARIO: "question", FAKE_CODEX_LOG: log }) }, cwd: dir });
+	const asked = await host.fusion({ role: "implement", task: "add the helper", backend: "codex" });
+	assert.match(asked.text ?? "", /^run-1 \(implement\) asks:\n\nWhich name should the helper take\?/);
+	assert.equal(asked.details.state, "waiting");
+
+	assert.match((await host.fusion({ role: "implement", task: "something else", backend: "codex" })).error ?? "", /^run-1 \(implement\) is still active/, "a waiting run keeps the writer slot");
+	host.notices.length = 0;
+	await host.command("off");
+	assert.match(host.notices[0] ?? "", /^fusion stays on while runs are unfinished: run-1 \(implement\)/);
+	assert.deepEqual(await host.tree(), { cancel: true });
+
+	// One answer reaches the child: the user's editor is open while the host answers, and whoever is second is told.
+	host.notices.length = 0;
+	const answering = host.command("answer run-1");
+	await until("the answer editor", () => host.editors.length > 0);
+	assert.equal(host.editors[0]!.title, "Answer run-1: Which name should the helper take?");
+	assert.equal((await host.control({ action: "message", run: "run-1", message: "call it fooHelper" })).text, "answer sent to run-1; the child goes on");
+	host.closeEditor("call it barHelper");
+	await answering;
+	assert.deepEqual(host.notices, ["run-1's question was already answered by the host: call it fooHelper; your answer was not sent"]);
+
+	const report = await ended(host, "run-1");
+	assert.match(report, /^run-1 \(implement\) done\.\n\nanswer received: call it fooHelper\n/);
+	const sent = fakeLog(log);
+	assert.deepEqual(sent.filter((message) => message.method === undefined), [{ id: 21, result: { success: true, contentItems: [{ type: "inputText", text: "call it fooHelper" }] } }], "the child took exactly one answer");
+	assert.equal(sent.filter((message) => message.method === "turn/steer").length, 0, "the losing answer was not sent as a steer");
+	assert.deepEqual(sent[0]!.params.capabilities, { experimentalApi: true });
+	assert.equal(host.entries().length, 1);
+	assert.equal(host.entries()[0]!.session.checkpoint, "turn-1", "an answered run settles on its own turn like any other");
+	assert.deepEqual(tripwireReaches("codex"), []);
+});
+
+test("cancelling a codex run while its question waits ends the question once through the run's own stop, and frees the writer slot", async () => {
+	const dir = gitRepo("codex-question-cancel");
+	const root = tempDir("codex-question-cancel-home");
+	const log = path.join(root, "requests.log");
+	const env: Record<string, string> = { FAKE_CODEX_SCENARIO: "question-cancel", FAKE_CODEX_LOG: log };
+	const host = makeHost({ backends: { codex: literalCodex(path.join(root, "codex-home"), env) }, cwd: dir });
+	const asked = await host.fusion({ role: "implement", task: "add the helper", backend: "codex", background: true });
+	assert.equal(asked.error, undefined);
+	await until("the question", async () => (await host.control({ action: "status", run: "run-1" })).details.state === "waiting");
+	assert.equal((await host.control({ action: "cancel", run: "run-1" })).text, "run-1 cancelled");
+	await host.control({ action: "wait", run: "run-1" });
+	assert.equal((await host.control({ action: "status", run: "run-1" })).details.state, "cancelled");
+	const sent = fakeLog(log);
+	assert.deepEqual(sent.filter((message) => message.method === undefined), [{ id: 21, result: { success: false, contentItems: [{ type: "inputText", text: CODEX_QUESTION_UNANSWERED }] } }], "one reply, and no resent or retried question");
+	assert.equal(sent.filter((message) => message.method === "turn/interrupt").length, 1);
+	assert.equal(host.entries().length, 1, "the cancelled run is recorded once");
+
+	env.FAKE_CODEX_SCENARIO = "ok";
+	assert.equal((await host.fusion({ role: "implement", task: "the next task", backend: "codex" })).error, undefined, "the writer slot is free again");
+	await ended(host, "run-2");
+	assert.deepEqual(tripwireReaches("codex"), []);
 });
 
 test("/fusion off hides the fusion tools and starts nothing, and /fusion on gives back the ones it hid", async () => {

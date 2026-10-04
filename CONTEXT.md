@@ -33,7 +33,7 @@ A run that goes on after the host's delegation call returns, so the host can kee
 _Avoid_: async run, detached run
 
 **Question**:
-A request for a small decision a child sends while it works. It is not an escalation that ends the run. A Codex child has no question tool yet; it reports a missing decision instead.
+A request for a small decision a child sends while it works. It is not an escalation that ends the run. A Codex child asks through Codex's experimental API, so far tested only against a fake.
 _Avoid_: escalation, prompt, elicitation
 
 **Waiting**:

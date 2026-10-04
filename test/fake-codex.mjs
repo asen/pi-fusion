@@ -25,6 +25,15 @@ import * as path from "node:path";
  * next entry of the comma list `FAKE_CODEX_STEERS` — `accept`, `reject` or `silent` — and completes its turn after the
  * last one. All of these are this fixture's own; no production request carries any of them.
  *
+ * The question scenarios send `item/tool/call` requests in the shape 0.160.0's source declares — thread, turn, call id,
+ * a null namespace, the tool and its arguments — and finish their turn only once every one of them was answered, with
+ * a final message that says whether the last answer was a success. `question` asks once after the turn/start answer
+ * and `question-early` before it; `question-two` asks twice at once; `question-foreign` sends the calls a host must
+ * refuse — another thread's, another turn's, a namespaced one, an empty question — and one valid one; `question-cancel`
+ * asks and never finishes on its own; `question-unknown-tool` calls a tool nobody registered. `question-inherited`
+ * asks on a resumed or forked thread, as a thread whose tools Codex restored from its history would, so it is one of
+ * the `FOUNDATIONS` scenarios. Whether a tool was registered is the host's request to show; the fake asks regardless.
+ *
  * It stays alive through its stdin reader, so a host's own shutdown — which ends stdin first — is what ends it, and the
  * owned cleanup's report is about a process that was really there. Two scenarios differ on purpose: `hang` ignores the
  * end of stdin and `no-read` stops reading it, and both stay up on a bounded keepalive until the cleanup signals them.
@@ -96,11 +105,13 @@ let refusedStarts = 0;
 /** The server requests `approvals` and the others are waiting on, by id. */
 const awaiting = new Map();
 let afterReplies;
+/** The result of the last reply the fake read to one of its own requests. */
+let lastResult;
 
 const usage = (input, cached, output, reasoning) => ({ inputTokens: input, cachedInputTokens: cached, outputTokens: output, reasoningOutputTokens: reasoning, totalTokens: input + output });
 
 /** The scenarios that answer the resume, fork, latest-turn and steer methods. */
-const FOUNDATIONS = new Set(["resume-ok", "resume-reset", "resume-moved", "resume-mismatch", "fork-ok", "fork-same-id", "fork-tip-missing", "turns-interrupted", "steer-ok", "steer-rejected", "steer-script"]);
+const FOUNDATIONS = new Set(["resume-ok", "resume-reset", "resume-moved", "resume-mismatch", "fork-ok", "fork-same-id", "fork-tip-missing", "turns-interrupted", "steer-ok", "steer-rejected", "steer-script", "question-inherited"]);
 /** What a persisted thread's cumulative total already is when it is loaded: the fake's seed, never a request's. */
 const SEED = HISTORY.seed ?? usage(5_000, 2_000, 200, 50);
 let forkCount = 0;
@@ -120,6 +131,20 @@ const persisted = () => {
 };
 
 const plus = (a, b) => Object.fromEntries(Object.keys(a).map((key) => [key, a[key] + (b[key] ?? 0)]));
+
+/** One question call, waited on by id, in the request shape the source declares. */
+const askCall = (id, threadId, turnId, over = {}) => {
+	awaiting.set(`${typeof id}:${id}`, true);
+	send({ id, method: "item/tool/call", params: { threadId, turnId, callId: `call-${id}`, namespace: null, tool: "ask_orchestrator", arguments: { question: "Which name should the helper take?" }, ...over } });
+};
+
+/** A turn's end once its questions were answered: a final message saying how the last one was, its usage, its completion. */
+const answeredEnd = (threadId, turnId, total, last) => () => {
+	const text = lastResult?.success === true ? `answer received: ${lastResult.contentItems?.[0]?.text}` : "no answer came, so the missing decision is reported";
+	notify("item/completed", { threadId, turnId, completedAtMs: 3, item: { type: "agentMessage", id: "msg-1", text, phase: null } });
+	tokenUsage(threadId, turnId, total, last);
+	completed(threadId, turnId);
+};
 
 const tokenUsage = (threadId, turnId, total, last, window = 200_000) => notify("thread/tokenUsage/updated", { threadId, turnId, tokenUsage: { total, last, modelContextWindow: window } });
 
@@ -250,6 +275,47 @@ function startTurn(id, params) {
 				completed(threadId, turnId);
 			};
 			return;
+		case "question":
+		case "question-early":
+			if (SCENARIO === "question-early") askCall(21, threadId, turnId);
+			answer();
+			if (SCENARIO === "question") askCall(21, threadId, turnId);
+			// Read while the question waits: the host's read loop has to go on taking these.
+			notify("item/started", { threadId, turnId, startedAtMs: 1, item: { type: "dynamicToolCall", id: "call-21", tool: "ask_orchestrator", status: "inProgress" } });
+			afterReplies = answeredEnd(threadId, turnId, usage(700, 200, 40, 5), usage(700, 200, 40, 5));
+			return;
+		case "question-two":
+			answer();
+			askCall(21, threadId, turnId);
+			askCall("q-22", threadId, turnId, { arguments: { question: "And which directory?" } });
+			afterReplies = answeredEnd(threadId, turnId, usage(700, 200, 40, 5), usage(700, 200, 40, 5));
+			return;
+		case "question-foreign":
+			answer();
+			askCall("f-1", "thr-sub", "turn-sub");
+			askCall("f-2", threadId, "turn-other");
+			askCall("f-3", threadId, turnId, { namespace: "fusion" });
+			askCall("f-4", threadId, turnId, { arguments: { question: "   " } });
+			askCall("f-5", threadId, turnId, { arguments: "Which name?" });
+			askCall(21, threadId, turnId);
+			afterReplies = answeredEnd(threadId, turnId, usage(700, 200, 40, 5), usage(700, 200, 40, 5));
+			return;
+		case "question-cancel":
+			answer();
+			askCall(21, threadId, turnId);
+			return;
+		case "question-unknown-tool":
+			answer();
+			send({ id: 31, method: "item/tool/call", params: { threadId, turnId, callId: "call-31", namespace: null, tool: "other_tool", arguments: {} } });
+			return;
+		case "question-inherited": {
+			// A loaded thread's turn asks through the tool its history restored, and ends cumulative from the seed.
+			answer();
+			askCall(21, threadId, turnId);
+			const last = usage(400, 300, 20, 5);
+			afterReplies = answeredEnd(threadId, turnId, plus(thread.seed ?? usage(0, 0, 0, 0), last), last);
+			return;
+		}
 		case "user-input":
 			answer();
 			send({ id: 11, method: "item/tool/requestUserInput", params: { threadId, turnId, itemId: "ask-1", questions: [], isBlocking: true } });
@@ -523,6 +589,7 @@ function request(message) {
 function reply(message) {
 	const key = `${typeof message.id}:${message.id}`;
 	if (!awaiting.delete(key)) return;
+	if ("result" in message) lastResult = message.result;
 	if (awaiting.size === 0 && afterReplies) {
 		const next = afterReplies;
 		afterReplies = undefined;

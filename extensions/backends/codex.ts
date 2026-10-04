@@ -2,7 +2,7 @@ import { readFileSync, realpathSync } from "node:fs";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import type { OwnedCleanup } from "../process-tree.ts";
-import type { CodexRole } from "./codex-binding.ts";
+import { CODEX_CONTINUED_QUESTIONS, type CodexRole } from "./codex-binding.ts";
 import { type CodexLaunch, type CodexLaunchRequest, codexLaunch } from "./codex-launch.ts";
 import {
 	baselineOf,
@@ -47,14 +47,16 @@ import { type Backend, type ChildControl, type ChildEvent, failed, type RunReque
  *
  * **Experimental and unqualified past stage 1.** Every shape this reads is a source reading of Codex 0.160.0's
  * app-server. A fresh call was measured natively once (G1); a resume, a fork and a steer are exercised here only against
- * `test/fake-codex.mjs`. The host registers one backend from `createCodexBackend` when the extension loads, and neither
- * importing this module nor that construction starts, locates or reads anything: the contract, the binary and the
- * client version are all looked for only when a run is requested.
+ * `test/fake-codex.mjs`, and so is a question: no native question has been measured (G3). The host registers one
+ * backend from `createCodexBackend` when the extension loads, and neither importing this module nor that construction
+ * starts, locates or reads anything: the contract, the binary and the client version are all looked for only when a
+ * run is requested.
  *
- * **The order.** A cancelled signal ends the call before anything is read. Then the contract and its addendum, the
- * launch — the host's own cwd and inherited environment, the binary located only now — and the client's version, and
- * only then a child: spawn, `initialize`, `initialized`. The home the child reports must be the one the launch predicted.
- * One thread is opened — `thread/start`, `thread/resume` of the recorded thread or `thread/fork` of it through its
+ * **The order.** A cancelled signal ends the call before anything is read. Then the contract, with the no-questions
+ * addendum after it when the run has no question callback, or the continued-questions fallback when a continuation has
+ * one, the launch — the host's own cwd and inherited environment,
+ * the binary located only now — and the client's version, and only then a child: spawn, `initialize`, `initialized`.
+ * The home the child reports must be the one the launch predicted. One thread is opened — `thread/start`, `thread/resume` of the recorded thread or `thread/fork` of it through its
  * checkpoint — naming the role's sandbox mode, approval `never`, the role's instructions and only the model and provider
  * the call named or the record repeats; its answer must name the right thread, this run's working directory, the
  * requested sandbox and a model and provider, the named ones exactly. A continued thread's latest turn is then read: a
@@ -68,13 +70,20 @@ import { type Backend, type ChildControl, type ChildEvent, failed, type RunReque
  * call ends or it is cancelled, and what is still queued then is dropped and counted. Nothing is resent, replayed or
  * sent to a guessed turn.
  *
+ * **Questions.** A run whose request carries `onQuestion` hands it to the transport as it is, which opts the connection
+ * into Codex's experimental API, registers the question tool on a fresh thread and answers a question on any turn the
+ * run owns, a continued thread's restored tool included. A fresh run's instructions are its contract alone, which tells
+ * it to ask; a continued one's add one fallback, because its thread has the tool only if it was started with it. A run with no callback keeps the addendum, so a missing decision ends up in its report, and a question its
+ * thread still makes is answered with a refusal the model can report rather than failing the run. Cancelling a run
+ * with a question open ends that question through the transport's own stop: no second stop, notice or retry.
+ *
  * **One stop.** The composition calls `shutdown` exactly once on the child it was handed, on every path after the start
  * resolved; a cancellation or a transport failure that already finalized the child makes that call the same memoized
  * finalization rather than a second one. Nothing above the mapping writes a cleanup sentence of its own.
  *
- * **What it never does.** No request names a cwd, a configuration map, base instructions, dynamic tools, or an effort
- * on a thread request; no turn/start names a model, provider, cwd or sandbox policy. Nothing rewinds, replays or names
- * a path. Fusion writes no trust entry, configuration or auth file: what the child inherits — the host's Codex home,
+ * **What it never does.** No request names a cwd, a configuration map, base instructions, a dynamic tool other than
+ * the question tool on a fresh thread with a callback, or an effort on a thread request; no turn/start names a model,
+ * provider, cwd or sandbox policy. Nothing rewinds, replays or names a path. Fusion writes no trust entry, configuration or auth file: what the child inherits — the host's Codex home,
  * configuration, MCP servers, multi-agent features — is the host's, and nothing here isolates a run from it.
  */
 
@@ -296,7 +305,10 @@ async function runCodexCall(request: RunRequest<CodexRole, CodexSession, ChildCo
 		let instructions: string;
 		try {
 			const read = deps.readContract ?? readRoleContract;
-			instructions = `${read(role.contract).trimEnd()}\n\n${read(role.addendum).trim()}\n`;
+			// A run that cannot ask is told what to do instead. One that can runs its contract, and a continued one is also
+			// told what to do if its thread was started without the tool, since nothing can register one on it now.
+			const after = request.onQuestion === undefined ? role.addendum : session.kind === "new" ? undefined : CODEX_CONTINUED_QUESTIONS;
+			instructions = after === undefined ? `${read(role.contract).trimEnd()}\n` : `${read(role.contract).trimEnd()}\n\n${read(after).trim()}\n`;
 		} catch (error) {
 			report.stage = "contract";
 			report.thrown = { error };
@@ -322,6 +334,7 @@ async function runCodexCall(request: RunRequest<CodexRole, CodexSession, ChildCo
 				launch: prepared.launch,
 				clientInfo,
 				onNotification: (notification) => feed.onNotification(notification),
+				...(request.onQuestion === undefined ? {} : { onQuestion: request.onQuestion }),
 				...(request.signal === undefined ? {} : { signal: request.signal }),
 				...(request.killGraceMs === undefined ? {} : { killGraceMs: request.killGraceMs }),
 				...(deps.cleanup === undefined ? {} : { cleanup: deps.cleanup }),

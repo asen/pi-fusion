@@ -13,6 +13,7 @@ import {
 	readErrorNotice,
 	readInitialize,
 	readItem,
+	readQuestionCall,
 	readReroute,
 	readThreadRead,
 	readThreadResume,
@@ -28,6 +29,10 @@ import {
 } from "../extensions/backends/codex-protocol.ts";
 import {
 	CODEX_BOUNDS,
+	CODEX_QUESTION_DESCRIPTION,
+	CODEX_QUESTION_REFUSED,
+	CODEX_QUESTION_UNANSWERED,
+	CODEX_QUESTION_UNAVAILABLE,
 	CODEX_UNSUPPORTED_CODE,
 	type CodexBounds,
 	type CodexChild,
@@ -42,6 +47,7 @@ import {
 	readMessage,
 	startCodexChild,
 } from "../extensions/backends/codex-transport.ts";
+import { QUESTION_TOOL_DESCRIPTION } from "../extensions/backends/pi-question-tool.mjs";
 import type { OwnedCleanup } from "../extensions/process-tree.ts";
 
 /*
@@ -257,6 +263,32 @@ test("items and approvals are diagnostics: bounded text, malformed reads as a re
 	assert.deepEqual(readApproval("command", { threadId: "t", turnId: "u", itemId: "i", command: "ls -la" }, 2), { kind: "command", threadId: "t", turnId: "u", itemId: "i", command: { text: "ls", cut: true } });
 	assert.deepEqual(readApproval("file", null, 2), { kind: "file" });
 	assert.deepEqual(boundText("a→b", 2), { text: "a", cut: true }, "a cut never leaves half a character");
+});
+
+test("a question call is read only for the question tool: its thread, turn and call, a null namespace and one non-empty question, refused whole", () => {
+	const call = { threadId: "t", turnId: "u", callId: "c", namespace: null, tool: "ask_orchestrator", arguments: { question: "Which one?", extra: 1 } };
+	assert.deepEqual(readQuestionCall(call, 64), { ok: true, value: { threadId: "t", turnId: "u", callId: "c", question: "Which one?" } });
+	const { namespace: _namespace, ...unnamed } = call;
+	assert.equal(readQuestionCall(unnamed, 64)?.ok, true, "a namespace left out is the same as null");
+	assert.equal(readQuestionCall({ ...call, tool: "other_tool" }, 64), undefined, "another tool is no question");
+	assert.equal(readQuestionCall("ask_orchestrator", 64), undefined);
+	for (const [what, bad] of [
+		["a namespace", { ...call, namespace: "fusion" }],
+		["no thread", { ...call, threadId: undefined }],
+		["no turn", { ...call, turnId: "" }],
+		["no call id", { ...call, callId: 7 }],
+		["arguments as a string", { ...call, arguments: "Which one?" }],
+		["arguments as an array", { ...call, arguments: ["Which one?"] }],
+		["no question", { ...call, arguments: {} }],
+		["a blank question", { ...call, arguments: { question: " \n " } }],
+		["a question that is not text", { ...call, arguments: { question: 3 } }],
+	] as const) {
+		const read = readQuestionCall(bad, 64);
+		assert.equal(read?.ok, false, what);
+	}
+	assert.equal(readQuestionCall({ ...call, arguments: { question: "é".repeat(40) } }, 64)?.ok, false, "a question past the cap is refused, never cut");
+	// The tool a contract names reads the same whichever backend runs it: Pi's description is Claude's, word for word.
+	assert.equal(CODEX_QUESTION_DESCRIPTION, QUESTION_TOOL_DESCRIPTION);
 });
 
 test("initialize is strict about the home and platform it reports", () => {
@@ -598,6 +630,7 @@ test("approval requests are declined on the wire, once per id, and surfaced as d
 for (const [scenario, method] of [
 	["user-input", "item/tool/requestUserInput"],
 	["unknown-request", "fake/surprise"],
+	["question-unknown-tool", "item/tool/call"],
 ] as const) {
 	test(`a ${method} request is answered with a JSON-RPC error and fails the run: the turn is interrupted and the child stopped`, async () => {
 		await withFake(scenario, async (fixture) => {
@@ -1063,6 +1096,198 @@ test("steer: a JSON-RPC error answering it resolves refused with its code, once,
 		assert.equal(await settledYet(turn.done), false);
 		assert.equal((await within("thread/read", child.readThread(thread.threadId))).status.type, "active", "the child is still read");
 		assert.equal(requests(fixture).filter((message) => message.method === "turn/steer").length, 1, "nothing retried or resent");
+	});
+});
+
+/* ------------------------------------------------------------------------------------------------------------------
+ * Questions: the one dynamic tool, asked of a callback that never holds up the read loop
+ * ---------------------------------------------------------------------------------------------------------------- */
+
+/** The registration a fresh thread of a child with a callback carries, as literal as the wire has it. */
+const QUESTION_TOOL = { type: "function", name: "ask_orchestrator", description: CODEX_QUESTION_DESCRIPTION, inputSchema: { type: "object", properties: { question: { type: "string" } }, required: ["question"] } };
+const QUESTION = "Which name should the helper take?";
+
+interface Asked {
+	question: string;
+	signal: AbortSignal;
+	answer(text: string): void;
+}
+
+/** A callback that holds each question until a case answers it, and rejects when its signal aborts, as the host's does. */
+function desk(): { onQuestion: (question: string, signal: AbortSignal) => Promise<string>; asked: Asked[] } {
+	const asked: Asked[] = [];
+	const onQuestion = (question: string, signal: AbortSignal) =>
+		new Promise<string>((resolve, reject) => {
+			signal.addEventListener("abort", () => reject(new Error("stopped")), { once: true });
+			asked.push({ question, signal, answer: resolve });
+		});
+	return { onQuestion, asked };
+}
+
+/** Waits, a turn of the event loop at a time, for something the child's lines bring about. */
+async function until(what: string, ready: () => boolean): Promise<void> {
+	await within(
+		what,
+		(async () => {
+			while (!ready()) await new Promise((resolve) => setImmediate(resolve));
+		})(),
+	);
+}
+
+const toolResult = (id: string | number, success: boolean, text: string) => ({ id, result: { success, contentItems: [{ type: "inputText", text }] } });
+const replies = (fixture: Fixture) => requests(fixture).filter((message) => message.method === undefined);
+
+test("with a callback: the connection opts in, a fresh thread is registered the one tool, and a question is answered once while the read loop goes on", async () => {
+	await withFake("question", async (fixture) => {
+		const { onQuestion, asked } = desk();
+		const child = await fixture.start({ onQuestion });
+		const thread = await within("thread/start", child.startThread({ sandbox: "workspace-write", approvalPolicy: "never", developerInstructions: CONTRACT }));
+		const turn = await within("turn/start", child.startTurn({ threadId: thread.threadId, text: "x" }));
+		await until("the question", () => asked.length === 1);
+		assert.equal(asked[0]!.question, QUESTION, "the question as it arrived");
+		assert.equal(asked[0]!.signal.aborted, false);
+
+		// While it waits, notifications and responses are still read: the callback is not awaited on the read loop.
+		await until("the tool item", () => turn.snapshot().items.started === 1);
+		assert.equal((await within("thread/read", child.readThread(thread.threadId))).threadId, thread.threadId);
+		assert.equal(await settledYet(turn.done), false, "the turn waits on its question");
+
+		asked[0]!.answer("call it fooHelper");
+		const result = await within("the turn", turn.done);
+		assert.equal(result.outcome, "completed");
+		assert.deepEqual(result.finalMessage, { text: "answer received: call it fooHelper", cut: false });
+		assert.equal(asked[0]!.signal.aborted, false, "an answered question's signal is left alone");
+		assert.equal(asked.length, 1);
+		assert.equal(child.counters.questions, 1);
+		assert.equal(child.counters.refusedQuestions, 0);
+		assert.equal(child.counters.unsupportedRequests, 0);
+
+		const sent = requests(fixture);
+		assert.deepEqual(sent[0], { id: 1, method: "initialize", params: { clientInfo: { name: "pi-fusion", title: "Pi-Fusion", version: "0" }, capabilities: { experimentalApi: true } } });
+		assert.deepEqual(sent[2], { id: 2, method: "thread/start", params: { sandbox: "workspace-write", approvalPolicy: "never", developerInstructions: CONTRACT, dynamicTools: [QUESTION_TOOL] } });
+		assert.deepEqual(replies(fixture), [toolResult(21, true, "call it fooHelper")], "one reply, under the request's own id");
+	});
+});
+
+test("a question that arrives before the turn/start answer is held for that answer and asked once it names the turn", async () => {
+	await withFake("question-early", async (fixture) => {
+		const { onQuestion, asked } = desk();
+		const child = await fixture.start({ onQuestion });
+		const thread = await within("thread/start", child.startThread({ sandbox: "workspace-write", approvalPolicy: "never", developerInstructions: CONTRACT }));
+		const turn = await within("turn/start", child.startTurn({ threadId: thread.threadId, text: "x" }));
+		await until("the question", () => asked.length === 1);
+		asked[0]!.answer("held, then asked");
+		assert.equal((await within("the turn", turn.done)).outcome, "completed");
+		assert.deepEqual(replies(fixture), [toolResult(21, true, "held, then asked")]);
+		assert.equal(child.counters.refusedQuestions, 0);
+	});
+});
+
+test("two questions at once are both the callback's, each answered under its own id: nothing is queued or refused here", async () => {
+	await withFake("question-two", async (fixture) => {
+		const { onQuestion, asked } = desk();
+		const child = await fixture.start({ onQuestion });
+		const thread = await within("thread/start", child.startThread({ sandbox: "workspace-write", approvalPolicy: "never", developerInstructions: CONTRACT }));
+		const turn = await within("turn/start", child.startTurn({ threadId: thread.threadId, text: "x" }));
+		await until("both questions", () => asked.length === 2);
+		assert.deepEqual(asked.map((entry) => entry.question), [QUESTION, "And which directory?"]);
+		asked[1]!.answer("src");
+		asked[0]!.answer("fooHelper");
+		assert.equal((await within("the turn", turn.done)).outcome, "completed");
+		assert.deepEqual(replies(fixture), [toolResult("q-22", true, "src"), toolResult(21, true, "fooHelper")]);
+		assert.equal(child.counters.questions, 2);
+	});
+});
+
+test("another thread's, another turn's, a namespaced or an empty question is refused with one fixed text and the run goes on; the valid one is asked", async () => {
+	await withFake("question-foreign", async (fixture) => {
+		const { onQuestion, asked } = desk();
+		const child = await fixture.start({ onQuestion });
+		const thread = await within("thread/start", child.startThread({ sandbox: "workspace-write", approvalPolicy: "never", developerInstructions: CONTRACT }));
+		const turn = await within("turn/start", child.startTurn({ threadId: thread.threadId, text: "x" }));
+		await until("the question", () => asked.length === 1);
+		asked[0]!.answer("only this one");
+		const result = await within("the turn", turn.done);
+		assert.equal(result.outcome, "completed");
+		assert.equal(asked.length, 1, "nothing but the run's own valid question reached the callback");
+		assert.deepEqual(replies(fixture), [...["f-1", "f-2", "f-3", "f-4", "f-5"].map((id) => toolResult(id, false, CODEX_QUESTION_REFUSED)), toolResult(21, true, "only this one")]);
+		assert.equal(child.counters.refusedQuestions, 5);
+		assert.equal(child.counters.unsupportedRequests, 0);
+		const exit = await within("the shutdown", child.shutdown());
+		assert.equal(exit.failure, undefined, "a refused question is the tool's answer, not the run's failure");
+	});
+});
+
+test("without a callback: no capability, no tool, and a question its thread still makes is answered unavailable while the turn goes on", async () => {
+	await withFake("question", async (fixture) => {
+		const child = await fixture.start();
+		const thread = await within("thread/start", child.startThread({ sandbox: "workspace-write", approvalPolicy: "never", developerInstructions: CONTRACT }));
+		const turn = await within("turn/start", child.startTurn({ threadId: thread.threadId, text: "x" }));
+		const result = await within("the turn", turn.done);
+		assert.equal(result.outcome, "completed");
+		assert.deepEqual(result.finalMessage, { text: "no answer came, so the missing decision is reported", cut: false });
+		const sent = requests(fixture);
+		assert.deepEqual(sent[0], { id: 1, method: "initialize", params: { clientInfo: { name: "pi-fusion", title: "Pi-Fusion", version: "0" } } }, "no capabilities member at all, not one set false");
+		assert.equal("dynamicTools" in sent[2]!.params, false);
+		assert.deepEqual(replies(fixture), [toolResult(21, false, CODEX_QUESTION_UNAVAILABLE)]);
+		assert.deepEqual([child.counters.questions, child.counters.refusedQuestions, child.counters.unsupportedRequests], [0, 1, 0]);
+	});
+});
+
+test("a callback that throws or answers with no text is an unanswered question, not a lost one: one refusal, and the turn goes on", async () => {
+	for (const onQuestion of [
+		(): Promise<string> => {
+			throw new Error("the callback broke");
+		},
+		() => Promise.resolve(undefined as unknown as string),
+	]) {
+		await withFake("question", async (fixture) => {
+			const child = await fixture.start({ onQuestion });
+			const thread = await within("thread/start", child.startThread({ sandbox: "workspace-write", approvalPolicy: "never", developerInstructions: CONTRACT }));
+			const turn = await within("turn/start", child.startTurn({ threadId: thread.threadId, text: "x" }));
+			assert.equal((await within("the turn", turn.done)).outcome, "completed");
+			assert.deepEqual(replies(fixture), [toolResult(21, false, CODEX_QUESTION_UNANSWERED)]);
+		});
+	}
+});
+
+test("cancelling while a question waits aborts its signal, answers it once ahead of the interrupt, and ends the turn as cancelled", async () => {
+	await withFake("question-cancel", async (fixture) => {
+		const controller = new AbortController();
+		const { onQuestion, asked } = desk();
+		const child = await fixture.start({ onQuestion, signal: controller.signal });
+		const thread = await within("thread/start", child.startThread({ sandbox: "workspace-write", approvalPolicy: "never", developerInstructions: CONTRACT }));
+		const turn = await within("turn/start", child.startTurn({ threadId: thread.threadId, text: "x" }));
+		await until("the question", () => asked.length === 1);
+		controller.abort();
+		const result = await within("the turn", turn.done);
+		assert.equal(result.outcome, "aborted");
+		assert.equal(asked[0]!.signal.aborted, true, "the question's own signal is aborted by the stop");
+		// A late answer after the stop settles nothing and writes nothing.
+		asked[0]!.answer("too late");
+		const exit = await within("the exit", child.exited);
+		assert.equal(exit.failure?.kind, "aborted");
+		const order = requests(fixture).map((message) => message.method ?? `reply ${message.id}`);
+		assert.ok(order.indexOf("reply 21") !== -1 && order.indexOf("reply 21") < order.indexOf("turn/interrupt"), "the question is answered before the interrupt");
+		assert.deepEqual(replies(fixture), [toolResult(21, false, CODEX_QUESTION_UNANSWERED)]);
+	});
+});
+
+test("a resumed thread is registered no tool, and still has its question answered: Codex restores the tool from the thread's history", async () => {
+	await withFake("question-inherited", async (fixture) => {
+		const { onQuestion, asked } = desk();
+		const child = await fixture.start({ onQuestion });
+		await within("thread/resume", child.resumeThread({ threadId: PERSISTED, ...OPEN }));
+		const turn = await within("turn/start", child.startTurn({ threadId: PERSISTED, text: "go on" }));
+		await until("the question", () => asked.length === 1);
+		asked[0]!.answer("restored");
+		const result = await within("the turn", turn.done);
+		assert.equal(result.outcome, "completed");
+		assert.deepEqual(result.usage?.last, LOADED_LAST);
+		const sent = requests(fixture);
+		assert.deepEqual(sent[0]?.params.capabilities, { experimentalApi: true }, "the connection opts in whichever way its thread was opened");
+		assert.deepEqual(sent.find((message) => message.method === "thread/resume")?.params, { threadId: PERSISTED, ...OPEN, excludeTurns: true }, "no dynamic tools on a resume");
+		assert.deepEqual(replies(fixture), [toolResult(21, true, "restored")]);
 	});
 });
 

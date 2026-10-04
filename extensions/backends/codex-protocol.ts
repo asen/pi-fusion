@@ -7,8 +7,9 @@ import * as path from "node:path";
  *
  * Provenance, kept apart on purpose: each shape below was read in Codex 0.160.0's app-server protocol source (its v2
  * types and the generated schema of that version), and none of it is measured against a running app-server. A later
- * version may move any of it. A field that Codex marks experimental is not read here, and an extra field a shape
- * carries is tolerated and ignored rather than refused, because ignoring it promotes nothing to evidence.
+ * version may move any of it. A field that Codex marks experimental is not read here, with one exception: the dynamic
+ * tool call a question arrives as, which a child sends only to a client that opted into the experimental API. An extra
+ * field a shape carries is tolerated and ignored rather than refused, because ignoring it promotes nothing to evidence.
  *
  * Fail closed is the rule for what decides a run — a thread's identity and selection, a turn's start and end, its usage
  * and the errors and reroutes it reports: a malformed one is a reason, never a partial value or a default. Tool items
@@ -511,4 +512,39 @@ export function readApproval(kind: "command" | "file", params: unknown, maxTextB
 	if (itemId !== undefined) denial.itemId = itemId;
 	if (typeof params.command === "string") denial.command = boundText(params.command, maxTextBytes);
 	return denial;
+}
+
+/* ------------------------------------------------------------------------------------------------------------------
+ * questions: the one dynamic tool this host answers
+ * ---------------------------------------------------------------------------------------------------------------- */
+
+/** The question tool's name: the one every role contract tells a child to ask through, whichever backend runs it. */
+export const CODEX_QUESTION_TOOL = "ask_orchestrator";
+
+/** The server request a dynamic tool call arrives as. Experimental in 0.160.0, like the registration it answers. */
+export const CODEX_TOOL_CALL_METHOD = "item/tool/call";
+
+/** A question call as far as the host takes one: the turn it came from, the child's call id, and the question. */
+export interface CodexQuestionCall extends CodexTurnKey {
+	callId: string;
+	question: string;
+}
+
+/**
+ * An item/tool/call request read as a question. `undefined` is a call that does not name the question tool, which is
+ * no tool this host has. Otherwise it is the call, or the fixed reason it cannot be hosted: a namespace, which a flat
+ * registration never has, a thread, turn or call id missing, or arguments that are not an object with a question that
+ * is non-empty and at most `maxQuestionBytes`. A question is refused whole rather than cut, and read as it arrived.
+ */
+export function readQuestionCall(params: unknown, maxQuestionBytes: number): CodexRead<CodexQuestionCall> | undefined {
+	if (!isRecord(params) || params.tool !== CODEX_QUESTION_TOOL) return undefined;
+	if (params.namespace !== undefined && params.namespace !== null) return no("a question call names a tool namespace the question tool is not in");
+	const threadId = ident(params.threadId);
+	const turnId = ident(params.turnId);
+	const callId = ident(params.callId);
+	if (threadId === undefined || turnId === undefined || callId === undefined) return no("a question call does not name its thread, turn and call");
+	const args = params.arguments;
+	if (!isRecord(args) || typeof args.question !== "string" || args.question.trim() === "") return no("a question call carries no question");
+	if (Buffer.byteLength(args.question) > maxQuestionBytes) return no("a question call carries a question longer than this host takes");
+	return ok({ threadId, turnId, callId, question: args.question });
 }

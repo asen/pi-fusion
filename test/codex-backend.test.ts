@@ -34,7 +34,17 @@ import {
 	type CodexRun,
 } from "../extensions/backends/codex-outcome.ts";
 import type { CodexThreadStart } from "../extensions/backends/codex-protocol.ts";
-import { type CodexBounds, type CodexChild, type CodexChildOptions, type CodexExit, CodexTransportError, startCodexChild } from "../extensions/backends/codex-transport.ts";
+import {
+	type CodexBounds,
+	type CodexChild,
+	type CodexChildOptions,
+	type CodexExit,
+	CODEX_QUESTION_TOOL_SPEC,
+	CODEX_QUESTION_UNANSWERED,
+	CODEX_QUESTION_UNAVAILABLE,
+	CodexTransportError,
+	startCodexChild,
+} from "../extensions/backends/codex-transport.ts";
 import { type ChildControl, type ChildEvent, type CodexUsageBaseline, failed, hostBackend, type ResolvedSelection, type SessionIntent } from "../extensions/backends/types.ts";
 import { type OwnedCleanup, productionFacilities } from "../extensions/process-tree.ts";
 
@@ -57,6 +67,10 @@ const CASE_DEADLINE_MS = 20_000;
 /** The contracts as a test reads them: the name, so the instructions a thread gets are visibly the two composed. */
 const readContract = (name: string): string => `contract ${name}\n`;
 const INSTRUCTIONS = (role: "implement" | "ask") => `contract ${role === "ask" ? "ask-answer.md" : "implement.md"}\n\ncontract codex-no-questions.md\n`;
+/** A run with a question callback runs its contract alone: the addendum is for a child that cannot ask. */
+const ASKING_INSTRUCTIONS = (role: "implement" | "ask") => `contract ${role === "ask" ? "ask-answer.md" : "implement.md"}\n`;
+/** A continuation that can ask also gets the fallback for a thread that was started without the question tool. */
+const CONTINUED_ASKING_INSTRUCTIONS = (role: "implement" | "ask") => `contract ${role === "ask" ? "ask-answer.md" : "implement.md"}\n\ncontract codex-continued-questions.md\n`;
 
 const RETAINED: string[] = [];
 after(() => assert.deepEqual(RETAINED, [], "every case proved its fake was over before its root was removed"));
@@ -151,6 +165,8 @@ interface CaseOptions {
 	recorded?: ResolvedSelection;
 	/** Steers pushed into the run's control before the run is started. */
 	steers?: string[];
+	/** The run's question callback, handed to the backend as the host hands it. None when unset. */
+	onQuestion?: (question: string, signal: AbortSignal) => Promise<string>;
 }
 
 interface Fixture {
@@ -236,6 +252,7 @@ async function withBackend(scenario: string, body: (fixture: Fixture) => Promise
 					session: backend.session(options.intent ?? { kind: "new" }),
 					signal: options.signal,
 					input,
+					...(options.onQuestion === undefined ? {} : { onQuestion: options.onQuestion }),
 					onProgress: () => (progress += 1),
 					onEvent: (event) => {
 						events.push(event);
@@ -904,6 +921,99 @@ test("steers still queued when the run stops taking input are dropped, noted onc
 /* ------------------------------------------------------------------------------------------------------------------
  * Composition boundaries
  * ---------------------------------------------------------------------------------------------------------------- */
+
+/* ------------------------------------------------------------------------------------------------------------------
+ * Questions: the run's own callback, on a fresh thread and on one Codex restored the tool on
+ * ---------------------------------------------------------------------------------------------------------------- */
+
+const toolResult = (id: number, success: boolean, text: string) => ({ id, result: { success, contentItems: [{ type: "inputText", text }] } });
+const replies = (fixture: Fixture) => requests(fixture).filter((message) => message.method === undefined);
+
+test("a fresh run with a callback opts in, registers the one tool, runs its contract alone, and settles on its turn once the answer came", async () => {
+	await withBackend("question", async (fixture) => {
+		const asked: { question: string; signal: AbortSignal }[] = [];
+		const outcome = await fixture.call(
+			{ role: "implement" },
+			{
+				onQuestion: async (question, signal) => {
+					asked.push({ question, signal });
+					return "call it fooHelper";
+				},
+			},
+		);
+		ended(outcome, "stop");
+		assert.match(outcome.run.text, /^answer received: call it fooHelper\n\nNote: the codex child reported no effort/, "the answer the child got, then the usual note on a host-default effort");
+		assert.deepEqual(asked.map((entry) => entry.question), ["Which name should the helper take?"]);
+		assert.equal(asked[0]!.signal.aborted, false);
+		assert.deepEqual(sent(fixture, "initialize")[0].params.capabilities, { experimentalApi: true });
+		assert.deepEqual(sent(fixture, "thread/start")[0].params, { sandbox: "workspace-write", approvalPolicy: "never", developerInstructions: ASKING_INSTRUCTIONS("implement"), dynamicTools: [{ ...CODEX_QUESTION_TOOL_SPEC }] });
+		assert.deepEqual(replies(fixture), [toolResult(21, true, "call it fooHelper")]);
+		assert.deepEqual(methods(fixture), ["initialize", "initialized", "thread/start", "turn/start", "reply", "thread/read"], "the answer is a reply on the wire, then the turn's own end and the readback");
+		assert.deepEqual([outcome.run.tokensIn, outcome.run.tokensOut], [700, 40]);
+	});
+});
+
+test("a resume with no callback keeps the addendum and no capability; the restored tool's question is refused and the model's report completes the run", async () => {
+	await withBackend("question-inherited", async (fixture) => {
+		const outcome = await fixture.call({ role: "implement" }, { intent: resume(), recorded: RECORDED });
+		ended(outcome, "stop");
+		assert.equal(outcome.run.text, "no answer came, so the missing decision is reported");
+		assert.equal("capabilities" in sent(fixture, "initialize")[0].params, false);
+		assert.deepEqual(sent(fixture, "thread/resume")[0].params, { threadId: "thr-old", model: "gpt-5", modelProvider: "openai", sandbox: "workspace-write", approvalPolicy: "never", developerInstructions: INSTRUCTIONS("implement"), excludeTurns: true });
+		assert.deepEqual(replies(fixture), [toolResult(21, false, CODEX_QUESTION_UNAVAILABLE)]);
+		// The baseline accounting is the continuation's as ever: the call's share, and a new baseline at its own turn.
+		assert.deepEqual(outcome.run.session, { backend: "codex", sessionId: "thr-old", checkpoint: "turn-1", baseline: { ...plus(SEED, LAST), cacheWriteInputTokens: 0 } });
+		assert.deepEqual([outcome.run.tokensIn, outcome.run.tokensOut, outcome.run.cacheRead], [400, 20, 300]);
+	});
+});
+
+test("a fork with a callback registers nothing on its thread, runs its contract with the continued-questions fallback, and has the restored tool's question answered", async () => {
+	await withBackend("question-inherited", async (fixture) => {
+		const outcome = await fixture.call({ role: "ask" }, { intent: fork(), recorded: RECORDED, onQuestion: async () => "forked answer" });
+		ended(outcome, "stop");
+		assert.equal(outcome.run.text, "answer received: forked answer");
+		assert.deepEqual(sent(fixture, "initialize")[0].params.capabilities, { experimentalApi: true });
+		assert.deepEqual(sent(fixture, "thread/fork")[0].params, { threadId: "thr-old", lastTurnId: "turn-seed-2", model: "gpt-5", modelProvider: "openai", sandbox: "read-only", approvalPolicy: "never", developerInstructions: CONTINUED_ASKING_INSTRUCTIONS("ask"), excludeTurns: true });
+		assert.deepEqual(replies(fixture), [toolResult(21, true, "forked answer")]);
+		assert.deepEqual([outcome.run.tokensIn, outcome.run.tokensOut, outcome.run.cacheRead], [400, 20, 300]);
+	});
+});
+
+test("a resume with a callback gets the continued-questions fallback after its contract, and the real fallback names each role's own section", async () => {
+	await withBackend("question-inherited", async (fixture) => {
+		const outcome = await fixture.call({ role: "implement" }, { intent: resume(), recorded: RECORDED, onQuestion: async () => "resumed answer" });
+		ended(outcome, "stop");
+		assert.equal(sent(fixture, "thread/resume")[0].params.developerInstructions, CONTINUED_ASKING_INSTRUCTIONS("implement"));
+		assert.equal("dynamicTools" in sent(fixture, "thread/resume")[0].params, false);
+	});
+	const shipped = fs.readFileSync(path.join(repoRoot, "contracts", "codex-continued-questions.md"), "utf8");
+	assert.match(shipped, /If ask_orchestrator is not among your tools, do not ask in your output and do not go on as if a question had been answered/);
+	assert.match(shipped, /under Escalation for an implement report, under Open questions for a plan or an ask answer, and under Notes for an ask review/);
+});
+
+test("a run cancelled while its question waits aborts the question's signal, answers it once, and stops its child once", async () => {
+	await withBackend("question-cancel", async (fixture) => {
+		const controller = new AbortController();
+		let signal: AbortSignal | undefined;
+		const outcome = await fixture.call(
+			{ role: "implement" },
+			{
+				signal: controller.signal,
+				onQuestion: (_question, own) =>
+					new Promise<string>((_resolve, reject) => {
+						signal = own;
+						own.addEventListener("abort", () => reject(new Error("stopped")), { once: true });
+						controller.abort();
+					}),
+			},
+		);
+		ended(outcome, "aborted");
+		assert.equal(outcome.run.errorMessage, RUN_ABORTED);
+		assert.equal(signal?.aborted, true);
+		assert.deepEqual(replies(fixture), [toolResult(21, false, CODEX_QUESTION_UNANSWERED)]);
+		assert.equal(sent(fixture, "turn/interrupt").length, 1);
+	});
+});
 
 test("a continuation of another backend's session, or of a thread with no checkpoint and baseline, is refused before any contract, lookup or start", async () => {
 	let touched = 0;

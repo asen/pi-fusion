@@ -3,10 +3,13 @@ import { ChildTree, type CleanupReport, type ExitOutcome, KILL_GRACE_MS, type La
 import {
 	boundText,
 	CODEX_APPROVAL_METHODS,
+	CODEX_QUESTION_TOOL,
+	CODEX_TOOL_CALL_METHOD,
 	type CodexDenial,
 	type CodexInitialize,
 	type CodexItem,
 	type CodexLatestTurn,
+	type CodexQuestionCall,
 	type CodexRead,
 	type CodexReroute,
 	type CodexSandboxRequest,
@@ -22,6 +25,7 @@ import {
 	readErrorNotice,
 	readInitialize,
 	readItem,
+	readQuestionCall,
 	readReroute,
 	readThreadRead,
 	readThreadResume,
@@ -48,13 +52,27 @@ import { LineFramer, MAX_TIMER_MS, type PiLine } from "./pi-transport.ts";
  * required. Host request ids are integers this transport counts up from one; a server request's id is the child's and
  * lives in its own namespace, so a response is only ever correlated against what this side issued.
  *
- * The capabilities this build gives a child are deliberately few: it declares none at the handshake, answers every
- * command or file approval with `decline`, and has no answer for anything else the child asks — a question for the
- * user, a dynamic tool call, an elicitation — which is answered with a JSON-RPC error and ends the run as unsupported.
- * There is no navigation and no generic request: the only methods it sends are the handshake, thread/start, turn/start,
- * thread/read and turn/interrupt, and the stable resume, fork, latest-turn and steer foundations — thread/resume,
- * thread/fork, thread/turns/list and turn/steer — that no backend drives yet. Shapes come from `codex-protocol.ts`, read
- * in Codex 0.160.0's source and not measured against a running app-server.
+ * The capabilities this build gives a child are deliberately few: it answers every command or file approval with
+ * `decline`, and has no answer for anything else the child asks — a question for the user, another dynamic tool, an
+ * elicitation — which is answered with a JSON-RPC error and ends the run as unsupported. The one exception is the
+ * question tool, and only for a child started with `onQuestion`: that child, and no other, opts into Codex's
+ * experimental API at the handshake, for the whole connection, and a fresh thread is registered `ask_orchestrator` as
+ * a dynamic tool. A resumed or forked thread is registered nothing — the stable requests take no tools, and Codex
+ * restores a thread's tools from its own history — so a question call is answered on any turn this transport owns,
+ * whether or not this child registered the tool. There is no navigation and no generic request: the only methods it
+ * sends are the handshake, thread/start, turn/start, thread/read and turn/interrupt, and the stable resume, fork,
+ * latest-turn and steer foundations — thread/resume, thread/fork, thread/turns/list and turn/steer. Shapes come from
+ * `codex-protocol.ts`, read in Codex 0.160.0's source and not measured against a running app-server.
+ *
+ * **Questions.** An `item/tool/call` naming `ask_orchestrator` is taken only from a live, unfinished turn this
+ * transport admitted: one that arrives for its thread before the turn/start answer named the turn is held until that
+ * answer, then asked if it names that turn and refused if not. The callback is never awaited on the read loop, so
+ * notifications, responses and the turn's end go on being read while a question waits. Each request is answered once:
+ * with the host's answer as the tool's one text item, or with `success: false` and one fixed text when the call could
+ * not be hosted, the run has no callback, or the question ended unanswered — its turn ended, the host rejected, or the
+ * child is being stopped, which aborts the question's own signal. A refusal is the tool's answer and not the run's
+ * failure, so the model can go on and report what it lacked. Nothing is retried or resent, and the answer is never
+ * kept here.
  *
  * Framing reuses the Pi transport's byte-capped `LineFramer` and nothing else of it; the lifecycle, writer, readers and
  * failures here are this backend's own. The defaults below are bounded and internal: no environment variable, tool
@@ -549,6 +567,10 @@ export interface CodexCounters {
 	declinedApprovals: number;
 	/** Server requests answered with an error because this build supports nothing they ask for. */
 	unsupportedRequests: number;
+	/** Question calls handed to `onQuestion`. */
+	questions: number;
+	/** Question calls answered `success: false` without asking anyone: no callback, or not one this run could host. */
+	refusedQuestions: number;
 	/** A server request id this transport had already answered, asked again. Not answered twice. */
 	duplicateServerRequests: number;
 	/** Thrown by `onNotification`, caught so a child is never lost to a caller's own error. */
@@ -609,6 +631,12 @@ export interface CodexChildOptions {
 	 * whichever thread or turn it names. Display only; see `CodexNotification`.
 	 */
 	onNotification?: (notification: CodexNotification) => void;
+	/**
+	 * Answers the child's questions, and rejects when the signal aborts: the backend boundary's own question callback.
+	 * Present, it opts this connection into Codex's experimental API and registers the question tool on a fresh thread;
+	 * absent, neither happens, and a question call a continued thread still makes is answered `success: false`.
+	 */
+	onQuestion?: (question: string, signal: AbortSignal) => Promise<string>;
 }
 
 /** One app-server child as its caller drives it. Every call is refused once the child is closing or gone. */
@@ -670,6 +698,38 @@ const WRONG_STEER = "its turn/steer answer names another turn";
 
 /** The JSON-RPC code a refused server request is answered with: Codex's own method-not-found. */
 export const CODEX_UNSUPPORTED_CODE = -32601;
+
+/** What the model reads about the question tool: the Claude and Pi question tools' own sentence, word for word. */
+export const CODEX_QUESTION_DESCRIPTION =
+	"Ask the orchestrator that gave you this task for a decision you need to go on, such as a name or a choice between options inside the task's scope. The call waits until the orchestrator answers, which can take a long time; the answer is the result.";
+
+/** The one dynamic tool a fresh thread of a child started with `onQuestion` is registered, and nothing else ever is. */
+export const CODEX_QUESTION_TOOL_SPEC = Object.freeze({
+	type: "function",
+	name: CODEX_QUESTION_TOOL,
+	description: CODEX_QUESTION_DESCRIPTION,
+	inputSchema: Object.freeze({ type: "object", properties: Object.freeze({ question: Object.freeze({ type: "string" }) }), required: Object.freeze(["question"]) }),
+});
+
+/** A question call to a child with no `onQuestion`: a tool its thread kept from an earlier run that this one cannot answer. */
+export const CODEX_QUESTION_UNAVAILABLE =
+	"no one can answer a question in this run, so this call has no answer; if you cannot go on without the decision, stop and report the question, the options you see and the one you recommend";
+/** A question call this transport would not host: not one non-empty question from a running turn of this run's own. */
+export const CODEX_QUESTION_REFUSED = "this question was not taken, so nothing was asked: a question is asked only when it is non-empty and comes from this run's own running turn";
+/** A question that was asked and ended with no answer: its turn ended, the run is stopping, or the host gave none. */
+export const CODEX_QUESTION_UNANSWERED = "the question ended without an answer, because its turn or the run ended first; this call has no answer to report";
+
+/** One question call this transport took, from the request that carried it to its one reply. */
+interface OpenQuestion {
+	id: string | number;
+	key: CodexTurnKey;
+	question: string;
+	/** The turn it was asked on, once it was: a turn that ends ends its questions. */
+	turn?: TurnRecord;
+	/** The question's own signal, aborted when this transport ends it rather than the host answering it. */
+	controller?: AbortController;
+	done: boolean;
+}
 
 interface Deferred<T> {
 	promise: Promise<T>;
@@ -914,6 +974,8 @@ class CodexChildImpl implements CodexChild {
 		serverRequests: 0,
 		declinedApprovals: 0,
 		unsupportedRequests: 0,
+		questions: 0,
+		refusedQuestions: 0,
 		duplicateServerRequests: 0,
 		listenerErrors: 0,
 		droppedFrames: 0,
@@ -925,12 +987,14 @@ class CodexChildImpl implements CodexChild {
 	/** Every server request id answered, by type and value, for the life of this transport. Nothing is evicted. */
 	private readonly serverIds = new Set<string>();
 	private readonly stopWaiters: Array<() => void> = [];
+	/** Question calls taken and not yet answered, held or asked: each gets its one reply from here. */
+	private readonly questions = new Set<OpenQuestion>();
 	private state: "starting" | "ready" | "closing" | "ended" = "starting";
 	private handle?: LaunchedProcess;
 	private out?: CodexPipe;
 	private err?: CodexPipe;
 	/** The one turn/start in flight, if any, and what arrived for its thread before it was answered. */
-	private pendingStart?: { threadId: string; early: EarlyEvent[] };
+	private pendingStart?: { threadId: string; early: EarlyEvent[]; questions: OpenQuestion[] };
 	private activeTurn?: TurnRecord;
 	private failure?: CodexFailure;
 	private lastUnmatchedDenial?: CodexDenial;
@@ -990,7 +1054,9 @@ class CodexChildImpl implements CodexChild {
 		}
 		try {
 			const clientInfo = this.options.clientInfo ?? CODEX_CLIENT_INFO;
-			const result = await this.call("initialize", { clientInfo: { ...clientInfo } }, this.bounds.initializeMs, "control", undefined, (failure) => {
+			// The experimental API is opted into for the whole connection, and only when there is someone to ask.
+			const params = { clientInfo: { ...clientInfo }, ...(this.options.onQuestion === undefined ? {} : { capabilities: { experimentalApi: true } }) };
+			const result = await this.call("initialize", params, this.bounds.initializeMs, "control", undefined, (failure) => {
 				// The handshake's own bound ends the child rather than the call: there is nothing to go on with.
 				void this.finalize({ reason: "handshake", failure: codexFailure("handshake", { reason: "it did not answer initialize inside its bound" }) });
 				return failure;
@@ -1020,6 +1086,8 @@ class CodexChildImpl implements CodexChild {
 		if (refused) return Promise.reject(refused);
 		const body = this.threadBody(params);
 		if (body instanceof Error) return Promise.reject(body);
+		// Only a fresh thread is registered the question tool: a continued one keeps the tools its history restores.
+		if (this.options.onQuestion !== undefined) body.dynamicTools = [CODEX_QUESTION_TOOL_SPEC];
 		return this.call("thread/start", body, timeoutMs ?? this.bounds.requestMs, "request", (result) => {
 			const read = this.readOrFail(readThreadStart(result));
 			this.threads.set(read.threadId, {});
@@ -1097,7 +1165,7 @@ class CodexChildImpl implements CodexChild {
 		if (params.model !== undefined) body.model = params.model;
 		if (params.effort !== undefined) body.effort = params.effort;
 		// Held before the request is written: the child can stream the turn's first notifications ahead of its answer.
-		const pending = { threadId: params.threadId, early: [] as EarlyEvent[] };
+		const pending = { threadId: params.threadId, early: [] as EarlyEvent[], questions: [] as OpenQuestion[] };
 		this.pendingStart = pending;
 		const release = (): void => {
 			if (this.pendingStart === pending) this.pendingStart = undefined;
@@ -1126,10 +1194,19 @@ class CodexChildImpl implements CodexChild {
 				record.evidence.notifications += 1;
 				event.apply(record);
 			}
+			// After the early events, so a question held for a turn they already ended is refused rather than asked.
+			for (const question of pending.questions) {
+				if (question.key.turnId === key.turnId) this.ask(question, record);
+				else this.refuseQuestion(question, CODEX_QUESTION_REFUSED);
+			}
 			const turn: CodexTurn = { threadId: key.threadId, turnId: key.turnId, snapshot: () => structuredClone(record.evidence), done: record.answer.promise };
 			return turn;
 		}, unanswered);
-		started.catch(release);
+		started.catch(() => {
+			release();
+			// No turn was named, so no question held for one is asked.
+			for (const question of pending.questions) this.refuseQuestion(question, CODEX_QUESTION_REFUSED);
+		});
 		return started;
 	}
 
@@ -1299,10 +1376,15 @@ class CodexChildImpl implements CodexChild {
 		return framed !== undefined && this.writer.enqueue({ kind: "control", text: framed.text, bytes: framed.bytes });
 	}
 
-	/** One reply to a server request. A reply that cannot be queued leaves the child waiting on it, which ends the run. */
+	/**
+	 * One reply to a server request. A reply that cannot be queued leaves the child waiting on it, which ends the run,
+	 * except on the way out: a child already being stopped is only counted a dropped frame, never finalized again.
+	 */
 	private reply(id: string | number, body: { result: unknown } | { error: { code: number; message: string } }): void {
 		const framed = this.frame({ id, ...body });
-		if (!framed || !this.writer.enqueue({ kind: "reply", text: framed.text, bytes: framed.bytes })) this.protocol(REPLY_UNQUEUED);
+		if (framed && this.writer.enqueue({ kind: "reply", text: framed.text, bytes: framed.bytes })) return;
+		if (this.state === "closing" || this.state === "ended") this.tally.droppedFrames += 1;
+		else this.protocol(REPLY_UNQUEUED);
 	}
 
 	private bind(): void {
@@ -1435,10 +1517,97 @@ class CodexChildImpl implements CodexChild {
 			this.recordDenial(readApproval(kind, params, this.bounds.maxDiagnosticBytes));
 			return this.state !== "ended";
 		}
+		const question = method === CODEX_TOOL_CALL_METHOD ? readQuestionCall(params, this.bounds.maxMessageBytes) : undefined;
+		if (question !== undefined) {
+			this.takeQuestion(id, question);
+			return this.state !== "ended";
+		}
 		this.tally.unsupportedRequests += 1;
 		this.reply(id, { error: { code: CODEX_UNSUPPORTED_CODE, message: "this client does not support this request" } });
 		this.fail({ reason: "unsupported", failure: codexFailure("unsupported", { reason: `it sent a ${method} request` }) });
 		return true;
+	}
+
+	/**
+	 * One question call, scoped before anyone is asked: a run with no callback, a call that is not one, another thread's
+	 * and a turn that ended or was never this transport's are answered `success: false` at once. One for the thread of
+	 * a turn/start still unanswered is held, bounded, for the answer that names its turn.
+	 */
+	private takeQuestion(id: string | number, call: CodexRead<CodexQuestionCall>): void {
+		const refuse = (text: string): void => {
+			this.tally.refusedQuestions += 1;
+			this.toolResult(id, { success: false, text });
+		};
+		if (this.options.onQuestion === undefined) return refuse(CODEX_QUESTION_UNAVAILABLE);
+		if (this.state !== "ready") return refuse(CODEX_QUESTION_UNANSWERED);
+		if (!call.ok || !this.threads.has(call.value.threadId)) return refuse(CODEX_QUESTION_REFUSED);
+		const { threadId, turnId, question: text } = call.value;
+		const question: OpenQuestion = { id, key: { threadId, turnId }, question: text, done: false };
+		const turn = this.turns.get(keyOf(question.key));
+		if (turn) return this.ask(question, turn);
+		const pending = this.pendingStart;
+		if (pending === undefined || pending.threadId !== threadId || pending.questions.length >= this.bounds.maxEarlyNotifications) return refuse(CODEX_QUESTION_REFUSED);
+		pending.questions.push(question);
+		this.questions.add(question);
+	}
+
+	/**
+	 * Hands one question to the callback with a signal of its own, and leaves it: the answer, a rejection or this
+	 * transport ending it first is one reply, and the read loop goes on meanwhile. A turn that already ended is refused.
+	 */
+	private ask(question: OpenQuestion, turn: TurnRecord): void {
+		const ask = this.options.onQuestion;
+		if (ask === undefined || turn.done || this.state !== "ready") return this.refuseQuestion(question, turn.done ? CODEX_QUESTION_REFUSED : CODEX_QUESTION_UNANSWERED);
+		const controller = new AbortController();
+		question.turn = turn;
+		question.controller = controller;
+		this.questions.add(question);
+		this.tally.questions += 1;
+		let asked: Promise<unknown>;
+		try {
+			asked = Promise.resolve(ask(question.question, controller.signal));
+		} catch (error) {
+			asked = Promise.reject(error);
+		}
+		asked
+			.then(
+				(answer) => this.answerQuestion(question, typeof answer === "string" ? { success: true, text: answer } : { success: false, text: CODEX_QUESTION_UNANSWERED }),
+				() => this.answerQuestion(question, { success: false, text: CODEX_QUESTION_UNANSWERED }),
+			)
+			.catch(() => {});
+	}
+
+	/** A question taken and then not asked: held for a turn that was never named, or for one that had already ended. */
+	private refuseQuestion(question: OpenQuestion, text: string): void {
+		if (question.done) return;
+		this.tally.refusedQuestions += 1;
+		this.answerQuestion(question, { success: false, text });
+	}
+
+	/**
+	 * The one reply a question call gets, as the dynamic tool result: the answer as its one text item, or `success: false`
+	 * with a fixed text. A question this transport ends has its signal aborted after it is marked answered, so the
+	 * rejection that abort causes finds it done. Once the child is gone nothing is written.
+	 */
+	private answerQuestion(question: OpenQuestion, result: { success: boolean; text: string }): void {
+		if (question.done) return;
+		question.done = true;
+		this.questions.delete(question);
+		if (!result.success) question.controller?.abort();
+		this.toolResult(question.id, result);
+	}
+
+	/** A dynamic tool result on the wire, unless the child is gone. The text is written and never kept. */
+	private toolResult(id: string | number, result: { success: boolean; text: string }): void {
+		if (this.state === "ended") return;
+		this.reply(id, { result: { success: result.success, contentItems: [{ type: "inputText", text: result.text }] } });
+	}
+
+	/** Ends the questions still open — every one, or only those asked on one turn — each with its one unanswered reply. */
+	private endQuestions(turn?: TurnRecord): void {
+		for (const question of [...this.questions]) {
+			if (turn === undefined || question.turn === turn) this.answerQuestion(question, { success: false, text: CODEX_QUESTION_UNANSWERED });
+		}
 	}
 
 	private recordDenial(denial: CodexDenial): void {
@@ -1610,6 +1779,7 @@ class CodexChildImpl implements CodexChild {
 		const server = settled === "completed" || settled === "failed" || settled === "interrupted";
 		const reported = failure ?? (server ? undefined : this.failure);
 		turn.answer.resolve({ ...structuredClone(turn.evidence), outcome: settled, ...(reported === undefined ? {} : { failure: reported }) });
+		this.endQuestions(turn);
 	}
 
 	/** Frames that will never be written: each request owner is settled once, and a dropped reply is counted. */
@@ -1669,6 +1839,7 @@ class CodexChildImpl implements CodexChild {
 			() => this.releaseStop(),
 			() => this.writer.close(),
 			() => this.correlator.settleAll(failure),
+			() => this.endQuestions(),
 			() => {
 				for (const turn of this.turns.values()) this.finishTurn(turn, turn.fixed ?? "transport", failure);
 			},
@@ -1702,6 +1873,8 @@ class CodexChildImpl implements CodexChild {
 			else if (cause.reason !== "exited") turn.fixed = "transport";
 		}
 		this.writer.dropUnsent((item) => item.kind === "request");
+		// Every open question ends now, each answered unanswered ahead of the interrupt and its signal aborted.
+		this.endQuestions();
 		if (this.alive() && turn) {
 			// One read, no more: a failed one shows as the cleanup's own `discovery`, never as an error here.
 			await this.tree.observe().catch(() => undefined);
