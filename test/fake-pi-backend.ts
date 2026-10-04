@@ -101,6 +101,16 @@ export interface FakeBackendOptions {
 	defaultEffort?: string;
 	/** The scripts the first runs take, in order. The last one repeats for every run after them. */
 	scripts?: FakeScript[];
+	/**
+	 * Whether the run's input takes steers. Every name's is open from the start, a codex double's too, as this build's
+	 * codex backend's is; false hands over an input closed from the start, for a case about a child that takes none.
+	 */
+	steers?: boolean;
+	/**
+	 * How many steers an open input takes before it refuses the next while staying open, as a full queue does. Unset,
+	 * it takes every one.
+	 */
+	steerCapacity?: number;
 }
 
 export interface FakeBackend {
@@ -123,8 +133,14 @@ class FakeControl implements ChildControl {
 	private readonly waiters: Array<(text: string) => void> = [];
 	private taken = 0;
 
+	private readonly capacity: number;
+
+	constructor(capacity = Number.POSITIVE_INFINITY) {
+		this.capacity = capacity;
+	}
+
 	push(text: string): boolean {
-		if (!this.open) return false;
+		if (!this.open || this.pushed.length >= this.capacity) return false;
 		this.pushed.push(text);
 		const waiter = this.waiters.shift();
 		if (waiter) {
@@ -186,6 +202,7 @@ function defaultRef(name: BackendName, intent: SessionIntent | undefined, script
 
 export function fakeBackend(options: FakeBackendOptions = {}): FakeBackend {
 	const name = options.name ?? "pi";
+	const steers = options.steers ?? true;
 	const defaultEffort = options.defaultEffort ?? "medium";
 	let scripts: FakeScript[] = options.scripts ? [...options.scripts] : [];
 	const starts: FakeStart[] = [];
@@ -201,7 +218,11 @@ export function fakeBackend(options: FakeBackendOptions = {}): FakeBackend {
 
 	const backend: Backend<HostRole, FakeSession, FakeControl> = {
 		name,
-		control: () => new FakeControl(),
+		control: () => {
+			const control = new FakeControl(options.steerCapacity);
+			if (!steers) control.end();
+			return control;
+		},
 		session: (intent) => {
 			sessions.push(intent);
 			return fakeSession(name, intent);
@@ -314,7 +335,7 @@ function child(
 					: { ...ref, checkpoint };
 	const selection =
 		script.selection === undefined
-			? backend.name === "pi"
+			? backend.name === "pi" && role.model !== undefined
 				? { model: role.model, effort: (role as HostRole & { effort?: string }).effort ?? backend.defaultEffort }
 				: undefined
 			: (script.selection ?? undefined);

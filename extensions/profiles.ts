@@ -1,4 +1,5 @@
-import { type BackendName, isBackendName, isPiModel, PI_EFFORTS } from "./backends/types.ts";
+import { CODEX_HOST_DEFAULT } from "./backends/codex-binding.ts";
+import { type BackendName, isBackendName, isCodexToken, isPiModel, PI_EFFORTS } from "./backends/types.ts";
 import { KNOWN_ROLE_NAMES, type KnownRoleName, ROLE_SPECS } from "./roles.ts";
 
 /**
@@ -10,6 +11,12 @@ import { KNOWN_ROLE_NAMES, type KnownRoleName, ROLE_SPECS } from "./roles.ts";
 
 /** Claude Code's effort levels, which every Claude role but ultracode takes. */
 export const CLAUDE_EFFORTS = ["low", "medium", "high", "xhigh", "max"] as const;
+
+/**
+ * The Codex efforts the editor offers. They are suggestions and not a list a profile is checked against: which levels
+ * a Codex model takes is the model's own, so a profile may name any single token and the child is what refuses it.
+ */
+export const CODEX_EFFORT_SUGGESTIONS = ["low", "medium", "high", "xhigh"] as const;
 
 /** The one effort ultracode runs at: xhigh plus the standing workflow opt-in, so no other level is a choice for it. */
 export const ULTRACODE_EFFORT = "ultracode";
@@ -26,9 +33,12 @@ export const PROFILES_VERSION = 1;
 export interface RoleSetting {
 	enabled: boolean;
 	backend: BackendName;
-	/** A Claude alias or id, or a Pi provider and model id. Absent is an unconfigured Pi role, refused when called. */
+	/**
+	 * A Claude alias or id, a Pi provider and model id, or a Codex model id. Absent is an unconfigured Pi role, refused
+	 * when called, or a Codex role that runs on the model the host's own Codex configuration names.
+	 */
 	model?: string;
-	/** Absent leaves a Pi child its own default level; ultracode's is always `ultracode`. */
+	/** Absent leaves a Pi or Codex child its own default level; ultracode's is always `ultracode`. */
 	effort?: string;
 }
 
@@ -42,7 +52,8 @@ export interface Selection {
 
 /**
  * The legacy defaults this extension instance started with, per role and per backend: Claude's from its role
- * variables and built-in models, Pi's from `PI_FUSION_PI_<ROLE>_MODEL` and `_EFFORT`. It is captured once, so a call
+ * variables and built-in models, Pi's from `PI_FUSION_PI_<ROLE>_MODEL` and `_EFFORT`, and Codex's from
+ * `PI_FUSION_CODEX_<ROLE>_MODEL` and `_EFFORT` for the roles it runs. It is captured once, so a call
  * that names the other backend than the configured one gets the same answer for the life of the instance.
  */
 export type Baseline = Record<KnownRoleName, Partial<Record<BackendName, Selection>>>;
@@ -51,16 +62,18 @@ const trimmed = (env: NodeJS.ProcessEnv, key: string): string | undefined => env
 
 /** The legacy defaults, read from a copy of the environment once and kept. */
 export function captureBaseline(env: NodeJS.ProcessEnv = process.env): Baseline {
-	const pi = (role: string): Selection => {
-		const model = trimmed(env, `PI_FUSION_PI_${role.toUpperCase()}_MODEL`);
-		const effort = trimmed(env, `PI_FUSION_PI_${role.toUpperCase()}_EFFORT`);
+	const variables = (prefix: string, role: string): Selection => {
+		const model = trimmed(env, `${prefix}_${role.toUpperCase()}_MODEL`);
+		const effort = trimmed(env, `${prefix}_${role.toUpperCase()}_EFFORT`);
 		return { ...(model ? { model } : {}), ...(effort ? { effort } : {}) };
 	};
+	const pi = (role: string): Selection => variables("PI_FUSION_PI", role);
+	const codex = (role: string): Selection => variables("PI_FUSION_CODEX", role);
 	return {
-		plan: { claude: { model: trimmed(env, "PI_FUSION_PLAN_MODEL") ?? "fable", effort: "xhigh" }, pi: pi("plan") },
-		implement: { claude: { model: trimmed(env, "PI_FUSION_IMPLEMENT_MODEL") ?? "opus", effort: trimmed(env, "PI_FUSION_IMPLEMENT_EFFORT") ?? "high" }, pi: pi("implement") },
+		plan: { claude: { model: trimmed(env, "PI_FUSION_PLAN_MODEL") ?? "fable", effort: "xhigh" }, pi: pi("plan"), codex: codex("plan") },
+		implement: { claude: { model: trimmed(env, "PI_FUSION_IMPLEMENT_MODEL") ?? "opus", effort: trimmed(env, "PI_FUSION_IMPLEMENT_EFFORT") ?? "high" }, pi: pi("implement"), codex: codex("implement") },
 		ultracode: { claude: { model: trimmed(env, "PI_FUSION_ULTRACODE_MODEL") ?? "fable", effort: ULTRACODE_EFFORT } },
-		ask: { claude: { model: trimmed(env, "PI_FUSION_ASK_MODEL") ?? "opus", effort: trimmed(env, "PI_FUSION_ASK_EFFORT") ?? "high" }, pi: pi("ask") },
+		ask: { claude: { model: trimmed(env, "PI_FUSION_ASK_MODEL") ?? "opus", effort: trimmed(env, "PI_FUSION_ASK_EFFORT") ?? "high" }, pi: pi("ask"), codex: codex("ask") },
 		security: { pi: pi("security") },
 	};
 }
@@ -101,10 +114,20 @@ export function sameSettings(one: RoleSettings, other: RoleSettings): boolean {
 	});
 }
 
-/** The efforts a role takes on a backend, or none for ultracode, whose one level is not a choice. */
+/**
+ * The efforts a role takes on a backend, or none for ultracode, whose one level is not a choice. Claude's and Pi's are
+ * the whole list a profile is checked against; Codex's are the editor's suggestions, and a profile may name others.
+ */
 export function effortsFor(role: KnownRoleName, backend: BackendName): readonly string[] {
 	if (role === "ultracode") return [];
-	return backend === "claude" ? CLAUDE_EFFORTS : PI_EFFORTS;
+	switch (backend) {
+		case "claude":
+			return CLAUDE_EFFORTS;
+		case "pi":
+			return PI_EFFORTS;
+		case "codex":
+			return CODEX_EFFORT_SUGGESTIONS;
+	}
 }
 
 const shown = (value: unknown): string => (typeof value === "string" ? JSON.stringify(value) : String(value));
@@ -118,7 +141,7 @@ function roleSetting(role: KnownRoleName, value: unknown, where: string): RoleSe
 	if (!isRecord(value)) throw new Error(`${where} must be an object`);
 	for (const key of Object.keys(value)) if (!ROLE_FIELDS.has(key)) throw new Error(`${where} has unknown field ${JSON.stringify(key)}; use enabled, backend, model and effort`);
 	if (typeof value.enabled !== "boolean") throw new Error(`${where}.enabled must be true or false`);
-	if (!isBackendName(value.backend)) throw new Error(`${where}.backend must be claude or pi`);
+	if (!isBackendName(value.backend)) throw new Error(`${where}.backend must be claude, pi or codex`);
 	const backend = value.backend;
 	const runs = ROLE_SPECS[role].backends;
 	if (!runs.includes(backend)) throw new Error(`${where}.backend is ${backend}, but role ${role} runs on ${runs.join(", ")} only`);
@@ -128,11 +151,15 @@ function roleSetting(role: KnownRoleName, value: unknown, where: string): RoleSe
 		if (typeof value.model !== "string" || !value.model.trim()) throw new Error(`${where}.model must be a non-empty string; leave it out instead`);
 		if (value.model !== value.model.trim()) throw new Error(`${where}.model ${shown(value.model)} has spaces around it`);
 		if (backend === "pi" && !isPiModel(value.model)) throw new Error(`${where}.model ${shown(value.model)} is not a pi provider and model id such as deepseek/deepseek-chat`);
+		if (backend === "codex" && !isCodexToken(value.model)) throw new Error(`${where}.model ${shown(value.model)} has whitespace in it, which no codex model id has`);
 		setting.model = value.model;
 	}
 	if (value.effort !== undefined) {
 		if (role === "ultracode") {
 			if (value.effort !== ULTRACODE_EFFORT) throw new Error(`${where}.effort must be ${ULTRACODE_EFFORT} or left out: role ultracode runs at no other level`);
+		} else if (backend === "codex") {
+			// Which levels a Codex model takes is the model's own, so any single token is accepted here and the child refuses one it lacks.
+			if (!isCodexToken(value.effort)) throw new Error(`${where}.effort ${shown(value.effort)} is not a codex effort; name one level, such as ${CODEX_EFFORT_SUGGESTIONS.join(", ")}, with no spaces in it`);
 		} else if (typeof value.effort !== "string" || !effortsFor(role, backend).includes(value.effort)) {
 			throw new Error(`${where}.effort ${shown(value.effort)} is not a ${backend} effort; use one of ${effortsFor(role, backend).join(", ")}`);
 		}
@@ -141,6 +168,7 @@ function roleSetting(role: KnownRoleName, value: unknown, where: string): RoleSe
 	// A disabled role needs nothing more than its flag and a backend: it starts nothing, so nothing has to be chosen for it.
 	// An enabled Claude role runs on a model and an effort it names, because a profile never borrows a variable's.
 	// An enabled Pi role may name no model: that is an unconfigured role, refused when it is called, never guessed for.
+	// An enabled Codex role may name neither: it runs on the model and level the host's own Codex configuration names.
 	if (setting.enabled && backend === "claude") {
 		if (setting.model === undefined) throw new Error(`${where} is enabled on claude and names no model`);
 		if (role !== "ultracode" && setting.effort === undefined) throw new Error(`${where} is enabled on claude and names no effort`);
@@ -217,14 +245,17 @@ export function serializeDocument(document: ProfileDocument): string {
 
 /** The effort a role's setting runs at, as a person reads it: ultracode's fixed one, or what the setting names. */
 export const effortShown = (role: KnownRoleName, setting: RoleSetting): string =>
-	role === "ultracode" ? `${ULTRACODE_EFFORT} (fixed)` : (setting.effort ?? (setting.backend === "pi" ? "child default" : "none"));
+	role === "ultracode" ? `${ULTRACODE_EFFORT} (fixed)` : (setting.effort ?? (setting.backend === "pi" ? "child default" : setting.backend === "codex" ? CODEX_HOST_DEFAULT : "none"));
+
+/** The model a role's setting runs on, as a person reads it: a Codex role that names none takes the host's own default. */
+export const modelShown = (setting: RoleSetting): string => setting.model ?? (setting.backend === "codex" ? CODEX_HOST_DEFAULT : "unconfigured");
 
 /** One line per role, in columns: what `/fusion config` shows and what the editor offers to change. */
 export function settingsTable(settings: RoleSettings): string[] {
 	const rows = [["role", "enabled", "backend", "model", "effort"]];
 	for (const role of KNOWN_ROLE_NAMES) {
 		const setting = settings[role];
-		rows.push([role, setting.enabled ? "yes" : "no", setting.backend, setting.model ?? "unconfigured", effortShown(role, setting)]);
+		rows.push([role, setting.enabled ? "yes" : "no", setting.backend, modelShown(setting), effortShown(role, setting)]);
 	}
 	const widths = rows[0]!.map((_, column) => Math.max(...rows.map((row) => row[column]!.length)));
 	return rows.map((row) => row.map((cell, column) => (column === row.length - 1 ? cell : cell.padEnd(widths[column]!))).join("  "));

@@ -1,14 +1,19 @@
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import * as fs from "node:fs";
+import * as os from "node:os";
 import * as path from "node:path";
 import test from "node:test";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import ts from "typescript";
 import { claudeBackend, type Role } from "../extensions/backends/claude.ts";
-import { hostBackend, isPiModel, piModelParts, resolvedSelectionOf } from "../extensions/backends/types.ts";
-import { ASK_MODES, type AskMode, type ChildRun as ExportedChildRun, failed, ROLE_NAMES } from "../extensions/fusion.ts";
+import { createCodexBackend } from "../extensions/backends/codex.ts";
+import { CODEX_FOREIGN_SESSION, CODEX_NO_CHECKPOINT } from "../extensions/backends/codex-outcome.ts";
+import { hostBackend, isPiModel, keptRef, keptSelection, piModelParts, resolvedSelectionOf, sessionRefOf } from "../extensions/backends/types.ts";
+import { ASK_MODES, type AskMode, type ChildRun as ExportedChildRun, codexResumeCommand, failed, ROLE_NAMES } from "../extensions/fusion.ts";
 import { ChildTree } from "../extensions/process-tree.ts";
 import { canChangeFiles, isReviewable, KNOWN_ROLE_NAMES, ROLE_SPECS, runsOn } from "../extensions/roles.ts";
+import { CODEX_VARIABLES, PRODUCTION_DEFAULT_VARIABLES, productionDefaults, tripwires } from "./tripwire.ts";
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
@@ -77,6 +82,147 @@ test("the role capabilities depend on the boundary and on nothing else", () => {
 test("the pi binding is a binding, not an adapter: it depends on the boundary alone and names no SDK", () => {
 	const names = dependenciesOf("backends/pi-binding.ts");
 	assert.deepEqual(names, ["./types.ts"], `a role binding must name no host, no process and no SDK; it names ${names.join(", ")}`);
+});
+
+test("the codex binding is a binding, not an adapter: it depends on the boundary alone and names no SDK", () => {
+	const names = dependenciesOf("backends/codex-binding.ts");
+	assert.deepEqual(names, ["./types.ts"], `a role binding must name no host, no process, no protocol and no SDK; it names ${names.join(", ")}`);
+});
+
+test("nothing outside the host, the profiles and the codex backend's own modules reaches into the codex binding", () => {
+	// The binding is read by routing and by the settings' display label, and by the codex backend's composition and
+	// outcome mapping for its role shape. The registration of that backend is the host's own, pinned below.
+	const importers = productionModules()
+		.filter((file) => modulesNamedIn(fs.readFileSync(file, "utf8")).some((name) => /(^|\/)codex-binding\.ts$/.test(name)))
+		.map((file) => path.relative(path.join(repoRoot, "extensions"), file))
+		.sort();
+	assert.deepEqual(importers, ["backends/codex-outcome.ts", "backends/codex.ts", "fusion.ts", "profiles.ts"]);
+});
+
+/** The one declaration of `backends` in the host's source, parsed: the registry every routed call looks its backend up in. */
+function hostRegistry(): { declaration: ts.VariableDeclaration; file: ts.SourceFile } {
+	const file = ts.createSourceFile("fusion.ts", fs.readFileSync(path.join(repoRoot, "extensions", "fusion.ts"), "utf8"), ts.ScriptTarget.Latest, true);
+	const found: ts.VariableDeclaration[] = [];
+	const visit = (node: ts.Node): void => {
+		// Typed as the registry, which tells it from the role-capability list the settings editor keeps under the same name.
+		if (ts.isVariableDeclaration(node) && ts.isIdentifier(node.name) && node.name.text === "backends" && node.type?.getText(file).includes("HostBackend")) found.push(node);
+		ts.forEachChild(node, visit);
+	};
+	visit(file);
+	assert.equal(found.length, 1, "the host declares one backend registry, so one is all this has to read");
+	return { declaration: found[0]!, file };
+}
+
+test("the host registers claude, pi and codex by default, with the host's own registrations spread over them as they are", () => {
+	// Pinned out of the source before anything runs: the defaults first, each a factory call, and the host's own keys
+	// spread last with nothing between them and the lookup. A spread copies own keys only and copies an undefined one as
+	// undefined, so a key a host set to undefined is a backend left out, never this build's default in its place; a
+	// nullish fallback here would turn every `codex: undefined` of a test into a production codex app-server.
+	const { declaration, file } = hostRegistry();
+	assert.equal(
+		declaration.getText(file),
+		"backends: Partial<Record<BackendName, HostBackend>> = { claude: hostBackend(claudeBackend), pi: hostBackend(createPiBackend()), codex: hostBackend(createCodexBackend()), ...options.backends }",
+	);
+	assert.ok(ts.isVariableDeclarationList(declaration.parent) && (declaration.parent.flags & ts.NodeFlags.Const) !== 0, "the registry is a const: nothing reassigns it after the load");
+	const initializer = declaration.initializer!;
+	assert.ok(ts.isObjectLiteralExpression(initializer));
+	const last = initializer.properties.at(-1)!;
+	assert.ok(ts.isSpreadAssignment(last) && last.expression.getText(file) === "options.backends", "the host's own registrations come last and unwrapped");
+	// Every read of the registry is an index by a routed backend name or the list of what is registered, and none of
+	// them falls back to anything when the entry is undefined.
+	const source = file.getFullText();
+	const reads = [...source.matchAll(/\bbackends\[([^\]]+)\]/g)].map((match) => match[1]);
+	// The `0` is the settings editor's own local list of the backends a role runs on, not the registry.
+	assert.deepEqual(reads, ["route.backend", "0", "route.backend"], "a registry lookup is by the routed backend alone");
+	assert.equal([...source.matchAll(/backends\[route\.backend\]\s*(\?\?|\|\|)/g)].length, 0, "and no lookup falls back to a default");
+	// The same expression shape, evaluated over values that are not backends: the overlay semantics the audit relies on.
+	const marker = (name: string) => ({ name }) as never;
+	const own = { codex: undefined } as Partial<Record<string, unknown>>;
+	const overlaid: Record<string, unknown> = { claude: marker("claude"), pi: marker("pi"), codex: marker("codex"), ...own };
+	assert.ok(Object.hasOwn(overlaid, "codex") && overlaid.codex === undefined, "an explicit undefined removes the default");
+	const inherited: Record<string, unknown> = { claude: marker("claude"), pi: marker("pi"), codex: marker("codex"), ...(Object.create({ codex: undefined, pi: marker("inherited") }) as object) };
+	assert.deepEqual([(overlaid.claude as { name: string }).name, (inherited.pi as { name: string }).name, (inherited.codex as { name: string }).name], ["claude", "pi", "codex"], "an inherited key is never admitted over a default");
+});
+
+test("this build's default codex backend is lazy: constructing it reads, locates and starts nothing, even with no codex anywhere", () => {
+	// The production factory with no seams, exactly as the host calls it at load, under an environment that names no
+	// codex binary that exists and a PATH that holds none. Only its pure members are read; `run`, its one entry point,
+	// is never called, so nothing here could reach an app-server, a home or a login.
+	const kept = { PATH: process.env.PATH, PI_FUSION_CODEX_BIN: process.env.PI_FUSION_CODEX_BIN };
+	process.env.PATH = "";
+	process.env.PI_FUSION_CODEX_BIN = "/nowhere/codex";
+	try {
+		const backend = hostBackend(createCodexBackend());
+		assert.equal(backend.name, "codex");
+		assert.equal(backend.control().open, true, "a codex run's input is open from its admission, holding steers until its turn is named");
+		assert.deepEqual(backend.session({ kind: "new" }), { kind: "new" });
+		const baseline = { inputTokens: 30, cachedInputTokens: 20, outputTokens: 4, reasoningOutputTokens: 1, totalTokens: 34 };
+		assert.deepEqual(backend.session({ kind: "resume", ref: { backend: "codex", sessionId: "thr-1", checkpoint: "turn-1", baseline } }), { kind: "resume", id: "thr-1", at: "turn-1", baseline });
+		assert.deepEqual(backend.session({ kind: "fork", from: { backend: "codex", sessionId: "thr-1", checkpoint: "turn-1", baseline } }), { kind: "fork", from: "thr-1", at: "turn-1", baseline });
+		assert.throws(() => backend.session({ kind: "resume", ref: { backend: "codex", sessionId: "thr-1", checkpoint: "turn-1" } }), { message: CODEX_NO_CHECKPOINT });
+		assert.throws(() => backend.session({ kind: "fork", from: { backend: "claude", sessionId: "thr-1", checkpoint: "turn-1" } }), { message: CODEX_FOREIGN_SESSION });
+	} finally {
+		for (const [name, value] of Object.entries(kept)) {
+			if (value === undefined) delete process.env[name];
+			else process.env[name] = value;
+		}
+	}
+	// And with every seam a recording one: constructing and mapping touch none of them.
+	const reached: string[] = [];
+	const seam = (name: string) => () => {
+		reached.push(name);
+		throw new Error(`${name} reached`);
+	};
+	const fenced = createCodexBackend({ readContract: seam("contract"), launch: seam("launch"), start: seam("start"), clientInfo: seam("clientInfo"), now: seam("now") });
+	fenced.control();
+	fenced.session({ kind: "new" });
+	assert.deepEqual(reached, []);
+});
+
+test("the codex transport is a transport over its own protocol readers: it takes only the line framer from pi, and only the codex backend reaches it", () => {
+	assert.deepEqual(dependenciesOf("backends/codex-protocol.ts"), ["node:path"], "the protocol readers are pure: no process, no stream and no package");
+	assert.deepEqual(dependenciesOf("backends/codex-transport.ts").sort(), ["../process-tree.ts", "./codex-protocol.ts", "./pi-transport.ts", "node:stream"]);
+	// What it takes from pi is the generic byte-capped framer and the timer ceiling, and no pi lifecycle, protocol or
+	// diagnostic: those are pi's own and the codex lifecycle has its own. The pi transport's own imports are a node
+	// builtin, the process tree and the import-free bootstrap constants, so no SDK or runtime is reached through it.
+	const file = path.join(repoRoot, "extensions", "backends", "codex-transport.ts");
+	const source = ts.createSourceFile(file, fs.readFileSync(file, "utf8"), ts.ScriptTarget.Latest);
+	const fromPi = source.statements
+		.filter((statement): statement is ts.ImportDeclaration => ts.isImportDeclaration(statement) && ts.isStringLiteral(statement.moduleSpecifier) && statement.moduleSpecifier.text === "./pi-transport.ts")
+		.flatMap((statement) => {
+			const bindings = statement.importClause?.namedBindings;
+			return bindings && ts.isNamedImports(bindings) ? bindings.elements.map((element) => element.name.text) : ["<not named>"];
+		})
+		.sort();
+	assert.deepEqual(fromPi, ["LineFramer", "MAX_TIMER_MS", "PiLine"]);
+	assert.deepEqual(dependenciesOf("backends/pi-transport.ts").sort(), ["../process-tree.ts", "./pi-bootstrap-protocol.mjs", "node:stream", "node:string_decoder"]);
+	assert.deepEqual(dependenciesOf("backends/pi-bootstrap-protocol.mjs"), []);
+	const importers = productionModules()
+		.filter((candidate) => modulesNamedIn(fs.readFileSync(candidate, "utf8")).some((name) => /(^|\/)codex-(transport|protocol)\.ts$/.test(name)))
+		.map((candidate) => path.relative(path.join(repoRoot, "extensions"), candidate))
+		.sort();
+	assert.deepEqual(importers, ["backends/codex-outcome.ts", "backends/codex-transport.ts", "backends/codex.ts"], "only the codex backend's own composition and outcome mapping reach the codex transport and protocol");
+});
+
+test("the codex backend composes its own modules, and the host reaches it only through its factory: no other backend or package does", () => {
+	assert.deepEqual(dependenciesOf("backends/codex.ts").sort(), ["../process-tree.ts", "./codex-binding.ts", "./codex-launch.ts", "./codex-outcome.ts", "./codex-protocol.ts", "./codex-transport.ts", "./types.ts", "node:fs", "node:path", "node:url"]);
+	// The mapping is pure: the boundary, the binding's role shape and the protocol and transport types, no process or file.
+	assert.deepEqual(dependenciesOf("backends/codex-outcome.ts").sort(), ["./codex-binding.ts", "./codex-protocol.ts", "./codex-transport.ts", "./types.ts"]);
+	const importers = productionModules()
+		.filter((candidate) => modulesNamedIn(fs.readFileSync(candidate, "utf8")).some((name) => /(^|\/)codex(-outcome)?\.ts$/.test(name)))
+		.map((candidate) => path.relative(path.join(repoRoot, "extensions"), candidate))
+		.sort();
+	assert.deepEqual(importers, ["backends/codex.ts", "fusion.ts"], "the host registers the codex backend, and nothing else reaches it");
+	// What the host takes from it is the factory and nothing else: no transport, outcome mapping or contract path.
+	const file = path.join(repoRoot, "extensions", "fusion.ts");
+	const source = ts.createSourceFile(file, fs.readFileSync(file, "utf8"), ts.ScriptTarget.Latest);
+	const fromCodex = source.statements
+		.filter((statement): statement is ts.ImportDeclaration => ts.isImportDeclaration(statement) && ts.isStringLiteral(statement.moduleSpecifier) && statement.moduleSpecifier.text === "./backends/codex.ts")
+		.flatMap((statement) => {
+			const bindings = statement.importClause?.namedBindings;
+			return bindings && ts.isNamedImports(bindings) ? bindings.elements.map((element) => element.name.text) : ["<not named>"];
+		});
+	assert.deepEqual(fromCodex, ["createCodexBackend"]);
 });
 
 test("the pi outcome mapping is pure: node's own path helper, this backend's own modules, and nothing else", () => {
@@ -205,9 +351,11 @@ const REGISTRATIONS_TOTAL = 10;
 
 test("every Fusion registration in the suite names the backends it takes, and the registrations are the ones pinned here", () => {
 	// A registration that names neither marker would run with the pi backend this build registers, which is a real
-	// harness: a case that routed to it would start a child instead of failing in a way a test can read. So every
-	// registration has to say which of the two it is, and a bare one that somebody adds later fails here.
-	const TRIPWIRE = "piTripwire";
+	// harness, and with the codex backend this build registers, which is a real app-server: a case that routed to one would start a child
+	// instead of failing in a way a test can read. So every registration has to say which of the two it is, and a bare
+	// one that somebody adds later fails here. The marker is the combined `tripwires()`: a registration that names only
+	// the pi tripwire leaves codex unfenced, and is no more acceptable than a bare one.
+	const TRIPWIRE = "tripwires";
 	const DEFAULTS = "productionDefaults";
 	const defaults: string[] = [];
 	const counted: Record<string, number> = {};
@@ -215,7 +363,7 @@ test("every Fusion registration in the suite names the backends it takes, and th
 		const where = relative(file);
 		for (const call of fusionRegistrations(fs.readFileSync(file, "utf8"))) {
 			counted[where] = (counted[where] ?? 0) + 1;
-			const tripwire = call.includes(TRIPWIRE);
+			const tripwire = /\.\.\.tripwires\(\)/.test(call);
 			const production = call.includes(DEFAULTS);
 			assert.ok(tripwire || production, `${where} registers the extension without naming ${TRIPWIRE} or ${DEFAULTS}: ${call}`);
 			assert.ok(!(tripwire && production), `${where} registers the extension naming both ${TRIPWIRE} and ${DEFAULTS}, which cannot both be what it takes: ${call}`);
@@ -231,6 +379,148 @@ test("every Fusion registration in the suite names the backends it takes, and th
 	assert.deepEqual(defaults, ["test/extension.test.ts", "test/routing.test.ts"], "exactly two cases read this build's own pi registration, and every other one keeps the tripwire in its place");
 });
 
+/** The source of `test/tripwire.ts`, parsed, and the one function in it a registration audit reads by name. */
+function tripwireFunction(name: string): ts.FunctionDeclaration {
+	const source = fs.readFileSync(path.join(repoRoot, "test", "tripwire.ts"), "utf8");
+	const file = ts.createSourceFile("tripwire.ts", source, ts.ScriptTarget.Latest, true);
+	const found = file.statements.find((statement): statement is ts.FunctionDeclaration => ts.isFunctionDeclaration(statement) && statement.name?.text === name);
+	assert.ok(found?.body, `test/tripwire.ts declares no function ${name}`);
+	return found;
+}
+
+test("the production-default registration keeps the codex tripwire, because no missing-model refusal would stop a codex call there", () => {
+	// A codex role runs on the host's own default model when it names none, so the binding's missing-model refusal that
+	// keeps the two production-default cases away from a real pi child has no codex counterpart. What keeps them away
+	// from the production codex backend this build registers is the tripwire, and it is read
+	// here out of the source: every value the function returns registers the codex tripwire and nothing over it.
+	const returns: ts.ReturnStatement[] = [];
+	const visit = (node: ts.Node): void => {
+		if (ts.isReturnStatement(node)) returns.push(node);
+		else if (!ts.isFunctionLike(node)) ts.forEachChild(node, visit);
+	};
+	ts.forEachChild(tripwireFunction("productionDefaults").body!, visit);
+	assert.equal(returns.length, 1, "productionDefaults returns one value, so one is all this has to read");
+	const returned = returns[0]!.expression;
+	assert.ok(returned && ts.isObjectLiteralExpression(returned), "productionDefaults returns an object literal this can read");
+	const backends = returned.properties.find((property) => ts.isPropertyAssignment(property) && property.name.getText() === "backends");
+	assert.ok(backends && ts.isPropertyAssignment(backends) && ts.isObjectLiteralExpression(backends.initializer), "productionDefaults registers no backends of its own, so nothing fences codex");
+	assert.deepEqual(
+		backends.initializer.properties.map((property) => property.getText()),
+		["...codexTripwire()"],
+		"productionDefaults registers the codex tripwire and nothing else: no pi tripwire, which would hide the binding these cases read, and nothing over codex",
+	);
+
+	// And what it returns, with every variable it refuses cleared for the call: this build's own claude and pi, which
+	// it leaves alone, and the codex tripwire. No entry point of it is called, so nothing here is a reach.
+	const kept = PRODUCTION_DEFAULT_VARIABLES.map((name) => [name, process.env[name]] as const);
+	for (const [name] of kept) delete process.env[name];
+	try {
+		const registered = productionDefaults().backends ?? {};
+		assert.deepEqual(Object.keys(registered), ["codex"]);
+		assert.equal(registered.codex?.name, "codex");
+	} finally {
+		for (const [name, value] of kept) if (value !== undefined) process.env[name] = value;
+	}
+	// The variables it refuses include every codex one a later launch would read: both selection variables of each
+	// role codex runs, and the binary override.
+	assert.deepEqual(CODEX_VARIABLES, ["PI_FUSION_CODEX_PLAN_MODEL", "PI_FUSION_CODEX_PLAN_EFFORT", "PI_FUSION_CODEX_IMPLEMENT_MODEL", "PI_FUSION_CODEX_IMPLEMENT_EFFORT", "PI_FUSION_CODEX_ASK_MODEL", "PI_FUSION_CODEX_ASK_EFFORT", "PI_FUSION_CODEX_BIN"]);
+	for (const name of CODEX_VARIABLES) assert.ok(PRODUCTION_DEFAULT_VARIABLES.includes(name), `${name} is not refused by a production-default registration`);
+	const previous = process.env.PI_FUSION_CODEX_BIN;
+	process.env.PI_FUSION_CODEX_BIN = "/nowhere/codex";
+	try {
+		assert.throws(() => productionDefaults(), /PI_FUSION_CODEX_BIN is still set/);
+	} finally {
+		if (previous === undefined) delete process.env.PI_FUSION_CODEX_BIN;
+		else process.env.PI_FUSION_CODEX_BIN = previous;
+	}
+});
+
+test("the combined tripwires fence pi and codex, each under its own name", () => {
+	const fenced = tripwires();
+	assert.deepEqual(Object.keys(fenced), ["pi", "codex"]);
+	assert.deepEqual([fenced.pi.name, fenced.codex.name], ["pi", "codex"], "a backend registered under another name than its own is refused at registration");
+});
+
+test("a reach of either tripwire that a case swallowed still fails its file, and a file that reached neither passes", () => {
+	// Each probe is a test file of its own, run by a node process of its own, so the reach it makes on purpose fails
+	// that process's hook and not this suite's. The probes import the tripwires and call one entry point: nothing in
+	// them registers the extension or starts a child of any harness.
+	const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fusion-tripwire-"));
+	const module = pathToFileURL(path.join(repoRoot, "test", "tripwire.ts")).href;
+	const env = { ...process.env };
+	// The runner marks the files it starts; a probe that inherited the mark would report to a parent that is not there.
+	delete env.NODE_TEST_CONTEXT;
+	delete env.PI_FUSION_CHILD;
+	const probe = (name: string, body: string): { status: number | null; output: string } => {
+		const file = path.join(dir, `${name}.test.ts`);
+		fs.writeFileSync(file, `import test from "node:test";\nimport { tripwires } from ${JSON.stringify(module)};\ntest(${JSON.stringify(name)}, async () => {\n${body}\n});\n`);
+		const ran = spawnSync(process.execPath, ["--test", file], { cwd: dir, env, encoding: "utf8", timeout: 30_000 });
+		return { status: ran.status, output: `${ran.stdout}${ran.stderr}` };
+	};
+	try {
+		const clean = probe("clean", "\ttripwires();");
+		assert.equal(clean.status, 0, `a file that reached no tripwire failed:\n${clean.output}`);
+		for (const backend of ["pi", "codex"]) {
+			const reached = probe(`${backend}-reach`, `\tawait tripwires().${backend}.run({} as never).catch(() => {});`);
+			assert.equal(reached.status, 1, `a swallowed ${backend} reach did not fail its file:\n${reached.output}`);
+			assert.match(reached.output, new RegExp(`a case reached the ${backend} backend tripwire`), `the ${backend} probe failed for another reason:\n${reached.output}`);
+		}
+	} finally {
+		fs.rmSync(dir, { recursive: true, force: true });
+	}
+});
+
+/**
+ * The words a POSIX shell would read from a command made of plain words, single-quoted spans and `\'`, and nothing else. It
+ * reads, it never runs: anything a shell would expand, substitute, escape or redirect outside single quotes is refused,
+ * so a hint that passes is one whose every argument is literal text.
+ */
+function literalShellWords(command: string): string[] {
+	const words: string[] = [];
+	let word: string | undefined;
+	for (let at = 0; at < command.length; at++) {
+		const char = command[at]!;
+		if (char === " ") {
+			if (word !== undefined) words.push(word);
+			word = undefined;
+		} else if (char === "'") {
+			const end = command.indexOf("'", at + 1);
+			if (end === -1) throw new Error(`an unclosed quote at ${at}`);
+			word = (word ?? "") + command.slice(at + 1, end);
+			at = end;
+		} else if (char === "\\" && command[at + 1] === "'") {
+			// The one escape the hint uses: a quote between two quoted spans.
+			word = (word ?? "") + "'";
+			at += 1;
+		} else if (/[\s$`"\\;&|<>()*?[\]{}~#!]/.test(char) || (char === "=" && word === undefined)) {
+			throw new Error(`${JSON.stringify(char)} at ${at} would be read by the shell, not as text`);
+		} else word = (word ?? "") + char;
+	}
+	if (word !== undefined) words.push(word);
+	return words;
+}
+
+test("a codex resume hint names a plain thread id as it is, and any other as one literal argument that cannot be an option", () => {
+	for (const plain of ["thr-1", "thread-1", "019a2b3c-4d5e-7f00-8000-0123456789ab", "a_b.c:d/e@f+g=h,i%j"]) {
+		assert.equal(codexResumeCommand(plain), `codex resume ${plain}`, "an ordinary id keeps the hint it always had");
+	}
+	const hostile = ["$(touch /tmp/pwned)", "`id`", "it's a thread", "thread 1", "a\tb", "x;rm -rf ~", '"quoted"', "line\nbreak", "~", "*", "-rf", "--help", "-", "'", "=ls"];
+	for (const id of hostile) {
+		const command = codexResumeCommand(id);
+		const words = literalShellWords(command);
+		const expected = id.startsWith("-") ? ["codex", "resume", "--", id] : ["codex", "resume", id];
+		assert.deepEqual(words, expected, `${JSON.stringify(id)} is read back as exactly one literal argument: ${command}`);
+	}
+	assert.equal(codexResumeCommand("$(touch /tmp/pwned)"), "codex resume '$(touch /tmp/pwned)'");
+	assert.equal(codexResumeCommand("it's"), "codex resume 'it'\\''s'");
+	assert.equal(codexResumeCommand("-rf"), "codex resume -- '-rf'");
+	// zsh expands a word that starts with `=` into a command path, so a leading one is quoted; an interior one is plain.
+	assert.equal(codexResumeCommand("=ls"), "codex resume '=ls'");
+	assert.equal(codexResumeCommand("a=b"), "codex resume a=b");
+	// The reader itself refuses what a shell would interpret, so the check above cannot pass by reading too little.
+	for (const unsafe of ["codex resume $(id)", "codex resume `id`", 'codex resume "x"', "codex resume a;b", "codex resume 'open", "codex resume =ls"]) assert.throws(() => literalShellWords(unsafe), unsafe);
+});
+
 test("a pi model is a provider and a model id split at the first slash, so a provider's own slashes survive", () => {
 	assert.deepEqual(piModelParts("deepseek/deepseek-chat"), { provider: "deepseek", model: "deepseek-chat" });
 	assert.deepEqual(piModelParts("openrouter/deepseek/deepseek-chat"), { provider: "openrouter", model: "deepseek/deepseek-chat" });
@@ -242,6 +532,61 @@ test("a pi model is a provider and a model id split at the first slash, so a pro
 	// The record grammar is the same one, so a model id with slashes reads back as the selection it was written as.
 	assert.deepEqual(resolvedSelectionOf({ model: "openrouter/deepseek/deepseek-chat", effort: "medium" }, "pi"), { model: "openrouter/deepseek/deepseek-chat", effort: "medium" });
 	assert.equal(resolvedSelectionOf({ model: "deepseek-chat", effort: "medium" }, "pi"), undefined);
+});
+
+test("a codex reference is only ever one that says so, and never carries a pi session file", () => {
+	assert.deepEqual(sessionRefOf({ backend: "codex", sessionId: "thread-1" }, "codex"), { backend: "codex", sessionId: "thread-1" });
+	assert.deepEqual(sessionRefOf({ backend: "codex", sessionId: "thread-1", checkpoint: "turn-2" }), { backend: "codex", sessionId: "thread-1", checkpoint: "turn-2" });
+	const refused: unknown[] = [
+		{ sessionId: "thread-1" },
+		{ backend: "codex", sessionId: "thread-1", sessionFile: "/sessions/pi-1.jsonl" },
+		{ backend: "codex", sessionId: "thread-1", sessionFile: undefined, checkpoint: "" },
+		{ backend: "codex", sessionId: " " },
+		{ backend: "codex" },
+		{ backend: "pi", sessionId: "pi-1", sessionFile: "/sessions/pi-1.jsonl" },
+		{ backend: "claude", sessionId: "s-1" },
+		["codex"],
+		null,
+	];
+	for (const value of refused) assert.equal(sessionRefOf(value, "codex"), undefined, JSON.stringify(value));
+	assert.equal(sessionRefOf({ sessionId: "thread-1" }), undefined, "an untagged value read with no backend named is no reference, and never a codex one");
+	assert.deepEqual(sessionRefOf({ sessionId: "s-1" }, "claude"), { backend: "claude", sessionId: "s-1" }, "an untagged reference is still claude's");
+	assert.equal(sessionRefOf({ backend: "codex", sessionId: "thread-1" }, "claude"), undefined);
+	assert.equal(sessionRefOf({ backend: "codex", sessionId: "thread-1" }, "pi"), undefined);
+	assert.equal(sessionRefOf({ backend: "codex", sessionId: "thread-1", sessionFile: "/sessions/pi-1.jsonl" }, "pi"), undefined, "nor is a mixed one read as pi");
+	// What a monitor keeps is read by the same grammar, and a field past the ceiling drops the whole reference.
+	assert.deepEqual(keptRef({ backend: "codex", sessionId: "thread-1", checkpoint: "turn-2" }, "codex", 8), { backend: "codex", sessionId: "thread-1", checkpoint: "turn-2" });
+	assert.equal(keptRef({ backend: "codex", sessionId: "thread-1", checkpoint: "turn-2-long" }, "codex", 8), undefined);
+	assert.equal(keptRef({ backend: "codex", sessionId: "thread-1", sessionFile: "/f" }, "codex"), undefined);
+});
+
+test("each backend's selection grammar is its own: codex needs a provider, pi and claude an effort", () => {
+	assert.deepEqual(resolvedSelectionOf({ model: "gpt-5-codex", provider: "openai" }, "codex"), { model: "gpt-5-codex", provider: "openai" });
+	assert.deepEqual(resolvedSelectionOf({ model: "gpt-5-codex", provider: "openai", effort: "xhigh" }, "codex"), { model: "gpt-5-codex", provider: "openai", effort: "xhigh" });
+	assert.deepEqual(resolvedSelectionOf({ model: "gpt-5-codex", provider: "openai", effort: "any-level", extra: 1 }, "codex"), { model: "gpt-5-codex", provider: "openai", effort: "any-level" }, "an effort is a token codex takes or refuses, not one this host lists");
+	const refused: unknown[] = [
+		{ model: "gpt-5-codex" },
+		{ model: "gpt-5-codex", provider: "" },
+		{ model: "gpt-5-codex", provider: "open ai" },
+		{ model: " gpt-5-codex", provider: "openai" },
+		{ model: "", provider: "openai" },
+		{ provider: "openai" },
+		{ model: "gpt-5-codex", provider: "openai", effort: "" },
+		{ model: "gpt-5-codex", provider: "openai", effort: "very high" },
+		{ model: "gpt-5-codex", provider: "openai", effort: null },
+		{ model: "gpt-5-codex", provider: 7 },
+		[],
+	];
+	for (const value of refused) assert.equal(resolvedSelectionOf(value, "codex"), undefined, JSON.stringify(value));
+	// Pi still needs a valid thinking level, and Claude an effort; a provider beside either changes nothing they read.
+	assert.equal(resolvedSelectionOf({ model: "deepseek/deepseek-chat" }, "pi"), undefined);
+	assert.equal(resolvedSelectionOf({ model: "deepseek/deepseek-chat", effort: "ultra" }, "pi"), undefined);
+	assert.deepEqual(resolvedSelectionOf({ model: "deepseek/deepseek-chat", provider: "deepseek", effort: "high" }, "pi"), { model: "deepseek/deepseek-chat", effort: "high" });
+	assert.equal(resolvedSelectionOf({ model: "opus" }, "claude"), undefined);
+	assert.deepEqual(resolvedSelectionOf({ model: "opus", provider: "anthropic", effort: "high" }, "claude"), { model: "opus", effort: "high" });
+	assert.deepEqual(keptSelection({ model: "gpt-5", provider: "openai" }, "codex", 6), { model: "gpt-5", provider: "openai" });
+	assert.equal(keptSelection({ model: "gpt-5", provider: "openai-long" }, "codex", 6), undefined, "a provider past the ceiling drops the whole selection");
+	assert.equal(keptSelection({ model: "gpt-5", provider: "openai", effort: "minimal" }, "codex", 6), undefined, "and so does an effort");
 });
 
 test("a backend the host holds keeps its own role and session shapes behind the boundary", async () => {
@@ -273,7 +618,11 @@ test("every role a record may name has capabilities, and the host advertises the
 	assert.deepEqual(ROLE_SPECS.ultracode.backends, ["claude"]);
 	assert.deepEqual(ROLE_SPECS.security.backends, ["pi"]);
 	assert.equal(runsOn("security", "pi"), true, "and the backend it does run on binds it");
-	assert.deepEqual([...ROLE_SPECS.implement.backends].sort(), ["claude", "pi"]);
+	assert.deepEqual([...ROLE_SPECS.implement.backends].sort(), ["claude", "codex", "pi"]);
+	assert.deepEqual([...ROLE_SPECS.ask.backends].sort(), ["claude", "codex", "pi"]);
+	assert.deepEqual([...ROLE_SPECS.plan.backends].sort(), ["claude", "codex", "pi"], "codex runs plan beside claude and pi, continued from its recorded checkpoint");
+	assert.equal(runsOn("plan", "codex"), true);
+	for (const role of ["ultracode", "security"]) assert.equal(runsOn(role, "codex"), false, role);
 	assert.equal(canChangeFiles("ask"), false);
 	assert.equal(canChangeFiles("nobody"), true, "a role nothing knows is treated as one that can change files");
 	assert.equal(isReviewable("nobody"), false);

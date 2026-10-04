@@ -7,11 +7,12 @@ import * as path from "node:path";
 import test, { afterEach } from "node:test";
 import { fileURLToPath } from "node:url";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import fusion, { parseFusion } from "../extensions/fusion.ts";
+import fusion, { builtinConfiguration, parseFusion } from "../extensions/fusion.ts";
 import { memoryProfileStore } from "../extensions/profile-store.ts";
+import { settingsTable } from "../extensions/profiles.ts";
 import { HISTORY_VERSION } from "../extensions/history.ts";
 import { toolList, turnOn } from "./host-tools.ts";
-import { piTripwire } from "./tripwire.ts";
+import { tripwires } from "./tripwire.ts";
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 process.env.PI_FUSION_CLAUDE_BIN = path.join(repoRoot, "test", "fake-claude.mjs");
@@ -51,6 +52,7 @@ type Renderer = (message: any, options: { expanded: boolean; outputPad: number }
 const USAGE =
 	"Usage: /fusion dashboard | /fusion dashboard stop | /fusion status [run-N] | /fusion cancel run-N | /fusion wait run-N | /fusion steer run-N <text> | /fusion answer [run-N] [text] | /fusion review run-N | /fusion on | /fusion off | /fusion config | /fusion profile [list | use <name> | save <name> | default <name>]";
 const PROFILE_USAGE = "Usage: /fusion profile [list | use <name> | save <name> | default <name>]; builtin names the built-in configuration for use and default";
+const STATUS_HEADER = ["fusion: on", "profile: builtin", "", ...settingsTable(builtinConfiguration().roles), "", ""].join("\n");
 const ESC = "\u001b";
 const BEL = "\u0007";
 
@@ -101,9 +103,9 @@ function makeHost(cwd = repoRoot, mode: "tui" | "print" = "print", session: { id
 		sendMessage: (message: unknown, options: unknown) => sent.push([message, options]),
 		registerMessageRenderer: (customType: string, renderer: Renderer) => renderers.set(customType, renderer),
 	} as unknown as ExtensionAPI;
-	// Every run of this file is a claude one, and the tripwire is what keeps the pi backend this build registers out of
-	// reach of a case that routed to it by accident.
-	fusion(api, { backends: { ...piTripwire() }, profiles: memoryProfileStore() });
+	// Every run of this file is a claude one, and the tripwires are what keep the pi and codex backends out of reach of
+	// a case that routed to one by accident.
+	fusion(api, { backends: { ...tripwires() }, profiles: memoryProfileStore() });
 	const theme = { fg: (_color: string, text: string) => text, bold: (text: string) => text, dim: (text: string) => text };
 	const ui = {
 		setStatus(_key: string, _text: string | undefined) {},
@@ -665,13 +667,13 @@ test("parseFusion reads every /fusion form and answers anything else with the us
 test("/fusion status lists this Pi session's runs and details the one it is given", async () => {
 	const host = makeHost();
 	await host.command("status");
-	assert.deepEqual(host.notices, [["fusion: on\nno runs in this Pi session yet\nsession usage: est. $0.0000 · in 0 out 0 tokens · workflow agents 0 tokens · 0 calls", "info"]]);
+	assert.deepEqual(host.notices, [[`${STATUS_HEADER}no runs in this Pi session yet\nsession usage: est. $0.0000 · in 0 out 0 tokens · workflow agents 0 tokens · 0 calls`, "info"]]);
 	await withScenario("hang", () => host.claude({ role: "implement", task: "long work", background: true }));
 	host.notices.length = 0;
 	await host.command("status");
 	assert.equal(host.notices.length, 1);
 	assert.equal(host.notices[0]![1], "info");
-	assert.match(host.notices[0]![0], /^fusion: on\nrun-1 · implement · opus · running · background · \d+s\nsession usage: /);
+	assert.match(host.notices[0]![0], /^fusion: on\nprofile: builtin\n\n[\s\S]*?\n\nrun-1 · implement · opus · running · background · \d+s\nsession usage: /);
 	await started(host, "run-1");
 	host.notices.length = 0;
 	await host.command("status run-1");
@@ -1169,7 +1171,7 @@ test("a budget variable that names no amount is reported once, and the control i
 		await host.command("status");
 		assert.deepEqual(host.notices, [
 			["fusion: PI_FUSION_BUDGET_LIMIT_USD=1,000 is not a dollar amount; no limit is set", "warning"],
-			["fusion: on\nno runs in this Pi session yet\nsession usage: est. $0.0000 · in 0 out 0 tokens · workflow agents 0 tokens · 0 calls · warn at $5.00", "info"],
+			[`${STATUS_HEADER}no runs in this Pi session yet\nsession usage: est. $0.0000 · in 0 out 0 tokens · workflow agents 0 tokens · 0 calls · warn at $5.00`, "info"],
 		]);
 		host.notices.length = 0;
 		await host.command("status");
@@ -1237,13 +1239,13 @@ test("a warning notice that throws leaves its threshold pending, so a later run 
 test("the session usage shows in /fusion status and claude_control details with no budget variable set", async () => {
 	const host = makeHost();
 	await host.command("status");
-	assert.deepEqual(host.notices, [["fusion: on\nno runs in this Pi session yet\nsession usage: est. $0.0000 · in 0 out 0 tokens · workflow agents 0 tokens · 0 calls", "info"]]);
+	assert.deepEqual(host.notices, [[`${STATUS_HEADER}no runs in this Pi session yet\nsession usage: est. $0.0000 · in 0 out 0 tokens · workflow agents 0 tokens · 0 calls`, "info"]]);
 	await withScenario("ok", () => host.claude({ role: "implement", task: "do a thing" }));
 	host.notices.length = 0;
 	await host.command("status");
 	const [line, type] = host.notices[0]!;
 	assert.equal(type, "info");
-	assert.match(line, /^fusion: on\nrun-1 · implement · opus · done · \d+s · context <1%\nsession usage: est\. \$0\.2500 · in \d+ out \d+ tokens · workflow agents 250 tokens · 1 calls$/);
+	assert.match(line, /^fusion: on\nprofile: builtin\n\n[\s\S]*?\n\nrun-1 · implement · opus · done · \d+s · context <1%\nsession usage: est\. \$0\.2500 · in \d+ out \d+ tokens · workflow agents 250 tokens · 1 calls$/);
 	assert.ok(!line.includes("warn at") && !line.includes("· limit"), "with no threshold and no limit the line names neither");
 	const status = await host.control({ action: "status" });
 	assert.match(status.content[0]!.text, /^run-1 · implement · opus · done · \d+s( · context <1%)?$/, "the text the host reads is unchanged");
@@ -1257,7 +1259,7 @@ test("/fusion status names the thresholds the budget variables set", () =>
 		const host = makeHost();
 		await host.command("status");
 		assert.deepEqual(host.notices, [
-			["fusion: on\nno runs in this Pi session yet\nsession usage: est. $0.0000 · in 0 out 0 tokens · workflow agents 0 tokens · 0 calls · warn at $0.1000, $0.2000 · limit $5.00", "info"],
+			[`${STATUS_HEADER}no runs in this Pi session yet\nsession usage: est. $0.0000 · in 0 out 0 tokens · workflow agents 0 tokens · 0 calls · warn at $0.1000, $0.2000 · limit $5.00`, "info"],
 		]);
 	}));
 
@@ -1692,7 +1694,7 @@ test("a later Pi process on the same host session shows the earlier runs, their 
 		await second.command("status");
 		assert.match(
 			second.notices[0]![0],
-			/^fusion: on\nno runs in this Pi session yet\nrun-1 · ultracode · fable · done · earlier Pi process\nsession usage: est\. \$0\.2500 · in \d+ out \d+ tokens · workflow agents 250 tokens · 1 calls$/,
+			/^fusion: on\nprofile: builtin\n\n[\s\S]*?\n\nno runs in this Pi session yet\nrun-1 · ultracode · fable · done · earlier Pi process\nsession usage: est\. \$0\.2500 · in \d+ out \d+ tokens · workflow agents 250 tokens · 1 calls$/,
 		);
 		assert.deepEqual(second.completions("status "), [{ value: "status run-1", label: "status run-1" }], "the earlier run is offered for status, which acts on it");
 		second.notices.length = 0;
@@ -1720,7 +1722,7 @@ test("a later Pi process on the same host session shows the earlier runs, their 
 		second.notices.length = 0;
 		assert.match(await withScenario("ok", () => second.text(second.claude({ role: "ultracode", task: "another thing" }))), /\[run-2 · ultracode · fable · /);
 		await second.command("status");
-		assert.match(second.notices[0]![0], /^fusion: on\nrun-2 · ultracode · fable · done · \d+s · context <1%\nrun-1 · ultracode · fable · done · earlier Pi process\nsession usage: est\. \$0\.5000 · .* · 2 calls$/);
+		assert.match(second.notices[0]![0], /^fusion: on\nprofile: builtin\n\n[\s\S]*?\n\nrun-2 · ultracode · fable · done · \d+s · context <1%\nrun-1 · ultracode · fable · done · earlier Pi process\nsession usage: est\. \$0\.5000 · .* · 2 calls$/);
 		assert.deepEqual(
 			second.completions("status "),
 			[
@@ -1745,7 +1747,7 @@ test("one host session never reads another one's runs", () =>
 		const other = durable("host-9");
 		other.branch.push(...first.branch);
 		await other.command("status");
-		assert.deepEqual(other.notices, [["fusion: on\nno runs in this Pi session yet\nsession usage: est. $0.0000 · in 0 out 0 tokens · workflow agents 0 tokens · 0 calls", "info"]]);
+		assert.deepEqual(other.notices, [[`${STATUS_HEADER}no runs in this Pi session yet\nsession usage: est. $0.0000 · in 0 out 0 tokens · workflow agents 0 tokens · 0 calls`, "info"]]);
 		assert.equal(fs.existsSync(path.join(dir, "host-9.json")), false, "a session with nothing to keep writes nothing");
 	}));
 
@@ -1795,7 +1797,7 @@ test("a run whose Pi process ended while it was going comes back as aborted, in 
 			assert.deepEqual(sent.details, { handle: "run-1", state: "aborted", historical: true });
 			second.notices.length = 0;
 			await second.command("status");
-			assert.match(second.notices[0]![0], /^fusion: on\nno runs in this Pi session yet\nrun-1 · implement · opus · aborted · earlier Pi process\n/);
+			assert.match(second.notices[0]![0], /^fusion: on\nprofile: builtin\n\n[\s\S]*?\n\nno runs in this Pi session yet\nrun-1 · implement · opus · aborted · earlier Pi process\n/);
 			assert.match(await withScenario("ok", () => second.text(second.claude({ role: "implement", task: "another thing" }))), /\[run-2 · implement · /, "the interrupted run keeps its name");
 			assert.deepEqual(
 				heldFile(dir, "host-1").records.map((record) => [record.handle, record.state]),

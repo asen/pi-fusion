@@ -623,6 +623,30 @@ test("a long session file survives a write and a read whole, and one past the ce
 	});
 });
 
+test("a codex reference and selection are kept by codex's own grammar: provider included, effort optional, no session file", () => {
+	withDir((root) => {
+		const dir = path.join(root, "history");
+		const history = new History(dir);
+		const ref = { backend: "codex" as const, sessionId: "thread-1", checkpoint: "turn-2" };
+		const held = record({ id: "codex-run", backend: "codex", ref, selection: { model: "gpt-5-codex", provider: "openai" } });
+		assert.equal(history.save("host-1", "/work", held), undefined);
+		assert.deepEqual(history.load("host-1").records, [held], "a selection the child left on its own effort is still one to keep");
+		const over = "x".repeat(33_000);
+		const records = [
+			record({ id: "with-effort", backend: "codex", ref, selection: { model: "gpt-5-codex", provider: "openai", effort: "xhigh" } }),
+			{ ...record({ id: "mixed", backend: "codex" }), ref: { ...ref, sessionFile: "/sessions/pi-1.jsonl" }, selection: { model: "gpt-5-codex", effort: "high" } },
+			{ ...record({ id: "long-provider", backend: "codex" }), ref: { ...ref, sessionId: over }, selection: { model: "gpt-5-codex", provider: over } },
+		];
+		fs.writeFileSync(path.join(dir, "host-2.json"), JSON.stringify({ version: HISTORY_VERSION, hostSessionId: "host-2", cwd: "/work", records }));
+		const loaded = new History(dir).load("host-2").records;
+		assert.deepEqual([loaded[0]!.ref, loaded[0]!.selection], [ref, { model: "gpt-5-codex", provider: "openai", effort: "xhigh" }]);
+		assert.equal(loaded[1]!.ref, undefined, "a codex reference carrying a pi session file is a mixed one, and no identity at all");
+		assert.equal(loaded[1]!.selection, undefined, "a codex model with no provider is no selection to repeat");
+		assert.equal(loaded[2]!.ref, undefined, "a field past the ceiling drops the whole reference");
+		assert.equal(loaded[2]!.selection, undefined, "and a provider past it the whole selection");
+	});
+});
+
 test("a pi session a run only started has no id yet, and a reference this host cannot use is dropped", () => {
 	withDir((root) => {
 		const dir = path.join(root, "history");

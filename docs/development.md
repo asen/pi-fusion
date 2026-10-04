@@ -10,9 +10,9 @@ node --test test/control.test.ts
 node --test --test-name-pattern="continue" test/control.test.ts
 ```
 
-The suite uses Node's native TypeScript stripping and a 60-second per-test timeout. Typecheck is the only static check; there is no linter or formatter. `npm install` also installs the Claude Agent SDK's bundled binary (about 200 MB), but tests do not run that binary.
+The suite uses Node's native TypeScript stripping and a 60-second per-test timeout. Typecheck is the only static check; there is no linter or formatter. `npm install` also installs the Claude Agent SDK's bundled binary (about 200 MB), but tests do not run that binary. The Codex backend adds no dependency: it uses the host's own `codex` at run time, and no test needs one installed.
 
-Editing conventions and invariants live in [AGENTS.md](../AGENTS.md); vocabulary lives in [CONTEXT.md](../CONTEXT.md). Keep user-facing changes in the owning topic page. The code, not historical plans or measurement counts, defines current behavior.
+Editing conventions and invariants live in [AGENTS.md](../AGENTS.md); vocabulary lives in [CONTEXT.md](../CONTEXT.md). Keep user-facing changes in the owning topic page. Code defines current behavior. Keep completed implementation plans out of the docs; retain TODOs, open issues, future proposals, and scoped evidence.
 
 ## Module map
 
@@ -22,6 +22,7 @@ fusion.ts                     host lifecycle and registration
   +-- backends/types.ts       SDK-neutral boundary
   |     +-- claude.ts         Claude SDK and stream/questions
   |     +-- pi-backend.ts     Pi composition (see below)
+  |     +-- codex.ts          Codex app-server composition (experimental, registered)
   +-- process-tree.ts         launch and descendant cleanup
   +-- cards/dashboard        terminal and browser monitoring
   +-- changes/history/budget snapshots, persistence, accounting
@@ -36,6 +37,11 @@ fusion.ts                     host lifecycle and registration
 | `backends/types.ts` | Session references/intents, selection, request/outcome/event/callback shapes; imports nothing |
 | `backends/claude.ts` | Claude SDK options, input/question bridges, stream loop; SDK concerns stay here |
 | `backends/pi-binding.ts` | Pure Pi role/model/effort binding, contracts, and tool/resource lists |
+| `backends/codex-binding.ts` | Pure role/selection/contract binding, sandbox and approval policy; imports only `types.ts` |
+| `backends/codex-launch.ts` | POSIX binary lookup, inherited environment/cwd, predicted home and launch options; starts nothing |
+| `backends/codex-protocol.ts` | Strict-minimum app-server readers, based on Codex 0.160.0 source; sandbox policy read for its tag only |
+| `backends/codex-transport.ts` | Bounded JSONL/request lifecycle, scoped turn evidence, questions off the read loop, one-shot steers and owned shutdown; display notifications are unfiltered; imported only by Codex modules |
+| `backends/codex.ts`, `codex-outcome.ts` | Lazy call composition, checks, steer queue and one shutdown; pure selection, disposition, checkpoint/baseline, usage and display mapping. Factory construction reads, locates and starts nothing. See [Codex architecture](codex-backend.md#architecture) and [evidence](codex-backend.md#evidence) |
 | `backends/pi-storage.ts`, `pi-launch.ts` | Owned layout/catalog publication, call input, environment, launch options, and lazy host agent/package accessors |
 | `backends/pi-bootstrap.mjs` | Child-only public SDK construction, strict input/resource/session checks, in-memory settings, and native RPC serving |
 | `backends/pi-sdk-resolve.mjs`, `pi-bootstrap-protocol.mjs` | Child resolve preload; separately, import-free startup constants shared with transport |
@@ -50,11 +56,11 @@ fusion.ts                     host lifecycle and registration
 | `changes.ts`, `history.ts`, `budget.ts` | Git snapshots; opt-in host run history; running-total cost ledger |
 | `handoff.ts`, `review.ts` | Plan cap/model-change handoff; independent review eligibility and quoted prompt data |
 
-Role behavior belongs in `contracts/*.md`. Review **selection** belongs in `fusion.ts`: every review uses the session's configured `ask` backend/model/effort, not the reviewed role's backend or model. Architecture, storage, and runtime limitations are in [Pi backend](pi-backend.md).
+Role behavior belongs in `contracts/*.md`. Review **selection** belongs in `fusion.ts`: every review uses the session's configured `ask` backend/model/effort, not the reviewed role's backend or model. Architecture, storage, and runtime limitations are in [Pi backend](pi-backend.md); the experimental Codex backend is in [Codex backend](codex-backend.md).
 
 ## Test strategy
 
-`npm test` starts **no real Claude/Pi child and no paid inference**. It tests policy/protocols with fakes and doubles. A fake subprocess is still a process; it is not a native backend session.
+`npm test` starts **no real Claude/Pi/Codex child and no paid inference**, and no test host call locates a native `codex`. It tests policy/protocols with fakes and doubles. A fake subprocess is still a process; it is not a native backend session.
 
 | Layer | Fixture / tests | What a pass establishes |
 | --- | --- | --- |
@@ -62,10 +68,31 @@ Role behavior belongs in `contracts/*.md`. Review **selection** belongs in `fusi
 | Host lifecycle | `fake-pi-backend.ts`, `lifecycle.test.ts`, controls/session/routing/records tests | Admission, writer slot, records, continuations, questions, reviews, and cross-backend policy |
 | Pi native protocol | `fake-pi.mjs`, `pi-transport.test.ts`, `pi-backend-transport.test.ts` | Host framing, request/event order, composition, and process cleanup against literal RPC replies |
 | Pi helper stages | Binding/storage/launch/bootstrap/restore/question/prepare/task/outcome/backend tests | Validation, sequencing, gates, accounting, and mapping against scripted doubles or fenced fake subprocesses |
+| Codex app-server protocol | `fake-codex.mjs`, `codex-transport.test.ts` | Readers, framing, correlation, scoped turn/question evidence, denials, failures and cleanup against literal JSON-RPC from a builtins-only fake launched by path |
+| Codex backend composition | `fake-codex.mjs`, `codex-backend.test.ts` | Fresh/resume/fork sequencing, tip/readback/selection checks, checkpoint/baseline and per-call accounting, steers/questions, demotion, cancellation and one shutdown through injected fake seams |
+| Codex qualification harness | `codex-harness.test.ts`, `test/spikes/codex-app-server*.mjs` | CLI/guard and PASS/FAIL/UNPROVEN/SKIP rules, usage/steer/question verdicts, explicit `--fake` cases, request-shape parity and fixture retention. Guards never pass a case; fake passes are not native qualification |
+| Codex binding and host | `codex-binding.test.ts`, routing/lifecycle/profiles/dashboard/browser Codex cases | Pure role binding; routing/handoffs, controls, records, presentation, accounting and review with an in-memory double; delegated runs, failed resumes, reviews, steers and answered/cancelled questions with the fake-backed backend |
 | Configuration/mode | `profiles.test.ts` | Settings/store/commands, off-by-default, reminder, refresh/rollback, and allow-list preservation against a modeled host |
 | Presentation/persistence | Cards, dashboard, browser, history, changes, budget, review tests | Bounded/safe rendering and storage, Git snapshots, cost ledger, and review prompts/eligibility |
 
-Extension test hosts register `piTripwire()` in place of production Pi. Every tripwire entry point records a reach and throws; a file-level check catches accidental routing even when the extension turns that throw into a report. An injected backend uses `{ ...piTripwire(), pi: own }`. The two `productionDefaults()` hosts only test missing-model binding refusals and never ask the registered backend to run. Every host injects a memory profile store, so it reads/writes no user `profiles.json`.
+```text
+extension test host
+  +-- tripwires()                 -> Pi + Codex entry points throw
+  |     +-- { pi: own }           -> injected Pi double/fake
+  |     +-- { codex: own }        -> injected Codex double/fake
+  +-- productionDefaults()       -> Pi missing-model refusals only
+        +-- Codex tripwire kept  -> no native Codex entry
+```
+
+- Tripwires record every reach. File-level assertions catch accidental routing even if the host turns the throw into a report.
+- Registry overlays spread injected entries last; explicit `undefined` removes a default without fallback. A routed Codex case needs an own double/fake, never `codex: undefined` alone.
+- The two `productionDefaults()` hosts never run a backend. They refuse with Pi/Codex selection variables or `PI_FUSION_CODEX_BIN` set; Codex needs a tripwire because an omitted model uses its host default.
+- `test/backends.test.ts` audits registrations, overlays and import boundaries, and constructs the default Codex backend without calling `run`. Every registration uses `tripwires()` or `productionDefaults()`, never both.
+- Every host injects a memory profile store: no user `profiles.json` reads/writes. Codex tests use no native binary, home, auth or `PATH` lookup.
+
+[`test/fake-codex.mjs`](../test/fake-codex.mjs) is the literal app-server layer, separate from in-memory binding doubles. `FAKE_CODEX_SCENARIO` selects behavior; `FAKE_CODEX_LOG` records each input line in a per-case temporary file. Its other variables script replies, persisted-thread history, usage, steers and questions; the fixture source owns that catalogue. None is a production request field.
+
+Tests launch the fake by path with the host's Node, the SDK fence and app-server arguments, using narrowed bounds and cleanup graces. Nothing locates a Codex binary.
 
 Activate Fusion through the registered mode tool, not a default-on test option. Security tests must explicitly enable that role. Add scenarios to `fake-claude.mjs` rather than mocking the SDK; `FAKE_CLAUDE_SCENARIO` selects one, `PI_FUSION_CLAUDE_BIN` selects the fake, and `FAKE_CLAUDE_LOG` records its stdin.
 
@@ -77,9 +104,28 @@ The dashboard browser test looks for `PI_FUSION_CHROME`, usual platform paths, t
 
 ## Manual harnesses
 
-These stay under `test/spikes/`, outside the default test glob. Run them only as an explicitly agreed qualification step, one at a time in the foreground. This documentation cleanup does **not** rerun them.
+These stay under `test/spikes/`, outside the default test glob. Run them only as an explicitly agreed qualification step, one at a time in the foreground. Every harness below except the Codex one is a Pi harness; none qualifies Claude.
 
-Use direct Node, not `npx`, with dependencies already installed. Record Node/Pi versions, selected cases, exit status, stdout/stderr, skipped cases, and the kept fixture root. A short success excerpt is not a substitute for reading the complete selected run's footer and evidence. Use a sanitized controller environment as well as each harness's own synthesized child environment; do not supply real credentials or reuse a real profile.
+### Codex app-server
+
+```bash
+node test/spikes/codex-app-server.mjs --list                    # catalogue only; exits 2
+node test/spikes/codex-app-server.mjs --run --case model-free   # Q1, Q2, Q7, Q9
+node test/spikes/codex-app-server.mjs --run --case Q6 --keep
+node test/spikes/codex-app-server.mjs --run --case Q2 --model <id> # named-model readback, no turn
+node test/spikes/codex-app-server.mjs --run --fake --case Q1,Q2,Q4,Q6,Q7,Q9   # NOT NATIVE
+node test/spikes/codex-app-server.mjs --run --fake --case Q14                  # NOT NATIVE
+node test/spikes/codex-app-server.mjs --run --fake --case Q10,Q11,Q12,Q13,Q19  # G2 cases, NOT NATIVE
+node test/spikes/codex-app-server.mjs --run --fake --case Q15,Q16              # G3 cases, NOT NATIVE
+```
+
+- Native runs inherit the user's Codex install, environment, home, configuration, login, MCP, remote-control and multi-agent settings **unsanitized**, as production does. Do not use the sanitized Pi controller below or add credentials, copied homes or API keys.
+- Model cases make provider requests on that login/quota with **unknown USD cost**. Each native run needs its own explicit agreement; threads may leave rollouts, logs or state in the existing Codex home.
+- Nothing starts without `--run` and an explicit `--case`; argument guards exit 2 before loading production modules. `--fake` is deterministic evidence, never native qualification.
+- The [qualification harness section](codex-backend.md#qualification-harness) owns cases and verdict rules. Its pure half is `codex-app-server-cases.mjs`; automated coverage is in the [test-layer table](#test-strategy).
+- Record Codex/platform/Node versions, selected and skipped cases, exit status, **full output**, and any kept fixture root. Native results live only in [Codex evidence](codex-backend.md#evidence).
+
+For the Pi harnesses, use direct Node, not `npx`, with dependencies already installed. Record Node/Pi versions, selected cases, exit status, stdout/stderr, skipped cases, and the kept fixture root. A short success excerpt is not a substitute for reading the complete selected run's footer and evidence. Use a sanitized controller environment as well as each harness's own synthesized child environment; do not supply real credentials or reuse a real profile.
 
 ### Session lifecycle
 
@@ -161,6 +207,15 @@ Use a fresh sanitized setup for another qualification stage. Retargeting customa
 
 ## Evidence discipline
 
-Keep three labels distinct: **source inspection**, **deterministic fake/double test**, and **manual native measurement**. Document versions/platforms and skipped cases; do not promote one into another or into a guarantee for future Pi versions. The [backend evidence table](pi-backend.md#evidence-and-limits) records current qualification boundaries, including no native security-role, macOS, Windows, live-provider, or paid-inference qualification.
+```text
+source inspection       -> what the inspected version's code says
+fake / double test      -> behavior against scripted shapes
+manual native measurement -> behavior on the recorded host/version
 
-Historical plans and detailed rounds are retained in Git history. Earlier deviations and possible outside-root effects remain unknown where recorded. Removing obsolete prose authorizes no investigation or cleanup of those artifacts, real profiles, caches, or processes, and no upstream issue submission. The declined helper proposal was never submitted and no SDK source was modified.
+Neither source nor fake evidence becomes native qualification.
+No measurement guarantees another version, platform or provider.
+```
+
+Record versions/platforms and skipped cases in the owning [Pi evidence](pi-backend.md#evidence-and-limits) or [Codex evidence](codex-backend.md#evidence) section. Link those results rather than copying qualification summaries here.
+
+Historical round logs remain in Git; code defines current behavior. Earlier deviations and possible outside-root effects remain unknown where recorded. Documentation cleanup authorizes no investigation or cleanup of those artifacts, real profiles, caches, or processes, and no upstream issue submission. The declined helper proposal was never submitted and no SDK source was modified.

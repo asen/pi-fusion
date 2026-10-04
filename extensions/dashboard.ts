@@ -61,8 +61,8 @@ export interface RunProgress {
 	workflowTokens?: number;
 	sessionId?: string;
 	deniedTools?: string[];
-	/** What a Pi child confirmed it runs with, which is where a run that named no effort learns the child's own. */
-	selection?: { model: string; effort: string };
+	/** What a child confirmed it runs with, which is where a run that named no effort learns the child's own, if it reports one. */
+	selection?: { model: string; effort?: string };
 }
 
 export interface RunSummary {
@@ -957,7 +957,7 @@ export interface Dashboard {
 }
 
 /** What the page shows about this Pi session's spend: the totals so far and the thresholds the user configured. */
-export type UsageView = UsageTotals & { warnUsd: number[]; limitUsd?: number };
+export type UsageView = UsageTotals & { warnUsd: number[]; limitUsd?: number; unpricedRuns?: number };
 
 function reply(status: number, type: string, body: Buffer, extra?: Record<string, string>): Reply {
 	return { status, headers: { ...SECURITY_HEADERS, "Content-Type": type, "Content-Length": String(body.byteLength), ...extra }, body };

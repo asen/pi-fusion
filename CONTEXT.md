@@ -9,15 +9,15 @@ The Pi model that talks with the user and decides which work to hand off. No par
 _Avoid_: orchestrator, main model, parent
 
 **Child**:
-A headless coding session doing work the host handed off: Claude Code or Pi, according to its backend.
+A headless coding session doing work the host handed off: Claude Code, Pi, or Codex, according to its backend.
 _Avoid_: subagent, worker, delegate
 
 **Backend**:
-The implementation that runs a child: `claude` or `pi`, both registered. Fresh calls use the role's configured backend unless explicitly overridden; continuations stay on their recorded backend. A backend owns its session shape, binding, and protocol; the host owns handles, records, and scheduling. See [Profiles](docs/profiles.md).
+The implementation that runs a child: `claude`, `pi`, or `codex`. A backend owns its session shape, binding, and protocol; the host owns handles, records, and scheduling. See [Profiles](docs/profiles.md#what-a-call-runs-on) for selection and [Codex evidence](docs/codex-backend.md#evidence) for its experimental scope.
 _Avoid_: adapter, provider, harness, runtime (as synonyms for backend)
 
 **Role**:
-The job a child does: `plan`, `implement`, `ultracode`, `ask`, or `security`. Role metadata defines supported backends, tools, contract, and writer/review eligibility; session settings choose enabled state, backend, model, and effort. `ultracode` is Claude-only. `security` is Pi-only, disabled in `builtin`, and used only for an explicit security request once enabled.
+The job a child does: `plan`, `implement`, `ultracode`, `ask`, or `security`. Role metadata defines capabilities; session settings choose enabled state, backend, model, and effort. See [Routing](docs/routing.md#choosing-a-role) for role selection and [Profiles](docs/profiles.md) for settings.
 _Avoid_: agent type, tool, persona
 
 **Run**:
@@ -33,7 +33,7 @@ A run that goes on after the host's delegation call returns, so the host can kee
 _Avoid_: async run, detached run
 
 **Question**:
-A request for a small decision a child sends while it works. It is not an escalation that ends the run.
+A request for a small decision a child sends while it works. It is not an escalation that ends the run. See [Questions](docs/questions.md) for waiting, answering, and backend-specific limits.
 _Avoid_: escalation, prompt, elicitation
 
 **Waiting**:
@@ -45,7 +45,7 @@ The text supplied to a question through a control tool's `message` action or `/f
 _Avoid_: reply, response, decision (as synonyms for answer)
 
 **Handoff**:
-An implicit `plan` continuation replaced by a fresh run on the same backend because of the context cap or an explicitly changed model. It carries the last agreed report, not the old transcript. A cap handoff preserves the planner's model; Pi also preserves its recorded thinking level unless overridden, while Claude uses the call's effort or that backend's fresh-run defaults. Explicit `continue` is warned, never handed off. See [The context cap](docs/runs.md#the-context-cap).
+An implicit `plan` continuation replaced by a fresh run on the same backend because of the context cap or an explicitly changed model. It carries the last agreed report, not the old transcript. Explicit `continue` is never handed off. See [The context cap](docs/runs.md#the-context-cap) for selection and warnings.
 _Avoid_: rollover, compaction, reset
 
 **Escalation**:
@@ -53,7 +53,7 @@ The part of an `implement` report saying the task needs wider scope or an unreso
 _Avoid_: question, blocker
 
 **Steer**:
-Text sent to a running child with no open question. Acceptance for delivery does not prove model consumption or action; a late steer can remain unread. Ordinary editor text targets the host. See [Background controls](docs/runs.md#background-runs).
+Text sent to a running child with no open question. Acceptance for delivery does not prove model consumption or action; a late steer can remain unread. Ordinary editor text targets the host. See [Background controls](docs/runs.md#background-runs) for delivery, refusal, and queue rules.
 _Avoid_: interrupt, nudge, follow-up
 
 **Review run**:

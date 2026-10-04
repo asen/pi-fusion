@@ -1499,3 +1499,17 @@ test("the page offers a claude resume only for a claude run", () => {
 		"a pi run must leave before a claude resume command is built: its session is a file, not a claude session id",
 	);
 });
+
+test("the page offers codex resume only from a verified codex reference, before any claude command is built", () => {
+	const source = asset("app.js");
+	const resume = source.slice(source.indexOf("const appendResume"), source.indexOf("const appendChain"));
+	const codex = resume.slice(resume.indexOf('backendOf(detail) === "codex"'), resume.indexOf('backendOf(detail) === "pi"'));
+	assert.ok(codex.includes("resultRef(detail)") && codex.includes('str(ref.backend) === "codex"'), "the thread comes from the verified codex reference");
+	assert.ok(!/detail\.sessionId|session\.id/.test(codex), "and never from the scalar the child reported or the launch request");
+	assert.ok(resume.indexOf('backendOf(detail) === "codex"') < resume.indexOf("claude --resume"), "a codex run leaves before a claude resume command is built");
+	assert.ok(codex.includes("codexResumeCommand(thread)") && !codex.includes('"codex resume " + thread'), "the hint is the quoting formatter's, never the raw id glued on");
+	const formatter = source.slice(source.indexOf("const codexResumeCommand"), source.indexOf("const appendResume"));
+	assert.ok(formatter.includes("/^[A-Za-z0-9_@%+:,./][A-Za-z0-9_@%+=:,./-]*$/"), "a leading = is not a plain first character, since zsh expands it; an interior one is");
+	assert.ok(formatter.includes("'\\\\''") && formatter.includes('"codex resume -- "'), "an id is single-quoted with its quotes escaped, and one starting with - goes after --");
+	assert.ok(source.includes('"Codex thread request"'), "the launch request is labelled as a codex one");
+});

@@ -5,7 +5,7 @@
  */
 
 /** The harnesses a run can go through. A record that names none of them was written before backends were tagged. */
-export const BACKEND_NAMES = ["claude", "pi"] as const;
+export const BACKEND_NAMES = ["claude", "pi", "codex"] as const;
 export type BackendName = (typeof BACKEND_NAMES)[number];
 
 export const isBackendName = (value: unknown): value is BackendName => typeof value === "string" && (BACKEND_NAMES as readonly string[]).includes(value);
@@ -13,7 +13,8 @@ export const isBackendName = (value: unknown): value is BackendName => typeof va
 /**
  * Where a later call finds the child session of a run, verified by the backend that made it. Claude names a session
  * id the SDK resumes; Pi names the session id and the file that holds it, because a Pi session is only reachable
- * through its own transcript file. The checkpoint is the durable point a continuation restores, when one is trusted.
+ * through its own transcript file; Codex names the thread id its app-server reports, and nothing else. The checkpoint
+ * is the durable point a continuation restores, when one is trusted.
  */
 export interface ClaudeSessionRef {
 	backend: "claude";
@@ -29,7 +30,34 @@ export interface PiSessionRef {
 	checkpoint?: string;
 }
 
-export type SessionRef = ClaudeSessionRef | PiSessionRef;
+/**
+ * The cumulative usage a Codex thread had reported when it settled on its checkpoint: the thread's own `total`, which
+ * the child seeds from history on a resume or a fork, so one later call's usage is its total less this one and never
+ * a sum of the per-response updates. It is paired with the checkpoint and means nothing without it. A cache write the
+ * child did not report is left out rather than read as zero, because an absent count is unobserved, not none.
+ */
+export interface CodexUsageBaseline {
+	inputTokens: number;
+	cachedInputTokens: number;
+	outputTokens: number;
+	reasoningOutputTokens: number;
+	totalTokens: number;
+	cacheWriteInputTokens?: number;
+}
+
+/**
+ * A Codex thread: an id alone, like Claude's, so a reference carrying a Pi session file is not one of these. A
+ * checkpoint a continuation may restore comes with the usage baseline the thread had at it; one without is kept for
+ * reading only, which is what every thread this host recorded before baselines existed is.
+ */
+export interface CodexSessionRef {
+	backend: "codex";
+	sessionId: string;
+	checkpoint?: string;
+	baseline?: CodexUsageBaseline;
+}
+
+export type SessionRef = ClaudeSessionRef | PiSessionRef | CodexSessionRef;
 
 /** What the host asks of a session, with no backend detail in it: a backend maps this to its own session shape. */
 export type SessionIntent = { kind: "new" } | { kind: "resume"; ref: SessionRef } | { kind: "fork"; from: SessionRef };
@@ -40,10 +68,15 @@ export interface SelectionRequest {
 	effort?: string;
 }
 
-/** The model and effort the child actually runs with, read back from it, so a continuation repeats that selection. */
+/**
+ * The model and effort the child actually runs with, read back from it, so a continuation repeats that selection.
+ * Which fields a backend's selection must carry is that backend's grammar in `resolvedSelectionOf`: Claude and Pi
+ * always name an effort, and Codex names its model provider beside the model and may run at no named effort.
+ */
 export interface ResolvedSelection {
 	model: string;
-	effort: string;
+	provider?: string;
+	effort?: string;
 }
 
 /**
@@ -53,6 +86,9 @@ export interface ResolvedSelection {
 export const PI_EFFORTS = ["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const;
 
 const named = (value: unknown): string | undefined => (typeof value === "string" && value.trim() ? value : undefined);
+
+/** A value Codex reads as one opaque token: a model, a provider or an effort, never blank and with no whitespace in it. */
+export const isCodexToken = (value: unknown): value is string => typeof value === "string" && value.length > 0 && !/\s/.test(value);
 
 /**
  * A Pi model id, split where Pi splits it: the provider up to the first slash, and the model id after it, which is
@@ -75,9 +111,13 @@ export const isPiModel = (value: unknown): boolean => piModelParts(value) !== un
 /**
  * A session reference read back from a record or an outcome, or undefined when the value is not one this host may
  * act on. A Pi reference without its session file is such a value: the file is half of the identity, not a detail.
+ * A Codex reference is only ever one that says so: an untagged value is Claude's, never read as a Codex thread, and a
+ * Codex reference carrying a session file is a mixed one that names no session this host could resume. A Codex
+ * reference with a malformed usage baseline, or with a baseline and no checkpoint, is not one either.
  */
 export function sessionRefOf(value: unknown, backend: "claude"): ClaudeSessionRef | undefined;
 export function sessionRefOf(value: unknown, backend: "pi"): PiSessionRef | undefined;
+export function sessionRefOf(value: unknown, backend: "codex"): CodexSessionRef | undefined;
 export function sessionRefOf(value: unknown, backend?: BackendName): SessionRef | undefined;
 export function sessionRefOf(value: unknown, backend?: BackendName): SessionRef | undefined {
 	const data = value as Record<string, unknown> | null;
@@ -89,23 +129,87 @@ export function sessionRefOf(value: unknown, backend?: BackendName): SessionRef 
 	const checkpoint = named(data.checkpoint);
 	if (data.checkpoint !== undefined && checkpoint === undefined) return undefined;
 	const at = checkpoint === undefined ? {} : { checkpoint };
-	if (tag === "claude") return data.sessionFile === undefined ? { backend: "claude", sessionId, ...at } : undefined;
-	const sessionFile = named(data.sessionFile);
-	return sessionFile ? { backend: "pi", sessionId, sessionFile, ...at } : undefined;
+	switch (tag) {
+		case "claude":
+			return data.sessionFile === undefined ? { backend: "claude", sessionId, ...at } : undefined;
+		case "pi": {
+			const sessionFile = named(data.sessionFile);
+			return sessionFile ? { backend: "pi", sessionId, sessionFile, ...at } : undefined;
+		}
+		case "codex": {
+			if (data.backend !== "codex" || data.sessionFile !== undefined) return undefined;
+			// A baseline is read from the reference's own fields alone, so one a prototype carries is no baseline at all. A
+			// present one that is not exactly a baseline, or one with no checkpoint to pair it with, names no thread this
+			// host could account for, and the whole reference goes rather than a reference with its baseline dropped.
+			const given = Object.hasOwn(data, "baseline") ? data.baseline : undefined;
+			if (given === undefined) return { backend: "codex", sessionId, ...at };
+			const baseline = codexBaselineOf(given);
+			return baseline && checkpoint !== undefined ? { backend: "codex", sessionId, checkpoint, baseline } : undefined;
+		}
+		default:
+			return unknownBackend(tag);
+	}
 }
+
+/** A token count as a baseline holds it: a whole number of tokens, none below zero and none past exact arithmetic. */
+const isCount = (value: unknown): value is number => typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
+
+/**
+ * A Codex usage baseline rebuilt from a value's own fields, or undefined when it is not one: the five counts every
+ * baseline carries, with the cached input inside the input it is a part of, and the cache write only where it was
+ * reported. A field this does not know is not carried over, and an inherited one is not read.
+ */
+function codexBaselineOf(value: unknown): CodexUsageBaseline | undefined {
+	if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+	const own = (key: string): unknown => (Object.hasOwn(value, key) ? (value as Record<string, unknown>)[key] : undefined);
+	const inputTokens = own("inputTokens");
+	const cachedInputTokens = own("cachedInputTokens");
+	const outputTokens = own("outputTokens");
+	const reasoningOutputTokens = own("reasoningOutputTokens");
+	const totalTokens = own("totalTokens");
+	const cacheWriteInputTokens = own("cacheWriteInputTokens");
+	if (!isCount(inputTokens) || !isCount(cachedInputTokens) || !isCount(outputTokens) || !isCount(reasoningOutputTokens) || !isCount(totalTokens)) return undefined;
+	if (cachedInputTokens > inputTokens) return undefined;
+	if (cacheWriteInputTokens !== undefined && !isCount(cacheWriteInputTokens)) return undefined;
+	return { inputTokens, cachedInputTokens, outputTokens, reasoningOutputTokens, totalTokens, ...(cacheWriteInputTokens === undefined ? {} : { cacheWriteInputTokens }) };
+}
+
+/** The end of a dispatch over every backend name: a name added to the list and left out of a dispatch fails to compile. */
+const unknownBackend = (backend: never): undefined => {
+	void backend;
+	return undefined;
+};
 
 /** The selection a record or an outcome carries, or undefined when it is not one a continuation could repeat. */
 export function resolvedSelectionOf(value: unknown, backend: BackendName): ResolvedSelection | undefined {
 	const data = value as Record<string, unknown> | null;
 	if (!data || typeof data !== "object" || Array.isArray(data)) return undefined;
-	const model = named(data.model);
-	const effort = named(data.effort);
-	if (!model || !effort) return undefined;
-	if (backend === "claude") return { model, effort };
-	// A Pi model is a provider and a model id, read by the same grammar a request is read by, so a record this host
-	// wrote always reads back as the selection it meant, however many slashes the provider's own id carries.
-	if (!isPiModel(model)) return undefined;
-	return (PI_EFFORTS as readonly string[]).includes(effort) ? { model, effort } : undefined;
+	switch (backend) {
+		case "claude": {
+			const model = named(data.model);
+			const effort = named(data.effort);
+			return model && effort ? { model, effort } : undefined;
+		}
+		case "pi": {
+			const model = named(data.model);
+			const effort = named(data.effort);
+			if (!model || !effort) return undefined;
+			// A Pi model is a provider and a model id, read by the same grammar a request is read by, so a record this host
+			// wrote always reads back as the selection it meant, however many slashes the provider's own id carries.
+			if (!isPiModel(model)) return undefined;
+			return (PI_EFFORTS as readonly string[]).includes(effort) ? { model, effort } : undefined;
+		}
+		case "codex": {
+			// A Codex model is only repeatable with the provider that served it, so a selection naming none is not one.
+			// The effort is optional, since a child left on its own default reports none; one that is named but malformed
+			// makes the whole selection unreadable rather than a selection with the effort dropped.
+			if (!isCodexToken(data.model) || !isCodexToken(data.provider)) return undefined;
+			if (data.effort !== undefined && !isCodexToken(data.effort)) return undefined;
+			return { model: data.model, provider: data.provider, ...(data.effort === undefined ? {} : { effort: data.effort }) };
+		}
+		default:
+			return unknownBackend(backend);
+	}
 }
 
 /**
@@ -125,7 +229,17 @@ export const REF_FIELD_MAX_CHARS = 32_768;
 export function keptRef(value: unknown, backend: BackendName, max = REF_FIELD_MAX_CHARS): SessionRef | undefined {
 	const ref = sessionRefOf(value, backend);
 	if (!ref) return undefined;
-	const fields = [ref.sessionId, ref.checkpoint, ...(ref.backend === "pi" ? [ref.sessionFile] : [])];
+	const fields = [ref.sessionId, ref.checkpoint];
+	switch (ref.backend) {
+		case "pi":
+			fields.push(ref.sessionFile);
+			break;
+		case "claude":
+		case "codex":
+			break;
+		default:
+			return unknownBackend(ref);
+	}
 	return fields.every((field) => field === undefined || field.length <= max) ? ref : undefined;
 }
 
@@ -133,7 +247,7 @@ export function keptRef(value: unknown, backend: BackendName, max = REF_FIELD_MA
 export function keptSelection(value: unknown, backend: BackendName, max = REF_FIELD_MAX_CHARS): ResolvedSelection | undefined {
 	const selection = resolvedSelectionOf(value, backend);
 	if (!selection) return undefined;
-	return selection.model.length <= max && selection.effort.length <= max ? selection : undefined;
+	return [selection.model, selection.provider, selection.effort].every((field) => field === undefined || field.length <= max) ? selection : undefined;
 }
 
 /** One model's share of a run, as the backend reports it: the main loop, subagents and any agents it ran. */
@@ -265,7 +379,12 @@ export interface Backend<TRole, TSession, TControl extends ChildControl = ChildC
  */
 export interface HostRole {
 	name: string;
-	model: string;
+	/**
+	 * The model the role names. Claude and Pi roles always name one. A Codex role that names none runs on the host's own
+	 * Codex default, and leaves this unset rather than carrying a placeholder a runtime could mistake for a model id:
+	 * how such a role is shown is the host's presentation, never this field.
+	 */
+	model?: string;
 	/** The effort the role runs at, when it names one: a Pi role that names none leaves the child its own default. */
 	effort?: string;
 	contract: string;

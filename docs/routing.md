@@ -24,11 +24,22 @@ Disabled roles are not recommended and calls to them refuse. If a design questio
 
 ## Selecting a backend and model
 
-Unless you name overrides, the host leaves `backend`, `model`, and `effort` unset and uses the session's configured settings. Builtin routes enabled roles to Claude; security is assigned to Pi but remains disabled. Once enabled, a security call needs no `backend` because only Pi supports it. Ultracode is Claude-only.
+Unless you name overrides, the host leaves `backend`, `model`, and `effort` unset and uses the session's configured settings.
+
+```text
+builtin
+  +-- plan / implement / ultracode / ask -> Claude
+  +-- security                          -> Pi, disabled
+  +-- no role                           -> Codex
+
+Codex opt-in -> backend: "codex", or role settings/profile
+```
+
+Security needs separate activation and a Pi model; once enabled, its calls need no backend override. Ultracode is Claude-only. Codex supports `plan`, `implement`, and `ask` through your own install and defaults. It is **experimental**, including its whole-connection question API opt-in; see [Codex behavior](codex-backend.md) and [qualification limits](codex-backend.md#evidence).
 
 An explicit other-backend override uses that backend's captured legacy defaults, not the configured backend's model/effort. Pi requires an exact `provider/model-id` and guesses none. Unsupported role/backend combinations refuse before admission, once the enabled-role check permits routing.
 
-`claude` is a forced-Claude compatibility tool. Guidance recommends `fusion` for Pi-configured roles unless you explicitly request Claude Code. A continuation stays on its recorded backend/selection; a Pi run always needs `fusion`. Switching profiles does not move recorded threads.
+`claude` is a forced-Claude compatibility tool. Guidance recommends `fusion` for Pi-configured roles unless you explicitly request Claude Code. A continuation stays on its recorded backend/selection; a Pi or Codex run always needs `fusion`. Switching profiles does not move recorded threads.
 
 Implicit `plan` calls continue the latest plan on the routed backend, or hand off for its context cap or an explicitly changed model. An unreadable latest record refuses instead of falling back to another plan. See [Runs](runs.md) and [Profiles](profiles.md) for parameters and precedence.
 

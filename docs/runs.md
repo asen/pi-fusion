@@ -1,6 +1,6 @@
 # Runs, handles and background work
 
-A run has a handle such as `run-3`, a role, a backend, and a recorded child session. This page owns delegation parameters, continuation/recovery, background controls, and history. Pi implementation details and qualification limits live in [Pi backend](pi-backend.md).
+A run has a handle such as `run-3`, a role, a backend, and a recorded child session. This page owns delegation parameters, continuation/recovery, background controls, and history. Implementation details and qualification limits live in [Pi backend](pi-backend.md) and [Codex backend](codex-backend.md).
 
 ## Delegation parameters
 
@@ -15,9 +15,9 @@ The host calls `fusion` with a task; optional parameters select how it runs. `cl
 | `background` | `true` returns a handle immediately; the report arrives later. Available for every role. |
 | `fresh` | `plan` only: start a new plan instead of implicitly continuing. Cannot accompany `continue`. |
 | `mode` | `ask` only: `answer` (default) or `review`, choosing the corresponding contract. A continuation keeps its mode unless overridden. |
-| `model` | Override a model: Claude alias/id for `plan`, `implement`, or `ask`; `provider/model-id` for every Pi role. `ultracode` rejects it. |
-| `effort` | Claude `low`, `medium`, `high`, `xhigh`, or `max` for `plan`, `implement`, or `ask`; Pi also accepts `off` and `minimal`. Optional on Pi; fixed for `ultracode`, which rejects the parameter. |
-| `backend` | `fusion` only: `claude` or `pi`. Fresh calls otherwise use role settings; continuations cannot change backend. |
+| `model` | Override a model: Claude alias/id for `plan`, `implement`, or `ask`; `provider/model-id` for every Pi role; a Codex model id without whitespace for `plan`, `implement`, or `ask`. `ultracode` rejects it. |
+| `effort` | Claude `low`, `medium`, `high`, `xhigh`, or `max` for `plan`, `implement`, or `ask`; Pi also accepts `off` and `minimal`; Codex any single level without whitespace for `plan`, `implement`, or `ask`. `fusion` advertises it as a plain string and the routed backend's binding checks it before admission; `claude` keeps the Claude enum. A Codex level passes the binding lexically, and the model or server may still refuse it when the run starts. Optional on Pi and Codex; fixed for `ultracode`, which rejects the parameter. |
+| `backend` | `fusion` only: `claude`, `pi`, or experimental `codex`. Fresh calls use role settings unless overridden; continuations cannot change backend. Codex runs `plan`/`implement`/`ask` through the host's own install; see [behavior and qualification limits](codex-backend.md). |
 
 A role that does not accept a supplied parameter refuses it before starting a child. Disabled roles refuse new runs and continuations, including calls supplying their own model/backend. Security must be enabled separately through [settings](profiles.md); a model does not enable it.
 
@@ -25,7 +25,7 @@ All four workflow tools use sequential execution. Pi serializes tool calls in a 
 
 ## Child tools and settings
 
-Both backends run in the host's working directory with the role contract appended to their own system prompt. Tool lists differ:
+Every child runs in the host's working directory. Claude and Pi append the role contract to their own system prompt; Codex receives it as the thread's developer instructions, followed by `contracts/codex-no-questions.md` in a run with no question callback, or by `contracts/codex-continued-questions.md` in a resumed or forked run with one. Tool lists differ:
 
 | Role | Claude Code tools | Pi tools |
 | --- | --- | --- |
@@ -34,7 +34,9 @@ Both backends run in the host's working directory with the role contract appende
 | `ultracode` | Claude's own tools, Workflow, Agent, and the user's MCP servers | Unsupported |
 | Enabled `security` | Unsupported | Same as Pi implement |
 
-Every child also gets [ask_orchestrator](questions.md). Fixed-tool Claude roles use `bypassPermissions` and strict MCP configuration with only that question server. Fusion leaves Claude's normal settings/plugin/CLAUDE.md loading in place; ultracode's permission mode is [configurable](ultracode.md). Pi instead uses in-memory settings and explicit resources; see [its lifecycle](pi-backend.md#one-calls-lifecycle).
+A Codex role is bound with a sandbox instead of a tool list: `implement` in `workspace-write`, `ask` (both modes) in `read-only`, with approval policy `never`. The child's tools, MCP servers, writable roots, network setting and multi-agent features are whatever the user's Codex configuration gives that sandbox mode; Fusion isolates none of them. See [Codex backend](codex-backend.md#inheritance-not-isolation).
+
+Every Claude and Pi child also gets [ask_orchestrator](questions.md); a Codex child gets it experimentally as a dynamic tool, when its thread has one ([Questions on Codex](questions.md#on-codex)). Fixed-tool Claude roles use `bypassPermissions` and strict MCP configuration with only that question server. Fusion leaves Claude's normal settings/plugin/CLAUDE.md loading in place; ultracode's permission mode is [configurable](ultracode.md). Pi instead uses in-memory settings and explicit resources; see [its lifecycle](pi-backend.md#one-calls-lifecycle).
 
 Contracts restrict scope and ask's file changes, but a shell tool can still write files. These lists are not an operating-system permission boundary.
 
@@ -52,7 +54,7 @@ For example, the host can continue a completed run with:
 { "continue": "run-3", "task": "The migration test still fails; diagnose and fix it" }
 ```
 
-The run retains its role/backend. Supplying a different role or backend refuses the call. A profile switch alone does not change its recorded model/effort; permitted call overrides can. Disabling that role prevents continuation until it is enabled again. Pi continuations require `fusion`, never the forced-Claude compatibility tool.
+The run retains its role/backend. Supplying a different role or backend refuses the call. A profile switch alone does not change its recorded model/effort; permitted call overrides can. Disabling that role prevents continuation until it is enabled again. Pi and Codex continuations require `fusion`, never the forced-Claude compatibility tool.
 
 ### Resumes, tree navigation, and host forks
 
@@ -73,20 +75,36 @@ A host fork copies no child immediately. On first use, Claude resumes with `--fo
 | --- | --- |
 | Claude | Flat session id, last assistant-message UUID checkpoint, and admitted model/effort, defaults included |
 | Pi | Structured session id, absolute transcript file, trusted checkpoint where available, and actual model/thinking selection |
+| Codex | Tagged thread id, trusted checkpoint where available with the thread's cumulative usage baseline at that completed turn (five counts, plus a cache write only when reported), and the configured model and provider read back from the child, with its effort when it names one |
 | Older untagged entry | Claude, preserving compatibility with entries written before backend tags |
 
 Older Claude records missing model/effort use the legacy defaults captured when this extension instance loaded, **not** the current profile, and the result says so. A Claude entry without a checkpoint resumes the whole session. Very old plan entries under `consolidator` keys with generation `g` read as handle `run-<g+1>`.
 
-Unknown backend tags, mixed/incomplete session formats, and Pi records without a trusted checkpoint or repeatable selection are kept for reading, not guessed into a continuation. A refused latest plan stops implicit continuation; Fusion does not walk back to an older usable plan or hand off to escape the refusal.
+Unknown backend tags, mixed/incomplete session formats, and Pi or Codex records without a trusted checkpoint or repeatable selection are kept for reading, not guessed into a continuation.
+
+```text
+Codex record: tagged thread reference + selection with provider
+  +-- checkpoint + valid baseline -> eligible for backend continuation checks
+  +-- no checkpoint/baseline pair -> readable only; never upgraded
+  +-- baseline without checkpoint
+  |   or malformed baseline      -> reference unreadable
+  +-- flat Claude / Pi fields    -> refuse mixed session format
+```
+
+A baseline needs the exact non-negative whole counts, with cached input within input. A successful Codex run pairs its own completed turn with the thread's cumulative total there. Readable-only refusals offer `codex resume <thread id>`; [Codex continuation](codex-backend.md#continuation-and-fork) owns the runtime checks and native limits.
+
+Implicit Codex `plan` calls use the same continuation rules. A refused latest plan stops the call: no older-plan fallback or handoff to escape refusal. Use `fresh: true` for a new plan.
 
 ### Recovery policy
 
 | Ending | What the next call can do |
 | --- | --- |
-| Resume failed/cancelled | No new branch record; the previous successful checkpoint stays authoritative |
-| Fork failed after a verified new identity | Keep that fork at its starting checkpoint, avoiding a second fork; without verified selection it is readable but cannot continue |
+| Resume failed/cancelled | No new branch record; the previous successful checkpoint stays authoritative. On Codex that record stays the historical authority but is not guaranteed resumable: a failed or cancelled call whose turn was admitted can move the thread's tip past its checkpoint, and a later `continue` is then refused before any turn, naming a new run without `continue` that carries the earlier report (`plan` needs `fresh: true`: omitting `continue` alone repeats the implicit resume). Nothing forks, rewinds or replays to get back to it |
+| Fork failed after a verified new identity | Keep that fork at its starting checkpoint, avoiding a second fork; without verified selection it is readable but cannot continue. A Codex fork keeps the starting checkpoint its new thread reported, or none, never the source's, and no baseline, so it is readable only; a failed fork claiming a baseline fails |
 | First Pi call established a session but no trusted checkpoint | Read the session, but refuse continuation rather than replay the failed prompt |
-| First Pi call established no verified session | Keep handle/failure, refuse explicit **and** implicit continuation; start a new role call without `continue` (`plan` also takes `fresh: true`) |
+| First Codex call (no `continue`, no host fork) failed after reporting its thread, or a record written before Codex checkpoints | Keep the thread for reading and refuse continuation; the refusal names `codex resume <thread id>`, and new work needs a new run |
+| Codex resume/fork succeeded without a trusted checkpoint and its usage baseline | Fail the run and record nothing; the previous record stays authoritative |
+| First Pi or Codex call established no verified session | Keep handle/failure, refuse explicit **and** implicit continuation; start a new role call without `continue` (`plan` also takes `fresh: true`) |
 | Claude call failed before reporting a session | Keep handle; continuation can start a new Claude session |
 | Outcome claims an impossible identity or incomplete success | Fail the run and publish no identity to branch/history; any previous record remains unchanged |
 
@@ -98,8 +116,9 @@ Results, background notices, waits, and detailed status offer:
 
 - Claude: `claude --resume <session id>`. Normal transcripts live under `~/.claude/projects/<encoded working directory>/<session id>.jsonl`.
 - Pi: the **accepted outcome's transcript file**, not a Claude resume command. A fork names its new file, not the source. A running run, thrown backend, or rejected outcome offers no Pi path; a verified session kept only for reading may offer one.
+- Codex: `codex resume <thread id>`, from the accepted outcome's thread only, as an intended manual hint that has not been natively measured ([Codex evidence](codex-backend.md#evidence)); an id that is not one plain shell word is single-quoted, after `--` when it starts with `-`. A fork names its own thread; a thread kept only for reading names it in its continuation refusal.
 
-Pi restores only the exact recorded file/id/checkpoint and repeats its recorded selection. Missing files, absent checkpoints, old/malformed transcript formats, leaf mismatches, or clamped thinking levels refuse the call; no fallback or repair is attempted. The detailed [checkpoint checks](pi-backend.md#continuation-and-checkpoints) include their source-only limitations. For either backend, start a new run if its transcript cannot be continued; use `fresh: true` for a new plan.
+Pi restores only the exact recorded file/id/checkpoint and repeats its recorded selection. Missing files, absent checkpoints, old/malformed transcript formats, leaf mismatches, or clamped thinking levels refuse the call; no fallback or repair is attempted. The detailed [checkpoint checks](pi-backend.md#continuation-and-checkpoints) include their source-only limitations. For any backend, start a new run if its transcript cannot be continued; use `fresh: true` for a new plan.
 
 A host started with `--no-session` keeps branch entries only in memory, while children still use their own transcript storage.
 
@@ -129,12 +148,13 @@ The warning is composed once and carried consistently through controls, user not
 
 ## The context cap
 
-`PI_FUSION_PLAN_CONTEXT_PCT` defaults to **35%**. It compares the last model call's prompt tokens with its context window. An implicit plan continuation at/above the cap starts a fresh plan, carrying the previous report (up to 32 KiB) as quoted agreed-plan data, not instructions. The result names both handles. Explicitly naming a different model also hands off, on either backend.
+`PI_FUSION_PLAN_CONTEXT_PCT` defaults to **35%**. It compares the last model call's prompt tokens with its context window. On Codex that is the latest response's input against the reported model window, an estimate used only when both are positive: never the thread's cumulative total or the call's own usage, and not an exact occupancy. A run that recorded no positive pair has no share and is never capped. An implicit plan continuation at/above the cap starts a fresh plan, carrying the previous report (up to 32 KiB) as quoted agreed-plan data, not instructions. The result names both handles. Explicitly naming a different model also hands off, on any backend.
 
 A cap handoff keeps the old planner's model unless overridden. Its effort differs:
 
 - Claude uses the call's effort, otherwise that backend's fresh-run defaults; it does not carry the old effort. Those defaults are the configured plan settings or captured legacy defaults for an explicit other-backend override.
 - Pi carries recorded model and thinking level together unless the call overrides a field.
+- Codex carries the recorded model and effort the same way, but not the provider: a fresh thread names no provider, so it runs on the host's own Codex provider, unchecked against the old run's. Only a continued thread keeps its recorded provider.
 
 `fresh: true` and a first plan instead use the configured settings. Explicit `continue` is **never handed off**: the call runs, but its result warns above the cap and suggests a new self-contained brief, a new ask, or a fresh plan restating the agreement. The cap alone never strands an explicit continuation.
 
@@ -159,15 +179,19 @@ Both `fusion_control` and `claude_control` take `action`, optional `run`, and `m
 
 Claude steers use the SDK's queued user-message input; Pi buffers until task input attaches and sends native `steer` requests sequentially, once each, with no retry. Queued items can be dropped at close, and an in-flight accepted steer can still be unread when the agent loop ends. **Logged by host is not consumed by child, and consumed is not acted upon.** Neither a successful control response nor `/fusion steer` proves model consumption. The Pi pending-message completion guard refuses false success, not repairs or resends instructions.
 
+Codex buffers steers from admission until its turn is named, then sends each once in order as `turn/steer`. Closing/cancelling drops queued messages; nothing retries. The reply says **queued**, not read, and the report counts delivery outcomes. [Codex steers](codex-backend.md#steers) owns queue limits, outcome meanings and the narrower native evidence.
+
+A running child's input can refuse a message while it stays open, as a full Codex queue (32 waiting) does: the control reply and `/fusion steer` then say at once that it was not accepted now, and nothing was sent, queued or kept for a retry. A message that meets a closed input is the run ending, reported as above.
+
 Ordinary editor text targets the host. `/fusion steer run-N <text>` targets the child and logs the instruction in the host conversation. A waiting child instead needs `/fusion answer`; the host may forward an ordinary instruction through a control tool at its discretion.
 
-Generated questions/cards/handoffs use the invoking tool pair (`fusion`/`fusion_control` or `claude`/`claude_control`); a control reply uses the name called. Pi continuation hints always use `fusion`. Reviews with no initiating delegation tool use the primary pair. User commands always remain `/fusion ...`.
+Generated questions/cards/handoffs use the invoking tool pair (`fusion`/`fusion_control` or `claude`/`claude_control`); a control reply uses the name called. Pi and Codex continuation hints always use `fusion`. Reviews with no initiating delegation tool use the primary pair. User commands always remain `/fusion ...`.
 
 ## Runs across Pi processes
 
 An earlier process's branch-recorded run is not active. Controls explain that distinction; `fusion` can continue it only when its record is usable. Reports live in memory unless `PI_FUSION_HISTORY=1` saves them for a durable host session. No history is written for `--no-session`.
 
-History writes on start, token updates, and end. It restores earlier reports/usage/dashboard entries; branch entries remain continuation authority. A history record must name the same child as the branch: Claude session id, or Pi id **and file**. A mismatched identity is not shown/reviewed as that run. A fork reads ancestor history but never writes to that ancestor's file. A run left active by a dead process restores as `aborted`.
+History writes on start, token updates, and end. It restores earlier reports/usage/dashboard entries; branch entries remain continuation authority. A history record must name the same child as the branch: Claude session id, Pi id **and file**, or Codex thread id. A mismatched identity is not shown/reviewed as that run. A fork reads ancestor history but never writes to that ancestor's file. A run left active by a dead process restores as `aborted`.
 
 Detailed earlier-run status shows its state, elapsed time, changed-file count, and first 600 report/failure characters. It offers continuation only with a usable branch record and review only for work made in this working directory. Restored usage seeds the session ledger, and handles are not reused.
 

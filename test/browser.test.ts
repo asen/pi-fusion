@@ -1366,3 +1366,69 @@ test("a pi run's transcript is the file its outcome verified, and a fork's launc
 	assert.equal(await page.evaluate<string>(COPY_RESUME), "missing", "a run with no verified session has no copyable transcript");
 	assert.equal(await page.evaluate<string>(COPIED), `/sessions/pi-2.jsonl|${LONG_PI_FILE}`, "and nothing was copied for the run that has no verified session");
 });
+
+test("a codex run's thread is reopened with codex resume from its verified reference alone, never from the scalar id its child reported", { skip }, async () => {
+	const { page, store, url } = await fixture();
+	store.start({ id: "codex-fresh", backend: "codex", role: "codex-fresh-role", model: "host default", session: { kind: "new", backend: "codex" } });
+	// The child names its thread as it starts, and the snapshot carries that scalar: a diagnostic, not a resume command.
+	store.event("codex-fresh", { type: "init", sessionId: "thr-diagnostic" });
+	store.progress("codex-fresh", { role: { name: "implement" }, text: "", toolCalls: 1, tokensIn: 5, tokensOut: 1, cacheRead: 0, cacheWrite: 0, ms: 1, exitCode: null, signal: null, aborted: false, stderr: "", sessionId: "thr-diagnostic" } as never);
+	store.start({ id: "codex-refused", backend: "codex", role: "codex-refused-role", model: "host default", session: { kind: "new", backend: "codex" } });
+	store.event("codex-refused", { type: "init", sessionId: "thr-claimed" });
+	store.finish("codex-refused", { status: "failed", failure: "invalid session postcondition: run-9 succeeded without reporting the configured model and provider it ran with" });
+	await page.open(url);
+	await page.evaluate<string>(TAKE_CLIPBOARD);
+
+	assert.equal(await page.evaluate<string>(SELECT_ROLE("codex-fresh-role")), "ok");
+	await page.until<string>("the codex run is shown", DETAIL_TITLE, (title) => title === "codex-fresh-role");
+	assert.equal(await page.evaluate<string>(FACT("Codex thread request")), "new");
+	assert.equal(await page.evaluate<string>(FACT("Claude session")), "", "a codex run's request is never labelled a claude session");
+	assert.equal(await page.evaluate<string>(RESUME_TEXT), "", "a scalar the child reported in progress is no command to offer");
+
+	// Its outcome lands with the verified thread, and that thread is the one command offered and copied.
+	store.finish("codex-fresh", { status: "done", text: "done", ref: { backend: "codex", sessionId: "thr-1" } });
+	await page.until<string>("the verified thread appears", RESUME_TEXT, (text) => text === "codex resume thr-1");
+	assert.equal(await page.evaluate<string>(COPY_RESUME), "clicked");
+	assert.equal(await page.evaluate<string>(COPIED), "codex resume thr-1");
+
+	// An outcome the host refused passed no reference: no codex command, and no claude one built from the scalar.
+	assert.equal(await page.evaluate<string>(SELECT_ROLE("codex-refused-role")), "ok");
+	await page.until<string>("the refused codex run is shown", DETAIL_TITLE, (title) => title === "codex-refused-role");
+	assert.equal(await page.evaluate<string>(RESUME_TEXT), "");
+	assert.equal(await page.evaluate<string>(COPY_RESUME), "missing");
+	assert.equal(await page.evaluate<string>(COPIED), "codex resume thr-1", "nothing was copied for the refused run");
+
+	// A restored thread whose id a shell would interpret is offered and copied as one quoted literal argument, and the
+	// scalar the restored record carries is never what it falls back to.
+	const hostile = "$(touch pwned) `id` it's";
+	store.restore({ id: "codex-hostile", backend: "codex", role: "codex-hostile-role", model: "host default", state: "done", startedAt: Date.now() - 5_000, sessionId: "codex-scalar", ref: { backend: "codex", sessionId: hostile } });
+	store.restore({ id: "codex-equals", backend: "codex", role: "codex-equals-role", model: "host default", state: "done", startedAt: Date.now() - 4_500, ref: { backend: "codex", sessionId: "=ls" } });
+	store.restore({ id: "codex-option", backend: "codex", role: "codex-option-role", model: "host default", state: "done", startedAt: Date.now() - 4_000, ref: { backend: "codex", sessionId: "-rf" } });
+	await page.until<string>("the restored codex runs are listed", SELECT_ROLE("codex-option-role"), (found) => found === "ok");
+	await page.until<string>("the option-like thread is shown", DETAIL_TITLE, (title) => title === "codex-option-role");
+	assert.equal(await page.evaluate<string>(RESUME_TEXT), "codex resume -- '-rf'");
+	assert.equal(await page.evaluate<string>(SELECT_ROLE("codex-equals-role")), "ok");
+	await page.until<string>("the =-led thread is shown", DETAIL_TITLE, (title) => title === "codex-equals-role");
+	assert.equal(await page.evaluate<string>(RESUME_TEXT), "codex resume '=ls'", "zsh would expand a bare leading =");
+	assert.equal(await page.evaluate<string>(SELECT_ROLE("codex-hostile-role")), "ok");
+	await page.until<string>("the hostile thread is shown", DETAIL_TITLE, (title) => title === "codex-hostile-role");
+	const quoted = "codex resume '$(touch pwned) `id` it'\\''s'";
+	assert.equal(await page.evaluate<string>(RESUME_TEXT), quoted);
+	assert.equal(await page.evaluate<string>(COPY_RESUME), "clicked");
+	assert.equal(await page.evaluate<string>("(window.__copied || []).slice(-1)[0] || ''"), quoted, "Copy takes the quoted command, exactly as shown");
+	assert.doesNotMatch(await page.evaluate<string>(RESUME_TEXT), /codex-scalar|claude --resume/);
+
+	// The session estimate names the runs it cannot price rather than reading as though they cost nothing.
+	const usage = USAGE as typeof USAGE & { unpricedRuns?: number };
+	usage.unpricedRuns = 2;
+	try {
+		await page.until<string>(
+			"the header names the unpriced runs",
+			USAGE_TEXT,
+			(text) => text === "Session usage: $1.25 est. · 1,200 in · 340 out · 250 workflow tokens · 3 calls · cost unknown for 2 codex runs, not in the estimate · warn at $1.00, $2.00 · limit $5.00",
+		);
+	} finally {
+		delete usage.unpricedRuns;
+	}
+	await page.until<string>("the header is back as it was", USAGE_TEXT, (text) => !text.includes("codex"));
+});

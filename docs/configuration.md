@@ -16,7 +16,10 @@ Use [profiles and role settings](profiles.md) for session configuration; environ
 | `PI_FUSION_ASK_EFFORT` | Claude `high` |
 | `PI_FUSION_PI_<ROLE>_MODEL` | Unset; Pi `provider/model-id` for `PLAN`, `IMPLEMENT`, `ASK`, or `SECURITY` |
 | `PI_FUSION_PI_<ROLE>_EFFORT` | Unset; optional thinking level for the same Pi roles |
+| `PI_FUSION_CODEX_<ROLE>_MODEL` | Unset; Codex model id for `PLAN`, `IMPLEMENT`, or `ASK`; unset means the host's Codex default |
+| `PI_FUSION_CODEX_<ROLE>_EFFORT` | Unset; optional Codex effort for the same roles |
 | `PI_FUSION_CLAUDE_BIN` | Unset; use the SDK's bundled binary. Set a path to another executable; `.js`, `.mjs`, and `.cjs` paths run under Node |
+| `PI_FUSION_CODEX_BIN` | Unset; use the first executable `codex` on the inherited `PATH` (empty/relative entries resolve against the host cwd). Set an absolute path to a regular file; `.js`, `.mjs`, and `.cjs` paths run under the host's own Node executable (`process.execPath`), others must be executable. Read only when a Codex run starts, never at load: a missing `codex` fails that run and nothing else. Windows is refused |
 | `PI_FUSION_DASHBOARD_OPEN` | Unset; `0` shows the dashboard URL without opening a browser |
 | `PI_FUSION_WIDGET` | Unset; `0` hides the run widget, not the footer status |
 | `PI_FUSION_BUDGET_WARN_USD` | Unset; amount or comma-separated amounts, e.g. `5,20`, warning once at each threshold |
@@ -26,9 +29,9 @@ Use [profiles and role settings](profiles.md) for session configuration; environ
 | `PI_FUSION_HISTORY` | Unset; `1` saves prompts/reports/usage for durable host sessions; see [History](runs.md#runs-across-pi-processes) |
 | `PI_FUSION_HISTORY_DIR` | Unset; default `<agent dir>/pi-fusion/history` |
 
-Role model/effort variables are read once when the extension instance starts. Changing the shell afterwards requires a new instance. A profile is a complete snapshot and never falls back to a variable for an omitted configured field. An explicit call naming the other backend uses that backend's captured legacy defaults, not the model of the configured backend.
+Role model/effort variables are read once when the extension instance starts. Changing the shell afterwards requires a new instance. A profile is a complete snapshot and never falls back to a variable for an omitted configured field. An explicit call naming another backend uses that backend's captured legacy defaults, not the model of the configured backend.
 
-The built-in configuration enables every role except **security**, whose backend is Pi. `PI_FUSION_PI_SECURITY_MODEL` supplies its model, not its enabled state. Saved profiles retain their own enabled settings. Backend capabilities are code: `ultracode` is Claude-only and `security` Pi-only; disabling a role does not unregister a backend.
+The built-in configuration enables every role except **security**, whose backend is Pi. `PI_FUSION_PI_SECURITY_MODEL` supplies its model, not its enabled state. Saved profiles retain their own enabled settings. Backend capabilities are code: `ultracode` is Claude-only, `security` Pi-only, and Codex supports `plan`, `implement`, and `ask` runs (experimental; see [Codex backend](codex-backend.md)); disabling a role does not unregister a backend.
 
 Claude plan effort defaults to `xhigh`; there is no plan-effort environment variable, but a profile or call can set it. Ultracode effort is fixed to `ultracode`, not plain `xhigh`, because the latter drops the workflow opt-in. Its workflow agents' model/effort live in `contracts/ultracode.md`, not a variable.
 
@@ -61,6 +64,21 @@ A continuation otherwise repeats its recorded fields despite later environment/p
 
 There is no variable that enables/disables the Pi backend or installs a provider, SDK, or resource. See [Runtime requirements](pi-backend.md#runtime-requirements) for the importable host package, provider-resource limits, and `node` on `PATH`.
 
+## The codex backend's variables
+
+`PI_FUSION_CODEX_PLAN_MODEL`/`_EFFORT`, `PI_FUSION_CODEX_IMPLEMENT_MODEL`/`_EFFORT` and `PI_FUSION_CODEX_ASK_MODEL`/`_EFFORT` are the captured defaults for a fresh Codex call when no profile configures that role on Codex, or when a call names `backend: "codex"` for a role configured elsewhere. A Codex model/effort comes from:
+
+```text
+explicit call field
+  -> recorded selection for a continuation (model, provider, effort)
+  -> configured role setting (or captured defaults for the other-backend override)
+  -> otherwise unset: the host's own Codex configuration chooses
+```
+
+Nothing is required. A role that names no model is shown as `host default`, and once the child reports its model, stats read `host default -> <model>`; the label is presentation only and never reaches the child as a model id. Models and efforts are single tokens without whitespace. The binding checks only that lexical form, so a level such as `ultra` that Claude and Pi refuse is accepted for Codex; whether the model supports it is checked by the Codex model or server when the run starts, not before admission. Blank or whitespace-containing call fields refuse rather than fall through, and a malformed configured value refuses naming its variable or profile. With no model, thread/start names none; a requested effort is named only on turn/start. A fresh call names no model provider, so the host's own Codex configuration always chooses it; a continuation repeats the provider its thread recorded, even when the call overrides the model. A plan handoff is a fresh thread: it carries the recorded model and effort, not the provider.
+
+`plan` and `implement` bind a `workspace-write` sandbox and `ask` a `read-only` one, all with approval policy `never`. Only `plan` takes `fresh`, and only `ask` takes `mode`. Each runs its shared role contract. Only a run with no question callback, which no shipped delegation is, gets `contracts/codex-no-questions.md` after it, and a resumed or forked run with one gets the `contracts/codex-continued-questions.md` fallback; see [Questions on Codex](questions.md#on-codex).
+
 ## Where the pi backend writes
 
 Fusion owns `<agent dir>/pi-fusion`, normally under `~/.pi/agent`; `PI_CODING_AGENT_DIR` relocates the host root. Stable child transcripts/catalog/helpers live in `children`; input/compiler caches live in one `calls/<role>-<random>` directory per invocation. Call storage is removed after verified cleanup, or retained with a warning when cleanup is uncertain. No garbage collector or cleanup command removes retained calls.
@@ -81,7 +99,9 @@ session usage: est. $0.2500 · in 12.3k out 4.5k tokens · workflow agents 0 tok
 
 Dashboard headers and tool-result details carry the same ledger. Enabled history restores earlier usage. Cost is the backend's estimate from runtime/model pricing, not a subscription invoice, and updates lag work in flight. Successful Pi calls publish the turn's statistics delta, not the entire resumed session.
 
-`PI_FUSION_BUDGET_WARN_USD=5,20` warns once at each amount this process reaches. Warnings change no run. `PI_FUSION_BUDGET_LIMIT_USD=20` refuses new runs, continuations, and manual/automatic reviews at or above the threshold. It cancels nothing and sets no child `maxBudgetUsd` or `maxTurns`; a running child can spend beyond it. Raise/unset the limit and restart Pi to admit work again.
+A Codex child reports **no cost**, and Fusion estimates none: a Codex run shows no dollar figure, its tokens still count, and the estimate leaves it out. Every usage line then says so, for example `· cost unknown for 2 codex runs, not in the estimate`. Codex tokens are the parent thread's only; subagent threads are not counted.
+
+`PI_FUSION_BUDGET_WARN_USD=5,20` warns once at each amount this process reaches. Warnings change no run. `PI_FUSION_BUDGET_LIMIT_USD=20` refuses new runs, continuations, and manual/automatic reviews at or above the threshold. With either set, the first Codex run admitted in an extension instance (the same scope as the invalid-budget warning) says once that Codex spend is not in the estimate those act on; Codex runs add nothing to the estimate, and no Codex-specific refusal or estimate exists, so neither variable bounds Codex spend. It cancels nothing and sets no child `maxBudgetUsd` or `maxTurns`; a running child can spend beyond it. Raise/unset the limit and restart Pi to admit work again.
 
 Budget variables and the context-cap variable are read at extension load. Invalid budget amounts disable that control and warn once at the first delegation/control/command, for example:
 
