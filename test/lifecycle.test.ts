@@ -1053,7 +1053,7 @@ test("a backend registered under another backend's name is refused before it can
 	// A key that is no backend of this build is refused the same way, before anything is registered.
 	assert.throws(
 		() => makeHost({ backends: { gemini: fakeBackend({ name: "pi" }).backend } as unknown as Partial<Record<BackendName, HostBackend>> }),
-		/^Error: pi-fusion: "gemini" is not a backend this build knows; use one of claude, pi$/,
+		/^Error: pi-fusion: "gemini" is not a backend this build knows; use one of claude, pi, codex$/,
 	);
 	// A backend registered under its own name is what the rest of this suite runs on, and it still registers.
 	assert.doesNotThrow(() => makeHost({ backends: both(fakeBackend()) }));
@@ -1963,6 +1963,51 @@ test("an ask reviewer configured on a backend this host did not register is refu
 		assert.deepEqual(claude.starts, [], "no claude child stands in for the backend the ask role is configured on");
 		assert.equal(host.branch.length, 0, "nothing was recorded for a handle nothing took");
 		assert.equal(new History(dir).load("host-1").records[0]!.reviewedBy, undefined, "and the restored run is linked to no review");
+	});
+});
+
+/** A codex backend a host registered, which this build has no binding for: every entry point records a reach and throws. */
+function codexTripwire(): { backend: HostBackend; reaches: string[] } {
+	const reaches: string[] = [];
+	const reach = (what: string): never => {
+		reaches.push(what);
+		throw new Error(`the registered codex backend was asked for ${what}`);
+	};
+	return { reaches, backend: { name: "codex", control: () => reach("control"), session: () => reach("session"), run: async () => reach("run") } };
+}
+
+const NO_CODEX_BINDING = "cannot be bound for the codex backend: this build has no codex binding";
+
+test("a registered codex backend is still refused at its binding: a direct call and a configured one take no handle, session or run", async () => {
+	const codex = codexTripwire();
+	const claude = fakeBackend({ name: "claude" });
+	const host = makeHost({ backends: { claude: claude.backend, codex: codex.backend }, profiles: profileWith({ implement: { enabled: true, backend: "codex" } }) });
+	assert.equal((await host.fusion({ role: "ask", task: "x", backend: "codex" })).error, `role ask ${NO_CODEX_BINDING}`, "a call naming codex is refused by the binding, not by availability");
+	assert.equal((await host.fusion({ role: "implement", task: "x" })).error, `role implement ${NO_CODEX_BINDING}`, "and so is a role the profile puts on codex");
+	assert.deepEqual(codex.reaches, [], "no control, session or run was asked of the codex backend");
+	assert.deepEqual(claude.starts, [], "and no claude child stood in for it");
+	assert.deepEqual(host.entries(), [], "nothing was recorded");
+	assert.equal((await host.fusion({ role: "implement", task: "x", backend: "claude" })).error, undefined);
+	assert.equal(host.entries()[0]!.run, "run-1", "the refused calls took no handle");
+});
+
+test("a manual review by an ask role configured on a registered codex backend is refused at its binding, and starts, records and links nothing", async () => {
+	const dir = gitRepo("security-review-codex");
+	await withEnv(securityEnv(), async () => {
+		const pi = fakeBackend({ scripts: [{ pending: true }, {}] });
+		const claude = fakeBackend({ name: "claude" });
+		const codex = codexTripwire();
+		const host = makeSecurityHost({ backends: { ...both(pi, claude), codex: codex.backend }, cwd: dir, profiles: profileWith({ ask: { enabled: true, backend: "codex" } }) });
+		const done = await runThatChanged(host, pi, dir, { role: "security", task: "audit the token check" });
+		assert.equal(done.error, undefined);
+		host.notices.length = 0;
+		await host.command("review run-1");
+		assert.deepEqual(host.notices, [`run-2 would review run-1, and its reviewer could not be bound: role ask ${NO_CODEX_BINDING}`]);
+		assert.deepEqual(codex.reaches, [], "no control, session or run was asked of the codex backend");
+		assert.equal(pi.starts.length, 1, "no reviewer was started");
+		assert.deepEqual(claude.starts, [], "and no claude child stood in for it");
+		assert.equal(host.entries().length, 1, "nothing was recorded for a handle nothing took");
+		assert.equal((await host.control({ action: "status", run: "run-1" })).details.reviewedBy, undefined, "and the source is linked to no review");
 	});
 });
 

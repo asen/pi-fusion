@@ -17,7 +17,7 @@ The host calls `fusion` with a task; optional parameters select how it runs. `cl
 | `mode` | `ask` only: `answer` (default) or `review`, choosing the corresponding contract. A continuation keeps its mode unless overridden. |
 | `model` | Override a model: Claude alias/id for `plan`, `implement`, or `ask`; `provider/model-id` for every Pi role. `ultracode` rejects it. |
 | `effort` | Claude `low`, `medium`, `high`, `xhigh`, or `max` for `plan`, `implement`, or `ask`; Pi also accepts `off` and `minimal`. Optional on Pi; fixed for `ultracode`, which rejects the parameter. |
-| `backend` | `fusion` only: `claude` or `pi`. Fresh calls otherwise use role settings; continuations cannot change backend. |
+| `backend` | `fusion` only: `claude`, `pi`, or `codex`. Codex supports `implement`/`ask` and is refused as unavailable in this build. Fresh calls otherwise use role settings; continuations cannot change backend. |
 
 A role that does not accept a supplied parameter refuses it before starting a child. Disabled roles refuse new runs and continuations, including calls supplying their own model/backend. Security must be enabled separately through [settings](profiles.md); a model does not enable it.
 
@@ -77,7 +77,7 @@ A host fork copies no child immediately. On first use, Claude resumes with `--fo
 
 Older Claude records missing model/effort use the legacy defaults captured when this extension instance loaded, **not** the current profile, and the result says so. A Claude entry without a checkpoint resumes the whole session. Very old plan entries under `consolidator` keys with generation `g` read as handle `run-<g+1>`.
 
-Unknown backend tags, mixed/incomplete session formats, and Pi records without a trusted checkpoint or repeatable selection are kept for reading, not guessed into a continuation. A refused latest plan stops implicit continuation; Fusion does not walk back to an older usable plan or hand off to escape the refusal.
+Unknown backend tags, Codex-tagged entries (this build continues none), mixed/incomplete session formats, and Pi records without a trusted checkpoint or repeatable selection are kept for reading, not guessed into a continuation. A refused latest plan stops implicit continuation; Fusion does not walk back to an older usable plan or hand off to escape the refusal.
 
 ### Recovery policy
 

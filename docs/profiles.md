@@ -70,9 +70,9 @@ security   no       pi       unconfigured            child default
 Pick a role to change:
 
 - **Enabled:** switch it on/off.
-- **Backend:** only when the role supports both. Switching replaces model/effort with that backend's captured legacy defaults, not the previous backend's values.
-- **Model:** for Claude, type an alias/id; for Pi, choose a host-available model, type `provider/model-id`, or select Unconfigured.
-- **Effort:** select the backend's level, or Pi's child default. Ultracode effort is fixed, but its main model can change in settings; that is not its workflow agents' model.
+- **Backend:** only when the role supports more than one. Switching replaces model/effort with that backend's captured legacy defaults, not the previous backend's values.
+- **Model:** for Claude, type an alias/id; for Pi, choose a host-available model, type `provider/model-id`, or select Unconfigured; for Codex, type a model id or select Host default.
+- **Effort:** select the backend's level, or Pi's child default. Codex offers `low`, `medium`, `high`, `xhigh`, or host default as suggestions; a profile file may name another single-token level. Ultracode effort is fixed, but its main model can change in settings; that is not its workflow agents' model.
 
 Edits stay in a draft. **Apply** validates/applies the whole draft; **Cancel** or dialog close changes nothing. The current profile is marked `(modified)` after edits. Apply writes no profile file; use `save` to persist.
 
@@ -104,11 +104,11 @@ The Pi picker reads the host's available-model list without fetching/authenticat
 
 | Field | Rule |
 | --- | --- |
-| `enabled`, `backend` | Required boolean/backend name; role/backend capabilities must match |
-| `model` | Claude alias/id, or Pi provider/id split at the first slash (the id may contain more slashes) |
-| `effort` | Claude `low`, `medium`, `high`, `xhigh`, `max`; Pi also `off`, `minimal`; ultracode fixed `ultracode` or omitted |
+| `enabled`, `backend` | Required boolean and `claude`, `pi`, or `codex`; role/backend capabilities must match |
+| `model` | Claude alias/id; Pi provider/id split at the first slash (the id may contain more slashes); Codex model id without whitespace |
+| `effort` | Claude `low`, `medium`, `high`, `xhigh`, `max`; Pi also `off`, `minimal`; Codex any non-empty level without whitespace; ultracode fixed `ultracode` or omitted |
 
-An enabled Claude role needs a model and, except ultracode, an effort. Disabled roles need neither, but supplied fields are still validated. Pi can be enabled yet unconfigured; a later call must supply its missing model. Ultracode is Claude-only and security Pi-only.
+An enabled Claude role needs a model and, except ultracode, an effort. Disabled roles need neither, but supplied fields are still validated. Pi can be enabled yet unconfigured; a later call must supply its missing model. An enabled Codex role may omit model and effort; the table shows `host default`, meaning the host's own Codex configuration chooses them. Codex supports only `implement` and `ask`, and this build runs no Codex child yet: a call routed to it is refused as unavailable before anything starts. Ultracode is Claude-only and security Pi-only.
 
 Unknown versions/roles/fields, invalid names/types, or incompatible role/backend/effort combinations refuse the **whole file**. Validation is local; editing/loading/saving never starts a child or asks a provider whether the model exists. No credentials are copied into profiles.
 

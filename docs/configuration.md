@@ -16,6 +16,8 @@ Use [profiles and role settings](profiles.md) for session configuration; environ
 | `PI_FUSION_ASK_EFFORT` | Claude `high` |
 | `PI_FUSION_PI_<ROLE>_MODEL` | Unset; Pi `provider/model-id` for `PLAN`, `IMPLEMENT`, `ASK`, or `SECURITY` |
 | `PI_FUSION_PI_<ROLE>_EFFORT` | Unset; optional thinking level for the same Pi roles |
+| `PI_FUSION_CODEX_<ROLE>_MODEL` | Unset; Codex model id for `IMPLEMENT` or `ASK`; unset means the host's Codex default |
+| `PI_FUSION_CODEX_<ROLE>_EFFORT` | Unset; optional Codex effort for the same roles |
 | `PI_FUSION_CLAUDE_BIN` | Unset; use the SDK's bundled binary. Set a path to another executable; `.js`, `.mjs`, and `.cjs` paths run under Node |
 | `PI_FUSION_DASHBOARD_OPEN` | Unset; `0` shows the dashboard URL without opening a browser |
 | `PI_FUSION_WIDGET` | Unset; `0` hides the run widget, not the footer status |
@@ -28,7 +30,7 @@ Use [profiles and role settings](profiles.md) for session configuration; environ
 
 Role model/effort variables are read once when the extension instance starts. Changing the shell afterwards requires a new instance. A profile is a complete snapshot and never falls back to a variable for an omitted configured field. An explicit call naming the other backend uses that backend's captured legacy defaults, not the model of the configured backend.
 
-The built-in configuration enables every role except **security**, whose backend is Pi. `PI_FUSION_PI_SECURITY_MODEL` supplies its model, not its enabled state. Saved profiles retain their own enabled settings. Backend capabilities are code: `ultracode` is Claude-only and `security` Pi-only; disabling a role does not unregister a backend.
+The built-in configuration enables every role except **security**, whose backend is Pi. `PI_FUSION_PI_SECURITY_MODEL` supplies its model, not its enabled state. Saved profiles retain their own enabled settings. Backend capabilities are code: `ultracode` is Claude-only, `security` Pi-only, and Codex supports only `implement` and `ask` (this build names Codex but runs no Codex child yet); disabling a role does not unregister a backend.
 
 Claude plan effort defaults to `xhigh`; there is no plan-effort environment variable, but a profile or call can set it. Ultracode effort is fixed to `ultracode`, not plain `xhigh`, because the latter drops the workflow opt-in. Its workflow agents' model/effort live in `contracts/ultracode.md`, not a variable.
 

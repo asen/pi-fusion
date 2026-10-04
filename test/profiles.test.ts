@@ -73,6 +73,7 @@ test("the built-in configuration disables security even with a configured model,
 	assert.deepEqual(builtinSettings(captured).implement, { enabled: true, backend: "claude", model: "sonnet", effort: "high" });
 	assert.deepEqual(builtinSettings(captured).security, { enabled: false, backend: "pi", model: "deepseek/deepseek-chat" });
 	assert.deepEqual(captured.plan.pi, { effort: "high" }, "the other backend's legacy defaults are captured too, for a call that names it");
+	assert.deepEqual(captured.implement.codex, {}, "a codex role whose variables are unset runs on the host's own codex defaults");
 	env.PI_FUSION_IMPLEMENT_MODEL = "haiku";
 	assert.equal(captured.implement.claude?.model, "sonnet", "a baseline is a copy: a variable changed later does not reach it");
 });
@@ -84,7 +85,8 @@ test("a configuration is validated whole: every role, its backend, its model and
 		[(({ security: _, ...rest }) => rest)(LEGACY), /^Error: roles has no security role/],
 		[{ ...LEGACY, plan: { ...LEGACY.plan, colour: "red" } }, /^Error: roles\.plan has unknown field "colour"/],
 		[{ ...LEGACY, plan: { ...LEGACY.plan, enabled: "yes" } }, /^Error: roles\.plan\.enabled must be true or false$/],
-		[{ ...LEGACY, plan: { ...LEGACY.plan, backend: "codex" } }, /^Error: roles\.plan\.backend must be claude or pi$/],
+		[{ ...LEGACY, plan: { ...LEGACY.plan, backend: "gemini" } }, /^Error: roles\.plan\.backend must be claude, pi or codex$/],
+		[{ ...LEGACY, plan: { enabled: true, backend: "codex" } }, /^Error: roles\.plan\.backend is codex, but role plan runs on claude, pi only$/],
 		[{ ...LEGACY, ultracode: { enabled: true, backend: "pi" } }, /^Error: roles\.ultracode\.backend is pi, but role ultracode runs on claude only$/],
 		[{ ...LEGACY, security: { enabled: false, backend: "claude" } }, /^Error: roles\.security\.backend is claude, but role security runs on pi only$/],
 		[{ ...LEGACY, ask: { enabled: true, backend: "pi", model: "deepseek-chat" } }, /^Error: roles\.ask\.model "deepseek-chat" is not a pi provider and model id/],
@@ -111,6 +113,39 @@ test("a configuration is validated whole: every role, its backend, its model and
 	assert.equal(loose.plan.model, "openrouter/deepseek/deepseek-chat", "a provider's own slashes survive");
 	// A disabled role's supplied fields are still checked.
 	assert.throws(() => parseSettings({ ...LEGACY, ask: { enabled: false, backend: "pi", model: "nope" } }), /roles\.ask\.model "nope"/);
+});
+
+test("a codex role is checked by its own grammar: any single-token model and effort, and an enabled role may name neither", () => {
+	const env = { PI_FUSION_CODEX_IMPLEMENT_MODEL: " gpt-5-codex ", PI_FUSION_CODEX_IMPLEMENT_EFFORT: "high", PI_FUSION_CODEX_ASK_EFFORT: "minimal", PI_FUSION_CODEX_PLAN_MODEL: "gpt-5" } as NodeJS.ProcessEnv;
+	const captured = captureBaseline(env);
+	assert.deepEqual(captured.implement.codex, { model: "gpt-5-codex", effort: "high" });
+	assert.deepEqual(captured.ask.codex, { effort: "minimal" });
+	for (const role of ["plan", "ultracode", "security"] as const) assert.equal(captured[role].codex, undefined, `role ${role} does not run on codex, so no variable of it is read`);
+	assert.deepEqual(builtinSettings(captured).implement.backend, "claude", "codex is never a role's default backend");
+	// An enabled codex role with no model and no effort is the host's own default, not an unconfigured role.
+	const loose = parseSettings({ ...LEGACY, implement: { enabled: true, backend: "codex" }, ask: { enabled: true, backend: "codex", model: "gpt-5", effort: "ultra-deep" } });
+	assert.deepEqual(loose.implement, { enabled: true, backend: "codex" });
+	assert.deepEqual(loose.ask, { enabled: true, backend: "codex", model: "gpt-5", effort: "ultra-deep" }, "an effort the editor does not suggest is still one token a codex model may take");
+	assert.deepEqual(parseSettings({ ...LEGACY, ask: { enabled: true, backend: "codex", effort: "xhigh" } }).ask, { enabled: true, backend: "codex", effort: "xhigh" });
+	const bad: Array<[unknown, RegExp]> = [
+		[{ ...LEGACY, implement: { enabled: true, backend: "codex", model: "gpt 5" } }, /^Error: roles\.implement\.model "gpt 5" has whitespace in it, which no codex model id has$/],
+		[{ ...LEGACY, implement: { enabled: true, backend: "codex", model: "" } }, /^Error: roles\.implement\.model must be a non-empty string; leave it out instead$/],
+		[{ ...LEGACY, implement: { enabled: true, backend: "codex", effort: "very high" } }, /^Error: roles\.implement\.effort "very high" is not a codex effort; name one level, such as low, medium, high, xhigh, with no spaces in it$/],
+		[{ ...LEGACY, implement: { enabled: true, backend: "codex", effort: "" } }, /^Error: roles\.implement\.effort "" is not a codex effort/],
+		[{ ...LEGACY, implement: { enabled: true, backend: "codex", effort: 3 } }, /^Error: roles\.implement\.effort 3 is not a codex effort/],
+		[{ ...LEGACY, implement: { enabled: true, backend: "codex", sandbox: "read-only" } }, /^Error: roles\.implement has unknown field "sandbox"/],
+		[{ ...LEGACY, ultracode: { enabled: true, backend: "codex" } }, /^Error: roles\.ultracode\.backend is codex, but role ultracode runs on claude only$/],
+		[{ ...LEGACY, security: { enabled: false, backend: "codex" } }, /^Error: roles\.security\.backend is codex, but role security runs on pi only$/],
+	];
+	for (const [value, expected] of bad) assert.throws(() => parseSettings(value), expected, JSON.stringify(value));
+	// A profile document holding a codex role round-trips, model left out and all.
+	const saved = parseDocument(JSON.parse(document({ codex: loose }, "codex")));
+	assert.deepEqual(saved.profiles.codex, loose);
+	assert.deepEqual(settingsTable(loose).slice(2, 5), [
+		"implement  yes      codex    host default  host default",
+		"ultracode  yes      claude   fable         ultracode (fixed)",
+		"ask        yes      codex    gpt-5         ultra-deep",
+	]);
 });
 
 test("built-in security refuses explicit models and continuations, while a saved profile can enable it", () => {
@@ -781,6 +816,47 @@ test("the editor stages every change and applies them together, and a run that s
 	assert.match(racing.tools.get("fusion")!.description, /ask runs on claude with model opus at effort high/, "the ask role is still enabled");
 	run!.release();
 	await run!.call;
+});
+
+test("the editor puts a role on codex with the host's defaults, offers codex levels as suggestions, and keeps a typed model", async () => {
+	const row = (role: string) => (options: string[]) => options.find((option) => option.startsWith(`${role} `));
+	const host = sdkHost({
+		dialogs: [
+			row("implement"),
+			(options) => {
+				assert.equal(options[1], "backend: claude");
+				return options[1];
+			},
+			(options) => {
+				assert.deepEqual(options, ["claude", "pi", "codex"]);
+				return "codex";
+			},
+			(options) => {
+				assert.deepEqual(options.slice(2, 4), ["model: host default", "effort: host default"], "a codex role naming neither runs on the host's own defaults");
+				return options[2];
+			},
+			(options) => {
+				assert.deepEqual(options, ["Type a codex model id…", "Host default"]);
+				return options[0];
+			},
+			"gpt 5",
+			"model: host default",
+			"Type a codex model id…",
+			"gpt-5-codex",
+			"effort: host default",
+			(options) => {
+				assert.deepEqual(options, ["low", "medium", "high", "xhigh", "host default"]);
+				return "xhigh";
+			},
+			"Back",
+			"Apply",
+		],
+	});
+	await host.start();
+	await host.command("config");
+	assert.ok(host.notices.some(([text]) => text === "gpt 5 has whitespace in it, which no codex model id has; the model is unchanged"));
+	assert.equal(host.last(), "fusion settings applied to this session; disabled: security; save them with /fusion profile save <name>");
+	assert.match(host.tools.get("fusion")!.description, /implement runs on codex with model gpt-5-codex at effort xhigh/);
 });
 
 test("an empty answer changes nothing, and a backend changed and changed back starts from that backend's own defaults", async () => {

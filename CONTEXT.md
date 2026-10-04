@@ -13,11 +13,11 @@ A headless coding session doing work the host handed off: Claude Code or Pi, acc
 _Avoid_: subagent, worker, delegate
 
 **Backend**:
-The implementation that runs a child: `claude` or `pi`, both registered. Fresh calls use the role's configured backend unless explicitly overridden; continuations stay on their recorded backend. A backend owns its session shape, binding, and protocol; the host owns handles, records, and scheduling. See [Profiles](docs/profiles.md).
+The implementation that runs a child: `claude`, `pi`, or `codex`. Claude and Pi are registered; this build names Codex in settings and records but runs no Codex child yet, so a call routed there is refused as unavailable before anything starts. Fresh calls use the role's configured backend unless explicitly overridden; continuations stay on their recorded backend. A backend owns its session shape, binding, and protocol; the host owns handles, records, and scheduling. See [Profiles](docs/profiles.md).
 _Avoid_: adapter, provider, harness, runtime (as synonyms for backend)
 
 **Role**:
-The job a child does: `plan`, `implement`, `ultracode`, `ask`, or `security`. Role metadata defines supported backends, tools, contract, and writer/review eligibility; session settings choose enabled state, backend, model, and effort. `ultracode` is Claude-only. `security` is Pi-only, disabled in `builtin`, and used only for an explicit security request once enabled.
+The job a child does: `plan`, `implement`, `ultracode`, `ask`, or `security`. Role metadata defines supported backends, tools, contract, and writer/review eligibility; session settings choose enabled state, backend, model, and effort. `ultracode` is Claude-only. `security` is Pi-only, disabled in `builtin`, and used only for an explicit security request once enabled. Codex supports `implement` and `ask` only.
 _Avoid_: agent type, tool, persona
 
 **Run**:

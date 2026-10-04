@@ -36,6 +36,7 @@ import {
 	type HostRole,
 	type HostSession,
 	isBackendName,
+	isCodexToken,
 	isPiModel,
 	keptRef,
 	keptSelection,
@@ -61,7 +62,9 @@ import {
 	CLAUDE_EFFORTS,
 	captureBaseline,
 	copySettings,
+	effortShown,
 	effortsFor,
+	modelShown,
 	nameProblem,
 	type ProfileDocument,
 	parseSettings,
@@ -341,6 +344,8 @@ function recordOf(data: Record<string, unknown>): RunRecord | undefined {
 		};
 		if (data.backend === undefined || data.backend === "claude") return claudeRecord(base, data);
 		if (data.backend === "pi") return piRecord(base, data);
+		// This build names Codex and runs none of it yet: an entry tagged codex keeps its handle and is read as nothing to continue.
+		if (data.backend === "codex") return refused({ ...base, backend: "codex" }, "ran on codex, which this build cannot continue; start a new run");
 		return refused(base, `was recorded by backend ${shown(data.backend)}, which this pi-fusion does not know; it cannot be continued, so start a new run`);
 	}
 	if (typeof data.consolidatorGeneration !== "number") return undefined;
@@ -353,7 +358,9 @@ function recordOf(data: Record<string, unknown>): RunRecord | undefined {
 			...(typeof data.consolidatorCheckpoint === "string" ? { checkpoint: data.consolidatorCheckpoint } : {}),
 		});
 	}
-	if (data.backend === "pi") return refused({ ...generation, backend: "pi" }, "is tagged pi over the consolidator keys of a claude entry and names no pi session; it cannot be continued, so start a new run");
+	if (data.backend === "pi" || data.backend === "codex") {
+		return refused({ ...generation, backend: data.backend }, `is tagged ${data.backend} over the consolidator keys of a claude entry and names no ${data.backend} session; it cannot be continued, so start a new run`);
+	}
 	return refused(generation, `was recorded by backend ${shown(data.backend)}, which this pi-fusion does not know; it cannot be continued, so start a new run`);
 }
 
@@ -383,7 +390,7 @@ export function intentFor(record: RunRecord | undefined, hostSessionId: string):
 	if (record.refusal) throw new Error(record.refusal);
 	// A Claude record keeps its identity flat, and a record from before backends were tagged has nothing else.
 	const flat: SessionRef | undefined =
-		record.backend === "pi" || !record.sessionId ? undefined : { backend: "claude", sessionId: record.sessionId, ...(record.checkpoint ? { checkpoint: record.checkpoint } : {}) };
+		(record.backend !== undefined && record.backend !== "claude") || !record.sessionId ? undefined : { backend: "claude", sessionId: record.sessionId, ...(record.checkpoint ? { checkpoint: record.checkpoint } : {}) };
 	const ref = record.session ?? flat;
 	if (!ref) return { kind: "new" };
 	return record.hostSessionId === hostSessionId ? { kind: "resume", ref } : { kind: "fork", from: ref };
@@ -527,7 +534,15 @@ function piDecision(call: RecordCall, outcome: RunOutcome, entry: Record<string,
 export function recordDecision(call: RecordCall, outcome: RunOutcome): RecordDecision {
 	const entry: Record<string, unknown> = { run: call.handle, role: call.role, backend: call.backend, hostSessionId: call.hostSessionId };
 	if (call.mode) entry.mode = call.mode;
-	return call.backend === "pi" ? piDecision(call, outcome, entry) : claudeDecision(call, outcome, entry);
+	switch (call.backend) {
+		case "claude":
+			return claudeDecision(call, outcome, entry);
+		case "pi":
+			return piDecision(call, outcome, entry);
+		case "codex":
+			// No Codex run is recorded by this build: an outcome tagged codex is never read as a Claude or a Pi one.
+			return postcondition(call.handle, "ran on codex, which this build does not record");
+	}
 }
 
 /** A plan call that started a fresh run rather than continue the last one. */
@@ -667,8 +682,19 @@ function continuedBackend(record: RunRecord, asked: string | undefined): Backend
 
 /** Refuses the parameters the call's role does not take on the backend it routes to, before a model is resolved. */
 function checkParams(backend: BackendName, call: FusionParams & { role: KnownRoleName }): void {
-	if (backend === "claude") claudeParams(call);
-	else piParams(call);
+	switch (backend) {
+		case "claude":
+			claudeParams(call);
+			return;
+		case "pi":
+			piParams(call);
+			return;
+		case "codex":
+			// Codex has no binding in this build: the route has already checked the role runs there, and the mode is the
+			// one parameter checked beside it, so a call that goes nowhere is refused as unavailable rather than as Pi.
+			if (call.mode !== undefined && !(ASK_MODES as readonly string[]).includes(call.mode)) throw new Error(`unknown mode ${call.mode}; use one of ${ASK_MODES.join(", ")}`);
+			return;
+	}
 }
 
 /**
@@ -758,8 +784,14 @@ function piFallback(route: FusionRoute): PiFallback {
  * repeats rather than resolving its model again against whatever is configured now.
  */
 export function fusionRole(route: FusionRoute): HostRole {
-	if (route.backend === "claude") return roleFor(route.call, route.defaults);
-	return piRole(route.call, route.record?.selection, process.env, piFallback(route));
+	switch (route.backend) {
+		case "claude":
+			return roleFor(route.call, route.defaults);
+		case "pi":
+			return piRole(route.call, route.record?.selection, process.env, piFallback(route));
+		case "codex":
+			throw new Error(`role ${route.role} cannot be bound for the codex backend: this build has no codex binding`);
+	}
 }
 
 /** The run a fusion call starts or continues, with the role its backend bound for it. */
@@ -1179,8 +1211,8 @@ function summary(run: LiveRun): string {
 	return text.length > SUMMARY_CHARS ? `${text.slice(0, SUMMARY_CHARS)}…` : text;
 }
 
-/** A continuation uses the invoking tool pair when known; a Pi run is only ever continued through the primary tool. */
-const continueWith = (backend: string | undefined, tool?: string): string => (backend === "pi" || tool === TOOL_NAME || tool === CONTROL_TOOL_NAME ? TOOL_NAME : CLAUDE_TOOL_NAME);
+/** A continuation uses the invoking tool pair when known; a Pi or Codex run is only ever continued through the primary tool. */
+const continueWith = (backend: string | undefined, tool?: string): string => (backend === "pi" || backend === "codex" || tool === TOOL_NAME || tool === CONTROL_TOOL_NAME ? TOOL_NAME : CLAUDE_TOOL_NAME);
 
 function handleNumber(handle: string): number {
 	return Number(HANDLE.exec(handle)?.[1] ?? 0);
@@ -1278,13 +1310,16 @@ function openInBrowser(url: string): void {
  */
 const guidelines = (tool: string, control: string, roles: RoleSettings, options: { backend: boolean }): string[] => {
 	const on = (role: KnownRoleName): boolean => roles[role].enabled;
-	const roleTool = (role: KnownRoleName): string => !options.backend && roles[role].backend === "pi" ? TOOL_NAME : tool;
+	const roleTool = (role: KnownRoleName): string => !options.backend && roles[role].backend !== "claude" ? TOOL_NAME : tool;
 	const planTool = roleTool("plan");
 	const implementTool = roleTool("implement");
 	const askTool = roleTool("ask");
 	const lines: string[] = [`These ${tool} guidelines apply while Fusion is on, as it is now; once the user has turned Fusion off they no longer apply and you work directly.`];
-	const piRoles = options.backend ? [] : ROLE_NAMES.filter((role) => on(role) && roles[role].backend === "pi");
-	if (piRoles.length) lines.push(`This session routes ${piRoles.map((role) => `role ${role}`).join(", ")} to pi. Use fusion for these roles unless the user explicitly asks for Claude Code: ${tool} forces the claude backend and uses this instance's legacy Claude defaults instead of the configured Pi settings.`);
+	for (const backend of ["pi", "codex"] as const) {
+		const elsewhere = options.backend ? [] : ROLE_NAMES.filter((role) => on(role) && roles[role].backend === backend);
+		const label = backend === "pi" ? "Pi" : "Codex";
+		if (elsewhere.length) lines.push(`This session routes ${elsewhere.map((role) => `role ${role}`).join(", ")} to ${backend}. Use fusion for these roles unless the user explicitly asks for Claude Code: ${tool} forces the claude backend and uses this instance's legacy Claude defaults instead of the configured ${label} settings.`);
+	}
 	if (on("plan")) {
 		lines.push(
 			`Call ${planTool} with role plan, giving the goal, a short plan, constraints and what is already decided, when the design is unresolved: more than one viable approach, unclear requirements, a change to a shared contract or interface, or risk you cannot bound by reading the code. Treat the returned agreed plan as the contract and its Route section as a recommendation. Skip role plan when you can already state what to change, where, the acceptance criteria and how to verify it.`,
@@ -1354,7 +1389,7 @@ const securityGuideline = (tool: string, setting: RoleSetting): string =>
 /** How a role's setting reads in a description: where a fresh run of it goes and what it runs as there. */
 const settingText = (role: KnownRoleName, setting: RoleSetting): string => {
 	if (!setting.enabled) return `${role} is disabled`;
-	const model = setting.model ? `model ${setting.model}` : "no model configured";
+	const model = setting.model ? `model ${setting.model}` : setting.backend === "codex" ? "the host's default codex model" : "no model configured";
 	const effort = role === "ultracode" || !setting.effort ? "" : ` at effort ${setting.effort}`;
 	return `${role} runs on ${setting.backend} with ${model}${effort}`;
 };
@@ -2644,11 +2679,25 @@ export default function fusion(pi: ExtensionAPI, options: FusionOptions = {}) {
 		notice(`fusion uses profile ${name} in this session${disabledText(next.roles)}`, "info");
 	};
 
-	/** The model a role's setting takes in the editor: one of the host's available models or one typed, or none for Pi. */
+	/** The model a role's setting takes in the editor: one of the host's available models or one typed, or none for Pi and Codex. */
 	const pickModel = async (ctx: any, role: KnownRoleName, setting: RoleSetting): Promise<string | null | undefined> => {
 		if (setting.backend === "claude") {
 			const typed = await ctx.ui.input(`Claude model for ${role}: an alias or id`, setting.model ?? "");
 			return typed?.trim() || undefined;
+		}
+		if (setting.backend === "codex") {
+			const TYPE = "Type a codex model id…";
+			const HOST = "Host default";
+			const choice = await ctx.ui.select(`Codex model for ${role}`, [TYPE, HOST]);
+			if (choice === undefined) return undefined;
+			if (choice === HOST) return null;
+			const typed = (await ctx.ui.input(`Codex model for ${role}: a model id`, setting.model ?? ""))?.trim();
+			if (!typed) return undefined;
+			if (!isCodexToken(typed)) {
+				ctx.ui.notify(`${typed} has whitespace in it, which no codex model id has; the model is unchanged`, "warning");
+				return undefined;
+			}
+			return typed;
 		}
 		// The host's own list of models it has credentials for, read and never fetched. A child resolves its model against
 		// Fusion's own catalog, so a model offered here can still be one a child refuses when it starts.
@@ -2678,8 +2727,8 @@ export default function fusion(pi: ExtensionAPI, options: FusionOptions = {}) {
 			const options = [
 				`enabled: ${setting.enabled ? "yes" : "no"}`,
 				`backend: ${setting.backend}`,
-				`model: ${setting.model ?? "unconfigured"}`,
-				role === "ultracode" ? `effort: ${ULTRACODE_EFFORT} (fixed)` : `effort: ${setting.effort ?? (setting.backend === "pi" ? "child default" : "none")}`,
+				`model: ${modelShown(setting)}`,
+				`effort: ${effortShown(role, setting)}`,
 				"Back",
 			];
 			const choice = await ctx.ui.select(`fusion config · ${role}`, options);
@@ -2702,8 +2751,8 @@ export default function fusion(pi: ExtensionAPI, options: FusionOptions = {}) {
 					draft[role] = rest;
 				} else if (model !== undefined) draft[role] = { ...setting, model };
 			} else if (field === 3 && role !== "ultracode") {
-				const DEFAULT = "child default";
-				const efforts = [...effortsFor(role, setting.backend), ...(setting.backend === "pi" ? [DEFAULT] : [])];
+				const DEFAULT = setting.backend === "codex" ? "host default" : "child default";
+				const efforts = [...effortsFor(role, setting.backend), ...(setting.backend === "claude" ? [] : [DEFAULT])];
 				const effort = await ctx.ui.select(`Effort for ${role} on ${setting.backend}`, efforts);
 				if (effort === DEFAULT) {
 					const { effort: _, ...rest } = setting;
@@ -3283,7 +3332,7 @@ export default function fusion(pi: ExtensionAPI, options: FusionOptions = {}) {
 			backend: Type.Optional(
 				stringEnum(
 					BACKEND_NAMES,
-					"The harness the child runs in: claude, which runs every role but security, or pi, which runs plan, implement, ask and security on the user's own Pi provider configuration and needs a provider and model id from the call's model parameter or this session's configuration. Leave it unset to run the role on the backend this session's configuration names for it, and name one only when the user asks for it; role security goes to pi whether or not this names it, because no other harness runs it, and naming claude for it is refused. With continue it must name the backend that run is on, if it names one at all.",
+					"The harness the child runs in: claude, which runs every role but security, or pi, which runs plan, implement, ask and security on the user's own Pi provider configuration and needs a provider and model id from the call's model parameter or this session's configuration. codex names implement and ask on Codex, which this build cannot run yet, so a call naming it is refused before anything starts. Leave it unset to run the role on the backend this session's configuration names for it, and name one only when the user asks for it; role security goes to pi whether or not this names it, because no other harness runs it, and naming claude for it is refused. With continue it must name the backend that run is on, if it names one at all.",
 				),
 			),
 			model: Type.Optional(

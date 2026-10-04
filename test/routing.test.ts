@@ -12,6 +12,7 @@ import fusion, { builtinConfiguration, claudeCall, claudeRoute, type FusionParam
 import { KNOWN_ROLE_NAMES, roleSpec } from "../extensions/roles.ts";
 import { History } from "../extensions/history.ts";
 import { memoryProfileStore, type ProfileStore } from "../extensions/profile-store.ts";
+import { builtinSettings, captureBaseline, serializeDocument } from "../extensions/profiles.ts";
 import { PI_SELECTION_VARIABLES, piTripwire, productionDefaults } from "./tripwire.ts";
 import { securityProfiles, toolList, turnOn } from "./host-tools.ts";
 
@@ -60,7 +61,7 @@ test("an explicit backend must run the role, and an unknown one names the backen
 	assert.equal(fusionRoute({ role: "implement", task: "x", backend: "pi" }, records()).backend, "pi");
 	assert.equal(fusionRoute({ role: "implement", task: "x", backend: "claude" }, records()).backend, "claude");
 	assert.throws(() => fusionRoute({ role: "ultracode", task: "x", backend: "pi" }, records()), /^Error: role ultracode does not run on the pi backend; use one of claude$/);
-	assert.throws(() => fusionRoute({ role: "implement", task: "x", backend: "elsewhere" }, records()), /^Error: unknown backend elsewhere; use one of claude, pi$/);
+	assert.throws(() => fusionRoute({ role: "implement", task: "x", backend: "elsewhere" }, records()), /^Error: unknown backend elsewhere; use one of claude, pi, codex$/);
 });
 
 test("the security role runs on pi alone: a call with no backend goes there, claude is refused and a record continues there", () => {
@@ -712,6 +713,44 @@ test("a backend a host left out is refused without asking the user to configure 
 	assert.deepEqual(ext.appended, [], "a refused call records nothing");
 });
 
+test("codex runs implement and ask alone, and a route to it binds no role in this build", () => {
+	const route = fusionRoute({ role: "implement", task: "x", backend: "codex" }, records());
+	assert.deepEqual([route.backend, route.role, route.handle], ["codex", "implement", "run-1"]);
+	assert.deepEqual(fusionRoute({ role: "ask", task: "x", backend: "codex", mode: "review" }, records()).call.mode, "review");
+	assert.throws(() => fusionRoute({ role: "ask", task: "x", backend: "codex", mode: "summary" }, records()), /^Error: unknown mode summary; use one of answer, review$/);
+	assert.throws(() => fusionRoute({ role: "plan", task: "x", backend: "codex" }, records()), /^Error: role plan does not run on the codex backend; use one of claude, pi$/);
+	assert.throws(() => fusionRoute({ role: "ultracode", task: "x", backend: "codex" }, records()), /^Error: role ultracode does not run on the codex backend; use one of claude$/);
+	assert.throws(() => fusionCall({ role: "implement", task: "x", backend: "codex" }, records()), /^Error: role implement cannot be bound for the codex backend: this build has no codex binding$/);
+});
+
+test("a codex call goes nowhere in this build: named or configured, it is refused as unavailable before anything starts", async () => {
+	const roles = builtinSettings(captureBaseline({} as NodeJS.ProcessEnv));
+	roles.implement = { enabled: true, backend: "codex" };
+	const profiles = memoryProfileStore(serializeDocument({ version: 1, defaultProfile: "codex", profiles: { codex: roles } }));
+	let started = 0;
+	const claude: HostBackend = {
+		name: "claude",
+		control: () => ({ open: true, push: () => true, end() {} }),
+		session: () => {
+			started++;
+			return { kind: "new" };
+		},
+		run: async () => {
+			started++;
+			throw new Error("no child may start");
+		},
+	};
+	const ext = makeExtension({ claude }, profiles);
+	const unavailable =
+		"the codex backend is not available in this build: run-1 would run role implement on it, and this pi-fusion runs claude, pi only. Nothing was started and nothing was recorded. Take the work to claude, pi with a role it runs, or do it yourself; no configuration makes codex available here.";
+	assert.equal((await call(ext, "fusion", { role: "implement", task: "x", backend: "codex" }, makeCtx())).error, unavailable);
+	assert.equal((await call(ext, "fusion", { role: "implement", task: "x" }, makeCtx())).error, unavailable, "a profile that puts the role on codex is refused the same way");
+	assert.equal((await call(ext, "fusion", { role: "implement", task: "x", backend: "codex", model: "gpt 5", effort: "whatever" }, makeCtx())).error, unavailable, "and no binding is asked about the model first");
+	assert.match((await call(ext, "fusion", { continue: "run-1", task: "x" }, makeCtx([entry({ run: "run-1", role: "implement", backend: "codex", hostSessionId: "host-1", session: { backend: "codex", sessionId: "thread-1" } })]))).error ?? "", /^run-1 ran on codex, which this build cannot continue; start a new run$/);
+	assert.equal(started, 0, "no session was mapped and no child started");
+	assert.deepEqual(ext.appended, [], "a refused call records nothing");
+});
+
 test("a host that left out every backend says so, rather than offering an empty list of harnesses", async () => {
 	// Both keys overridden with nothing, which is a host that registered no backend at all. The sentence that names
 	// where the work goes instead has nowhere to point, so it is replaced rather than composed around an empty list.
@@ -768,6 +807,11 @@ test("every role the tools advertise has capabilities and a binding on each back
 		assert.ok(spec, `role ${role} is advertised and has no capabilities`);
 		assert.ok(spec.backends.length, `role ${role} is advertised and runs on no backend`);
 		for (const backend of spec.backends) {
+			// Codex is listed for its roles before it has a binding: until one exists, binding a role there is refused outright.
+			if (backend === "codex") {
+				assert.throws(() => fusionCall({ role, task: "x", backend }, records()), new RegExp(`^Error: role ${role} cannot be bound for the codex backend: this build has no codex binding$`), role);
+				continue;
+			}
 			const bound = backend === "claude" ? roleFor({ role, task: "x" }) : piRole({ role }, undefined, env);
 			assert.equal(bound.name, role, `the ${backend} binding of ${role} bound another role`);
 			assert.ok(bound.model, `the ${backend} binding of ${role} resolved no model`);

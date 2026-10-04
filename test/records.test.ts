@@ -190,6 +190,31 @@ test("an entry naming a backend this host does not know keeps its handle and is 
 	}
 });
 
+test("an entry tagged codex keeps its handle and backend and is never read as a claude or a pi run", () => {
+	const shapes: Array<Record<string, unknown>> = [
+		{ session: { backend: "codex", sessionId: "thread-1", checkpoint: "turn-2" }, selection: { model: "gpt-5-codex", provider: "openai" } },
+		{ session: { backend: "codex", sessionId: "thread-1", sessionFile: "/sessions/pi-1.jsonl" } },
+		{ session: { ...PI_REF }, selection: { ...PI_SELECTION } },
+		{ sessionId: "s-1", checkpoint: "c-1" },
+		{},
+	];
+	for (const shape of shapes) {
+		const records = runRecords([entry({ run: "run-4", role: "implement", backend: "codex", hostSessionId: "host-1", ...shape })]);
+		const record = records.runs.get("run-4");
+		assert.ok(record, JSON.stringify(shape));
+		assert.equal(record.backend, "codex");
+		assert.equal(record.session, undefined, "no identity is guessed out of it");
+		assert.equal(record.selection, undefined);
+		assert.equal(record.sessionId, undefined);
+		assert.equal(record.refusal, "run-4 ran on codex, which this build cannot continue; start a new run");
+		assert.equal(records.highest, 4, "the handle stays taken");
+		assert.throws(() => intentFor(record, "host-1"), /ran on codex, which this build cannot continue/);
+	}
+	const generation = runRecords([entry({ consolidatorGeneration: 0, consolidatorSessionId: "s-1", backend: "codex" })]).runs.get("run-1");
+	assert.equal(generation?.backend, "codex");
+	assert.match(generation?.refusal ?? "", /^run-1 is tagged codex over the consolidator keys of a claude entry and names no codex session/);
+});
+
 test("an entry with an unknown or inherited role is dropped", () => {
 	for (const role of ["nobody", "constructor", "toString", "valueOf", "hasOwnProperty", "__proto__"]) {
 		assert.equal(isKnownRole(role), false, role);
@@ -234,6 +259,14 @@ const claudeCall = (over: Partial<RecordCall> = {}): RecordCall => ({ handle: "r
 const piCall = (over: Partial<RecordCall> = {}): RecordCall => ({ handle: "run-1", role: "implement", backend: "pi", hostSessionId: "host-1", intent: { kind: "new" }, ...over });
 
 const outcome = (over: Partial<RunOutcome> = {}): RunOutcome => ({ ok: true, ...over });
+
+test("a codex outcome is recorded as nothing this build reads, whatever it reports", () => {
+	const call: RecordCall = { handle: "run-1", role: "implement", backend: "codex", hostSessionId: "host-1", intent: { kind: "new" } };
+	const invalid = { invalid: "invalid session postcondition: run-1 ran on codex, which this build does not record, so nothing was recorded for it and its earlier record, if any, is unchanged" };
+	for (const reported of [outcome(), outcome({ ok: false }), outcome({ session: { backend: "codex", sessionId: "thread-1", checkpoint: "turn-2" }, selection: { model: "gpt-5-codex", provider: "openai" } }), outcome({ sessionId: "s-1", checkpoint: "c-1" })]) {
+		assert.deepEqual(recordDecision(call, reported), invalid, JSON.stringify(reported));
+	}
+});
 
 const RESUME: SessionIntent = { kind: "resume", ref: PI_REF };
 const FORK: SessionIntent = { kind: "fork", from: PI_REF };

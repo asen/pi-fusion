@@ -5,7 +5,7 @@ import test from "node:test";
 import { fileURLToPath } from "node:url";
 import ts from "typescript";
 import { claudeBackend, type Role } from "../extensions/backends/claude.ts";
-import { hostBackend, isPiModel, piModelParts, resolvedSelectionOf } from "../extensions/backends/types.ts";
+import { hostBackend, isPiModel, keptRef, keptSelection, piModelParts, resolvedSelectionOf, sessionRefOf } from "../extensions/backends/types.ts";
 import { ASK_MODES, type AskMode, type ChildRun as ExportedChildRun, failed, ROLE_NAMES } from "../extensions/fusion.ts";
 import { ChildTree } from "../extensions/process-tree.ts";
 import { canChangeFiles, isReviewable, KNOWN_ROLE_NAMES, ROLE_SPECS, runsOn } from "../extensions/roles.ts";
@@ -244,6 +244,61 @@ test("a pi model is a provider and a model id split at the first slash, so a pro
 	assert.equal(resolvedSelectionOf({ model: "deepseek-chat", effort: "medium" }, "pi"), undefined);
 });
 
+test("a codex reference is only ever one that says so, and never carries a pi session file", () => {
+	assert.deepEqual(sessionRefOf({ backend: "codex", sessionId: "thread-1" }, "codex"), { backend: "codex", sessionId: "thread-1" });
+	assert.deepEqual(sessionRefOf({ backend: "codex", sessionId: "thread-1", checkpoint: "turn-2" }), { backend: "codex", sessionId: "thread-1", checkpoint: "turn-2" });
+	const refused: unknown[] = [
+		{ sessionId: "thread-1" },
+		{ backend: "codex", sessionId: "thread-1", sessionFile: "/sessions/pi-1.jsonl" },
+		{ backend: "codex", sessionId: "thread-1", sessionFile: undefined, checkpoint: "" },
+		{ backend: "codex", sessionId: " " },
+		{ backend: "codex" },
+		{ backend: "pi", sessionId: "pi-1", sessionFile: "/sessions/pi-1.jsonl" },
+		{ backend: "claude", sessionId: "s-1" },
+		["codex"],
+		null,
+	];
+	for (const value of refused) assert.equal(sessionRefOf(value, "codex"), undefined, JSON.stringify(value));
+	assert.equal(sessionRefOf({ sessionId: "thread-1" }), undefined, "an untagged value read with no backend named is no reference, and never a codex one");
+	assert.deepEqual(sessionRefOf({ sessionId: "s-1" }, "claude"), { backend: "claude", sessionId: "s-1" }, "an untagged reference is still claude's");
+	assert.equal(sessionRefOf({ backend: "codex", sessionId: "thread-1" }, "claude"), undefined);
+	assert.equal(sessionRefOf({ backend: "codex", sessionId: "thread-1" }, "pi"), undefined);
+	assert.equal(sessionRefOf({ backend: "codex", sessionId: "thread-1", sessionFile: "/sessions/pi-1.jsonl" }, "pi"), undefined, "nor is a mixed one read as pi");
+	// What a monitor keeps is read by the same grammar, and a field past the ceiling drops the whole reference.
+	assert.deepEqual(keptRef({ backend: "codex", sessionId: "thread-1", checkpoint: "turn-2" }, "codex", 8), { backend: "codex", sessionId: "thread-1", checkpoint: "turn-2" });
+	assert.equal(keptRef({ backend: "codex", sessionId: "thread-1", checkpoint: "turn-2-long" }, "codex", 8), undefined);
+	assert.equal(keptRef({ backend: "codex", sessionId: "thread-1", sessionFile: "/f" }, "codex"), undefined);
+});
+
+test("each backend's selection grammar is its own: codex needs a provider, pi and claude an effort", () => {
+	assert.deepEqual(resolvedSelectionOf({ model: "gpt-5-codex", provider: "openai" }, "codex"), { model: "gpt-5-codex", provider: "openai" });
+	assert.deepEqual(resolvedSelectionOf({ model: "gpt-5-codex", provider: "openai", effort: "xhigh" }, "codex"), { model: "gpt-5-codex", provider: "openai", effort: "xhigh" });
+	assert.deepEqual(resolvedSelectionOf({ model: "gpt-5-codex", provider: "openai", effort: "any-level", extra: 1 }, "codex"), { model: "gpt-5-codex", provider: "openai", effort: "any-level" }, "an effort is a token codex takes or refuses, not one this host lists");
+	const refused: unknown[] = [
+		{ model: "gpt-5-codex" },
+		{ model: "gpt-5-codex", provider: "" },
+		{ model: "gpt-5-codex", provider: "open ai" },
+		{ model: " gpt-5-codex", provider: "openai" },
+		{ model: "", provider: "openai" },
+		{ provider: "openai" },
+		{ model: "gpt-5-codex", provider: "openai", effort: "" },
+		{ model: "gpt-5-codex", provider: "openai", effort: "very high" },
+		{ model: "gpt-5-codex", provider: "openai", effort: null },
+		{ model: "gpt-5-codex", provider: 7 },
+		[],
+	];
+	for (const value of refused) assert.equal(resolvedSelectionOf(value, "codex"), undefined, JSON.stringify(value));
+	// Pi still needs a valid thinking level, and Claude an effort; a provider beside either changes nothing they read.
+	assert.equal(resolvedSelectionOf({ model: "deepseek/deepseek-chat" }, "pi"), undefined);
+	assert.equal(resolvedSelectionOf({ model: "deepseek/deepseek-chat", effort: "ultra" }, "pi"), undefined);
+	assert.deepEqual(resolvedSelectionOf({ model: "deepseek/deepseek-chat", provider: "deepseek", effort: "high" }, "pi"), { model: "deepseek/deepseek-chat", effort: "high" });
+	assert.equal(resolvedSelectionOf({ model: "opus" }, "claude"), undefined);
+	assert.deepEqual(resolvedSelectionOf({ model: "opus", provider: "anthropic", effort: "high" }, "claude"), { model: "opus", effort: "high" });
+	assert.deepEqual(keptSelection({ model: "gpt-5", provider: "openai" }, "codex", 6), { model: "gpt-5", provider: "openai" });
+	assert.equal(keptSelection({ model: "gpt-5", provider: "openai-long" }, "codex", 6), undefined, "a provider past the ceiling drops the whole selection");
+	assert.equal(keptSelection({ model: "gpt-5", provider: "openai", effort: "minimal" }, "codex", 6), undefined, "and so does an effort");
+});
+
 test("a backend the host holds keeps its own role and session shapes behind the boundary", async () => {
 	process.env.FAKE_CLAUDE_SCENARIO = "ok";
 	const held = hostBackend(claudeBackend);
@@ -273,7 +328,10 @@ test("every role a record may name has capabilities, and the host advertises the
 	assert.deepEqual(ROLE_SPECS.ultracode.backends, ["claude"]);
 	assert.deepEqual(ROLE_SPECS.security.backends, ["pi"]);
 	assert.equal(runsOn("security", "pi"), true, "and the backend it does run on binds it");
-	assert.deepEqual([...ROLE_SPECS.implement.backends].sort(), ["claude", "pi"]);
+	assert.deepEqual([...ROLE_SPECS.implement.backends].sort(), ["claude", "codex", "pi"]);
+	assert.deepEqual([...ROLE_SPECS.ask.backends].sort(), ["claude", "codex", "pi"]);
+	assert.deepEqual([...ROLE_SPECS.plan.backends].sort(), ["claude", "pi"], "codex runs no plan until its checkpoints are qualified");
+	for (const role of ["plan", "ultracode", "security"]) assert.equal(runsOn(role, "codex"), false, role);
 	assert.equal(canChangeFiles("ask"), false);
 	assert.equal(canChangeFiles("nobody"), true, "a role nothing knows is treated as one that can change files");
 	assert.equal(isReviewable("nobody"), false);

@@ -343,7 +343,7 @@ test("the fusion tool advertises every role a backend runs, a backend and every 
 	assert.deepEqual(properties.role.enum, ["plan", "implement", "ultracode", "ask", "security"], "the primary tool advertises security, which runs on pi alone");
 	assert.deepEqual(byName("claude").parameters.properties.role.enum, ["plan", "implement", "ultracode", "ask"], "and the compatibility tool advertises the four roles claude runs");
 	assert.match(properties.role.description, /^plan, implement, ultracode, ask or security\. Required unless continue is set\.$/);
-	assert.deepEqual(properties.backend.enum, ["claude", "pi"]);
+	assert.deepEqual(properties.backend.enum, ["claude", "pi", "codex"]);
 	assert.equal(properties.backend.type, "string");
 	assert.deepEqual(properties.effort.enum, ["off", "minimal", "low", "medium", "high", "xhigh", "max"]);
 	for (const level of ["low", "medium", "high", "xhigh", "max"]) assert.ok(properties.effort.enum.includes(level), `the claude tiers must stay in the union: ${level}`);

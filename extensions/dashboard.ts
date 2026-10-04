@@ -61,8 +61,8 @@ export interface RunProgress {
 	workflowTokens?: number;
 	sessionId?: string;
 	deniedTools?: string[];
-	/** What a Pi child confirmed it runs with, which is where a run that named no effort learns the child's own. */
-	selection?: { model: string; effort: string };
+	/** What a child confirmed it runs with, which is where a run that named no effort learns the child's own, if it reports one. */
+	selection?: { model: string; effort?: string };
 }
 
 export interface RunSummary {
