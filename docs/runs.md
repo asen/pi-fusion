@@ -191,9 +191,19 @@ Generated questions/cards/handoffs use the invoking tool pair (`fusion`/`fusion_
 
 An earlier process's branch-recorded run is not active. Controls explain that distinction; `fusion` can continue it only when its record is usable. Reports live in memory unless `PI_FUSION_HISTORY=1` saves them for a durable host session. No history is written for `--no-session`.
 
-History writes on start, token updates, and end. It restores earlier reports/usage/dashboard entries; branch entries remain continuation authority. A history record must name the same child as the branch: Claude session id, Pi id **and file**, or Codex thread id. A mismatched identity is not shown/reviewed as that run. A fork reads ancestor history but never writes to that ancestor's file. A run left active by a dead process restores as `aborted`.
+History writes on start, token updates, and end. On its first delegation, control or command, a later process restores earlier usage and the reports that status and review read. Branch entries remain continuation authority. For those lookups a history record must name the same child as the branch's latest entry for its handle: Claude session id, Pi id **and file**, or Codex thread id. A mismatched identity is not reported or reviewed as that run. A fork reads ancestor history but never writes to that ancestor's file. A run left active by a dead process restores as `aborted`, and the host writes that correction back to its own session's file. The dashboard lists earlier runs through a separate, read-only [archive](dashboard.md#archived-runs).
 
 Detailed earlier-run status shows its state, elapsed time, changed-file count, and first 600 report/failure characters. It offers continuation only with a usable branch record and review only for work made in this working directory. Restored usage seeds the session ledger, and handles are not reused.
+
+### Archive eligibility
+
+The dashboard archive reads this host session's file and the files of ancestor sessions named by any `pi-fusion` entry on the current branch, superseded entries included. A record is shown at most once, by its history id:
+
+- **This session's record:** shown unless the branch has entries for its handle from this session and its child contradicts all of them. A run killed before its entry, or one the branch never recorded, stays readable.
+- **An ancestor's record:** shown only when a branch entry names that host session, handle, backend and child. That file also holds the runs of branches this one left.
+- **Request lineage, this session only:** a failed, aborted, cancelled, or left-running/waiting record whose own child contradicts the branch is still shown when its saved resume or fork request names, exactly, a parent the current branch recorded for the same handle and backend. That entry may be superseded or come from an ancestor session. A Pi parent needs the same session id **and** file, checkpoints aside; a Codex parent needs the same verified thread id. A done run, a new-session attempt, and a request naming an unrecorded parent stay excluded. Saved request fields are capped at 400 characters without a truncation flag, so a parent id or file of 399 characters or more is treated as possibly cut, and that record is not admitted this way.
+
+The lineage rule is display only. It creates no reference, selection, continuation, review or control target. A Pi child's identity is only its exact accepted reference. A Claude record's flat session id is what its run reported, and failed runs can have one. When a record is shown only through lineage and no accepted Claude reference confirms that id, the dashboard shows the id but no resume command. Version-1 history cannot tell an abandoned failed continuation against a parent the branch still records from another attempt against that parent, so both can appear.
 
 ### History data and limits
 
@@ -208,6 +218,6 @@ Detailed earlier-run status shows its state, elapsed time, changed-file count, a
 | Failure text | 4 KiB |
 | Changed paths per run | 500 |
 
-Oldest records/files go first. A single oversized record can lose its path list to fit while preserving counts. Accepted reference/selection fields are exact; over-32768-character values are omitted, never shortened into another file/model. Live history writes keep no session identity until an outcome is accepted, so a process killed mid-run offers no transcript path from unverified progress.
+Oldest records/files go first, by count or by bytes: large records can leave far fewer than 100 in a file. A single oversized record can lose its path list to fit while preserving counts. Pruned or never-saved data cannot be recovered, and there is no migration. Dashboard retention (`PI_FUSION_DASHBOARD_MAX_RUNS`, `/fusion dashboard limit`) is memory only and never prunes these files. Accepted reference/selection fields are exact; over-32768-character values are omitted, never shortened into another file/model. Live history writes keep no session identity until an outcome is accepted, so a process killed mid-run offers no transcript path from unverified progress.
 
 Files are replaced through temporary-file/rename, never followed through symbolic links. Corrupt/foreign files warn and can be replaced by a later write; newer-version files are left alone; other storage trouble warns once per process and does not prevent runs. Files persist until manually deleted or pruned by a cap. See [Configuration](configuration.md#session-usage-and-budget) for restored usage and budget behavior.

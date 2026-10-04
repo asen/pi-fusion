@@ -21,13 +21,13 @@ Use [profiles and role settings](profiles.md) for session configuration; environ
 | `PI_FUSION_CLAUDE_BIN` | Unset; use the SDK's bundled binary. Set a path to another executable; `.js`, `.mjs`, and `.cjs` paths run under Node |
 | `PI_FUSION_CODEX_BIN` | Unset; use the first executable `codex` on the inherited `PATH` (empty/relative entries resolve against the host cwd). Set an absolute path to a regular file; `.js`, `.mjs`, and `.cjs` paths run under the host's own Node executable (`process.execPath`), others must be executable. Read only when a Codex run starts, never at load: a missing `codex` fails that run and nothing else. Windows is refused |
 | `PI_FUSION_DASHBOARD_OPEN` | Unset; `0` shows the dashboard URL without opening a browser |
-| `PI_FUSION_DASHBOARD_MAX_RUNS` | `30`; positive decimal safe integer run-retention target, captured at extension load; override with `/fusion dashboard limit N`. See [Dashboard](dashboard.md#rendering-and-retained-data) |
+| `PI_FUSION_DASHBOARD_MAX_RUNS` | `30`; positive decimal safe integer run-retention target for the in-memory store, captured at extension load; override with `/fusion dashboard limit N`. It never deletes disk history or changes the 30-run archive page. See [Dashboard](dashboard.md#rendering-and-retained-data) |
 | `PI_FUSION_WIDGET` | Unset; `0` hides the run widget, not the footer status |
 | `PI_FUSION_BUDGET_WARN_USD` | Unset; amount or comma-separated amounts, e.g. `5,20`, warning once at each threshold |
 | `PI_FUSION_BUDGET_LIMIT_USD` | Unset; amount at/above which no new run, continuation, or review starts; cancels nothing |
 | `PI_FUSION_PLAN_CONTEXT_PCT` | `35`; plan cap-handoff and continuation-warning percentage; `0` disables those context-based actions |
 | `PI_FUSION_AUTO_REVIEW` | Unset; `1` reviews completed coding runs with changed files, using configured `ask` settings |
-| `PI_FUSION_HISTORY` | Unset; `1` saves prompts/reports/usage for durable host sessions; see [History](runs.md#runs-across-pi-processes) |
+| `PI_FUSION_HISTORY` | Unset; `1` saves prompts/reports/usage to private version-1 JSON files for durable host sessions, and lets the dashboard list [archived runs](dashboard.md#archived-runs); see [History](runs.md#runs-across-pi-processes) |
 | `PI_FUSION_HISTORY_DIR` | Unset; default `<agent dir>/pi-fusion/history` |
 
 Role model/effort variables are read once when the extension instance starts. Changing the shell afterwards requires a new instance. A profile is a complete snapshot and never falls back to a variable for an omitted configured field. An explicit call naming another backend uses that backend's captured legacy defaults, not the model of the configured backend.

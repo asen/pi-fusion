@@ -3,9 +3,10 @@ import * as fs from "node:fs";
 import { createServer } from "node:http";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
-import { type BackendName, type ChildEvent, isBackendName, keptRef, type SessionRef } from "./backends/types.ts";
+import { type BackendName, type ChildEvent, isBackendName, keptRef, keptSelection, type ResolvedSelection, type SessionRef } from "./backends/types.ts";
 import type { UsageTotals } from "./budget.ts";
 import type { ChangedFile } from "./changes.ts";
+import type { ArchiveAbsence, ArchiveDetail, ArchiveSummary } from "./dashboard-archive.ts";
 import type { RunOrigin } from "./fusion.ts";
 
 /** The default retention target; running and waiting runs may exceed it. */
@@ -244,14 +245,60 @@ export interface RestoredRun {
 	startedAt: number;
 	endedAt?: number;
 	prompt?: string;
+	/** Set when the history cut the text on its way to disk, which a text now short enough to fit here no longer shows. */
+	promptTruncated?: boolean;
 	contract?: string;
 	session?: RunSession;
 	sessionId?: string;
 	/** The session the run's backend verified, as the history kept it: a reference, never the launch request. */
 	ref?: SessionRef;
+	/** What the child confirmed it ran with, as the history kept it. */
+	selection?: ResolvedSelection;
 	report?: string;
+	reportTruncated?: boolean;
 	failure?: string;
+	failureTruncated?: boolean;
 	files?: ReadonlyArray<ChangedFile>;
+	filesTotal?: number;
+	usage?: { costUsd?: number; tokensIn?: number; tokensOut?: number; workflowTokens?: number; toolCalls?: number };
+}
+
+/**
+ * What the history saved about a finished run, capped the way this store caps a run, and nothing it did not save: a
+ * counter the record never carried is absent here rather than zero, so each reader decides how to show the gap. The
+ * launch request stays in `session` and the verified reference in `ref`; neither is ever filled in from the other.
+ */
+export interface RestoredView {
+	id: string;
+	handle?: string;
+	backend: BackendName;
+	background?: true;
+	role: string;
+	model: string;
+	effort?: string;
+	title?: string;
+	tool?: string;
+	toolCallId?: string;
+	hostSessionId?: string;
+	origin?: RunOrigin;
+	reviews?: string;
+	reviewedBy?: string;
+	status: RunStatus;
+	startedAt: number;
+	endedAt?: number;
+	prompt?: string;
+	promptTruncated: boolean;
+	contract?: string;
+	session?: RunSession;
+	sessionId?: string;
+	ref?: SessionRef;
+	selection?: ResolvedSelection;
+	report?: string;
+	reportTruncated: boolean;
+	reportFlags?: string[];
+	failure?: string;
+	failureTruncated: boolean;
+	files?: ChangedFile[];
 	filesTotal?: number;
 	usage?: { costUsd?: number; tokensIn?: number; tokensOut?: number; workflowTokens?: number; toolCalls?: number };
 }
@@ -494,6 +541,84 @@ function sessionOf(session: RunSession): RunSession {
 }
 
 /**
+ * A history record as a finished run, or undefined when it is none: a record still running or waiting was finished
+ * by nobody. A truncation flag is the history's or this cap's, whichever cut the text. `now` stands in for a start
+ * time only a record of no shape this module writes leaves out.
+ */
+export function restoredView(input: RestoredRun, now: number): RestoredView | undefined {
+	const status = cap(String(input.state));
+	if (!ENDED_STATUSES.has(status)) return undefined;
+	// Nothing older than backend tags ever ran anywhere but Claude, so a record without one is a Claude run.
+	const backend: BackendName = isBackendName(input.backend) ? input.backend : "claude";
+	const startedAt = num(input.startedAt) ?? now;
+	const view: RestoredView = {
+		id: cap(String(input.id)),
+		backend,
+		role: cap(String(input.role)),
+		model: cap(String(input.model)),
+		status: status as RunStatus,
+		startedAt,
+		promptTruncated: false,
+		reportTruncated: false,
+		failureTruncated: false,
+	};
+	const endedAt = num(input.endedAt);
+	if (endedAt !== undefined) view.endedAt = endedAt;
+	if (input.handle !== undefined) view.handle = cap(String(input.handle));
+	if (input.background === true) view.background = true;
+	if (input.effort) view.effort = cap(String(input.effort));
+	if (input.title !== undefined) view.title = cap(String(input.title));
+	if (input.tool !== undefined) view.tool = cap(String(input.tool));
+	if (input.toolCallId !== undefined) view.toolCallId = cap(String(input.toolCallId));
+	if (input.hostSessionId !== undefined) view.hostSessionId = cap(String(input.hostSessionId));
+	if (input.origin !== undefined && ORIGINS.has(input.origin)) view.origin = input.origin as RunOrigin;
+	if (input.reviews !== undefined) view.reviews = cap(String(input.reviews));
+	if (input.reviewedBy !== undefined) view.reviewedBy = cap(String(input.reviewedBy));
+	if (input.prompt !== undefined) {
+		const prompt = capBytes(String(input.prompt), PROMPT_CAP_BYTES);
+		view.prompt = prompt.text;
+		view.promptTruncated = prompt.truncated || input.promptTruncated === true;
+	}
+	if (input.contract !== undefined) view.contract = cap(String(input.contract));
+	if (input.session !== undefined) view.session = sessionOf(input.session);
+	if (input.sessionId !== undefined) view.sessionId = cap(String(input.sessionId));
+	// A restored reference is read with the same grammar a live one is, and under this run's own backend: a record
+	// that names another backend's session, an incomplete one or one too long to keep whole leaves the run none.
+	const ref = keptRef(input.ref, backend);
+	if (ref) view.ref = { ...ref };
+	const selection = keptSelection(input.selection, backend);
+	if (selection) view.selection = { ...selection };
+	if (input.report !== undefined) {
+		const report = capBytes(String(input.report), TEXT_CAP_BYTES);
+		view.report = report.text;
+		view.reportTruncated = report.truncated || input.reportTruncated === true;
+		const flags = reportFlagsOf(report.text);
+		if (flags.length) view.reportFlags = flags;
+	}
+	if (input.failure !== undefined) {
+		const failure = capBytes(String(input.failure), FAILURE_CAP_BYTES);
+		view.failure = failure.text;
+		view.failureTruncated = failure.truncated || input.failureTruncated === true;
+	}
+	if (input.files !== undefined) {
+		view.files = input.files.slice(0, MAX_FILES).map(fileOf);
+		view.filesTotal = num(input.filesTotal) ?? input.files.length;
+	} else {
+		const filesTotal = num(input.filesTotal);
+		if (filesTotal !== undefined) view.filesTotal = filesTotal;
+	}
+	if (input.usage !== undefined) {
+		const usage: NonNullable<RestoredView["usage"]> = {};
+		for (const field of ["costUsd", "tokensIn", "tokensOut", "workflowTokens", "toolCalls"] as const) {
+			const value = num(input.usage[field]);
+			if (value !== undefined) usage[field] = value;
+		}
+		view.usage = usage;
+	}
+	return view;
+}
+
+/**
  * Every delegated run of this Pi session, in memory and bounded: the browser reads it, nothing writes back. It holds
  * the prompt each child was given and what the child reported through `ChildRun` and `ChildEvent`. The failure message
  * can carry the last lines of the child's stderr, as Pi's tool result does.
@@ -577,86 +702,61 @@ export class RunStore {
 	 * session already holds, because what this session knows about a run is newer than what the file does.
 	 */
 	restore(input: RestoredRun): boolean {
-		const status = cap(String(input.state));
-		if (!ENDED_STATUSES.has(status)) return false;
-		const id = cap(String(input.id));
-		if (this.runs.has(id)) return false;
-		const startedAt = num(input.startedAt) ?? this.clock();
-		const endedAt = num(input.endedAt);
-		const usage = input.usage ?? {};
-		const text = capBytes(String(input.report ?? ""), TEXT_CAP_BYTES);
+		const view = restoredView(input, this.clock());
+		if (!view || this.runs.has(view.id)) return false;
+		const usage = view.usage ?? {};
+		// The store's shape has no room for an absent counter, so a restored run reads zero where the history kept none.
 		const run: StoredRun = {
-			id,
-			// Nothing older than backend tags ever ran anywhere but Claude, so a record without one is a Claude run.
-			backend: isBackendName(input.backend) ? input.backend : "claude",
-			role: cap(String(input.role)),
-			model: cap(String(input.model)),
-			status: status as RunStatus,
+			id: view.id,
+			backend: view.backend,
+			role: view.role,
+			model: view.model,
+			status: view.status,
 			restored: true,
-			startedAt,
-			updatedAt: endedAt ?? startedAt,
-			toolCalls: num(usage.toolCalls) ?? 0,
+			startedAt: view.startedAt,
+			updatedAt: view.endedAt ?? view.startedAt,
+			toolCalls: usage.toolCalls ?? 0,
 			agentToolCalls: 0,
 			toolErrors: 0,
-			tokensIn: num(usage.tokensIn) ?? 0,
-			tokensOut: num(usage.tokensOut) ?? 0,
+			tokensIn: usage.tokensIn ?? 0,
+			tokensOut: usage.tokensOut ?? 0,
 			cacheRead: 0,
 			cacheWrite: 0,
 			models: [],
 			thinking: [],
 			calls: new Map(),
 			agentPrompts: new Map(),
-			prompt: "",
-			promptTruncated: false,
+			prompt: view.prompt ?? "",
+			promptTruncated: view.promptTruncated,
 			tasks: new Map(),
 			log: [],
 			logSeq: 0,
-			text: text.text,
-			textTruncated: text.truncated,
-			failureTruncated: false,
+			text: view.report ?? "",
+			textTruncated: view.reportTruncated,
+			failureTruncated: view.failureTruncated,
 		};
-		if (endedAt !== undefined) run.endedAt = endedAt;
-		if (input.handle !== undefined) run.handle = cap(String(input.handle));
-		if (input.background === true) run.background = true;
-		if (input.effort) run.effort = cap(String(input.effort));
-		if (input.title !== undefined) run.title = cap(String(input.title));
-		if (input.tool !== undefined) run.tool = cap(String(input.tool));
-		if (input.toolCallId !== undefined) run.toolCallId = cap(String(input.toolCallId));
-		if (input.hostSessionId !== undefined) run.hostSessionId = cap(String(input.hostSessionId));
-		if (input.origin !== undefined && ORIGINS.has(input.origin)) run.origin = input.origin as RunOrigin;
-		if (input.reviews !== undefined) run.reviews = cap(String(input.reviews));
-		if (input.reviewedBy !== undefined) run.reviewedBy = cap(String(input.reviewedBy));
-		if (input.prompt !== undefined) {
-			const prompt = capBytes(String(input.prompt), PROMPT_CAP_BYTES);
-			run.prompt = prompt.text;
-			run.promptTruncated = prompt.truncated;
-		}
-		if (input.contract !== undefined) run.contract = cap(String(input.contract));
-		if (input.session !== undefined) run.session = sessionOf(input.session);
-		if (input.sessionId !== undefined) run.sessionId = cap(String(input.sessionId));
-		// A restored reference is read with the same grammar a live one is, and under this run's own backend: a record
-		// that names another backend's session, an incomplete one or one too long to keep whole leaves the run none.
-		const restoredRef = keptRef(input.ref, run.backend);
-		if (restoredRef) run.ref = { ...restoredRef };
-		if (input.failure !== undefined) {
-			const failure = capBytes(String(input.failure), FAILURE_CAP_BYTES);
-			run.failure = failure.text;
-			run.failureTruncated = failure.truncated;
-		}
-		if (input.files !== undefined) {
-			run.files = input.files.slice(0, MAX_FILES).map(fileOf);
-			run.filesTotal = num(input.filesTotal) ?? input.files.length;
-		} else {
-			const filesTotal = num(input.filesTotal);
-			if (filesTotal !== undefined) run.filesTotal = filesTotal;
-		}
-		const costUsd = num(usage.costUsd);
-		if (costUsd !== undefined) run.costUsd = costUsd;
-		const workflowTokens = num(usage.workflowTokens);
-		if (workflowTokens !== undefined) run.workflowTokens = workflowTokens;
-		const flags = reportFlagsOf(run.text);
-		if (flags.length) run.reportFlags = flags;
-		this.runs.set(id, run);
+		if (view.endedAt !== undefined) run.endedAt = view.endedAt;
+		if (view.handle !== undefined) run.handle = view.handle;
+		if (view.background) run.background = true;
+		if (view.effort !== undefined) run.effort = view.effort;
+		if (view.title !== undefined) run.title = view.title;
+		if (view.tool !== undefined) run.tool = view.tool;
+		if (view.toolCallId !== undefined) run.toolCallId = view.toolCallId;
+		if (view.hostSessionId !== undefined) run.hostSessionId = view.hostSessionId;
+		if (view.origin !== undefined) run.origin = view.origin;
+		if (view.reviews !== undefined) run.reviews = view.reviews;
+		if (view.reviewedBy !== undefined) run.reviewedBy = view.reviewedBy;
+		if (view.contract !== undefined) run.contract = view.contract;
+		if (view.session !== undefined) run.session = view.session;
+		if (view.sessionId !== undefined) run.sessionId = view.sessionId;
+		if (view.ref !== undefined) run.ref = view.ref;
+		if (view.failure !== undefined) run.failure = view.failure;
+		if (view.files !== undefined) run.files = view.files;
+		if (view.filesTotal !== undefined) run.filesTotal = view.filesTotal;
+		if (view.reportFlags !== undefined) run.reportFlags = view.reportFlags;
+		if (usage.costUsd !== undefined) run.costUsd = usage.costUsd;
+		if (usage.workflowTokens !== undefined) run.workflowTokens = usage.workflowTokens;
+		this.runs.set(view.id, run);
 		this.evict();
 		return true;
 	}
@@ -972,6 +1072,7 @@ const TOKEN_BYTES = 24;
 const RUN_ID = /^[A-Za-z0-9_-]{1,64}$/;
 const TOOL_USE_ID = /^[A-Za-z0-9_-]{1,128}$/;
 const DETAIL_PREFIX = "api/runs/";
+const ARCHIVE_PATH = "api/archive";
 const ASSET_DIR = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "dashboard");
 
 interface Reply {
@@ -991,6 +1092,141 @@ export interface Dashboard {
 	port: number;
 	close(): Promise<void>;
 }
+
+/** How many archived runs one page carries, whatever the live store keeps. */
+export const ARCHIVE_PAGE_SIZE = 30;
+/** A cursor as this server writes one: base64url, and short enough for any URL it serves. */
+const CURSOR = /^[A-Za-z0-9_-]{1,1024}$/;
+
+/** A position in the archive's order, which is newest start first and then id, both descending. */
+export interface ArchiveKey {
+	startedAt: number;
+	id: string;
+}
+
+/** One page of the archive: its runs, how many the archive holds, and where the next older page starts, if one does. */
+export interface ArchivePage {
+	entries: ArchiveSummary[];
+	total: number;
+	next?: ArchiveKey;
+}
+
+/**
+ * The archived runs the host's current branch may show, current as of the moment the dashboard asked: `ArchiveIndex`
+ * after a refresh is one. It reads history on disk and never the store, and grants no control over any run.
+ */
+export interface ArchiveProvider {
+	readonly revision: number;
+	summaries(): ArchiveSummary[];
+	/** The runs strictly older than `before`, or the newest when it is left out, `size` at most. */
+	page(before: ArchiveKey | undefined, size: number): ArchivePage;
+	detail(id: string): ArchiveDetail | undefined;
+}
+
+/** The cursor that names a position, which is the only spelling of it `archiveKey` reads back. */
+export function archiveCursor(key: ArchiveKey): string {
+	return Buffer.from(JSON.stringify([key.startedAt, key.id]), "utf8").toString("base64url");
+}
+
+/** The position a cursor names, or undefined for anything this server did not write: it never names a file. */
+export function archiveKey(cursor: string): ArchiveKey | undefined {
+	if (!CURSOR.test(cursor)) return undefined;
+	let data: unknown;
+	try {
+		data = JSON.parse(Buffer.from(cursor, "base64url").toString("utf8"));
+	} catch {
+		return undefined;
+	}
+	if (!Array.isArray(data) || data.length !== 2) return undefined;
+	const [startedAt, id] = data as [unknown, unknown];
+	if (typeof startedAt !== "number" || !Number.isFinite(startedAt) || typeof id !== "string" || !id || id.length > MAX_STRING_CHARS) return undefined;
+	const key = { startedAt, id };
+	return archiveCursor(key) === cursor ? key : undefined;
+}
+
+/**
+ * An archived run as the page's run list reads it: the fields the history saved, under the names a live run uses,
+ * and nothing else there, so a counter it never saved is absent rather than zero. `history` is the archive's own
+ * projection, and `unavailable` and `interrupted` repeat what it says is missing and how the run ended.
+ */
+export type ArchivedRun = Partial<Omit<RunSummary, "restored">> &
+	Pick<RunSummary, "id" | "backend" | "role" | "model" | "status" | "startedAt"> & {
+		restored: true;
+		provenance: "history";
+		unavailable: ArchiveAbsence[];
+		interrupted?: true;
+		history: ArchiveSummary;
+	};
+
+/** An archived run in full as the page's detail reads it: its saved report is the text a live run's detail carries. */
+export type ArchivedRunDetail = Omit<ArchivedRun, "history"> &
+	Partial<Pick<RunDetail, "prompt" | "promptTruncated" | "contract" | "session" | "ref" | "files" | "filesTruncated" | "text" | "textTruncated" | "failure" | "failureTruncated">> & {
+		history: ArchiveDetail;
+	};
+
+/** The fields a live summary and an archived one share, copied from what the history saved and from nothing else. */
+function archivedFields(summary: ArchiveSummary): Omit<ArchivedRun, "history"> {
+	const run: Omit<ArchivedRun, "history"> = {
+		id: summary.id,
+		backend: summary.backend,
+		role: summary.role,
+		model: summary.model,
+		status: summary.status,
+		startedAt: summary.startedAt,
+		hostSessionId: summary.hostSessionId,
+		restored: true,
+		provenance: "history",
+		unavailable: [...summary.unavailable],
+	};
+	if (summary.handle !== undefined) run.handle = summary.handle;
+	if (summary.background) run.background = true;
+	// What the child confirmed it ran with is what a live run's list shows once a child confirms it.
+	const effort = summary.selection?.effort ?? summary.effort;
+	if (effort !== undefined) run.effort = effort;
+	if (summary.selection !== undefined) run.modelId = summary.selection.model;
+	if (summary.title !== undefined) run.title = summary.title;
+	if (summary.tool !== undefined) run.tool = summary.tool;
+	if (summary.toolCallId !== undefined) run.toolCallId = summary.toolCallId;
+	if (summary.origin !== undefined && ORIGINS.has(summary.origin)) run.origin = summary.origin as RunOrigin;
+	if (summary.reviews !== undefined) run.reviews = summary.reviews;
+	if (summary.reviewedBy !== undefined) run.reviewedBy = summary.reviewedBy;
+	if (summary.endedAt !== undefined) run.endedAt = summary.endedAt;
+	if (summary.interrupted) run.interrupted = true;
+	const usage = summary.usage;
+	if (usage?.costUsd !== undefined) run.costUsd = usage.costUsd;
+	if (usage?.tokensIn !== undefined) run.tokensIn = usage.tokensIn;
+	if (usage?.tokensOut !== undefined) run.tokensOut = usage.tokensOut;
+	if (usage?.workflowTokens !== undefined) run.workflowTokens = usage.workflowTokens;
+	if (usage?.toolCalls !== undefined) run.toolCalls = usage.toolCalls;
+	if (summary.filesChanged !== undefined) run.filesChanged = summary.filesChanged;
+	if (summary.reportFlags !== undefined) run.reportFlags = [...summary.reportFlags];
+	return run;
+}
+
+export function archivedRun(summary: ArchiveSummary): ArchivedRun {
+	return { ...archivedFields(summary), history: structuredClone(summary) };
+}
+
+export function archivedRunDetail(detail: ArchiveDetail): ArchivedRunDetail {
+	const run: ArchivedRunDetail = { ...archivedFields(detail), prompt: detail.prompt, promptTruncated: detail.promptTruncated, filesTruncated: detail.filesTruncated, history: structuredClone(detail) };
+	if (detail.contract !== undefined) run.contract = detail.contract;
+	if (detail.session !== undefined) run.session = { ...detail.session };
+	if (detail.sessionId !== undefined) run.sessionId = detail.sessionId;
+	if (detail.ref !== undefined) run.ref = { ...detail.ref };
+	if (detail.files !== undefined) run.files = detail.files.map((file) => ({ ...file }));
+	if (detail.report !== undefined) {
+		run.text = detail.report;
+		run.textTruncated = detail.reportTruncated;
+	}
+	if (detail.failure !== undefined) {
+		run.failure = detail.failure;
+		run.failureTruncated = detail.failureTruncated;
+	}
+	return run;
+}
+
+/** What the page is told about the archive beside a list of runs: whether there is one, and where it goes on. */
+export type ArchiveMeta = { available: false; pageSize: number } | { available: true; pageSize: number; revision: number; total: number; next?: string };
 
 /** What the page shows about this Pi session's spend: the totals so far and the thresholds the user configured. */
 export type UsageView = UsageTotals & { warnUsd: number[]; limitUsd?: number; unpricedRuns?: number };
@@ -1029,7 +1265,13 @@ function sameToken(candidate: string, token: string): boolean {
  * Serves `store` read-only over HTTP on 127.0.0.1. The random token in the URL is the only credential, so the URL is
  * the secret: it is never put in a response body or logged. The assets are read once here and never at request time.
  */
-export function startDashboard(store: RunStore, opts: { cwd: string; port?: number; usage?: () => UsageView }): Promise<Dashboard> {
+/**
+ * `archive` is asked again on every request that reads older runs, so each answer follows the host's branch as it is
+ * then, and answers undefined where no history is kept. The run list is every run the store holds, live ones always,
+ * and the newest archived page beside them; `api/archive?before=<cursor>` walks older pages. A run both hold is the
+ * store's: an id the store has is never shown from the archive, and a detail is read from the store first.
+ */
+export function startDashboard(store: RunStore, opts: { cwd: string; port?: number; usage?: () => UsageView; archive?: () => ArchiveProvider | undefined }): Promise<Dashboard> {
 	return new Promise<Dashboard>((resolve, reject) => {
 		let assets: Assets;
 		try {
@@ -1043,6 +1285,31 @@ export function startDashboard(store: RunStore, opts: { cwd: string; port?: numb
 		const usage = opts.usage;
 		let port = 0;
 
+		/** The archive as it is now, or none: a provider that fails costs the page its older runs, never its live ones. */
+		const provider = (): ArchiveProvider | undefined => {
+			try {
+				return opts.archive?.();
+			} catch {
+				return undefined;
+			}
+		};
+
+		/** One archived page after `before`, without the runs the store holds, and what the page is told about the rest. */
+		const archived = (before: ArchiveKey | undefined, live: ReadonlySet<string>): { runs: ArchivedRun[]; archive: ArchiveMeta } => {
+			const archive = provider();
+			let page: ArchivePage | undefined;
+			try {
+				page = archive?.page(before, ARCHIVE_PAGE_SIZE);
+			} catch {}
+			if (!archive || !page) return { runs: [], archive: { available: false, pageSize: ARCHIVE_PAGE_SIZE } };
+			// The cursor follows the archive's own order, so a run hidden here because it is live moves no page boundary.
+			const runs = page.entries.filter((entry) => !live.has(entry.id)).map(archivedRun);
+			return {
+				runs,
+				archive: { available: true, pageSize: ARCHIVE_PAGE_SIZE, revision: archive.revision, total: page.total, ...(page.next ? { next: archiveCursor(page.next) } : {}) },
+			};
+		};
+
 		const route = (method: string, url: string, host: string | undefined, origin: string | undefined): Reply => {
 			if (method !== "GET" && method !== "HEAD") return plain(405, "Method not allowed", { Allow: "GET, HEAD" });
 			if (url.length > MAX_URL_CHARS) return plain(414, "URI too long");
@@ -1055,14 +1322,31 @@ export function startDashboard(store: RunStore, opts: { cwd: string; port?: numb
 			if (rest === "" || rest === "index.html") return reply(200, HTML_TYPE, assets.html);
 			if (rest === "app.js") return reply(200, JS_TYPE, assets.js);
 			if (rest === "app.css") return reply(200, CSS_TYPE, assets.css);
-			if (rest === "api/runs") return jsonReply({ cwd, runs: store.summaries(), ...(usage ? { usage: usage() } : {}) });
+			if (rest === "api/runs") {
+				const live = store.summaries();
+				const { runs, archive } = archived(undefined, new Set(live.map((run) => run.id)));
+				const all: Array<(RunSummary & { provenance: "live" }) | ArchivedRun> = [...live.map((run) => ({ ...run, provenance: "live" as const })), ...runs];
+				// Stable, so a live run comes before an archived one that started at the same moment.
+				all.sort((left, right) => right.startedAt - left.startedAt);
+				return jsonReply({ cwd, runs: all, ...(usage ? { usage: usage() } : {}), archive });
+			}
+			if (rest === ARCHIVE_PATH) {
+				const query = url.includes("?") ? url.slice(url.indexOf("?") + 1) : "";
+				const cursors = new URLSearchParams(query).getAll("before");
+				if (cursors.length > 1) return plain(400, "Bad request");
+				const before = cursors.length ? archiveKey(cursors[0]!) : undefined;
+				if (cursors.length && !before) return plain(400, "Bad request");
+				return jsonReply(archived(before, new Set(store.summaries().map((run) => run.id))));
+			}
 			if (rest.startsWith(DETAIL_PREFIX)) {
 				const parts = rest.slice(DETAIL_PREFIX.length).split("/");
 				const id = parts[0] ?? "";
 				if (!RUN_ID.test(id)) return notFound();
 				if (parts.length === 1) {
 					const detail = store.detail(id);
-					return detail ? jsonReply(detail) : notFound();
+					if (detail) return jsonReply({ ...detail, provenance: "live" });
+					const held = provider()?.detail(id);
+					return held ? jsonReply(archivedRunDetail(held)) : notFound();
 				}
 				if (parts.length === 3 && parts[1] === "calls" && TOOL_USE_ID.test(parts[2] ?? "")) {
 					const call = store.callDetail(id, parts[2]!);

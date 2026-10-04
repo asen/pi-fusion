@@ -20,6 +20,10 @@ const PINNED_SLACK_PX = 40;
 const PAGE_TITLE = "pi-fusion dashboard";
 const NARROW_QUERY = "(max-width: 767px)";
 const TABS = ["overview", "log", "tasks", "report"];
+/** What an archived run shows where history kept nothing: never a zero, an empty list or a running clock. */
+const NOT_SAVED = "Not saved in history";
+/** How many pages past the loaded range a refresh may read to find the range's old end again or the pinned run. */
+const RECONCILE_EXTRA = 5;
 
 const cwdNode = document.getElementById("cwd");
 const usageNode = document.getElementById("usage");
@@ -33,11 +37,22 @@ const runsToggle = document.getElementById("runs-toggle");
 const state = {
 	cwd: "",
 	usage: null,
+	/** What the last poll listed: every live run and the newest archived page. */
+	liveRuns: [],
+	/** Those and every older archived page loaded, one row per invocation id, a live row before an archived one. */
 	runs: [],
+	/**
+	 * The archive as the page knows it. `available` is null before any poll said, `revision` the newest the server has
+	 * named, and `pages` the older pages loaded through `next` cursors, each with the revision it was read at.
+	 * `generation` moves when the archive is a different one, so nothing read from the old one lands in the new one.
+	 */
+	archive: { available: null, revision: -1, total: 0, firstNext: "", pages: [], loading: false, failed: false, reconciling: false, refreshFailed: false, generation: 0, loadSeq: 0 },
 	runsKey: "",
 	attentionKey: "",
 	runsSeq: 0,
 	pinnedId: "",
+	/** Set once the pinned run's detail answered 404 while it was not listed: it is gone, not merely out of range. */
+	pinnedGone: false,
 	selectedId: "",
 	detail: null,
 	detailKey: "",
@@ -110,9 +125,18 @@ const statusPill = (status) => el("span", "status status-" + slug(status), str(s
 
 const quietFor = (run, now) => now - (isNum(run.lastEventAt) ? run.lastEventAt : num(run.startedAt));
 
-const stalled = (run, now) => run.status === "running" && quietFor(run, now) >= STALL_MS;
+const stalled = (run, now) => !isArchived(run) && run.status === "running" && quietFor(run, now) >= STALL_MS;
 
 const active = (run) => run.status === "running" || run.status === "waiting";
+
+/** A run read back from the on-disk history: it has what was saved and nothing a watching process measured. */
+const isArchived = (run) => Boolean(run) && run.provenance === "history";
+
+/** A count an archived run may never have saved, which reads as not saved rather than as a measured zero. */
+const savedCount = (run, field) => (isArchived(run) && !isNum(run[field]) ? NOT_SAVED : formatCount(run[field]));
+
+/** How long an archived run took, from the times it saved; one with no end saved has no duration to show. */
+const savedDuration = (run) => (isNum(run.endedAt) ? formatSeconds(run.endedAt - num(run.startedAt)) : "not recorded");
 
 const addWatch = (watches, check) => {
 	check(Date.now());
@@ -134,7 +158,10 @@ const tick = () => {
 
 const shortId = (id) => str(id).slice(0, 8);
 
-/** Runs grouped by the Pi session that made them, newest group first; each run's step counts from the group's first run. */
+/**
+ * Runs grouped by the Pi session that made them, newest group first; each run's step counts from the group's first
+ * loaded run. With an archive, older runs of a session may not be loaded, so the count is of loaded runs only.
+ */
 const chains = (runs) => {
 	const groups = new Map();
 	for (const run of runs) {
@@ -164,7 +191,11 @@ const runItem = (run, step) => {
 	if (str(run.handle)) name.appendChild(el("span", "run-handle", str(run.handle)));
 	head.appendChild(name);
 	head.appendChild(statusPill(run.status));
-	if (run.restored === true) head.appendChild(el("span", "restored", "restored"));
+	if (isArchived(run)) {
+		const label = el("span", "restored archived", "archived");
+		label.title = "from the run history: only its saved input, output and basic facts";
+		head.appendChild(label);
+	} else if (run.restored === true) head.appendChild(el("span", "restored", "restored"));
 	item.appendChild(head);
 	const flags = list(run.reportFlags).map(str).filter(Boolean);
 	if (flags.length > 0) {
@@ -174,18 +205,23 @@ const runItem = (run, step) => {
 	}
 	const model = backendOf(run) + " · " + (str(run.modelId) || str(run.model));
 	item.appendChild(el("span", "run-model", run.background === true ? model + " · background" : model));
-	if (str(run.question)) item.appendChild(el("span", "run-question", str(run.question)));
+	if (str(run.question) && !isArchived(run)) item.appendChild(el("span", "run-question", str(run.question)));
 	const meta = el("span", "run-meta");
 	const clock = el("span", "run-clock");
 	clock.title = "elapsed";
-	addClock(state.runClocks, clock, (now) => formatSeconds(elapsed(run, now)));
+	if (isArchived(run)) clock.textContent = savedDuration(run);
+	else addClock(state.runClocks, clock, (now) => formatSeconds(elapsed(run, now)));
 	meta.appendChild(clock);
-	const tools = el("span", "run-count", formatCount(run.toolCalls) + " tools");
-	tools.title = "root tool calls";
-	meta.appendChild(tools);
-	const agents = el("span", "run-count", formatCount(run.agentToolCalls) + " agent");
-	agents.title = "forwarded agent tool calls";
-	meta.appendChild(agents);
+	if (!isArchived(run) || isNum(run.toolCalls)) {
+		const tools = el("span", "run-count", formatCount(run.toolCalls) + " tools");
+		tools.title = "root tool calls";
+		meta.appendChild(tools);
+	}
+	if (!isArchived(run)) {
+		const agents = el("span", "run-count", formatCount(run.agentToolCalls) + " agent");
+		agents.title = "forwarded agent tool calls";
+		meta.appendChild(agents);
+	}
 	if (isNum(run.filesChanged)) {
 		const files = el("span", "run-count", formatCount(run.filesChanged) + (run.filesChanged === 1 ? " file" : " files"));
 		files.title = "files changed";
@@ -197,6 +233,10 @@ const runItem = (run, step) => {
 		meta.appendChild(cost);
 	}
 	item.appendChild(meta);
+	if (isArchived(run)) {
+		item.addEventListener("click", () => selectRun(str(run.id)));
+		return item;
+	}
 	const quiet = el("span", "run-stall hidden");
 	item.appendChild(quiet);
 	addWatch(state.runWatches, (now) => {
@@ -210,7 +250,7 @@ const runItem = (run, step) => {
 };
 
 const renderAttention = () => {
-	const waiting = state.runs.filter((run) => run.status === "waiting");
+	const waiting = state.runs.filter((run) => run.status === "waiting" && !isArchived(run));
 	const key = JSON.stringify(waiting.map((run) => [str(run.id), str(run.role), str(run.handle), str(run.question)]));
 	if (key === state.attentionKey) return;
 	state.attentionKey = key;
@@ -250,24 +290,251 @@ const renderRuns = () => {
 	state.runWatches = [];
 	const frame = document.createDocumentFragment();
 	const { groups, steps } = chains(state.runs);
+	const loaded = state.archive.available === true ? " loaded" : "";
 	for (const [host, runs] of groups) {
-		const header = el("div", "run-group", (host ? "Pi session " + shortId(host) : "Unknown Pi session") + " · " + runs.length + (runs.length === 1 ? " run" : " runs"));
+		const header = el("div", "run-group", (host ? "Pi session " + shortId(host) : "Unknown Pi session") + " · " + runs.length + loaded + (runs.length === 1 ? " run" : " runs"));
 		if (host) header.title = host;
 		frame.appendChild(header);
 		for (const run of runs) frame.appendChild(runItem(run, steps.get(run.id)));
 	}
-	runsNode.replaceChildren(frame);
+	listNode.replaceChildren(frame);
 	if (focusedId === undefined) return;
-	const again = Array.from(runsNode.querySelectorAll(".run")).find((node) => node.dataset.id === focusedId);
+	const again = Array.from(listNode.querySelectorAll(".run")).find((node) => node.dataset.id === focusedId);
 	if (again) again.focus({ preventScroll: true });
 };
+
+/** The cursor of the next older page: after the last loaded page, or after the first page the poll lists. */
+const archiveTail = () => {
+	const pages = state.archive.pages;
+	return pages.length > 0 ? pages[pages.length - 1].next : state.archive.firstNext;
+};
+
+/** The oldest revision any loaded older page was read at, or none with no older page loaded. */
+const pagesRevision = () => state.archive.pages.reduce((low, page) => Math.min(low, page.revision), Infinity);
+
+/** Whether the loaded older pages may hold what the archive no longer says: a newer revision has been named since. */
+const archiveDirty = () => state.archive.pages.length > 0 && pagesRevision() < state.archive.revision;
+
+/** The rows of an archive response that are runs at all. */
+const archiveRows = (payload) => list(payload && payload.runs).filter((run) => run && typeof run.id === "string");
+
+/** Forgets every older page and anything in flight for them, because the archive they came from is not this one. */
+const resetArchive = () => {
+	const archive = state.archive;
+	archive.pages = [];
+	archive.generation++;
+	archive.loading = false;
+	archive.failed = false;
+	archive.reconciling = false;
+	archive.refreshFailed = false;
+};
+
+/** The control at the end of the run list: what the archive has left, and the one way to read more of it. */
+const renderMore = () => {
+	const archive = state.archive;
+	moreNode.classList.toggle("hidden", archive.available === null);
+	const focused = document.activeElement === moreButton;
+	let text = "";
+	let button = "";
+	let busy = false;
+	if (archive.available === false) text = "Older runs are not available: this session keeps no run history.";
+	else if (archive.available === true) {
+		const shown = state.runs.filter(isArchived).length;
+		const tail = archiveTail();
+		if (archive.loading) {
+			text = "Loading older runs.";
+			button = "Loading older runs";
+			busy = true;
+		} else if (archive.reconciling) {
+			text = "Updating the loaded older runs.";
+			button = "Load older runs";
+			busy = true;
+		} else if (archive.failed) {
+			text = "Could not load older runs.";
+			button = "Retry loading older runs";
+		} else if (tail) {
+			text = shown + " of " + archive.total + " archived runs loaded." + (archive.refreshFailed ? " Could not refresh them; trying again." : "");
+			button = "Load older runs";
+		} else text = archive.total > 0 ? "No older runs in history." : "No runs in history yet.";
+	}
+	if (moreText.textContent !== text) moreText.textContent = text;
+	moreButton.classList.toggle("hidden", button === "");
+	if (button && moreButton.textContent !== button) moreButton.textContent = button;
+	moreButton.setAttribute("aria-disabled", String(busy));
+	moreNode.setAttribute("aria-busy", String(busy));
+	// A button that went away takes the focus with it, so it moves to the last run rather than to the page body.
+	if (focused && button === "") {
+		const rows = listNode.querySelectorAll(".run");
+		if (rows.length > 0) rows[rows.length - 1].focus({ preventScroll: true });
+	}
+};
+
+/** Every run the page has, one row per invocation id: the poll's own first, so a live row wins over an archived one. */
+const mergeRuns = () => {
+	const seen = new Set();
+	const merged = [];
+	const add = (run) => {
+		if (seen.has(run.id)) return;
+		seen.add(run.id);
+		merged.push(run);
+	};
+	for (const run of state.liveRuns) add(run);
+	for (const page of state.archive.pages) for (const run of page.runs) add(run);
+	// Stable, so a live run keeps its place before an archived one that started at the same moment.
+	merged.sort((left, right) => num(right.startedAt) - num(left.startedAt));
+	state.runs = merged;
+};
+
+/** Shows what the page now has, without moving the focus or a pinned selection that still resolves. */
+const showMerged = () => {
+	mergeRuns();
+	const key = JSON.stringify([state.runs, state.archive.available === true]);
+	const selected = chooseSelection();
+	if (key !== state.runsKey || selected !== state.selectedId) {
+		state.runsKey = key;
+		state.selectedId = selected;
+		renderRuns();
+	}
+	// After the list, so a control that goes away hands its focus to the run list as it now is.
+	renderMore();
+};
+
+/** What a poll says about the archive: a different archive starts over, and a moved one refreshes the loaded range. */
+const applyArchive = (meta) => {
+	const archive = state.archive;
+	if (!meta || typeof meta !== "object") {
+		if (archive.available !== null) resetArchive();
+		archive.available = null;
+		return;
+	}
+	if (meta.available !== true) {
+		if (archive.available !== false) resetArchive();
+		archive.available = false;
+		archive.firstNext = "";
+		archive.total = 0;
+		return;
+	}
+	const revision = num(meta.revision);
+	if (archive.available !== true || revision < archive.revision) {
+		resetArchive();
+		archive.revision = revision;
+	}
+	archive.available = true;
+	archive.revision = Math.max(archive.revision, revision);
+	archive.total = num(meta.total);
+	archive.firstNext = str(meta.next);
+	if (archiveDirty()) reconcileArchive().catch(() => {});
+};
+
+/**
+ * Reads the loaded range again from the first page's cursor, as many pages as were loaded and a few more while the
+ * range's old end or the pinned run is not found yet, and swaps it in whole. A refresh another archive overtook, or
+ * one read at a revision older than one the page has already seen, is dropped: it could bring back what is gone.
+ */
+const reconcileArchive = async () => {
+	const archive = state.archive;
+	if (archive.reconciling || archive.loading || !archive.available) return;
+	const generation = archive.generation;
+	const loadedPages = archive.pages;
+	const target = loadedPages.length;
+	const oldRows = loadedPages.flatMap((page) => page.runs);
+	const oldest = oldRows[oldRows.length - 1];
+	const pinned = state.pinnedId;
+	archive.reconciling = true;
+	renderMore();
+	const pages = [];
+	let cursor = archive.firstNext;
+	let ok = true;
+	const reached = () => {
+		const rows = pages.flatMap((page) => page.runs);
+		const last = rows[rows.length - 1];
+		const old = !oldest || (last && (num(last.startedAt) < num(oldest.startedAt) || (num(last.startedAt) === num(oldest.startedAt) && str(last.id) <= str(oldest.id))));
+		const found = !pinned || !isArchived(oldRows.find((run) => run.id === pinned)) || rows.some((run) => run.id === pinned);
+		return old && found;
+	};
+	try {
+		while (cursor && (pages.length < target || (pages.length < target + RECONCILE_EXTRA && !reached()))) {
+			const payload = await fetchJson("api/archive?before=" + encodeURIComponent(cursor));
+			if (generation !== archive.generation) return;
+			const meta = payload && payload.archive;
+			if (!meta || meta.available !== true) {
+				ok = false;
+				break;
+			}
+			const page = { runs: archiveRows(payload), next: str(meta.next), revision: num(meta.revision) };
+			archive.revision = Math.max(archive.revision, page.revision);
+			pages.push(page);
+			cursor = page.next;
+		}
+	} catch {
+		ok = false;
+	} finally {
+		if (generation === archive.generation) archive.reconciling = false;
+	}
+	if (generation !== archive.generation) return;
+	const fresh = pages.every((page) => page.revision >= archive.revision);
+	archive.refreshFailed = !ok;
+	if (ok && fresh) archive.pages = pages;
+	showMerged();
+	syncDetail().catch(() => {});
+};
+
+/** Reads the next older page once; a failure keeps everything shown and offers a retry, never a disconnect. */
+const loadOlder = async () => {
+	const archive = state.archive;
+	if (archive.available !== true || archive.loading || archive.reconciling) return;
+	const cursor = archiveTail();
+	if (!cursor) return;
+	const generation = archive.generation;
+	const seq = ++archive.loadSeq;
+	archive.loading = true;
+	archive.failed = false;
+	renderMore();
+	let page;
+	try {
+		// A page read at a revision older than one a poll already named may hold what is gone, so it is read again.
+		for (let attempt = 0; attempt < 3 && !page; attempt++) {
+			const payload = await fetchJson("api/archive?before=" + encodeURIComponent(cursor));
+			if (generation !== archive.generation || seq !== archive.loadSeq) return;
+			const meta = payload && payload.archive;
+			if (!meta || meta.available !== true) break;
+			const revision = num(meta.revision);
+			if (revision >= archive.revision) page = { runs: archiveRows(payload), next: str(meta.next), revision };
+		}
+	} catch {}
+	if (generation !== archive.generation || seq !== archive.loadSeq) return;
+	archive.loading = false;
+	if (!page || archiveTail() !== cursor) archive.failed = !page;
+	else {
+		archive.revision = Math.max(archive.revision, page.revision);
+		archive.pages.push(page);
+	}
+	showMerged();
+	if (archiveDirty()) reconcileArchive().catch(() => {});
+};
+
+/** The run list is rebuilt on every change; the control after it is built once, so a focused button keeps its focus. */
+const listNode = el("div", "run-list");
+const moreNode = el("div", "archive-more hidden");
+const moreText = el("p", "archive-status");
+moreText.setAttribute("role", "status");
+const moreButton = el("button", "archive-load hidden", "Load older runs");
+moreButton.type = "button";
+moreButton.addEventListener("click", () => {
+	if (moreButton.getAttribute("aria-disabled") === "true") return;
+	loadOlder().catch(() => {});
+});
+moreNode.appendChild(moreText);
+moreNode.appendChild(moreButton);
+runsNode.appendChild(listNode);
+runsNode.appendChild(moreNode);
 
 runsNode.addEventListener("keydown", (event) => {
 	if (event.key !== "ArrowDown" && event.key !== "ArrowUp") return;
 	const target = event.target;
 	if (!target || !target.classList || !target.classList.contains("run")) return;
 	event.preventDefault();
-	const items = Array.from(runsNode.querySelectorAll(".run"));
+	const items = Array.from(listNode.querySelectorAll(".run"));
 	const next = items[items.indexOf(target) + (event.key === "ArrowDown" ? 1 : -1)];
 	if (next) next.focus();
 });
@@ -280,7 +547,48 @@ const addFact = (facts, label, value) => {
 	facts.appendChild(cell);
 };
 
+/**
+ * The facts of an archived run: what history saved, and an explicit "not saved" for each measurement a watching
+ * process would have shown, so nothing it never kept reads as a zero or as a clock still running.
+ */
+const archivedFacts = (detail) => {
+	const facts = el("dl", "facts");
+	const unavailable = new Set(list(detail.unavailable).map(str));
+	addFact(facts, "Status", statusPill(detail.status));
+	addFact(facts, "Source", "Archived: only the saved input, output and basic facts are available");
+	if (detail.interrupted === true) addFact(facts, "Ended", "interrupted: its Pi process ended while it was going");
+	addFact(facts, "Elapsed", savedDuration(detail));
+	addFact(facts, "Last event", NOT_SAVED);
+	addFact(facts, "Tool calls", savedCount(detail, "toolCalls"));
+	addFact(facts, "Agent tool calls", isNum(detail.agentToolCalls) ? formatCount(detail.agentToolCalls) : NOT_SAVED);
+	addFact(facts, "Tool errors", isNum(detail.toolErrors) ? formatCount(detail.toolErrors) : NOT_SAVED);
+	addFact(facts, "Tokens in", savedCount(detail, "tokensIn"));
+	addFact(facts, "Tokens out", savedCount(detail, "tokensOut"));
+	addFact(facts, "Cache read", NOT_SAVED);
+	addFact(facts, "Cache write", NOT_SAVED);
+	if (isNum(detail.workflowTokens)) addFact(facts, "Workflow agent tokens", formatCount(detail.workflowTokens));
+	addFact(facts, "Cost (estimate)", isNum(detail.costUsd) ? formatUsd(detail.costUsd) : NOT_SAVED);
+	addFact(facts, "Model usage", NOT_SAVED);
+	if (unavailable.has("numTurns")) addFact(facts, "Model turns", NOT_SAVED);
+	if (unavailable.has("apiMs")) addFact(facts, "API time", NOT_SAVED);
+	if (unavailable.has("context")) addFact(facts, "Context", NOT_SAVED);
+	addFact(facts, "Backend", backendOf(detail));
+	if (str(detail.modelId)) addFact(facts, "Model id", str(detail.modelId));
+	if (str(detail.effort)) addFact(facts, "Effort", str(detail.effort));
+	if (str(detail.tool)) addFact(facts, "Pi tool", str(detail.tool));
+	if (str(detail.toolCallId)) addFact(facts, "Pi tool call", str(detail.toolCallId));
+	if (str(detail.hostSessionId)) addFact(facts, "Pi session", str(detail.hostSessionId));
+	if (str(detail.origin) && detail.origin !== "tool") addFact(facts, "Origin", str(detail.origin));
+	if (str(detail.reviews)) addFact(facts, "Reviews", str(detail.reviews));
+	if (str(detail.reviewedBy)) addFact(facts, "Reviewed by", str(detail.reviewedBy));
+	if (str(detail.contract)) addFact(facts, "Contract", str(detail.contract));
+	if (detail.session && typeof detail.session === "object") addFact(facts, sessionLabel(detail), sessionText(detail.session));
+	if (unavailable.has("deniedTools")) addFact(facts, "Denied tools", NOT_SAVED);
+	return facts;
+};
+
 const factsList = (detail) => {
+	if (isArchived(detail)) return archivedFacts(detail);
 	const facts = el("dl", "facts");
 	addFact(facts, "Status", statusPill(detail.status));
 	const clock = el("span", "fact-clock");
@@ -764,7 +1072,13 @@ const appendModels = (parent, models) => {
 };
 
 const appendFiles = (parent, detail) => {
-	if (!Array.isArray(detail.files)) return;
+	if (!Array.isArray(detail.files)) {
+		if (!isArchived(detail) || !isNum(detail.filesChanged)) return;
+		const node = section("Files changed");
+		node.appendChild(el("p", "empty-note", formatCount(detail.filesChanged) + (detail.filesChanged === 1 ? " file" : " files") + " changed; the list was omitted and not saved in history."));
+		parent.appendChild(node);
+		return;
+	}
 	const files = detail.files;
 	const node = section("Files changed");
 	if (files.length === 0) {
@@ -964,7 +1278,7 @@ const appendReport = (parent, detail) => {
 		renderDetail();
 	});
 	node.firstChild.appendChild(raw);
-	if (detail.textTruncated === true) node.appendChild(el("p", "note", "truncated"));
+	if (detail.textTruncated === true) node.appendChild(el("p", "note", isArchived(detail) ? "truncated when it was saved to history" : "truncated"));
 	if (state.rawReport) node.appendChild(el("pre", "report", body));
 	else {
 		const report = el("div", "report md");
@@ -974,10 +1288,10 @@ const appendReport = (parent, detail) => {
 	parent.appendChild(node);
 };
 
-const appendBlock = (parent, title, body, truncated, className, copy) => {
+const appendBlock = (parent, title, body, truncated, className, copy, archived) => {
 	if (!body) return;
 	const node = section(title, copy ? body : "");
-	if (truncated === true) node.appendChild(el("p", "note", "truncated"));
+	if (truncated === true) node.appendChild(el("p", "note", archived ? "truncated when it was saved to history" : "truncated"));
 	node.appendChild(el("pre", className, body));
 	parent.appendChild(node);
 };
@@ -997,7 +1311,9 @@ const codexResumeCommand = (threadId) => {
  * Only a Claude session is reopened with the Claude CLI: a Pi run's session is shown as the file it lives in, and
  * that file comes from the verified result alone. The launch request is not a fallback: a fork's request names the
  * parent's file, and offering that as this run's transcript would point at another child's work. A run whose result
- * the host has not verified shows no path at all, which is what a new run shows until its outcome lands. A Codex run's
+ * the host has not verified shows no path at all, which is what a new run shows until its outcome lands. An archived
+ * Claude id the history marks as only reported is shown as text: no entry or accepted reference confirms it as a
+ * session to resume, and the parent its request named is another run's session, never a stand-in for it. A Codex run's
  * thread is reopened with `codex resume`, from its verified codex reference alone: the scalar id its child reported in
  * progress is a diagnostic, and it never becomes a Claude command or a Codex one.
  */
@@ -1027,6 +1343,10 @@ const appendResume = (parent, detail) => {
 	}
 	const sessionId = str(detail.sessionId);
 	if (!sessionId) return;
+	if (isArchived(detail) && detail.history && detail.history.diagnosticSessionId === true) {
+		parent.appendChild(el("p", "note resume-diagnostic", "Claude session " + sessionId + " was reported by this run but never confirmed, so no resume command is offered."));
+		return;
+	}
 	const line = el("p", "resume");
 	line.appendChild(el("code", "resume-command", "claude --resume " + sessionId));
 	line.appendChild(copyButton("claude --resume " + sessionId));
@@ -1037,12 +1357,12 @@ const appendChain = (parent, detail) => {
 	const step = chains(state.runs).steps.get(str(detail.id));
 	if (!step || step.of < 2) return;
 	const chain = el("nav", "chain");
-	chain.setAttribute("aria-label", "Runs of this Pi session");
+	chain.setAttribute("aria-label", state.archive.available === true ? "Loaded runs of this Pi session" : "Runs of this Pi session");
 	step.ordered.forEach((run, at) => {
 		if (at > 0) chain.appendChild(el("span", "chain-arrow", "→"));
 		const link = el("button", run.id === detail.id ? "chain-step chain-current" : "chain-step", at + 1 + " " + str(run.role));
 		link.type = "button";
-		link.title = str(run.status);
+		link.title = state.archive.available === true ? str(run.status) + " · " + (at + 1) + " of " + step.of + " loaded runs" : str(run.status);
 		link.classList.add("chain-" + slug(run.status));
 		link.addEventListener("click", () => selectRun(str(run.id)));
 		chain.appendChild(link);
@@ -1060,7 +1380,19 @@ const stat = (line, value, label) => {
 	line.appendChild(node);
 };
 
+const archivedStats = (detail) => {
+	const line = el("p", "stats");
+	stat(line, savedDuration(detail), "elapsed");
+	stat(line, "not saved", "last event");
+	stat(line, isNum(detail.toolCalls) ? formatCount(detail.toolCalls) : "not saved", "tools");
+	stat(line, isNum(detail.tokensIn) ? formatCount(detail.tokensIn) : "not saved", "in");
+	stat(line, isNum(detail.tokensOut) ? formatCount(detail.tokensOut) : "not saved", "out");
+	if (isNum(detail.costUsd)) stat(line, formatUsd(detail.costUsd), "");
+	return line;
+};
+
 const statsLine = (detail) => {
+	if (isArchived(detail)) return archivedStats(detail);
 	const line = el("p", "stats");
 	const clock = el("span");
 	addClock(state.detailClocks, clock, (now) => formatSeconds(elapsed(detail, now)));
@@ -1167,8 +1499,10 @@ const appendDetail = (parent, detail) => {
 		}
 		head.appendChild(row);
 	}
+	const archived = isArchived(detail);
+	if (archived) head.appendChild(el("p", "archive-note", "Archived run: only its saved input, output and basic facts are available." + (detail.interrupted === true ? " Its Pi process ended while it was going, so nobody finished it." : "")));
 	top.appendChild(head);
-	appendBlock(top, "Question", str(detail.question), false, "question");
+	if (!archived) appendBlock(top, "Question", str(detail.question), false, "question");
 	top.appendChild(statsLine(detail));
 	if (state.tabRun !== str(detail.id)) {
 		state.tabRun = str(detail.id);
@@ -1178,18 +1512,23 @@ const appendDetail = (parent, detail) => {
 	}
 	const panels = { overview: panel("overview"), log: panel("log"), tasks: panel("tasks"), report: panel("report") };
 	panels.overview.appendChild(factsList(detail));
-	appendBlock(panels.overview, "Prompt", str(detail.prompt), detail.promptTruncated, "prompt", true);
-	appendModels(panels.overview, list(detail.models));
+	appendBlock(panels.overview, "Prompt", str(detail.prompt), detail.promptTruncated, "prompt", true, archived);
+	if (!archived) appendModels(panels.overview, list(detail.models));
 	appendFiles(panels.overview, detail);
 	appendResume(panels.overview, detail);
-	appendLog(panels.log, str(detail.id), list(detail.log));
-	appendTimeline(panels.tasks, detail, list(detail.tasks));
-	appendTasks(panels.tasks, list(detail.tasks));
-	appendThinking(panels.tasks, list(detail.thinking));
-	if (!panels.tasks.firstChild) panels.tasks.appendChild(el("p", "empty", "No tasks yet."));
+	if (archived) {
+		panels.log.appendChild(el("p", "empty not-saved", NOT_SAVED + ": the log and tool calls of an archived run were not kept."));
+		panels.tasks.appendChild(el("p", "empty not-saved", NOT_SAVED + ": the tasks, timeline and thinking of an archived run were not kept."));
+	} else {
+		appendLog(panels.log, str(detail.id), list(detail.log));
+		appendTimeline(panels.tasks, detail, list(detail.tasks));
+		appendTasks(panels.tasks, list(detail.tasks));
+		appendThinking(panels.tasks, list(detail.thinking));
+		if (!panels.tasks.firstChild) panels.tasks.appendChild(el("p", "empty", "No tasks yet."));
+	}
 	appendReport(panels.report, detail);
-	appendBlock(panels.report, "Failure", str(detail.failure), detail.failureTruncated, "failure");
-	if (!panels.report.firstChild) panels.report.appendChild(el("p", "empty", active(detail) ? "The report arrives when the run ends." : "No report."));
+	appendBlock(panels.report, "Failure", str(detail.failure), detail.failureTruncated, "failure", false, archived);
+	if (!panels.report.firstChild) panels.report.appendChild(el("p", "empty", active(detail) ? "The report arrives when the run ends." : archived ? "No report was saved." : "No report."));
 	top.appendChild(tabStrip(detail, panels));
 	parent.appendChild(top);
 	for (const key of TABS) {
@@ -1258,9 +1597,15 @@ const setConnected = (connected) => {
 	bannerNode.classList.toggle("hidden", connected);
 };
 
+/**
+ * The pinned run while it is listed, or while history is kept and its detail still resolves: an archived run can leave
+ * the loaded range when newer runs arrive and still be one the archive shows. A detail that is gone unpins it.
+ */
 const chooseSelection = () => {
 	if (state.pinnedId && state.runs.some((run) => run.id === state.pinnedId)) return state.pinnedId;
+	if (state.pinnedId && state.archive.available === true && !state.pinnedGone) return state.pinnedId;
 	state.pinnedId = "";
+	state.pinnedGone = false;
 	const running = state.runs.find(active);
 	if (running) return str(running.id);
 	return state.runs.length > 0 ? str(state.runs[0].id) : "";
@@ -1299,18 +1644,18 @@ const applyRuns = (payload) => {
 		cwdNode.textContent = cwd;
 	}
 	applyUsage(payload);
-	state.runs = list(payload && payload.runs).filter((run) => run && typeof run.id === "string");
-	const key = JSON.stringify(state.runs);
-	const selected = chooseSelection();
-	if (key === state.runsKey && selected === state.selectedId) return;
-	state.runsKey = key;
-	state.selectedId = selected;
-	renderRuns();
+	state.liveRuns = list(payload && payload.runs).filter((run) => run && typeof run.id === "string");
+	applyArchive(payload && payload.archive);
+	showMerged();
 };
 
 const fetchJson = async (path) => {
 	const response = await fetch(path, { cache: "no-store", headers: { accept: "application/json" } });
-	if (!response.ok) throw new Error("HTTP " + response.status);
+	if (!response.ok) {
+		const error = new Error("HTTP " + response.status);
+		error.status = response.status;
+		throw error;
+	}
 	return await response.json();
 };
 
@@ -1325,13 +1670,28 @@ const syncDetail = async () => {
 		return;
 	}
 	const summary = state.runs.find((run) => run.id === id);
-	const key = id + ":" + num(summary && summary.updatedAt);
+	// Where the detail comes from is part of what it is: a live run the store let go reads from history at the same
+	// moment, and an archived one changes only with the archive, so its revision stands in for a time it never has.
+	const provenance = summary ? str(summary.provenance) || "live" : "unlisted";
+	const key = id + ":" + provenance + ":" + (summary && !isArchived(summary) ? num(summary.updatedAt) : "r" + state.archive.revision);
 	if (key === state.detailKey) return;
 	const seq = ++state.detailSeq;
 	let detail;
 	try {
 		detail = await fetchJson("api/runs/" + encodeURIComponent(id));
-	} catch {
+	} catch (error) {
+		if (seq !== state.detailSeq || state.selectedId !== id) return;
+		// A pinned run that left the list and whose detail is gone now is no run to keep showing.
+		if (error && error.status === 404 && id === state.pinnedId && !summary) {
+			state.pinnedGone = true;
+			showMerged();
+			if (state.selectedId !== id) {
+				state.detail = null;
+				state.detailKey = "";
+				renderDetail();
+				await syncDetail();
+			}
+		}
 		return;
 	}
 	if (seq !== state.detailSeq || state.selectedId !== id) return;
@@ -1352,6 +1712,7 @@ const showRuns = (open) => {
 
 const selectRun = (id) => {
 	state.pinnedId = id;
+	state.pinnedGone = false;
 	if (state.runsOpen) {
 		showRuns(false);
 		runsToggle.focus({ preventScroll: true });

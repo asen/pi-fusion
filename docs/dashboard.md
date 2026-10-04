@@ -11,7 +11,7 @@ The first command starts a local HTTP server on `127.0.0.1` at a random port, sh
 
 It is **read-only**: no prompting, cancellation, editing, or shell-command endpoint. Use [user commands](fusion-command.md) or a control tool to change runs. The browser polls once per second; there is no SSE or WebSocket.
 
-The server stops on quit, `/reload`, `/new`, `/resume`, or `/fork`. Reopen for a new capability URL and fresh in-memory store, with eligible history restoration when enabled. Runs are captured from extension load, not just from the moment the dashboard opens. See [History](runs.md#runs-across-pi-processes) for disk persistence and restoration rules.
+The server stops on quit, `/reload`, `/new`, `/resume`, or `/fork`. Reopen for a new capability URL and a fresh in-memory store; with history enabled, earlier runs come back as [archived runs](#archived-runs). Runs are captured from extension load, not just from the moment the dashboard opens. See [History](runs.md#runs-across-pi-processes) for disk persistence.
 
 ## Runs and detail tabs
 
@@ -32,6 +32,23 @@ A waiting banner offers each waiting run without changing selection until clicke
 
 A run with no real event for 60 seconds gets an amber edge/timer. Thinking deltas count as events, so this highlights missing progress, not merely slow reasoning. The page shows only events the backend emits: Claude workflow/task/model details are not promised for Pi. It holds no subagent transcript; Claude `forwardSubagentText` and `agentProgressSummaries` remain off.
 
+## Archived runs
+
+With `PI_FUSION_HISTORY=1` and a durable host session (not `--no-session`), the list also shows runs from the [run history](runs.md#runs-across-pi-processes), labelled as archived. It reads this host session's history file and the files of ancestor sessions the current branch names, and only the runs that branch can vouch for (see [archive eligibility](runs.md#archive-eligibility)). It never reads abandoned branches or unrelated session files. Each invocation keeps its own row by its history id, so continuing one handle three times shows three rows.
+
+After a restart or `/resume`, the first list is history only. No child is running again and no question can be answered. A run left running or waiting by a process that is gone reads `aborted`, marked interrupted, and its end time shows as not recorded. A run this process starts shows live first and joins the archive once the store lets it go.
+
+**Load older runs** fetches fixed pages of 30, newest first. The page size does not depend on the live retention target, and loaded pages stay through polls. A cursor is a position, not an offset, so runs archived since then never repeat. Runs the history has since pruned leave the list, and their detail is gone.
+
+An archived detail shows what the history saved:
+
+- prompt, report, failure, the usage counters it kept, changed files, the session request, and the accepted reference/selection;
+- labels where the history truncated text or kept a file count without its list.
+
+Logs, tool inputs/results, tasks, timeline, thinking, per-model usage, cache, event times, turns, API time, context and denied tools read **Not saved in history**, never zero. The history holds no child transcript.
+
+Browsing is read-only. It writes no history file, re-seeds no usage, reserves no handle, and grants no continuation, review or control. Those still follow the host branch and the host's own restore of its session (see [Runs across Pi processes](runs.md#runs-across-pi-processes)).
+
 ## Log and keyboard navigation
 
 Click a tool row to expand its input/result. Awaiting results are grey, error results red, and tool-error count appears in facts. Agent calls can expose their prompts. Task bars run from start to end on the run's clock, grow while active, and show overlap/state.
@@ -49,7 +66,7 @@ The log initially follows newest rows. Scrolling up preserves the visible rows a
 
 The header ledger matches `/fusion status`. Per-run facts include token/cache usage, cost, model/effort, turns/API time where emitted, and context. The context meter turns amber at 70%, red at 90%. Before Claude reports a window, its fallback is 1M for ids ending `[1m]`, 200k otherwise. Cost is a runtime/model-price estimate, not a subscription charge. The model first shows the admitted setting, then the child's confirmed id.
 
-Pi transcript hints come from a **verified outcome the host accepted**, never a launch request or live progress claim. A fork names the new child, not the source. Live/thrown/rejected Pi runs offer no path. Claude hints use `claude --resume <session id>`. Codex hints use `codex resume <thread id>` from the accepted thread reference only: the scalar id a Codex child reports while it runs is never offered, as a Codex command or a Claude one, and a Codex run's launch request is labelled **Codex thread request**. A Codex run shows no cost, and the header says how many Codex runs the estimate leaves out. Identity fields are copied exactly, not shortened into another path/id; values over 32768 characters are omitted. The session-request facts are separate and may legitimately name the source a fork was requested from.
+Pi transcript hints come from a **verified outcome the host accepted**, never a launch request or live progress claim. A fork names the new child, not the source. Live/thrown/rejected Pi runs offer no path. Claude hints use `claude --resume <session id>` from the flat id the run reported, as before, for live runs and archived runs the branch records. An archived Claude run shown only through its [request lineage](runs.md#archive-eligibility) keeps that id readable but offers no resume command, unless an accepted Claude reference names the same id. Its parent is never offered in its place. Codex hints use `codex resume <thread id>` from the accepted thread reference only: the scalar id a Codex child reports while it runs is never offered, as a Codex command or a Claude one, and a Codex run's launch request is labelled **Codex thread request**. A Codex run shows no cost, and the header says how many Codex runs the estimate leaves out. Identity fields are copied exactly, not shortened into another path/id; values over 32768 characters are omitted. The session-request facts are separate and may legitimately name the source a fork was requested from.
 
 For coding runs in Git trees, snapshots compare status and content before/after work, including untracked and already-dirty files. A file is listed only when it changed between snapshots; a concurrent commit can be marked committed. Line counts are against HEAD (whole new files), so they can include earlier dirty edits. Other writers' changes can also appear: **this is not attribution proof**. Ask runs have no file snapshot. Git commands are bounded to ten seconds; failures omit file data without failing the run. Live counts are sampled at most once per ten seconds.
 
@@ -68,7 +85,7 @@ Inspect or change the target at runtime:
 /fusion dashboard limit 200
 ```
 
-Both settings accept positive decimal safe integers (1–9007199254740991); zero does not disable retention. The command works with Fusion off, while children run, and without opening the dashboard. Lowering the target immediately evicts eligible finished runs; running and waiting runs can exceed it, and the store trims again as they finish. Raising it retains more subsequent runs, but does not recover already-evicted data. Neither operation changes continuation records, disk history, or per-run caps.
+Both settings accept positive decimal safe integers (1–9007199254740991); zero does not disable retention. The command works with Fusion off, while children run, and without opening the dashboard. Lowering the target immediately evicts eligible finished runs; running and waiting runs can exceed it, and the store trims again as they finish. Raising it retains more subsequent runs, but does not recover already-evicted data. Neither operation changes continuation records, disk history, archived pages, or per-run caps: retention is memory only and deletes nothing on disk.
 
 The command override is memory-only, belongs to this extension instance, and is not saved in profiles. Stopping/reopening the dashboard preserves it; a reload or session replacement reads the environment again. Larger targets retain more potentially sensitive output in host memory and increase the summaries the browser polls/renders.
 
