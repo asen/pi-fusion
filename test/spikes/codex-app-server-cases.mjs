@@ -17,7 +17,8 @@ import * as path from "node:path";
 export const EXIT = Object.freeze({ pass: 0, failure: 1, none: 2 });
 
 /**
- * Every case this harness knows: stage 1's G1 cases, then Q14, a stage 2 preparation measurement outside G1. `model` marks a case that starts a turn, which is a provider request on the
+ * Every case this harness knows: stage 1's G1 cases, then stage 2's G2 cases (Q10 to Q13 and Q19) and Q14, a stage 2
+ * preparation measurement outside G2's gate. `model` marks a case that starts a turn, which is a provider request on the
  * user's own login and quota with a cost Codex does not report; the others start a child and at most a thread. `fake`
  * marks a case the fake app-server can drive end to end; the rest need a native child that really runs a model. `needs`
  * names the option without which a case skips before anything starts, which it then does in either mode.
@@ -31,7 +32,12 @@ export const CASES = Object.freeze([
 	{ id: "Q6", model: true, fake: true, title: "cancellation through the production signal once the primary turn's first command starts (fake: at turn admission): aborted, stop requested, clean owned shutdown" },
 	{ id: "Q7", model: false, fake: true, title: "under the production owned shutdown (SIGTERM to observed descendants first, then stdin end) the root exits by itself: status 0, no root signal, nothing left" },
 	{ id: "Q9", model: false, fake: true, title: "an untrusted fixture cwd started with no request cwd: configuration bytes unchanged, sandbox kept" },
+	{ id: "Q10", model: true, fake: true, title: "G2: a fresh backend ask, then a backend resume of its reference: tip at the checkpoint, a new checkpoint and baseline, the selection pinned, per-call usage against the baseline" },
+	{ id: "Q11", model: true, fake: true, title: "G2: one extra direct-transport turn moves a fresh thread's tip; the backend resume of the original reference is refused with RESUME_MOVED before any turn/start" },
+	{ id: "Q12", model: true, fake: true, title: "G2: a fresh backend ask, then a backend fork of its reference: a new thread at a completed starting tip, a new checkpoint and baseline, per-call usage against the source baseline" },
+	{ id: "Q13", model: true, fake: true, title: "G2: one steer pushed when the primary turn's first command starts (fake: at turn admission), accepted by the child for that admitted turn, then a clean completion" },
 	{ id: "Q14", model: true, fake: true, title: "usage over two sequential turns of one fresh ask thread: every scoped usage counter, absent fields as absent, total-vs-last additivity observed (stage 2 preparation, not G1)" },
+	{ id: "Q19", model: true, fake: true, title: "G2: a fresh backend ask (--model optional), then a resume naming no model: the recorded model, provider and effort pinned in request and readback (a same-model round trip unless measured otherwise)" },
 ]);
 
 /** Named selections. `all` is spelled out on purpose: nothing native runs without a `--case`. */
@@ -129,7 +135,7 @@ node test/spikes/codex-app-server.mjs --run --fake --case <ids> [options]
   --case Q1,Q2 | model-free | all
                             what runs; there is no default selection
   --fake                    drive test/fake-codex.mjs by path instead of Codex: NOT NATIVE evidence
-  --model <id>              Q2 explicit-model leg
+  --model <id>              Q2 explicit-model leg; Q19's fresh call (its resume names none)
   --effort <level>          Q3b named effort (skipped without one; no catalogue is guessed)
   --keep                    keep the fixture root even when every child ended cleanly
   --list | --help           print and exit 2; nothing runs
@@ -321,4 +327,69 @@ export function cacheWriteObservation(updates) {
 	const counts = `over ${updates.length * 2} breakdowns: ${tally.positive} positive, ${tally.zero} zero, ${tally.absent} absent, ${tally.null} null, ${tally.invalid} invalid`;
 	if (tally.positive === 0) return `${counts}; no positive cache write was reported, so this run measures no cache-write vs input relation`;
 	return `${counts}; cached + cacheWrite <= input held in ${tally.within} of ${tally.positive} positive breakdowns (an observation, not proof that cache write is part of input)`;
+}
+
+/* ------------------------------------------------------------------------------------------------------------------
+ * G2: per-call usage, published counters and steers
+ * ---------------------------------------------------------------------------------------------------------------- */
+
+/** The five counts a baseline is measured in. Cache write is a diagnostic beside them and never one of them. */
+export const CORE_FIELDS = Object.freeze(REQUIRED_FIELDS);
+
+/**
+ * One call's share of a thread's cumulative total, field by field over the five core counts: the current total less the
+ * baseline the call started from, none on a fresh thread. `holds` is the current count at or above its baseline; the
+ * difference is shown even when it does not hold, because that is the measurement, never clamped.
+ */
+export function coreDelta(baseline, current) {
+	return Object.fromEntries(
+		CORE_FIELDS.map((field) => {
+			const before = baseline === undefined ? 0 : baseline[field];
+			const now = current[field];
+			const counted = Number.isSafeInteger(before) && Number.isSafeInteger(now);
+			return [field, { baseline: before, current: now, delta: counted ? now - before : "unknown", holds: counted && now >= before }];
+		}),
+	);
+}
+
+/**
+ * Where a run's published counters differ from a call's delta: input, output and cache read are the SDK fields a run
+ * publishes, so only they are compared. Reasoning output and the total have no published field, and cache write is a
+ * diagnostic whose 0 may be unobserved, so neither is a problem here.
+ */
+export function publishedUsageProblems(run, delta) {
+	const pairs = [
+		["tokensIn", "inputTokens"],
+		["tokensOut", "outputTokens"],
+		["cacheRead", "cachedInputTokens"],
+	];
+	return pairs.filter(([published, field]) => run[published] !== delta[field].delta).map(([published, field]) => `${published}=${run[published]} but the ${field} delta is ${delta[field].delta}`);
+}
+
+/**
+ * Why a run's published context does not follow the rule, or `undefined` when it does: the latest response's input
+ * against the window when both are positive, and neither published otherwise. Never the cumulative total or the delta.
+ */
+export function contextProblem(run, lastInput, window) {
+	const positive = typeof lastInput === "number" && lastInput > 0 && typeof window === "number" && window > 0;
+	if (positive) return run.contextTokens === lastInput && run.contextWindow === window ? undefined : `context ${run.contextTokens}/${run.contextWindow} is not the latest input ${lastInput} against the window ${window}`;
+	return run.contextTokens === undefined && run.contextWindow === undefined ? undefined : `context ${run.contextTokens}/${run.contextWindow} is published although the latest input ${lastInput} or the window ${window} is not positive`;
+}
+
+/**
+ * Q13's verdict from what the run's own input and the child's answer said, never from the model's reply: the one push
+ * taken, exactly one `turn/steer` for the admitted turn, the child's answer accepting it, and the queue counting that
+ * one acceptance and nothing else. A steer never pushed, never sent, refused or left unanswered is unproven; a second
+ * send or one naming another turn is a failure, because the run sends each message once and only to its own turn.
+ */
+export function steerProof({ pushed, queued, calls, turn, report }) {
+	if (!pushed) return { status: "unproven", why: "no steer was pushed: the trigger never came" };
+	if (!queued) return { status: "unproven", why: "the run's input did not take the steer" };
+	if (calls.length > 1) return { status: "fail", why: `${calls.length} turn/steer requests were sent for one pushed message` };
+	if (calls.length === 0) return { status: "unproven", why: "no turn/steer request was sent" };
+	const [call] = calls;
+	if (turn === undefined || call.threadId !== turn.threadId || call.turnId !== turn.turnId) return { status: "fail", why: "the turn/steer named another thread or turn than the admitted one" };
+	if (call.outcome !== "accepted") return { status: "unproven", why: `the child did not accept the steer (${call.outcome})` };
+	if (!report || report.accepted !== 1 || report.rejected + report.unconfirmed + report.unsent + report.dropped !== 0) return { status: "unproven", why: `the run's steer counts do not say one accepted: ${JSON.stringify(report)}` };
+	return { status: "pass", why: "one steer, sent once to the admitted turn, accepted by the child" };
 }

@@ -15,13 +15,17 @@ import {
 	canonicalPath,
 	caseStatus,
 	composeInstructions,
+	contextProblem,
+	coreDelta,
 	describeCounters,
 	exitCode,
 	forcedExitNotice,
 	GROUPS,
 	parseArgs,
+	publishedUsageProblems,
 	reportedCount,
 	selectCases,
+	steerProof,
 	threadParams,
 	usageCounters,
 	usageProblem,
@@ -103,12 +107,19 @@ test("the command line is strict: both spellings, no valueless or repeated flag,
 	assert.equal(parseArgs([]).case, undefined);
 	assert.deepEqual(selectCases("q2,Q1")?.cases?.map((entry) => entry.id), ["Q1", "Q2"]);
 	assert.deepEqual(selectCases("model-free")?.cases?.map((entry) => entry.id), ["Q1", "Q2", "Q7", "Q9"]);
-	assert.deepEqual(selectCases("all")?.cases?.map((entry) => entry.id), ["Q1", "Q2", "Q3", "Q3b", "Q4", "Q6", "Q7", "Q9", "Q14"]);
+	assert.deepEqual(selectCases("all")?.cases?.map((entry) => entry.id), ["Q1", "Q2", "Q3", "Q3b", "Q4", "Q6", "Q7", "Q9", "Q10", "Q11", "Q12", "Q13", "Q14", "Q19"]);
+	assert.deepEqual(selectCases("q19,Q13,q10,Q12,Q11")?.cases?.map((entry) => entry.id), ["Q10", "Q11", "Q12", "Q13", "Q19"], "G2's cases in catalogue order");
+	for (const id of ["Q10", "Q11", "Q12", "Q13", "Q19"]) {
+		const entry = CASES.find((candidate) => candidate.id === id);
+		assert.ok(entry?.model && entry.fake && entry.needs === undefined, `${id} starts turns, runs under --fake and needs no option`);
+		assert.ok(!GROUPS["model-free"]!.includes(id), `${id} is not model-free`);
+	}
+	assert.match(selectCases("Q14b").error ?? "", /Q14b/, "Q14b is folded into Q10 and Q12, not a case of its own");
 	assert.deepEqual(selectCases("q14")?.cases?.map((entry) => entry.id), ["Q14"]);
 	assert.deepEqual(Object.keys(GROUPS), ["model-free", "all"]);
 	assert.ok(!GROUPS["model-free"]!.includes("Q14"), "Q14 starts turns, so the model-free group leaves it out");
 	assert.equal(CASES.find((entry) => entry.id === "Q14")?.model, true);
-	assert.deepEqual(CASES.filter((entry) => entry.fake).map((entry) => entry.id), ["Q1", "Q2", "Q4", "Q6", "Q7", "Q9", "Q14"]);
+	assert.deepEqual(CASES.filter((entry) => entry.fake).map((entry) => entry.id), ["Q1", "Q2", "Q4", "Q6", "Q7", "Q9", "Q10", "Q11", "Q12", "Q13", "Q14", "Q19"]);
 	assert.match(selectCases("Q1,nope").error ?? "", /nope/);
 	for (const removed of ["Q5", "Q5b", "Q5c", "Q8", "Q8b"]) assert.match(selectCases(removed).error ?? "", new RegExp(removed), `${removed} is no longer a case`);
 	assert.match(selectCases(undefined).error ?? "", /needs/);
@@ -184,6 +195,50 @@ test("Q14 relates cache write to input only from a positive count, and says when
 });
 
 /* ------------------------------------------------------------------------------------------------------------------
+ * G2 per-call usage and steer verdicts
+ * ---------------------------------------------------------------------------------------------------------------- */
+
+test("G2 usage: the delta is the total less the baseline in the five core counts, shown unclamped, and none on a fresh thread", () => {
+	const baseline = { ...breakdown(1_200, 400, 130, 25), cacheWriteInputTokens: 0 };
+	const delta = coreDelta(baseline, breakdown(1_600, 700, 150, 30));
+	assert.deepEqual(Object.keys(delta), ["inputTokens", "cachedInputTokens", "outputTokens", "reasoningOutputTokens", "totalTokens"], "cache write is no core count");
+	assert.deepEqual(delta.inputTokens, { baseline: 1_200, current: 1_600, delta: 400, holds: true });
+	assert.equal(delta.totalTokens!.delta, 420);
+	const fresh = coreDelta(undefined, breakdown(10, 4, 2, 1));
+	assert.deepEqual(fresh.outputTokens, { baseline: 0, current: 2, delta: 2, holds: true }, "a fresh thread's delta is its total");
+	const under = coreDelta(baseline, breakdown(1_600, 700, 120, 30));
+	assert.deepEqual(under.outputTokens, { baseline: 130, current: 120, delta: -10, holds: false }, "a count below its baseline is shown, not clamped");
+	assert.equal(coreDelta({ ...baseline, inputTokens: Number.NaN }, breakdown(1, 0, 1, 0)).inputTokens!.delta, "unknown");
+});
+
+test("G2 usage: the published in/out/cacheRead must be the delta, and context follows the latest-input rule", () => {
+	const delta = coreDelta(breakdown(1_200, 400, 130, 25), breakdown(1_600, 700, 150, 30));
+	assert.deepEqual(publishedUsageProblems({ tokensIn: 400, tokensOut: 20, cacheRead: 300 }, delta), []);
+	assert.deepEqual(publishedUsageProblems({ tokensIn: 1_600, tokensOut: 20, cacheRead: 700 }, delta), ["tokensIn=1600 but the inputTokens delta is 400", "cacheRead=700 but the cachedInputTokens delta is 300"], "the cumulative total published as the call's is a problem");
+	assert.equal(contextProblem({ contextTokens: 400, contextWindow: 200_000 }, 400, 200_000), undefined);
+	assert.match(contextProblem({ contextTokens: 1_600, contextWindow: 200_000 }, 400, 200_000) ?? "", /not the latest input 400/);
+	assert.equal(contextProblem({}, 400, null), undefined, "no window, nothing published");
+	assert.equal(contextProblem({}, 0, 200_000), undefined, "a zero input, nothing published");
+	assert.match(contextProblem({ contextTokens: 400, contextWindow: 200_000 }, 0, 200_000) ?? "", /published although/);
+});
+
+test("G2 steer verdict: only one accepted turn/steer for the admitted turn passes; never pushed, unsent, refused or unanswered is unproven; a resend or another turn fails", () => {
+	const turn = { threadId: "thr-1", turnId: "turn-1" };
+	const counts = (over: object = {}) => ({ pushed: 1, accepted: 1, rejected: 0, unconfirmed: 0, unsent: 0, dropped: 0, ...over });
+	const one = (outcome = "accepted", at = turn) => [{ ...at, outcome }];
+	assert.equal(steerProof({ pushed: true, queued: true, calls: one(), turn, report: counts() }).status, "pass");
+	assert.deepEqual(steerProof({ pushed: false, queued: false, calls: [], turn, report: counts({ pushed: 0, accepted: 0 }) }), { status: "unproven", why: "no steer was pushed: the trigger never came" });
+	assert.equal(steerProof({ pushed: true, queued: false, calls: [], turn, report: counts({ pushed: 0, accepted: 0 }) }).status, "unproven");
+	assert.equal(steerProof({ pushed: true, queued: true, calls: [], turn, report: counts({ accepted: 0, dropped: 1 }) }).status, "unproven");
+	assert.equal(steerProof({ pushed: true, queued: true, calls: one("refused (rejected)"), turn, report: counts({ accepted: 0, rejected: 1 }) }).status, "unproven");
+	assert.equal(steerProof({ pushed: true, queued: true, calls: one("no answer (timeout)"), turn, report: counts({ accepted: 0, unconfirmed: 1 }) }).status, "unproven");
+	assert.equal(steerProof({ pushed: true, queued: true, calls: [...one(), ...one()], turn, report: counts({ accepted: 2 }) }).status, "fail", "a second send for one message");
+	assert.equal(steerProof({ pushed: true, queued: true, calls: one("accepted", { threadId: "thr-1", turnId: "turn-other" }), turn, report: counts() }).status, "fail");
+	assert.equal(steerProof({ pushed: true, queued: true, calls: one(), turn: undefined, report: counts() }).status, "fail", "no admitted turn to have sent it to");
+	assert.equal(steerProof({ pushed: true, queued: true, calls: one(), turn, report: counts({ dropped: 1 }) }).status, "unproven", "the counts must say one accepted and nothing else");
+});
+
+/* ------------------------------------------------------------------------------------------------------------------
  * the harness as a program
  * ---------------------------------------------------------------------------------------------------------------- */
 
@@ -244,6 +299,11 @@ test("every guard path exits 2 having loaded no production module, located no co
 			["--case", "Q14"],
 			["--fake", "--case", "Q14"],
 			["--list", "--run", "--fake", "--case", "Q14"],
+			["--case", "Q10,Q11,Q12,Q13,Q19"],
+			["--fake", "--case", "Q10,Q11,Q12,Q13,Q19"],
+			["--help", "--run", "--fake", "--case", "Q13"],
+			["--run", "--case", "Q19", "--model"],
+			["--run", "--case", "Q14b"],
 			["--run"],
 			["--run", "--case"],
 			["--run", "--case", "nope"],
@@ -269,14 +329,16 @@ test("every guard path exits 2 having loaded no production module, located no co
 		const list = harness(box, ["--list"]).stdout;
 		assert.deepEqual(
 			[...list.matchAll(/^ {2}(Q\S+) /gm)].map((match) => match[1]),
-			["Q1", "Q2", "Q3", "Q3b", "Q4", "Q6", "Q7", "Q9", "Q14"],
-			"--list names the nine cases",
+			["Q1", "Q2", "Q3", "Q3b", "Q4", "Q6", "Q7", "Q9", "Q10", "Q11", "Q12", "Q13", "Q14", "Q19"],
+			"--list names the fourteen cases",
 		);
 		assert.match(list, /Q6 +\[model\] \[fake\][\s\S]*model-free/);
 		assert.match(list, /Q14 +\[model\] \[fake\] usage over two sequential turns/);
 		assert.match(list, /model-free +Q1, Q2, Q7, Q9\n/, "the model-free group lists no model case");
 		assert.match(list, /G1 needs Q1, Q2, Q3, Q4, Q6, Q7 and Q9 to PASS natively; Q3b is optional/);
-		assert.match(list, /Q14 is stage 2 preparation, a usage measurement outside G1; G2 is not enabled/);
+		for (const id of ["Q10", "Q11", "Q12", "Q13", "Q19"]) assert.match(list, new RegExp(`\n {2}${id} +\\[model\\] \\[fake\\] G2: `));
+		assert.match(list, /G2 needs Q10, Q11, Q12, Q13 and Q19 to PASS natively, one agreed case at a time; none has run natively, so G2 is pending/);
+		assert.match(list, /Q14 is stage 2 preparation, a usage measurement outside G1 and G2; Q14b's per-call usage is folded into Q10 and Q12/);
 		assert.match(harness(box, ["--run", "--case", "Q1", "--outside-dir", "/dev/shm"]).stdout, /unrecognised argument: --outside-dir/);
 		assert.ok(!fs.existsSync(box.tripped), "no codex ran");
 		assert.ok(!fs.existsSync(box.env.CODEX_HOME!) && !fs.existsSync(box.env.HOME!), "no Codex home or home was created");
@@ -510,6 +572,146 @@ test("a case skipped for a missing option, or for needing a native child, stays 
 		const flagged = harness(box, ["--run", "--fake", "--case", "Q3b", "--effort", "high"], 25_000);
 		assert.equal(flagged.status, 2);
 		assert.match(flagged.stdout, /RESULT Q3b: skip \(needs a native child/, "given its option, the case needs a native child");
+	} finally {
+		fs.rmSync(box.root, { recursive: true, force: true });
+	}
+});
+
+/* ------------------------------------------------------------------------------------------------------------------
+ * G2's cases under --fake
+ * ---------------------------------------------------------------------------------------------------------------- */
+
+const G2 = ["Q10", "Q11", "Q12", "Q13", "Q19"];
+
+/** The requests (not notifications) one fake run's children read, from the fake's own log, each child's apart by its `argv` line. */
+function fakeRequests(log: string): { method: string; params: Record<string, unknown> }[][] {
+	const children: { method: string; params: Record<string, unknown> }[][] = [];
+	for (const line of fs.readFileSync(log, "utf8").split("\n").filter(Boolean)) {
+		const entry = JSON.parse(line);
+		if (entry.argv) children.push([]);
+		else if (entry.in?.method && "id" in entry.in) children.at(-1)!.push(entry.in);
+	}
+	return children;
+}
+
+/** What every fake G2 run must show: NOT NATIVE, the backend loaded and the host not, no codex, no home, the root removed. */
+function assertFakeOnly(box: Sandbox, out: string): void {
+	assert.match(out, /NOT NATIVE EVIDENCE/);
+	assert.ok(out.split("\n").filter((line) => line.includes("RESULT ")).every((line) => line.endsWith("[FAKE, NOT NATIVE]")));
+	const modules = loaded(box);
+	assert.ok(modules.some((url) => url.endsWith("/extensions/backends/codex.ts")) && modules.some((url) => url.endsWith("/extensions/backends/codex-transport.ts")), "the production backend and transport were loaded");
+	assert.ok(!modules.some((url) => url.endsWith("/extensions/fusion.ts")), "the host runtime takes no part");
+	assert.ok(!fs.existsSync(box.tripped), "no codex ran: the fake was launched by path");
+	assert.ok(!fs.existsSync(box.env.CODEX_HOME!), "the inherited CODEX_HOME was neither created nor used");
+	assert.deepEqual(fs.readdirSync(box.env.TMPDIR!).filter((name) => name.startsWith("pi-fusion-codex-qual-")), [], "the fixture root was removed once every child was proved over");
+	assert.doesNotMatch(out, /fake answer|loaded answer|steered answer|pfq-q13-steer/, "no reply or steer text is printed");
+}
+
+test("--fake G2 cases each pass on their own, through chained production backend calls, NOT NATIVE", { timeout: 55_000 }, (t) => {
+	const psDir = commandDirectory("ps");
+	if (!psDir) return t.skip("no ps on PATH for the owned cleanup's discovery");
+	const box = sandbox([psDir]);
+	const log = path.join(box.root, "fake-requests.log");
+	try {
+		for (const id of G2) {
+			fs.rmSync(log, { force: true });
+			fs.rmSync(box.resolved, { force: true });
+			const ran = harness({ ...box, env: { ...box.env, FAKE_CODEX_LOG: log } }, ["--run", "--fake", "--case", id], 25_000);
+			const out = ran.stdout;
+			assert.equal(ran.status, 0, `${id}\n${out}\n${ran.stderr}`);
+			assert.match(out, new RegExp(`RESULT ${id}: pass \\[FAKE, NOT NATIVE\\]`));
+			assert.doesNotMatch(out, /\n {4}(FAIL|UNPROVEN)/, `${id}: nothing failed or was unproven`);
+			assertFakeOnly(box, out);
+			const children = fakeRequests(log);
+			const methods = children.map((child) => child.map((request) => request.method).filter((method) => method !== "initialize"));
+			const params = (child: number, method: string) => children[child]!.find((request) => request.method === method)!.params;
+			if (id === "Q10" || id === "Q19") {
+				assert.deepEqual(methods, [
+					["thread/start", "turn/start", "thread/read"],
+					["thread/resume", "thread/turns/list", "turn/start", "thread/read"],
+				]);
+				assert.deepEqual([params(1, "thread/resume").threadId, params(1, "thread/resume").excludeTurns], ["thr-1", true]);
+				assert.equal(params(1, "turn/start").effort, "medium", "the recorded effort is named again");
+			}
+			if (id === "Q11") {
+				assert.deepEqual(
+					methods,
+					[
+						["thread/start", "turn/start", "thread/read"],
+						["thread/resume", "turn/start", "thread/read"],
+						["thread/resume", "thread/turns/list"],
+					],
+					"the refusing call sends no turn/start",
+				);
+				assert.match(out, /extra turn: turn=x-turn-1 outcome=completed vs recorded checkpoint turn-1/);
+				assert.match(out, /latest turn read: thread=thr-1 turn=x-turn-1 status=completed/);
+				assert.match(out, /turn\/start requests on the refusing call: 0/);
+				assert.match(out, /PASS the backend resume of the original reference is refused with the fixed RESUME_MOVED/);
+			}
+			if (id === "Q12") {
+				assert.deepEqual(methods, [
+					["thread/start", "turn/start", "thread/read"],
+					["thread/fork", "thread/turns/list", "turn/start", "thread/read"],
+				]);
+				const fork = params(1, "thread/fork");
+				assert.deepEqual([fork.threadId, fork.lastTurnId, fork.excludeTurns], ["thr-1", "turn-1", true], "the fork targets the source checkpoint");
+				assert.match(out, /starting tip vs source checkpoint: fork-turn-1 vs turn-1: a different id/);
+				assert.match(out, /outcome reference: backend=codex thread=f-thr-fork-1 checkpoint=f-turn-1 baseline: inputTokens=1600/);
+			}
+			if (id === "Q13") {
+				assert.deepEqual(methods, [["thread/start", "turn/start", "turn/steer", "thread/read"]], "one steer and no retry");
+				assert.equal(params(0, "turn/steer").expectedTurnId, "turn-1");
+				assert.match(out, /turn\/steer sent: thread=thr-1 expectedTurnId=turn-1 input=\d+B outcome=accepted/);
+				assert.match(out, /PASS steer: one steer, sent once to the admitted turn, accepted by the child/);
+			}
+		}
+	} finally {
+		fs.rmSync(box.root, { recursive: true, force: true });
+	}
+});
+
+test("--fake G2 cases pass together, with per-call usage against each baseline and the selection pinned, NOT NATIVE", { timeout: 30_000 }, (t) => {
+	const psDir = commandDirectory("ps");
+	if (!psDir) return t.skip("no ps on PATH for the owned cleanup's discovery");
+	const box = sandbox([psDir]);
+	try {
+		const ran = harness(box, ["--run", "--fake", "--case", G2.join(","), "--model", "gpt-explicit"], 25_000);
+		const out = ran.stdout;
+		assert.equal(ran.status, 0, `${out}\n${ran.stderr}`);
+		for (const id of G2) assert.match(out, new RegExp(`RESULT ${id}: pass`));
+		assert.match(out, /exit 0 \[FAKE, NOT NATIVE\]/);
+		assertFakeOnly(box, out);
+		// The fake's resumed turn is one response on a seeded total: the delta is that response, published as the call's.
+		assert.match(out, /resume: inputTokens: total 1600 - baseline 1200 = 400/);
+		assert.match(out, /PASS resume: the published in\/out\/cacheRead are this call's delta/);
+		assert.match(out, /resume: delta vs the one update's last: inputTokens yes, .*\(an observation, not a summing policy\)/);
+		assert.match(out, /fresh: delta vs last: not compared: 2 scoped updates/);
+		assert.match(out, /PASS fork: every core count of the total is at or above the baseline/);
+		assert.match(out, /PASS resume: the verified selection is the recorded one/);
+		assert.match(out, /scope: NAMED-MODEL ROUND TRIP \(--model gpt-explicit\)[^\n]*no model-switch proof/);
+		assert.match(out, /PASS fresh: the verified model is the named gpt-explicit/);
+		assert.match(out, /thread\/resume sent: threadId=thr-1 model=gpt-explicit provider=openai/, "Q19's resume names the recorded model");
+		assert.match(out, /cache write: published 0 \(a diagnostic: 0 may be unobserved, never gating\); USD unknown/);
+	} finally {
+		fs.rmSync(box.root, { recursive: true, force: true });
+	}
+});
+
+test("a --fake Q13 whose one steer the child refuses is UNPROVEN however cleanly the run ends, and nothing is resent", { timeout: 30_000 }, (t) => {
+	const psDir = commandDirectory("ps");
+	if (!psDir) return t.skip("no ps on PATH for the owned cleanup's discovery");
+	const box = sandbox([psDir]);
+	const log = path.join(box.root, "fake-requests.log");
+	try {
+		const ran = harness({ ...box, env: { ...box.env, FAKE_CODEX_STEERS: "reject", FAKE_CODEX_LOG: log } }, ["--run", "--fake", "--case", "Q13"], 25_000);
+		const out = ran.stdout;
+		assert.equal(ran.status, 1, `${out}\n${ran.stderr}`);
+		assert.match(out, /UNPROVEN steer: the child did not accept the steer \(refused \(rejected\)\)/);
+		assert.match(out, /PASS production verdict: success/);
+		assert.match(out, /PASS \(guard\) child: owned shutdown clean/);
+		assert.match(out, /RESULT Q13: unproven/);
+		assert.equal(fakeRequests(log).flat().filter((request) => request.method === "turn/steer").length, 1, "the refused steer was not resent");
+		assert.ok(!fs.existsSync(box.tripped));
 	} finally {
 		fs.rmSync(box.root, { recursive: true, force: true });
 	}

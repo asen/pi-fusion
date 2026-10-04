@@ -9,6 +9,7 @@
  *   node test/spikes/codex-app-server.mjs --run --case Q3 --keep              # one model case
  *   node test/spikes/codex-app-server.mjs --run --fake --case Q1,Q2,Q4,Q6,Q7,Q9  # NOT NATIVE
  *   node test/spikes/codex-app-server.mjs --run --fake --case Q14             # NOT NATIVE
+ *   node test/spikes/codex-app-server.mjs --run --fake --case Q10,Q11,Q12,Q13,Q19  # G2 cases, NOT NATIVE
  *
  * Nothing runs without `--run` and an explicit `--case` (`all` is a deliberate value, not a default). `--help`,
  * `--list`, an unknown or malformed argument, a missing `--run` or a missing or unmatched `--case` exit 2 before any
@@ -24,6 +25,12 @@
  * turns on one thread with the production transport because the backend runs one. No request names a cwd, a sandbox
  * policy or a configuration override, and `fusion.ts` and the host runtime take no part.
  *
+ * G2's cases (Q10 to Q13, Q19) chain backend calls the way the host does: a later call's session is
+ * `backend.session(intent)` over the earlier outcome's own reference, and its role `codexRole` over the earlier verified
+ * selection. The start seam forwards the stage 2 methods too (thread/resume, thread/fork, the latest-turn read, a
+ * steer) and keeps only safe facts of them: ids, selection fields, byte counts and answers' tags. Q11 alone adds one
+ * direct-transport turn between two backend calls, to move the thread's tip with a turn that really completed.
+ *
  * What it never does. It copies, reads or prints no credential or auth file, logs in to nothing, injects no API key,
  * prints no environment, and writes no Codex configuration. `config.toml` in the predicted Codex home is hashed in
  * memory before and after every case to report a mutation, and searched only for the fixture's path (Q9), as a yes or
@@ -38,7 +45,9 @@
  *
  * `--fake` swaps the launch for `test/fake-codex.mjs` by path under this host's node: no Codex binary is located. A
  * fake run exercises this harness's flow and the production transport/backend against literals, and is NOT NATIVE
- * evidence of anything a real Codex does.
+ * evidence of anything a real Codex does. A continuation under `--fake` tells the next fake process what the earlier
+ * one left — the turns and the total, read from the record — through the fake's own history variables, which no
+ * production request carries and a native run never sets.
  *
  * Exit codes: 0 when every selected case passed (annotated skips allowed), 1 when any failed or is unproven, 2 when no
  * case ran at all.
@@ -56,6 +65,9 @@ import {
 	canonicalPath,
 	caseStatus,
 	composeInstructions,
+	contextProblem,
+	coreDelta,
+	CORE_FIELDS,
 	describeCounters,
 	EXIT,
 	exitCode,
@@ -63,7 +75,9 @@ import {
 	forcedExitNotice,
 	GROUPS,
 	parseArgs,
+	publishedUsageProblems,
 	selectCases,
+	steerProof,
 	threadParams,
 	USAGE,
 	USAGE_FIELDS,
@@ -104,7 +118,8 @@ async function main(cli) {
 		console.log("groups:");
 		for (const [name, members] of Object.entries(GROUPS)) console.log(`  ${name.padEnd(11)} ${members.join(", ")}`);
 		console.log("\nG1 needs Q1, Q2, Q3, Q4, Q6, Q7 and Q9 to PASS natively; Q3b is optional named-effort evidence and does not block it.");
-		console.log("Q14 is stage 2 preparation, a usage measurement outside G1; G2 is not enabled and its other cases (Q10+) are not implemented here.");
+		console.log("G2 needs Q10, Q11, Q12, Q13 and Q19 to PASS natively, one agreed case at a time; none has run natively, so G2 is pending.");
+		console.log("Q14 is stage 2 preparation, a usage measurement outside G1 and G2; Q14b's per-call usage is folded into Q10 and Q12.");
 		console.log("\nNative results so far: docs/codex-backend.md.");
 		return EXIT.none;
 	}
@@ -306,11 +321,13 @@ class Context {
 	}
 
 	/**
-	 * A fake child's environment. The fake's own `FAKE_CODEX_*` variables, when already set, win over the case's scenario:
-	 * a seam for exercising this harness's failure branches under `--fake`, read by the fake alone and never native.
+	 * A fake child's environment. The fake's own `FAKE_CODEX_*` variables, when already set, win over the case's scenario
+	 * and its extras: a seam for exercising this harness's failure branches under `--fake`, read by the fake alone and
+	 * never native. `extra` is a case's fake-only cross-process history.
 	 */
-	fakeEnv(scenario) {
-		return { ...process.env, FAKE_CODEX_SCENARIO: process.env.FAKE_CODEX_SCENARIO ?? scenario, CODEX_HOME: this.fakeHome };
+	fakeEnv(scenario, extra = {}) {
+		const unset = Object.fromEntries(Object.entries(extra).filter(([key]) => process.env[key] === undefined));
+		return { ...process.env, ...unset, FAKE_CODEX_SCENARIO: process.env.FAKE_CODEX_SCENARIO ?? scenario, CODEX_HOME: this.fakeHome };
 	}
 
 	/** One launch. Native is exactly `codexLaunch` over this process's environment; fake is the fixture by path. */
@@ -420,8 +437,8 @@ const roleThreadParams = (mod, role) => threadParams(role, composeInstructions(r
  * One child driven directly through the production transport: launch, handshake, the body, and one host shutdown.
  * Used where a case must not start a turn, and by Q14, whose two turns on one thread the backend does not run.
  */
-async function withChild(ctx, cwd, body, { scenario = "ok", onNotification } = {}) {
-	const prepared = ctx.launchFor(cwd, scenario);
+async function withChild(ctx, cwd, body, { scenario = "ok", fakeExtra, onNotification } = {}) {
+	const prepared = ctx.launchFor(cwd, scenario, ctx.fake && fakeExtra ? ctx.fakeEnv(scenario, fakeExtra) : undefined);
 	let child;
 	try {
 		child = await ctx.mod.startCodexChild({ launch: prepared.launch, clientInfo: ctx.mod.codexClientInfo(), signal: ctx.abort.signal, ...(onNotification ? { onNotification } : {}) });
@@ -464,11 +481,35 @@ async function preflightStart(ctx, result, cwd, call) {
  * The production backend over seams that only observe: the production launch (kept), the production start (its child
  * recorded, every raw notification teed), `onCall`, and optionally a contract reader. Cancels through the production
  * signal on the case deadline or an interrupt, and waits for every handed child to exit before answering.
+ *
+ * A continuation is asked for as the host asks: `intent` goes through `backend.session`, and `recorded`, the selection
+ * the earlier run verified, through `codexRole`. The child the backend is handed forwards every method it drives and
+ * keeps, of the stage 2 ones, only safe facts: the request's ids and selection fields, the latest-turn answers, and
+ * each steer's key, byte count and outcome. `fakeExtra` is a fake child's cross-process history, never native.
  */
-async function backendRun(ctx, result, { call, prompt, cwd, scenario = "ok", readContract, onNotification, onTurn, deadlineMs = MODEL_CASE_MS, allowAborted = false }) {
+async function backendRun(ctx, result, { call, prompt, cwd, leg, scenario = "ok", intent = { kind: "new" }, recorded, fakeExtra, readContract, onNotification, onTurn, deadlineMs = MODEL_CASE_MS, allowAborted = false }) {
 	const { mod } = ctx;
-	const record = { notifications: [], dropped: 0 };
+	if (leg !== undefined) result.fact("call", leg);
+	const record = { notifications: [], dropped: 0, methods: [], tips: [], steers: [], turnStarts: 0 };
+	const env = ctx.fake ? ctx.fakeEnv(scenario, fakeExtra) : undefined;
 	const controller = new AbortController();
+	const backend = mod.createCodexBackend({
+		...(env === undefined ? {} : { env }),
+		launch: (request) => (record.launch = ctx.launchFor(request.cwd, scenario, request.env)),
+		start: (options) => startObserved(mod, record, options, { onNotification: (notification) => onNotification?.(notification, controller, record), onTurn: (turn) => onTurn?.(turn, controller, record) }),
+		...(readContract === undefined ? {} : { readContract }),
+		onCall: (report) => (record.report = report),
+	});
+	const role = mod.codexRole(call, recorded, {});
+	record.role = role;
+	let session;
+	try {
+		session = backend.session(intent);
+	} catch (error) {
+		result.fail(`the backend's session mapping refused the ${intent.kind} intent before anything started: ${message(error)}`);
+		return record;
+	}
+	record.input = backend.control();
 	const cancel = () => controller.abort();
 	ctx.abort.signal.addEventListener("abort", cancel, { once: true });
 	let deadlineHit = false;
@@ -476,69 +517,7 @@ async function backendRun(ctx, result, { call, prompt, cwd, scenario = "ok", rea
 		deadlineHit = true;
 		controller.abort();
 	}, deadlineMs);
-	const tee = (notification) => {
-		if (record.notifications.length < NOTIFICATION_CAP) record.notifications.push(notification);
-		else record.dropped += 1;
-		try {
-			onNotification?.(notification, controller, record);
-		} catch {}
-	};
-	const start = async (options) => {
-		let child;
-		try {
-			child = await mod.startCodexChild({ ...options, onNotification: (notification) => (tee(notification), options.onNotification?.(notification)) });
-		} catch (error) {
-			if (error && error.finalExit) record.exit = error.finalExit;
-			record.startError = error;
-			throw error;
-		}
-		record.child = child;
-		record.initialize = child.initialize;
-		return {
-			get pid() {
-				return child.pid;
-			},
-			get initialize() {
-				return child.initialize;
-			},
-			get counters() {
-				return child.counters;
-			},
-			get exited() {
-				return child.exited;
-			},
-			startThread: async (params, timeoutMs) => {
-				record.threadParams = params;
-				record.thread = await child.startThread(params, timeoutMs);
-				return record.thread;
-			},
-			startTurn: async (params, timeoutMs) => {
-				record.turnParams = params;
-				record.turn = await child.startTurn(params, timeoutMs);
-				try {
-					onTurn?.(record.turn, controller, record);
-				} catch {}
-				return record.turn;
-			},
-			readThread: async (threadId, timeoutMs) => {
-				record.read = await child.readThread(threadId, timeoutMs);
-				return record.read;
-			},
-			interrupt: (turn, timeoutMs) => child.interrupt(turn, timeoutMs),
-			threadStatus: (threadId) => child.threadStatus(threadId),
-			shutdown: (reason) => child.shutdown(reason),
-		};
-	};
-	const backend = mod.createCodexBackend({
-		...(ctx.fake ? { env: ctx.fakeEnv(scenario) } : {}),
-		launch: (request) => (record.launch = ctx.launchFor(request.cwd, scenario, request.env)),
-		start,
-		...(readContract === undefined ? {} : { readContract }),
-		onCall: (report) => (record.report = report),
-	});
-	const role = mod.codexRole(call, undefined, {});
-	record.role = role;
-	const running = backend.run({ role, prompt, cwd, session: backend.session({ kind: "new" }), signal: controller.signal, input: backend.control(), onProgress: () => {}, onEvent: () => {} });
+	const running = backend.run({ role, prompt, cwd, session, signal: controller.signal, input: record.input, onProgress: () => {}, onEvent: () => {} });
 	let settled = await bounded(running, deadlineMs + SETTLE_MS);
 	clearTimeout(timer);
 	ctx.abort.signal.removeEventListener("abort", cancel);
@@ -563,9 +542,106 @@ async function backendRun(ctx, result, { call, prompt, cwd, scenario = "ok", rea
 	if (record.report?.startCalled) {
 		const declined = (record.evidence?.denialCount ?? 0) + (record.exit?.counters.declinedApprovals ?? 0);
 		result.guard(declined === 0, `no approval requested under approval never (declined ${declined})`);
-		checkShutdown(ctx, result, record.exit, "child", allowAborted);
+		checkShutdown(ctx, result, record.exit, leg === undefined ? "child" : `${leg} child`, allowAborted);
 	}
 	return record;
+}
+
+/**
+ * The production start, with the child it answers recorded and every raw notification teed, handed back as a child
+ * that forwards each method the backend drives. Nothing is changed on the way through, and nothing is sent that the
+ * backend did not send.
+ */
+async function startObserved(mod, record, options, hooks) {
+	const tee = (notification) => {
+		if (record.notifications.length < NOTIFICATION_CAP) record.notifications.push(notification);
+		else record.dropped += 1;
+		try {
+			hooks.onNotification(notification);
+		} catch {}
+	};
+	let child;
+	try {
+		child = await mod.startCodexChild({ ...options, onNotification: (notification) => (tee(notification), options.onNotification?.(notification)) });
+	} catch (error) {
+		if (error && error.finalExit) record.exit = error.finalExit;
+		record.startError = error;
+		throw error;
+	}
+	record.child = child;
+	record.initialize = child.initialize;
+	return {
+		get pid() {
+			return child.pid;
+		},
+		get initialize() {
+			return child.initialize;
+		},
+		get counters() {
+			return child.counters;
+		},
+		get exited() {
+			return child.exited;
+		},
+		startThread: async (params, timeoutMs) => {
+			record.methods.push("thread/start");
+			record.threadMethod = "thread/start";
+			record.threadParams = params;
+			record.thread = await child.startThread(params, timeoutMs);
+			return record.thread;
+		},
+		resumeThread: async (params, timeoutMs) => {
+			record.methods.push("thread/resume");
+			record.threadMethod = "thread/resume";
+			record.threadParams = params;
+			record.thread = await child.resumeThread(params, timeoutMs);
+			return record.thread;
+		},
+		forkThread: async (params, timeoutMs) => {
+			record.methods.push("thread/fork");
+			record.threadMethod = "thread/fork";
+			record.threadParams = params;
+			record.thread = await child.forkThread(params, timeoutMs);
+			return record.thread;
+		},
+		latestTurn: async (threadId, timeoutMs) => {
+			record.methods.push("thread/turns/list");
+			const answer = await child.latestTurn(threadId, timeoutMs);
+			record.tips.push({ threadId, tip: answer.none ? { none: true } : { none: false, turnId: answer.turnId, status: answer.status } });
+			return answer;
+		},
+		startTurn: async (params, timeoutMs) => {
+			record.methods.push("turn/start");
+			record.turnStarts += 1;
+			record.turnParams = params;
+			record.turn = await child.startTurn(params, timeoutMs);
+			try {
+				hooks.onTurn(record.turn);
+			} catch {}
+			return record.turn;
+		},
+		steer: async (key, text, timeoutMs) => {
+			record.methods.push("turn/steer");
+			const entry = { threadId: key.threadId, turnId: key.turnId, bytes: Buffer.byteLength(text), outcome: "pending" };
+			record.steers.push(entry);
+			try {
+				const answer = await child.steer(key, text, timeoutMs);
+				entry.outcome = answer.outcome === "accepted" ? "accepted" : `refused (${answer.failure.kind})`;
+				return answer;
+			} catch (error) {
+				entry.outcome = `no answer (${error instanceof mod.CodexTransportError ? error.kind : "thrown"})`;
+				throw error;
+			}
+		},
+		readThread: async (threadId, timeoutMs) => {
+			record.methods.push("thread/read");
+			record.read = await child.readThread(threadId, timeoutMs);
+			return record.read;
+		},
+		interrupt: (turn, timeoutMs) => child.interrupt(turn, timeoutMs),
+		threadStatus: (threadId) => child.threadStatus(threadId),
+		shutdown: (reason) => child.shutdown(reason),
+	};
 }
 
 /** What every backend run prints: the production verdict, the selection, the readbacks and the turn's evidence. */
@@ -573,14 +649,22 @@ function describeRun(ctx, result, record) {
 	const run = record.run;
 	result.fact("production verdict", `${ctx.mod.failed(run) ? "failed" : "success"} stopReason=${run.stopReason}${run.errorMessage ? ` error=${JSON.stringify(run.errorMessage)}` : ""} stage=${record.report?.stage ?? "unknown"}`);
 	if (record.initialize) result.fact("initialize", `userAgent=${JSON.stringify(record.initialize.userAgent)} home=${record.initialize.codexHome}`);
-	if (record.threadParams) result.fact("thread/start sent", `model=${record.threadParams.model ?? "(host default)"} provider=${record.threadParams.modelProvider ?? "(none)"} sandbox=${record.threadParams.sandbox} approvalPolicy=${record.threadParams.approvalPolicy} instructions=${Buffer.byteLength(record.threadParams.developerInstructions)}B no cwd`);
+	if (record.threadParams) {
+		const params = record.threadParams;
+		const ids = record.threadMethod === "thread/start" ? "" : `threadId=${params.threadId} ${params.lastTurnId === undefined ? "" : `lastTurnId=${params.lastTurnId} `}`;
+		result.fact(`${record.threadMethod} sent`, `${ids}model=${params.model ?? "(host default)"} provider=${params.modelProvider ?? "(none)"} sandbox=${params.sandbox} approvalPolicy=${params.approvalPolicy} instructions=${Buffer.byteLength(params.developerInstructions)}B no cwd${record.threadMethod === "thread/start" ? "" : " (the transport adds excludeTurns: true)"}`);
+	}
 	if (record.thread) {
-		result.fact("thread/start answer", describeStart(record.thread));
+		result.fact(`${record.threadMethod} answer`, `${describeStart(record.thread)}${record.threadMethod === "thread/fork" ? ` forkedFromId=${record.thread.forkedFromId ?? "(not reported)"}` : ""}`);
 		result.fact("reported sandbox", describeSandbox(record.thread.sandbox));
 	}
+	for (const { threadId, tip } of record.tips) result.fact("latest turn read", `thread=${threadId} ${tip.none ? "none" : `turn=${tip.turnId} status=${tip.status}`}`);
 	if (record.turnParams) result.fact("turn/start sent", `prompt=${Buffer.byteLength(record.turnParams.text)}B effort=${record.turnParams.effort ?? "(none)"}`);
+	for (const steer of record.steers) result.fact("turn/steer sent", `thread=${steer.threadId} expectedTurnId=${steer.turnId} input=${steer.bytes}B outcome=${steer.outcome}`);
 	if (record.read) result.fact("thread/read answer", describeRead(record.read));
+	result.fact("request order", record.methods.length === 0 ? "none" : record.methods.join(" > "));
 	if (run.selection) result.fact("verified selection", JSON.stringify(run.selection));
+	if (run.session) result.fact("outcome reference", describeRef(run.session));
 	const evidence = record.evidence;
 	if (evidence) {
 		result.fact("turn", `completion=${evidence.completion ? evidence.completion.status : "none"} usage=${evidence.usage ? "reported" : "none"} items=${evidence.items.completed} reroutes=${evidence.rerouteCount} denials=${evidence.denialCount} retryableErrors=${evidence.retryableErrors} terminalErrors=${evidence.terminalErrors}`);
@@ -588,6 +672,12 @@ function describeRun(ctx, result, record) {
 	}
 	result.fact("tokens", `in=${run.tokensIn} out=${run.tokensOut} cacheRead=${run.cacheRead} cacheWrite=${run.cacheWrite} (cache write vs input: Q14, unqualified) cost=unknown (Codex reports none; never estimated)`);
 	if (record.dropped > 0) result.fact("notifications dropped past the cap", String(record.dropped));
+}
+
+/** A Codex outcome reference as one line: the thread, its checkpoint and the five core counts of its baseline. */
+function describeRef(ref) {
+	const baseline = ref.baseline === undefined ? "none" : `${CORE_FIELDS.map((field) => `${field}=${ref.baseline[field]}`).join(" ")} cacheWriteInputTokens=${ref.baseline.cacheWriteInputTokens ?? "absent"}`;
+	return `backend=${ref.backend} thread=${ref.sessionId} checkpoint=${ref.checkpoint ?? "none"} baseline: ${baseline}`;
 }
 
 /** Completed item types in the primary turn, counted from the raw notifications. */
@@ -603,6 +693,93 @@ function primaryItems(record) {
 	return record.notifications
 		.filter((notification) => notification.method === "item/completed" && notification.params?.threadId === threadId && notification.params?.turnId === turnId && typeof notification.params?.item?.type === "string")
 		.map((notification) => notification.params.item);
+}
+
+/** A command item started in the primary turn, correlated by the ids its own thread and turn/start answers named. */
+const primaryCommand = (notification, record) =>
+	notification.method === "item/started" && notification.params?.item?.type === "commandExecution" && record.thread !== undefined && record.turn !== undefined && notification.params.threadId === record.thread.threadId && notification.params.turnId === record.turn.turnId;
+
+/* ------------------------------------------------------------------------------------------------------------------
+ * G2: continuations as the host chains them
+ * ---------------------------------------------------------------------------------------------------------------- */
+
+/**
+ * What a later fake process is told an earlier one left: its completed turns, oldest first, and the thread's total, read
+ * from the record the harness got. Fake-only: the fake's own variables, which no production request carries and a
+ * native child never reads, standing in for the persisted thread a real Codex keeps between processes.
+ */
+const fakeHistory = (turns, seed, prefix) => ({ FAKE_CODEX_HISTORY: JSON.stringify({ turns: turns.map((id) => ({ id, status: "completed" })), seed }), FAKE_CODEX_PREFIX: prefix });
+
+/** The fresh call a G2 case continues from. Under `--fake`, a scenario whose thread reports an effort the continuation then pins. */
+const freshScenario = "host-effort";
+
+/** The reference and selection a settled call left, copied: what the host would record, and what a continuation is mapped from. */
+const sourceOf = (record) => ({ ref: structuredClone(record.run.session), selection: { ...record.run.selection }, turn: record.turn.turnId });
+
+/** The scoped usage updates of the primary turn, as reported, from the raw notifications. */
+function scopedUsage(record) {
+	const threadId = record.thread?.threadId;
+	const turnId = record.turn?.turnId;
+	return record.notifications.filter((notification) => notification.method === "thread/tokenUsage/updated" && notification.params?.threadId === threadId && notification.params?.turnId === turnId).map((notification) => usageCounters(notification.params));
+}
+
+/**
+ * The checks every settled G2 call gets, fresh or continued: the production success, the admitted turn's own completion,
+ * an idle readback at the barrier, a non-empty report (never printed), and the outcome settling on that turn with the
+ * thread's total at the barrier as its baseline. Then this call's usage: each core count at or above the baseline it
+ * started from, the published SDK counters equal to the delta, and the context rule. False when there is nothing to
+ * read usage from, so a case stops before chaining a continuation onto a run that did not settle.
+ */
+function checkSettled(ctx, result, label, record, baseline) {
+	const run = record.run;
+	if (!result.check(!ctx.mod.failed(run), `${label}: production verdict: success`)) return false;
+	const evidence = record.evidence;
+	result.check(evidence?.completion?.status === "completed", `${label}: the admitted turn's own completion says completed`);
+	result.check(record.read?.status.type === "idle", `${label}: the thread reads back idle at the post-turn barrier`);
+	result.check(run.text.trim() !== "", `${label}: the report is non-empty (its text is not printed)`);
+	const ref = run.session;
+	result.check(ref?.backend === "codex" && ref.sessionId === record.thread?.threadId && ref.checkpoint === record.turn?.turnId, `${label}: the outcome reference names this thread and this call's admitted turn as its checkpoint`);
+	const usage = evidence?.usage;
+	if (!usage) {
+		result.unproven(`${label}: the turn reported no usage the transport kept`);
+		return false;
+	}
+	const sameTotal = ref?.baseline !== undefined && [...CORE_FIELDS, "cacheWriteInputTokens"].every((field) => ref.baseline[field] === usage.total[field]);
+	result.check(sameTotal, `${label}: the outcome baseline is the thread's total at the barrier, exactly`);
+	const updates = scopedUsage(record);
+	result.fact(`${label}: baseline before`, baseline === undefined ? "none (a fresh thread)" : CORE_FIELDS.map((field) => `${field}=${baseline[field]}`).join(" "));
+	result.fact(`${label}: scoped usage updates`, `${updates.length} (transport: ${evidence.usageUpdates}, of which after completion ${evidence.usageAfterCompletion})`);
+	if (updates.length > 0) {
+		const latest = updates[updates.length - 1];
+		result.fact(`${label}: latest update total`, describeCounters(latest.total));
+		result.fact(`${label}: latest update last`, `${describeCounters(latest.last)} modelContextWindow=${latest.modelContextWindow}`);
+	}
+	const delta = coreDelta(baseline, usage.total);
+	for (const field of CORE_FIELDS) result.fact(`${label}: ${field}`, `total ${delta[field].current} - baseline ${delta[field].baseline} = ${delta[field].delta}`);
+	result.check(CORE_FIELDS.every((field) => delta[field].holds), `${label}: every core count of the total is at or above the baseline`);
+	const published = publishedUsageProblems(run, delta);
+	result.check(published.length === 0, `${label}: the published in/out/cacheRead are this call's delta${published.length === 0 ? "" : `: ${published.join("; ")}`}`);
+	result.fact(`${label}: reasoning and total`, `delta ${delta.reasoningOutputTokens.delta} and ${delta.totalTokens.delta}: measured here, and no published run field carries either`);
+	if (updates.length === 1) {
+		const last = updates[0].last;
+		result.fact(`${label}: delta vs the one update's last`, `${CORE_FIELDS.map((field) => `${field} ${last[field] === delta[field].delta ? "yes" : "no"}`).join(", ")} (an observation, not a summing policy)`);
+	} else result.fact(`${label}: delta vs last`, `not compared: ${updates.length} scoped updates, and summing last is no policy`);
+	const context = contextProblem(run, usage.last.inputTokens, usage.modelContextWindow);
+	result.check(context === undefined, `${label}: context is the latest last.inputTokens against a positive window, or unpublished${context ? `: ${context}` : ""}`);
+	result.fact(`${label}: cache write`, `published ${run.cacheWrite} (a diagnostic: 0 may be unobserved, never gating); USD unknown`);
+	return true;
+}
+
+/** That a continuation ran on the recorded selection: named in its request and turn/start, read back, and verified. */
+function checkPinned(result, label, record, selection) {
+	const params = record.threadParams;
+	result.check(params?.model === selection.model && params?.modelProvider === selection.provider, `${label}: the ${record.threadMethod} request names the recorded model and provider`);
+	if (selection.effort !== undefined) result.check(record.turnParams?.effort === selection.effort, `${label}: turn/start names the recorded effort ${selection.effort}`);
+	else result.fact(`${label}: effort`, "the record has none, so turn/start names none");
+	const read = record.read;
+	result.check(read !== undefined && (read.model === selection.model || read.model === null) && read.modelProvider === selection.provider && (selection.effort === undefined || read.reasoningEffort === selection.effort), `${label}: the readback matches the recorded model, provider and effort (a null model kept as the start answer's)`);
+	const verified = record.run.selection;
+	result.check(verified?.model === selection.model && verified?.provider === selection.provider && verified?.effort === selection.effort, `${label}: the verified selection is the recorded one`);
 }
 
 /* ------------------------------------------------------------------------------------------------------------------
@@ -792,9 +969,6 @@ const RUNNERS = {
 			cancelledAt = why;
 			controller.abort();
 		};
-		// A command item started in the primary turn, correlated by the ids its own thread/start and turn/start answers named.
-		const primaryCommand = (notification, record) =>
-			notification.method === "item/started" && notification.params?.item?.type === "commandExecution" && record.thread !== undefined && record.turn !== undefined && notification.params.threadId === record.thread.threadId && notification.params.turnId === record.turn.turnId;
 		const record = await backendRun(ctx, result, {
 			call: { role: "implement" },
 			prompt,
@@ -965,6 +1139,163 @@ const RUNNERS = {
 		const declined = outcome.exit?.counters.declinedApprovals ?? 0;
 		result.guard(declined === 0, `no approval requested under approval never (declined ${declined})`);
 		checkShutdown(ctx, result, outcome.exit, "child");
+	},
+
+	Q10: async (ctx, result) => {
+		const work = path.join(ctx.caseDir("Q10"), "work");
+		fs.mkdirSync(work);
+		const call = { role: "ask", mode: "answer" };
+		result.fact("limits", "two backend calls, one short reply each; no reply text printed");
+		const fresh = await backendRun(ctx, result, { leg: "fresh", call, prompt: "Reply with the single word OK.", cwd: work, scenario: freshScenario });
+		if (!fresh.run || !checkSettled(ctx, result, "fresh", fresh, undefined)) return;
+		const source = sourceOf(fresh);
+		const resumed = await backendRun(ctx, result, { leg: "resume", call, recorded: source.selection, intent: { kind: "resume", ref: source.ref }, prompt: "Reply with the single word OK again.", cwd: work, scenario: "resume-ok", fakeExtra: fakeHistory([source.ref.checkpoint], source.ref.baseline, "b-") });
+		if (!resumed.run) return;
+		result.check(resumed.threadMethod === "thread/resume" && resumed.threadParams?.threadId === source.ref.sessionId && resumed.threadParams?.lastTurnId === undefined, "resume: thread/resume named the recorded thread and no turn");
+		const tip = resumed.tips[0];
+		result.check(resumed.tips.length === 1 && tip.threadId === source.ref.sessionId && !tip.tip.none && tip.tip.turnId === source.ref.checkpoint && tip.tip.status === "completed", "resume: the latest-turn read named the recorded thread and found the recorded checkpoint, completed");
+		result.check(resumed.methods.indexOf("thread/turns/list") !== -1 && resumed.methods.indexOf("thread/turns/list") < resumed.methods.indexOf("turn/start"), "resume: the tip was read before turn/start");
+		if (!checkSettled(ctx, result, "resume", resumed, source.ref.baseline)) return;
+		const ref = resumed.run.session;
+		result.check(ref.sessionId === source.ref.sessionId && ref.checkpoint !== source.ref.checkpoint, "resume: the same thread, settled on a new checkpoint");
+		checkPinned(result, "resume", resumed, source.selection);
+	},
+
+	Q11: async (ctx, result) => {
+		const work = path.join(ctx.caseDir("Q11"), "work");
+		fs.mkdirSync(work);
+		const call = { role: "ask", mode: "answer" };
+		result.fact("limits", "one fresh backend call, one direct-transport turn, and a backend resume refused before any turn: two replies; no reply text printed");
+		const fresh = await backendRun(ctx, result, { leg: "fresh", call, prompt: "Reply with the single word OK.", cwd: work, scenario: freshScenario });
+		if (!fresh.run || !checkSettled(ctx, result, "fresh", fresh, undefined)) return;
+		const source = sourceOf(fresh);
+		// One turn this harness starts itself, on its own child, with the record's selection and the role's contract.
+		const role = ctx.mod.codexRole(call, source.selection, {});
+		const direct = await withChild(
+			ctx,
+			work,
+			async (child, prepared) => {
+				const answer = await child.resumeThread({ threadId: source.ref.sessionId, ...roleThreadParams(ctx.mod, role) });
+				const problem = ctx.mod.threadStartProblem(role, answer, canonicalPath(answer.cwd), canonicalPath(prepared.expectedCwd));
+				if (problem !== undefined) return { problem };
+				const turn = await child.startTurn({ threadId: answer.threadId, text: "Reply with the single word EXTRA.", ...(role.effort === undefined ? {} : { effort: role.effort }) });
+				const ended = await bounded(turn.done, MODEL_CASE_MS);
+				if (!ended.ok) return { turn };
+				const read = await child.readThread(answer.threadId);
+				return { turn, done: ended.value, evidence: turn.snapshot(), read };
+			},
+			{ scenario: "resume-ok", fakeExtra: fakeHistory([source.ref.checkpoint], source.ref.baseline, "x-") },
+		);
+		checkShutdown(ctx, result, direct.exit, "direct child");
+		if (direct.startError || direct.thrown) return result.unproven(`the direct extra turn did not run: ${message(direct.startError ?? direct.thrown)}`);
+		if (direct.value.problem) return result.unproven(`the direct resume failed the production start checks: ${direct.value.problem}`);
+		const extra = direct.value;
+		result.fact("extra turn", `turn=${extra.turn.turnId} outcome=${extra.done?.outcome ?? "did not end in time"} vs recorded checkpoint ${source.ref.checkpoint}`);
+		if (extra.done?.outcome !== "completed") return result.unproven("the extra turn did not complete, so no moved tip was made by a completed turn");
+		result.fact("extra turn readback", describeRead(extra.read));
+		const seed = extra.evidence.usage?.total ?? source.ref.baseline;
+		const final = await backendRun(ctx, result, { leg: "resume of the original reference", call, recorded: source.selection, intent: { kind: "resume", ref: source.ref }, prompt: "Reply with the single word OK again.", cwd: work, scenario: "resume-ok", fakeExtra: fakeHistory([source.ref.checkpoint, extra.turn.turnId], seed, "y-") });
+		if (!final.run) return;
+		result.check(final.run.stopReason === "thread" && final.run.errorMessage === ctx.mod.RESUME_MOVED, "the backend resume of the original reference is refused with the fixed RESUME_MOVED");
+		result.fact("turn/start requests on the refusing call", String(final.turnStarts));
+		result.check(final.turnStarts === 0, "no turn/start was sent on the refusing call");
+		const tip = final.tips[0]?.tip;
+		result.check(tip !== undefined && !tip.none && tip.turnId === extra.turn.turnId, "the latest-turn read found the extra turn, past the recorded checkpoint");
+		result.check(final.run.session?.checkpoint === undefined && final.run.session?.baseline === undefined, "the refusal settles no checkpoint and no baseline");
+		result.fact("the refusal's way on", `names a new run without continue: ${final.run.errorMessage?.includes("start a new run without continue") === true}; names fresh true for a plan call: ${final.run.errorMessage?.includes("a plan call takes fresh true") === true} (this case is an ask)`);
+	},
+
+	Q12: async (ctx, result) => {
+		const work = path.join(ctx.caseDir("Q12"), "work");
+		fs.mkdirSync(work);
+		const call = { role: "ask", mode: "answer" };
+		result.fact("limits", "two backend calls, one short reply each; no reply text printed");
+		const fresh = await backendRun(ctx, result, { leg: "fresh", call, prompt: "Reply with the single word OK.", cwd: work, scenario: freshScenario });
+		if (!fresh.run || !checkSettled(ctx, result, "fresh", fresh, undefined)) return;
+		const source = sourceOf(fresh);
+		// The intent the host maps a continuation to from another host session: a fork of the reference.
+		result.fact("intent", "fork, as the host continues a record from another host session");
+		const forked = await backendRun(ctx, result, { leg: "fork", call, recorded: source.selection, intent: { kind: "fork", from: source.ref }, prompt: "Reply with the single word OK again.", cwd: work, scenario: "fork-ok", fakeExtra: { ...fakeHistory([source.ref.checkpoint], source.ref.baseline, "f-"), FAKE_CODEX_FORK_RENAME: "1" } });
+		if (!forked.run) return;
+		result.check(forked.threadMethod === "thread/fork" && forked.threadParams?.threadId === source.ref.sessionId && forked.threadParams?.lastTurnId === source.ref.checkpoint, "fork: thread/fork named the source thread and its recorded checkpoint as lastTurnId");
+		const newThread = forked.thread?.threadId;
+		result.check(newThread !== undefined && newThread !== source.ref.sessionId, "fork: the answer names a new thread");
+		const forkedFrom = forked.thread?.forkedFromId;
+		result.check(forkedFrom === undefined || forkedFrom === source.ref.sessionId, `fork: forkedFromId is the source when reported (${forkedFrom ?? "not reported"})`);
+		const tip = forked.tips[0];
+		result.check(forked.tips.length === 1 && tip.threadId === newThread && !tip.tip.none && tip.tip.status === "completed", "fork: the new thread's latest turn read is completed: its starting checkpoint");
+		if (tip && !tip.tip.none) result.fact("starting tip vs source checkpoint", `${tip.tip.turnId} vs ${source.ref.checkpoint}: ${tip.tip.turnId === source.ref.checkpoint ? "the same id" : "a different id"} (how fork names copied turns is a fact here, not a requirement)`);
+		if (!checkSettled(ctx, result, "fork", forked, source.ref.baseline)) return;
+		const ref = forked.run.session;
+		result.check(ref.sessionId === newThread && ref.checkpoint !== tip?.tip.turnId, "fork: settled on the new thread at this call's admitted turn, not the starting tip");
+		checkPinned(result, "fork", forked, source.selection);
+	},
+
+	Q13: async (ctx, result) => {
+		const work = path.join(ctx.caseDir("Q13"), "work");
+		fs.mkdirSync(work);
+		const marker = token("Q13", "steer");
+		const steer = { pushed: false, queued: false, at: undefined };
+		const push = (record, why) => {
+			if (steer.pushed) return;
+			steer.pushed = true;
+			steer.at = why;
+			steer.queued = record.input.push(`Also include the word ${marker} in your reply.`);
+		};
+		result.fact("limits", "one backend call, one steer pushed once, no retry or resend; the turn is waited for, not cancelled; no reply or steer text printed");
+		const record = await backendRun(ctx, result, {
+			call: { role: "ask", mode: "answer" },
+			prompt: ctx.fake ? "Reply with the single word OK." : "Run the shell command `sleep 20` once and wait for it to finish; then reply with the single word DONE.",
+			cwd: work,
+			scenario: "steer-script",
+			fakeExtra: { FAKE_CODEX_STEERS: "accept" },
+			...(ctx.fake ? { deadlineMs: 30_000 } : {}),
+			// As Q6: the fake runs no command, so its turn's admission is the trigger there. Natively, a command item that
+			// arrived before the turn/start answer is already in the record, and is found once the turn is admitted.
+			onTurn: (_turn, _controller, record) => {
+				if (ctx.fake) push(record, "the turn was admitted (fake)");
+				else if (record.notifications.some((notification) => primaryCommand(notification, record))) push(record, "the primary turn's first command item started (before the turn/start answer)");
+			},
+			onNotification: (notification, _controller, record) => {
+				if (!ctx.fake && primaryCommand(notification, record)) push(record, "the primary turn's first command item started");
+			},
+		});
+		if (!record.run) return;
+		result.fact("steer pushed when", steer.at ?? "never");
+		if (!ctx.fake && steer.pushed) result.fact("note", "an item/started for a command is not proof the command ran or how long it took");
+		result.fact("the run's input took it", String(steer.queued));
+		const counts = record.input.report();
+		result.fact("the run's steer counts", JSON.stringify(counts));
+		const methods = {};
+		for (const notification of record.notifications) if (notification.params?.threadId === record.thread?.threadId) methods[notification.method] = (methods[notification.method] ?? 0) + 1;
+		result.fact("notification methods on the primary thread (supporting only)", JSON.stringify(methods));
+		result.fact("the request body", "turn/steer { threadId, expectedTurnId, input } is the transport's, pinned by its unit tests");
+		const proof = steerProof({ pushed: steer.pushed, queued: steer.queued, calls: record.steers, turn: record.turn ? { threadId: record.turn.threadId, turnId: record.turn.turnId } : undefined, report: counts });
+		result.add(proof.status, `steer: ${proof.why}`);
+		result.check(!ctx.mod.failed(record.run), "production verdict: success");
+		result.check(record.evidence?.completion?.status === "completed", "the admitted turn's own completion says completed");
+		result.check(record.run.text.trim() !== "", "the report is non-empty (its text is not printed)");
+		result.fact("the report mentions the steer's word", `${record.run.text.includes(marker)} (model prose: supporting only; acceptance is the child's answer, not consumption)`);
+	},
+
+	Q19: async (ctx, result) => {
+		const work = path.join(ctx.caseDir("Q19"), "work");
+		fs.mkdirSync(work);
+		const named = ctx.cli.model;
+		const scope = named === undefined ? "SAME-MODEL ROUND TRIP: no --model, so the fresh call ran the host default and the resume pins that same model; this proves no pin against a changed default and no model switch" : `NAMED-MODEL ROUND TRIP (--model ${named}): the resume pins the named model from its record; whether it differs from the host default is not measured here, so this is no model-switch proof`;
+		result.fact("scope", scope);
+		result.fact("limits", "two backend calls, one short reply each; no model catalogue, configuration override or host configuration change; no reply text printed");
+		const fresh = await backendRun(ctx, result, { leg: "fresh", call: { role: "ask", mode: "answer", ...(named === undefined ? {} : { model: named }) }, prompt: "Reply with the single word OK.", cwd: work, scenario: freshScenario });
+		if (!fresh.run || !checkSettled(ctx, result, "fresh", fresh, undefined)) return;
+		if (named !== undefined) result.check(fresh.run.selection.model === named, `fresh: the verified model is the named ${named}`);
+		const source = sourceOf(fresh);
+		result.fact("recorded selection", JSON.stringify(source.selection));
+		const resumed = await backendRun(ctx, result, { leg: "resume", call: { role: "ask", mode: "answer" }, recorded: source.selection, intent: { kind: "resume", ref: source.ref }, prompt: "Reply with the single word OK again.", cwd: work, scenario: "resume-ok", fakeExtra: fakeHistory([source.ref.checkpoint], source.ref.baseline, "b-") });
+		if (!resumed.run) return;
+		result.check(resumed.role.model === source.selection.model && resumed.role.provider === source.selection.provider && resumed.role.effort === source.selection.effort, "resume: the call named no model, and the role binding took the recorded model, provider and effort");
+		if (!checkSettled(ctx, result, "resume", resumed, source.ref.baseline)) return;
+		checkPinned(result, "resume", resumed, source.selection);
+		result.check(resumed.run.session.sessionId === source.ref.sessionId && resumed.run.session.checkpoint !== source.ref.checkpoint, "resume: the same thread, settled on a new checkpoint and baseline");
 	},
 };
 

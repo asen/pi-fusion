@@ -72,3 +72,28 @@ export interface Additivity {
 }
 export declare function additivity(previousTotal: Counters, currentTotal: Counters, lasts: Counters[]): Record<string, Additivity>;
 export declare function cacheWriteObservation(updates: UsageCounters[]): string;
+
+export declare const CORE_FIELDS: readonly string[];
+export interface CoreDelta {
+	baseline: number;
+	current: number;
+	delta: number | "unknown";
+	holds: boolean;
+}
+export declare function coreDelta(baseline: Readonly<Record<string, unknown>> | undefined, current: Readonly<Record<string, unknown>>): Record<string, CoreDelta>;
+export declare function publishedUsageProblems(run: { tokensIn: number; tokensOut: number; cacheRead: number }, delta: Record<string, CoreDelta>): string[];
+export declare function contextProblem(run: { contextTokens?: number; contextWindow?: number }, lastInput: number | undefined, window: number | null | undefined): string | undefined;
+export interface SteerCall {
+	threadId: string;
+	turnId: string;
+	outcome: string;
+}
+export interface SteerCounts {
+	pushed: number;
+	accepted: number;
+	rejected: number;
+	unconfirmed: number;
+	unsent: number;
+	dropped: number;
+}
+export declare function steerProof(input: { pushed: boolean; queued: boolean; calls: SteerCall[]; turn: { threadId: string; turnId: string } | undefined; report: SteerCounts | undefined }): { status: Status; why: string };
