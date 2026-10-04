@@ -71,12 +71,14 @@ Pick a role to change:
 
 - **Enabled:** switch it on/off.
 - **Backend:** only when the role supports more than one. Switching replaces model/effort with that backend's captured legacy defaults, not the previous backend's values.
-- **Model:** for Claude, type an alias/id; for Pi, choose a host-available model, type `provider/model-id`, or select Unconfigured; for Codex, type a model id or select Host default.
+- **Model:** for Claude, type an alias/id; for Pi, choose a host-available model, type `provider/model-id`, or select Unconfigured; for Codex, choose a suggested model id, type another id, or select Host default.
 - **Effort:** select the backend's level, or Pi's child default. Codex offers `low`, `medium`, `high`, `xhigh`, or host default as suggestions, or type another single-token level; one with whitespace is refused and leaves the effort unchanged. Ultracode effort is fixed, but its main model can change in settings; that is not its workflow agents' model.
 
 Edits stay in a draft. **Apply** validates/applies the whole draft; **Cancel** or dialog close changes nothing. The current profile is marked `(modified)` after edits. Apply writes no profile file; use `save` to persist.
 
 The Pi picker reads the host's available-model list without fetching/authenticating or changing the host model. Children resolve against their own Fusion catalog/resources, so a picker entry is not proof the child can use it.
+
+The Codex picker offers `gpt-6.1-sol`, `gpt-6-astra`, `gpt-6-luna`, and `gpt-6-sol` as static shortcuts. These are suggestions, not an allowlist or an availability check: no server lookup runs, and custom providers may use other ids. Choosing a model leaves effort unchanged.
 
 ## The profiles file
 

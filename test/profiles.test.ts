@@ -13,6 +13,7 @@ import {
 	BUILTIN,
 	builtinSettings,
 	captureBaseline,
+	CODEX_MODEL_SUGGESTIONS,
 	copySettings,
 	nameProblem,
 	parseDocument,
@@ -880,6 +881,51 @@ test("the editor stages every change and applies them together, and a run that s
 	await run!.call;
 });
 
+test("the editor selects each static codex model for every supported role without changing effort, and profiles keep the exact id", async () => {
+	for (const role of ["plan", "implement", "ask"] as const) {
+		for (const model of CODEX_MODEL_SUGGESTIONS) {
+			const roles = settings({ [role]: { enabled: true, backend: "codex", model: "custom-model", effort: "ultra-deep" } });
+			const store = memoryProfileStore(document({ codex: roles }, "codex"));
+			const host = sdkHost({
+				profiles: store,
+				dialogs: [
+					(options) => options.find((option) => option.startsWith(`${role} `)),
+					"model: custom-model",
+					(options) => {
+						assert.deepEqual(options, [...CODEX_MODEL_SUGGESTIONS, "Type a codex model id…", "Host default"]);
+						return model;
+					},
+					"Back",
+					"Apply",
+				],
+			});
+			await host.start();
+			await host.command("config");
+			assert.equal(host.last(), "fusion settings applied to this session; disabled: security; save them with /fusion profile save <name>");
+			assert.ok(host.tools.get("fusion")!.description.includes(`${role} runs on codex with model ${model} at effort ultra-deep`));
+			assert.ok(!host.titles.includes(`Codex model for ${role}: a model id`), "a shortcut does not open the manual input");
+			assert.equal(host.dialogs.length, 0);
+			await host.command("profile save selected");
+			assert.deepEqual((await store.read()).profiles.selected, { ...roles, [role]: { ...roles[role], model } });
+		}
+	}
+});
+
+test("closing the codex model picker or leaving its manual input empty keeps the current model", async () => {
+	for (const answers of [[undefined], ["Type a codex model id…", undefined], ["Type a codex model id…", "   "]]) {
+		const roles = settings({ ask: { enabled: true, backend: "codex", model: "custom-model", effort: "high" } });
+		const host = sdkHost({
+			profiles: memoryProfileStore(document({ codex: roles }, "codex")),
+			dialogs: [(options) => options.find((option) => option.startsWith("ask ")), "model: custom-model", ...answers, "Back", "Apply"],
+		});
+		await host.start();
+		await host.command("config");
+		assert.equal(host.last(), "fusion config: nothing changed");
+		assert.ok(host.tools.get("fusion")!.description.includes("ask runs on codex with model custom-model at effort high"));
+		assert.equal(host.dialogs.length, 0);
+	}
+});
+
 test("the editor puts a role on codex with the host's defaults, offers codex levels as suggestions, and keeps a typed model", async () => {
 	const row = (role: string) => (options: string[]) => options.find((option) => option.startsWith(`${role} `));
 	const host = sdkHost({
@@ -898,8 +944,8 @@ test("the editor puts a role on codex with the host's defaults, offers codex lev
 				return options[2];
 			},
 			(options) => {
-				assert.deepEqual(options, ["Type a codex model id…", "Host default"]);
-				return options[0];
+				assert.deepEqual(options, ["gpt-6.1-sol", "gpt-6-astra", "gpt-6-luna", "gpt-6-sol", "Type a codex model id…", "Host default"]);
+				return "Type a codex model id…";
 			},
 			"gpt 5",
 			"model: host default",

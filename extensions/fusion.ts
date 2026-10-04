@@ -62,6 +62,7 @@ import {
 	builtinSettings,
 	CLAUDE_EFFORTS,
 	captureBaseline,
+	CODEX_MODEL_SUGGESTIONS,
 	copySettings,
 	effortShown,
 	effortsFor,
@@ -2930,9 +2931,10 @@ export default function fusion(pi: ExtensionAPI, options: FusionOptions = {}) {
 		if (setting.backend === "codex") {
 			const TYPE = "Type a codex model id…";
 			const HOST = "Host default";
-			const choice = await ctx.ui.select(`Codex model for ${role}`, [TYPE, HOST]);
+			const choice = await ctx.ui.select(`Codex model for ${role}`, [...CODEX_MODEL_SUGGESTIONS, TYPE, HOST]);
 			if (choice === undefined) return undefined;
 			if (choice === HOST) return null;
+			if (choice !== TYPE) return choice;
 			const typed = (await ctx.ui.input(`Codex model for ${role}: a model id`, setting.model ?? ""))?.trim();
 			if (!typed) return undefined;
 			if (!isCodexToken(typed)) {
