@@ -99,6 +99,31 @@ test("nothing outside the host and the profiles reaches into the codex binding, 
 	assert.ok(source.includes("const backends: Partial<Record<BackendName, HostBackend>> = { claude: hostBackend(claudeBackend), pi: hostBackend(createPiBackend()), ...options.backends };"), "the host registers a backend beside claude and pi");
 });
 
+test("the codex transport is a transport over its own protocol readers: it takes only the line framer from pi, and nothing registers it yet", () => {
+	assert.deepEqual(dependenciesOf("backends/codex-protocol.ts"), ["node:path"], "the protocol readers are pure: no process, no stream and no package");
+	assert.deepEqual(dependenciesOf("backends/codex-transport.ts").sort(), ["../process-tree.ts", "./codex-protocol.ts", "./pi-transport.ts", "node:stream"]);
+	// What it takes from pi is the generic byte-capped framer and the timer ceiling, and no pi lifecycle, protocol or
+	// diagnostic: those are pi's own and the codex lifecycle has its own. The pi transport's own imports are a node
+	// builtin, the process tree and the import-free bootstrap constants, so no SDK or runtime is reached through it.
+	const file = path.join(repoRoot, "extensions", "backends", "codex-transport.ts");
+	const source = ts.createSourceFile(file, fs.readFileSync(file, "utf8"), ts.ScriptTarget.Latest);
+	const fromPi = source.statements
+		.filter((statement): statement is ts.ImportDeclaration => ts.isImportDeclaration(statement) && ts.isStringLiteral(statement.moduleSpecifier) && statement.moduleSpecifier.text === "./pi-transport.ts")
+		.flatMap((statement) => {
+			const bindings = statement.importClause?.namedBindings;
+			return bindings && ts.isNamedImports(bindings) ? bindings.elements.map((element) => element.name.text) : ["<not named>"];
+		})
+		.sort();
+	assert.deepEqual(fromPi, ["LineFramer", "MAX_TIMER_MS", "PiLine"]);
+	assert.deepEqual(dependenciesOf("backends/pi-transport.ts").sort(), ["../process-tree.ts", "./pi-bootstrap-protocol.mjs", "node:stream", "node:string_decoder"]);
+	assert.deepEqual(dependenciesOf("backends/pi-bootstrap-protocol.mjs"), []);
+	const importers = productionModules()
+		.filter((candidate) => modulesNamedIn(fs.readFileSync(candidate, "utf8")).some((name) => /(^|\/)codex-(transport|protocol)\.ts$/.test(name)))
+		.map((candidate) => path.relative(path.join(repoRoot, "extensions"), candidate))
+		.sort();
+	assert.deepEqual(importers, ["backends/codex-transport.ts"], "no backend, host or registration reaches the codex transport in this build");
+});
+
 test("the pi outcome mapping is pure: node's own path helper, this backend's own modules, and nothing else", () => {
 	const names = dependenciesOf("backends/pi-outcome.ts");
 	// `node:path` is there for one thing, deciding whether a recorded session file is absolute; everything else it
