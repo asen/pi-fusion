@@ -7,13 +7,13 @@ import { memoryProfileStore } from "../extensions/profile-store.ts";
 import { KNOWN_ROLE_NAMES, runsOn } from "../extensions/roles.ts";
 
 /**
- * The pi and codex backends the test hosts register in place of the ones this build registers, or will, by default.
+ * The pi and codex backends the test hosts register in place of the ones this build registers by default.
  * Every registration takes both through `tripwires()` but the two `productionDefaults()` registrations, which take
  * this build's own pi backend and reach no method of it: each deletes every variable a pi role could resolve a model
  * from first, so the registration is refused while one is still set and the explicit pi call is then refused by the
  * binding for having no model, before a session, a control or a run is asked for. Those two still take the codex
  * tripwire, because nothing would refuse a codex call there: a codex role runs on the host's own default model when it
- * names none, so no missing-model refusal stands between a production codex registration and a real app-server.
+ * names none, so no missing-model refusal stands between this build's codex registration and a real app-server.
  *
  * Nothing in the suite is about running a real Pi or Codex child: a case that reached a production backend would
  * compose storage, write a call input and launch a harness instead of failing in a way a test can read. So every entry

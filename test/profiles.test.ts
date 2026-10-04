@@ -643,9 +643,10 @@ test("roles configured on codex are described as fresh runs that cannot ask or b
 	assert.ok(claudeGuidance.some((guideline) => guideline.startsWith("Role implement and role ask run on codex in this session, which fusion runs and claude does not.")));
 	const description = host.tools.get("fusion")!.description;
 	assert.match(description, /implement runs on codex with the host's default codex model; .*ask runs on codex with model gpt-5-codex at effort high/);
-	assert.match(description, /backend codex names implement, in a workspace-write sandbox, and ask, read-only, as fresh runs/);
+	assert.match(description, /backend codex is experimental: it runs implement, in a workspace-write sandbox, and ask, read-only, as fresh runs/);
 	assert.match(description, /A codex child gets no ask_orchestrator and takes no message while it runs/);
-	assert.match(description, /This build registers no codex backend, so a call routed to codex is refused as unavailable before anything starts\./);
+	assert.match(description, /a codex run cannot be continued: a follow-up is a new run that carries its report as context, and its stats line names the codex resume command that reopens its thread\./);
+	assert.doesNotMatch(description, /registers no codex backend|refused as unavailable/, "codex is registered in this build");
 	// A builtin session routes nothing to codex, so neither tool carries the line.
 	await host.command("profile use builtin");
 	for (const tool of ["fusion", "claude"]) assert.ok(!host.tools.get(tool)!.promptGuidelines!.some((guideline) => / on codex in this session/.test(guideline)), tool);

@@ -17,7 +17,7 @@ The host calls `fusion` with a task; optional parameters select how it runs. `cl
 | `mode` | `ask` only: `answer` (default) or `review`, choosing the corresponding contract. A continuation keeps its mode unless overridden. |
 | `model` | Override a model: Claude alias/id for `plan`, `implement`, or `ask`; `provider/model-id` for every Pi role; a Codex model id without whitespace for `implement` or `ask`. `ultracode` rejects it. |
 | `effort` | Claude `low`, `medium`, `high`, `xhigh`, or `max` for `plan`, `implement`, or `ask`; Pi also accepts `off` and `minimal`; Codex any single level without whitespace for `implement` or `ask`. `fusion` advertises it as a plain string and the routed backend's binding checks it before admission; `claude` keeps the Claude enum. A Codex level passes the binding lexically, and the model or server may still refuse it when the run starts. Optional on Pi and Codex; fixed for `ultracode`, which rejects the parameter. |
-| `backend` | `fusion` only: `claude`, `pi`, or `codex`. Codex binds `implement`/`ask` (no `fresh`, `mode` for `ask` only) but registers no backend in this build, so a call routed there is refused as unavailable. Fresh calls otherwise use role settings; continuations cannot change backend. |
+| `backend` | `fusion` only: `claude`, `pi`, or `codex`. Codex is **experimental**: it runs fresh `implement`/`ask` runs (no `fresh`, `mode` for `ask` only) through the host's own Codex install, and a Codex run cannot be continued; see [Codex backend](codex-backend.md). Fresh calls otherwise use role settings; continuations cannot change backend. |
 
 A role that does not accept a supplied parameter refuses it before starting a child. Disabled roles refuse new runs and continuations, including calls supplying their own model/backend. Security must be enabled separately through [settings](profiles.md); a model does not enable it.
 
@@ -34,7 +34,7 @@ Both backends run in the host's working directory with the role contract appende
 | `ultracode` | Claude's own tools, Workflow, Agent, and the user's MCP servers | Unsupported |
 | Enabled `security` | Unsupported | Same as Pi implement |
 
-A Codex role is bound with a sandbox instead of a tool list: `implement` in `workspace-write`, `ask` (both modes) in `read-only`, with approval policy `never`. This build registers no Codex backend, so no Codex child runs yet.
+A Codex role is bound with a sandbox instead of a tool list: `implement` in `workspace-write`, `ask` (both modes) in `read-only`, with approval policy `never`. The child's tools, MCP servers, writable roots, network setting and multi-agent features are whatever the user's Codex configuration gives that sandbox mode; Fusion isolates none of them. See [Codex backend](codex-backend.md#inheritance-not-isolation).
 
 Every Claude and Pi child also gets [ask_orchestrator](questions.md); a Codex child does not. Fixed-tool Claude roles use `bypassPermissions` and strict MCP configuration with only that question server. Fusion leaves Claude's normal settings/plugin/CLAUDE.md loading in place; ultracode's permission mode is [configurable](ultracode.md). Pi instead uses in-memory settings and explicit resources; see [its lifecycle](pi-backend.md#one-calls-lifecycle).
 
@@ -80,7 +80,7 @@ A host fork copies no child immediately. On first use, Claude resumes with `--fo
 
 Older Claude records missing model/effort use the legacy defaults captured when this extension instance loaded, **not** the current profile, and the result says so. A Claude entry without a checkpoint resumes the whole session. Very old plan entries under `consolidator` keys with generation `g` read as handle `run-<g+1>`.
 
-Unknown backend tags, mixed/incomplete session formats, and Pi or Codex records without a trusted checkpoint or repeatable selection are kept for reading, not guessed into a continuation. A Codex record is read only from its tagged thread reference and its selection only with a provider; flat Claude ids, checkpoints, models, or a Pi session file in a Codex entry refuse it. This build binds a continuable Codex record to its recorded model and provider but registers no Codex backend, so the call is still refused as unavailable. A refused latest plan stops implicit continuation; Fusion does not walk back to an older usable plan or hand off to escape the refusal.
+Unknown backend tags, mixed/incomplete session formats, and Pi or Codex records without a trusted checkpoint or repeatable selection are kept for reading, not guessed into a continuation. A Codex record is read only from its tagged thread reference and its selection only with a provider; flat Claude ids, checkpoints, models, or a Pi session file in a Codex entry refuse it. Every Codex run this build makes settles on no checkpoint, so its record is kept for reading only; a hand-built Codex record with a checkpoint binds its recorded model and provider and is then refused by the backend, which runs fresh threads only. A refused latest plan stops implicit continuation; Fusion does not walk back to an older usable plan or hand off to escape the refusal.
 
 ### Recovery policy
 
@@ -103,7 +103,7 @@ Results, background notices, waits, and detailed status offer:
 
 - Claude: `claude --resume <session id>`. Normal transcripts live under `~/.claude/projects/<encoded working directory>/<session id>.jsonl`.
 - Pi: the **accepted outcome's transcript file**, not a Claude resume command. A fork names its new file, not the source. A running run, thrown backend, or rejected outcome offers no Pi path; a verified session kept only for reading may offer one.
-- Codex: `codex resume <thread id>`, from the accepted outcome's thread only. A fork names its own thread; a thread kept only for reading names it in its continuation refusal.
+- Codex: `codex resume <thread id>`, from the accepted outcome's thread only; an id that is not one plain shell word is single-quoted, after `--` when it starts with `-`. A fork names its own thread; a thread kept only for reading names it in its continuation refusal.
 
 Pi restores only the exact recorded file/id/checkpoint and repeats its recorded selection. Missing files, absent checkpoints, old/malformed transcript formats, leaf mismatches, or clamped thinking levels refuse the call; no fallback or repair is attempted. The detailed [checkpoint checks](pi-backend.md#continuation-and-checkpoints) include their source-only limitations. For either backend, start a new run if its transcript cannot be continued; use `fresh: true` for a new plan.
 
@@ -160,10 +160,12 @@ Both `fusion_control` and `claude_control` take `action`, optional `run`, and `m
 | --- | --- |
 | `status` | Without a handle, list runs; with one, show activity, tools, open question, and live changed files for coding runs. It does not return the report. |
 | `wait` | Wait for final recording/report or a question. Esc leaves the run going. |
-| `message` | Answer a waiting question or steer a running child. An ended run receives nothing; the reply gives its final state/report summary and offers continuation only when permitted. |
+| `message` | Answer a waiting question or steer a running child. A running Codex child takes no steer: the reply says so at once and sends nothing, without waiting for the run to end. An ended run receives nothing; the reply gives its final state/report summary and offers continuation only when permitted. |
 | `cancel` | Stop the run and mark it cancelled, carrying any cleanup warning. |
 
 Claude steers use the SDK's queued user-message input; Pi buffers until task input attaches and sends native `steer` requests sequentially, once each, with no retry. Queued items can be dropped at close, and an in-flight accepted steer can still be unread when the agent loop ends. **Logged by host is not consumed by child, and consumed is not acted upon.** Neither a successful control response nor `/fusion steer` proves model consumption. The Pi pending-message completion guard refuses false success, not repairs or resends instructions.
+
+Codex children have no input while they run; a control `message` or `/fusion steer` to one is refused at once with a pointer to `wait` and `cancel`, and logs nothing. A follow-up is a new run carrying the report as context.
 
 Ordinary editor text targets the host. `/fusion steer run-N <text>` targets the child and logs the instruction in the host conversation. A waiting child instead needs `/fusion answer`; the host may forward an ordinary instruction through a control tool at its discretion.
 

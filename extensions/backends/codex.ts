@@ -36,8 +36,9 @@ import { type Backend, type ChildControl, type ChildEvent, failed, type RunReque
  * judgement of evidence is `codex-outcome.ts`'s, and every wire and process concern the transport's.
  *
  * **Experimental and unqualified.** Every shape this reads is a source reading of Codex 0.160.0's app-server, exercised
- * here only against `test/fake-codex.mjs`. Nothing registers this backend in this build: `createCodexBackend` is a
- * factory nobody in the host calls yet, so importing this module starts, locates and reads nothing.
+ * here only against `test/fake-codex.mjs`. The host registers one backend from `createCodexBackend` when the extension
+ * loads, and neither importing this module nor that construction starts, locates or reads anything: the contract, the
+ * binary and the client version are all looked for only when a run is requested.
  *
  * **The order.** A cancelled signal ends the call before anything is read. Then the contract and its addendum, the
  * launch — the host's own cwd and inherited environment, the binary located only now — and the client's version, and
@@ -334,7 +335,8 @@ async function drive(child: CodexChild, role: CodexRole, prepared: CodexLaunch, 
 
 /**
  * A Codex backend over these seams. A factory rather than an instance, because a module-level one would be a backend
- * nobody decided to build; constructing one reads, locates and starts nothing.
+ * nobody decided to build; constructing one reads, locates and starts nothing, so the host builds its default at load
+ * and a machine with no `codex` installed finds out only when a run routed here asks for it.
  */
 export function createCodexBackend(deps: CodexBackendDeps = {}): Backend<CodexRole, CodexSession, ChildControl> {
 	return {

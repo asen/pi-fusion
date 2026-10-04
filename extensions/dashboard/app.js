@@ -367,7 +367,11 @@ const section = (title, copyText) => {
 const backendOf = (run) => str(run.backend) || "claude";
 
 /** The launch request, labelled as one: for a fork it names the session forked *from*, not the child that was made. */
-const sessionLabel = (detail) => (backendOf(detail) === "pi" ? "Pi session request" : "Claude session");
+const sessionLabel = (detail) => {
+	const backend = backendOf(detail);
+	if (backend === "pi") return "Pi session request";
+	return backend === "codex" ? "Codex thread request" : "Claude session";
+};
 
 /** The session the backend verified the run ran in, which is the only one this page names as the child's own. */
 const resultRef = (detail) => {
@@ -979,12 +983,37 @@ const appendBlock = (parent, title, body, truncated, className, copy) => {
 };
 
 /**
+ * The `codex resume` command for a thread, with the id as one literal shell argument: the host's own rule, kept here
+ * because this page loads no host module. A plain id is shown as it is; any other, a leading `=` included, which zsh
+ * expands, is single-quoted, and one starting with `-` goes after `--` so it is never read as an option.
+ */
+const codexResumeCommand = (threadId) => {
+	if (/^[A-Za-z0-9_@%+:,./][A-Za-z0-9_@%+=:,./-]*$/.test(threadId)) return "codex resume " + threadId;
+	const quoted = "'" + threadId.split("'").join("'\\''") + "'";
+	return threadId.startsWith("-") ? "codex resume -- " + quoted : "codex resume " + quoted;
+};
+
+/**
  * Only a Claude session is reopened with the Claude CLI: a Pi run's session is shown as the file it lives in, and
  * that file comes from the verified result alone. The launch request is not a fallback: a fork's request names the
  * parent's file, and offering that as this run's transcript would point at another child's work. A run whose result
- * the host has not verified shows no path at all, which is what a new run shows until its outcome lands.
+ * the host has not verified shows no path at all, which is what a new run shows until its outcome lands. A Codex run's
+ * thread is reopened with `codex resume`, from its verified codex reference alone: the scalar id its child reported in
+ * progress is a diagnostic, and it never becomes a Claude command or a Codex one.
  */
 const appendResume = (parent, detail) => {
+	if (backendOf(detail) === "codex") {
+		const ref = resultRef(detail);
+		const thread = ref && str(ref.backend) === "codex" ? str(ref.sessionId) : "";
+		if (thread) {
+			const line = el("p", "resume");
+			const command = codexResumeCommand(thread);
+			line.appendChild(el("code", "resume-command", command));
+			line.appendChild(copyButton(command));
+			parent.appendChild(line);
+		}
+		return;
+	}
 	if (backendOf(detail) === "pi") {
 		const ref = resultRef(detail);
 		const file = str(ref ? ref.sessionFile : "");
@@ -1245,6 +1274,9 @@ const usageText = (usage) => {
 		formatCount(usage.workflowTokens) + " workflow tokens",
 		formatCount(usage.calls) + " calls",
 	];
+	// Runs whose backend reports no cost are left out of the estimate, which says so rather than reading as free.
+	const unpriced = isNum(usage.unpricedRuns) && usage.unpricedRuns > 0 ? usage.unpricedRuns : 0;
+	if (unpriced > 0) parts.push("cost unknown for " + formatCount(unpriced) + " codex " + (unpriced === 1 ? "run" : "runs") + ", not in the estimate");
 	const warn = list(usage.warnUsd).filter(isNum);
 	if (warn.length > 0) parts.push("warn at " + warn.map(formatUsd).join(", "));
 	if (isNum(usage.limitUsd)) parts.push("limit " + formatUsd(usage.limitUsd));

@@ -101,6 +101,11 @@ export interface FakeBackendOptions {
 	defaultEffort?: string;
 	/** The scripts the first runs take, in order. The last one repeats for every run after them. */
 	scripts?: FakeScript[];
+	/**
+	 * Whether the run's input takes steers. A codex child takes none, so a double under that name hands over an input
+	 * closed from the start, as the real one does, unless a case says otherwise; every other name's is open.
+	 */
+	steers?: boolean;
 }
 
 export interface FakeBackend {
@@ -186,6 +191,7 @@ function defaultRef(name: BackendName, intent: SessionIntent | undefined, script
 
 export function fakeBackend(options: FakeBackendOptions = {}): FakeBackend {
 	const name = options.name ?? "pi";
+	const steers = options.steers ?? name !== "codex";
 	const defaultEffort = options.defaultEffort ?? "medium";
 	let scripts: FakeScript[] = options.scripts ? [...options.scripts] : [];
 	const starts: FakeStart[] = [];
@@ -201,7 +207,11 @@ export function fakeBackend(options: FakeBackendOptions = {}): FakeBackend {
 
 	const backend: Backend<HostRole, FakeSession, FakeControl> = {
 		name,
-		control: () => new FakeControl(),
+		control: () => {
+			const control = new FakeControl();
+			if (!steers) control.end();
+			return control;
+		},
 		session: (intent) => {
 			sessions.push(intent);
 			return fakeSession(name, intent);

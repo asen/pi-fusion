@@ -217,6 +217,10 @@ test("the widget names what every active run is doing, and what the session has 
 	assert.deepEqual(widgetLines(undefined, [running], usage).at(-1), "session usage: est. $0.2500 · warn at $0.1000, $0.2000 · limit $5.00");
 	assert.deepEqual(widgetLines(theme, [running], { ...usage, warnUsd: [], limitUsd: undefined }).at(-1), "<muted>session usage: est. $0.2500</muted>");
 	assert.equal(widgetLines(undefined, [running], usage).length, 2);
+	// Runs whose backend reports no cost are named beside the estimate, never folded into it as free.
+	assert.deepEqual(widgetLines(undefined, [running], { ...usage, unpricedRuns: 2 }).at(-1), "session usage: est. $0.2500 · cost unknown for 2 codex runs, not in the estimate · warn at $0.1000, $0.2000 · limit $5.00");
+	assert.deepEqual(widgetLines(undefined, [running], { ...usage, warnUsd: [], limitUsd: undefined, unpricedRuns: 1 }).at(-1), "session usage: est. $0.2500 · cost unknown for 1 codex run, not in the estimate");
+	assert.deepEqual(widgetLines(undefined, [running], { ...usage, unpricedRuns: 0 }).at(-1), "session usage: est. $0.2500 · warn at $0.1000, $0.2000 · limit $5.00");
 });
 
 const ESC = "\u001b";

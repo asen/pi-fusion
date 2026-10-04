@@ -6,6 +6,8 @@ import test, { after } from "node:test";
 import { fileURLToPath } from "node:url";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { CODEX_HOST_DEFAULT, codexRole } from "../extensions/backends/codex-binding.ts";
+import { createCodexBackend } from "../extensions/backends/codex.ts";
+import { CODEX_FRESH_ONLY } from "../extensions/backends/codex-outcome.ts";
 import { type PiRole, piModelVariable, piRole } from "../extensions/backends/pi-binding.ts";
 import type { Backend, BackendName, ChildControl, ChildRun, HostBackend, PiSessionRef, ResolvedSelection, SessionIntent } from "../extensions/backends/types.ts";
 import { hostBackend } from "../extensions/backends/types.ts";
@@ -838,41 +840,70 @@ test("a fresh codex call takes the call's model and effort, then the session's c
 	assert.equal("provider" in fusionCall({ role: "implement", task: "x", backend: "codex" }, records(), 35, captured).bound, false);
 });
 
-test("a codex call goes nowhere in this build: named or configured, it is refused as unavailable before anything starts", async () => {
+/**
+ * This build's own codex backend, constructed by its own factory, over seams that record a reach and refuse: a case
+ * that reached one would have read a contract, located a binary or started a child. The session mapping and the closed
+ * control are the production ones, which is what a continuation refusal is about.
+ */
+function fencedCodex(): { backend: HostBackend; reached: string[] } {
+	const reached: string[] = [];
+	const refuse = (name: string) => (): never => {
+		reached.push(name);
+		throw new Error(`the case reached the codex ${name} seam`);
+	};
+	return { backend: hostBackend(createCodexBackend({ readContract: refuse("contract"), launch: refuse("launch"), start: refuse("start"), clientInfo: refuse("clientInfo") })), reached };
+}
+
+/** A codex double that records what the host routed to it, and whose run throws before any outcome: nothing is recorded. */
+function routedCodex(): { backend: HostBackend; routed: string[] } {
+	const routed: string[] = [];
+	return {
+		routed,
+		backend: {
+			name: "codex",
+			control: () => ({ open: false, push: () => false, end() {} }),
+			session: (intent) => {
+				routed.push(`session ${intent.kind}`);
+				return { kind: "new" };
+			},
+			run: async (request) => {
+				routed.push(`run ${request.role.name}${request.role.model === undefined ? "" : ` ${request.role.model}`}`);
+				throw new Error("stopped by the case before any child");
+			},
+		},
+	};
+}
+
+test("a codex call goes to the codex backend this host registers, named or configured, and binds before it gets there", async () => {
 	const roles = builtinSettings(captureBaseline({} as NodeJS.ProcessEnv));
 	roles.implement = { enabled: true, backend: "codex" };
 	const profiles = memoryProfileStore(serializeDocument({ version: 1, defaultProfile: "codex", profiles: { codex: roles } }));
-	let started = 0;
-	const claude: HostBackend = {
-		name: "claude",
-		control: () => ({ open: true, push: () => true, end() {} }),
-		session: () => {
-			started++;
-			return { kind: "new" };
-		},
-		run: async () => {
-			started++;
-			throw new Error("no child may start");
-		},
-	};
-	// Codex left out over its tripwire, which is how this build stands: it registers no codex backend.
-	const ext = makeExtension({ claude, codex: undefined }, profiles);
-	const unavailable =
-		"the codex backend is not available in this build: run-1 would run role implement on it, and this pi-fusion runs claude, pi only. Nothing was started and nothing was recorded. Take the work to claude, pi with a role it runs, or do it yourself; no configuration makes codex available here.";
-	assert.equal((await call(ext, "fusion", { role: "implement", task: "x", backend: "codex" }, makeCtx())).error, unavailable);
-	assert.equal((await call(ext, "fusion", { role: "implement", task: "x" }, makeCtx())).error, unavailable, "a profile that puts the role on codex is refused the same way");
-	assert.equal((await call(ext, "fusion", { role: "implement", task: "x", backend: "codex", model: "gpt 5", effort: "whatever" }, makeCtx())).error, unavailable, "and no binding is asked about the model first");
+	// An own codex double over the tripwires: nothing here is this build's codex backend or a codex child.
+	const codex = routedCodex();
+	const ext = makeExtension({ codex: codex.backend }, profiles);
+	assert.equal((await call(ext, "fusion", { role: "implement", task: "x", backend: "codex" }, makeCtx())).error, "stopped by the case before any child");
+	assert.equal((await call(ext, "fusion", { role: "ask", task: "x", backend: "codex", model: "gpt-5-codex" }, makeCtx())).error, "stopped by the case before any child");
+	assert.equal((await call(ext, "fusion", { role: "implement", task: "x" }, makeCtx())).error, "stopped by the case before any child", "a profile that puts the role on codex goes there");
+	assert.deepEqual(codex.routed, ["session new", "run implement", "session new", "run ask gpt-5-codex", "session new", "run implement"]);
+	// What no codex value can be is refused by the binding before the backend is asked for anything.
+	assert.match((await call(ext, "fusion", { role: "implement", task: "x", backend: "codex", model: "gpt 5" }, makeCtx())).error ?? "", /^the call names model "gpt 5", which is not a codex model/);
+	assert.equal((await call(ext, "fusion", { role: "plan", task: "x", backend: "codex" }, makeCtx())).error, "role plan does not run on the codex backend; use one of claude, pi");
+	assert.equal(codex.routed.length, 6, "the refused calls reached nothing");
+	assert.deepEqual(ext.appended, [], "a backend that threw returned no outcome, so nothing was recorded");
+});
+
+test("a codex record is refused before this build's codex backend runs anything: a readable thread by its record, a continuable one by the fresh-only mapping", async () => {
+	const codex = fencedCodex();
+	const ext = makeExtension({ codex: codex.backend });
 	assert.equal(
 		(await call(ext, "fusion", { continue: "run-1", task: "x" }, makeCtx([entry({ ...codexEntry(), session: { backend: "codex", sessionId: "thread-1" } })]))).error,
 		"run-1 ran on codex and recorded no trusted checkpoint, so it is kept for reading and not continued; open its thread with codex resume thread-1, and new work needs a new run without continue",
-		"a thread with no trusted checkpoint is refused for reading before the backend is looked for",
+		"a thread with no trusted checkpoint, which is every thread this build's codex runs settle on, is refused for reading before the backend is asked",
 	);
-	assert.equal(
-		(await call(ext, "fusion", { continue: "run-1", task: "x" }, makeCtx([entry(codexEntry())]))).error,
-		"the codex backend is not available in this build: run-1 ran on it, and this pi-fusion runs claude, pi only. Nothing was started and nothing was recorded. Read what that run reported and start a new run on claude, pi; no configuration makes codex available here.",
-		"a continuable codex record goes nowhere either",
-	);
-	assert.equal(started, 0, "no session was mapped and no child started");
+	// A record with a checkpoint no codex run of this build writes still goes nowhere: the backend maps no resume.
+	assert.equal((await call(ext, "fusion", { continue: "run-1", task: "x" }, makeCtx([entry(codexEntry())]))).error, CODEX_FRESH_ONLY);
+	assert.equal((await call(ext, "fusion", { continue: "run-1", task: "x" }, makeCtx([entry(codexEntry())], "host-2"))).error, CODEX_FRESH_ONLY, "nor a fork, which another host session's continuation is");
+	assert.deepEqual(codex.reached, [], "no contract was read, no binary located and nothing started");
 	assert.deepEqual(ext.appended, [], "a refused call records nothing");
 });
 
@@ -938,7 +969,7 @@ test("an effort only codex takes is accepted on codex, named or configured, whil
 	assert.deepEqual(continued.bound, { ...CODEX_IMPLEMENT, model: "o3", provider: "openai", effort: "ultra" });
 });
 
-test("a codex run is continued through fusion alone, on the selection and provider it recorded, and goes nowhere while no codex backend is registered", async () => {
+test("a codex record routes through fusion alone, on the selection and provider it recorded, and this build's codex backend refuses to continue it", async () => {
 	const records = runRecords([entry(codexEntry())]);
 	const route = fusionRoute({ continue: "run-1", task: "x" }, records);
 	assert.deepEqual([route.backend, route.role, route.handle, route.record?.session], ["codex", "implement", "run-1", CODEX_REF]);
@@ -955,14 +986,13 @@ test("a codex run is continued through fusion alone, on the selection and provid
 	assert.deepEqual(fusionCall({ continue: "run-1", task: "x" }, withEffort).bound, { ...codexAsk("review"), model: "gpt-5-codex", provider: "azure", effort: "minimal" });
 	assert.throws(() => fusionCall({ continue: "run-1", task: "x", fresh: true }, records), /^Error: fresh is not allowed with continue$/);
 	assert.throws(() => claudeRoute({ continue: "run-1", task: "x" }, records), /^Error: run-1 ran on the codex backend, which the claude tool does not run; continue it with fusion and continue run-1$/);
-	// Codex left out over its tripwire, which is how this build stands: the binding succeeds, so nothing but the
-	// missing registration may stop the call, and no tripwire is there to be reached.
-	const ext = makeExtension({ codex: undefined });
+	// This build's codex backend over refusing seams: the binding succeeds, so the fresh-only session mapping is what
+	// stops the call, before any seam could be reached.
+	const codex = fencedCodex();
+	const ext = makeExtension({ codex: codex.backend });
 	const branch = [entry(codexEntry())];
-	assert.equal(
-		(await call(ext, "fusion", { continue: "run-1", task: "x" }, makeCtx(branch))).error,
-		"the codex backend is not available in this build: run-1 ran on it, and this pi-fusion runs claude, pi only. Nothing was started and nothing was recorded. Read what that run reported and start a new run on claude, pi; no configuration makes codex available here.",
-	);
+	assert.equal((await call(ext, "fusion", { continue: "run-1", task: "x" }, makeCtx(branch))).error, CODEX_FRESH_ONLY);
+	assert.deepEqual(codex.reached, []);
 	assert.equal((await call(ext, "claude", { continue: "run-1", task: "x" }, makeCtx(branch))).error, "run-1 ran on the codex backend, which the claude tool does not run; continue it with fusion and continue run-1");
 	// Controls of either pair name fusion for a codex run, and a thread kept only for reading says how to reopen it.
 	for (const tool of ["claude_control", "fusion_control"]) {

@@ -258,7 +258,12 @@ export interface WidgetUsage {
 	calls: number;
 	warnUsd: number[];
 	limitUsd?: number;
+	/** Runs whose backend reports no cost, a codex one, which the estimate leaves out rather than counting as free. */
+	unpricedRuns?: number;
 }
+
+/** What the estimate leaves out, said beside it, so a session of runs with no known cost never reads as a free one. */
+export const unpricedText = (runs: number | undefined): string | undefined => (runs ? `cost unknown for ${runs} codex ${runs === 1 ? "run" : "runs"}, not in the estimate` : undefined);
 
 function widgetRunLine(theme: CardTheme, run: WidgetRun): string {
 	const handle = plainText(run.handle);
@@ -274,6 +279,8 @@ function widgetRunLine(theme: CardTheme, run: WidgetRun): string {
 
 function widgetUsageLine(usage: WidgetUsage): string {
 	const parts = [`session usage: est. ${usd(usage.costUsd)}`];
+	const unpriced = unpricedText(usage.unpricedRuns);
+	if (unpriced) parts.push(unpriced);
 	if (usage.warnUsd.length) parts.push(`warn at ${usage.warnUsd.map((threshold) => usd(threshold)).join(", ")}`);
 	if (usage.limitUsd !== undefined) parts.push(`limit ${usd(usage.limitUsd)}`);
 	return parts.join(" · ");

@@ -7,8 +7,10 @@ import test from "node:test";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import ts from "typescript";
 import { claudeBackend, type Role } from "../extensions/backends/claude.ts";
+import { createCodexBackend } from "../extensions/backends/codex.ts";
+import { CODEX_FRESH_ONLY } from "../extensions/backends/codex-outcome.ts";
 import { hostBackend, isPiModel, keptRef, keptSelection, piModelParts, resolvedSelectionOf, sessionRefOf } from "../extensions/backends/types.ts";
-import { ASK_MODES, type AskMode, type ChildRun as ExportedChildRun, failed, ROLE_NAMES } from "../extensions/fusion.ts";
+import { ASK_MODES, type AskMode, type ChildRun as ExportedChildRun, codexResumeCommand, failed, ROLE_NAMES } from "../extensions/fusion.ts";
 import { ChildTree } from "../extensions/process-tree.ts";
 import { canChangeFiles, isReviewable, KNOWN_ROLE_NAMES, ROLE_SPECS, runsOn } from "../extensions/roles.ts";
 import { CODEX_VARIABLES, PRODUCTION_DEFAULT_VARIABLES, productionDefaults, tripwires } from "./tripwire.ts";
@@ -87,19 +89,94 @@ test("the codex binding is a binding, not an adapter: it depends on the boundary
 	assert.deepEqual(names, ["./types.ts"], `a role binding must name no host, no process, no protocol and no SDK; it names ${names.join(", ")}`);
 });
 
-test("nothing outside the host, the profiles and the codex backend's own modules reaches into the codex binding, and no codex runtime is registered by this build", () => {
+test("nothing outside the host, the profiles and the codex backend's own modules reaches into the codex binding", () => {
 	// The binding is read by routing and by the settings' display label, and by the codex backend's composition and
-	// outcome mapping for its role shape. That backend is not registered here: the registration list is the host's own.
+	// outcome mapping for its role shape. The registration of that backend is the host's own, pinned below.
 	const importers = productionModules()
 		.filter((file) => modulesNamedIn(fs.readFileSync(file, "utf8")).some((name) => /(^|\/)codex-binding\.ts$/.test(name)))
 		.map((file) => path.relative(path.join(repoRoot, "extensions"), file))
 		.sort();
 	assert.deepEqual(importers, ["backends/codex-outcome.ts", "backends/codex.ts", "fusion.ts", "profiles.ts"]);
-	const source = fs.readFileSync(path.join(repoRoot, "extensions", "fusion.ts"), "utf8");
-	assert.ok(source.includes("const backends: Partial<Record<BackendName, HostBackend>> = { claude: hostBackend(claudeBackend), pi: hostBackend(createPiBackend()), ...options.backends };"), "the host registers a backend beside claude and pi");
 });
 
-test("the codex transport is a transport over its own protocol readers: it takes only the line framer from pi, and nothing registers it yet", () => {
+/** The one declaration of `backends` in the host's source, parsed: the registry every routed call looks its backend up in. */
+function hostRegistry(): { declaration: ts.VariableDeclaration; file: ts.SourceFile } {
+	const file = ts.createSourceFile("fusion.ts", fs.readFileSync(path.join(repoRoot, "extensions", "fusion.ts"), "utf8"), ts.ScriptTarget.Latest, true);
+	const found: ts.VariableDeclaration[] = [];
+	const visit = (node: ts.Node): void => {
+		// Typed as the registry, which tells it from the role-capability list the settings editor keeps under the same name.
+		if (ts.isVariableDeclaration(node) && ts.isIdentifier(node.name) && node.name.text === "backends" && node.type?.getText(file).includes("HostBackend")) found.push(node);
+		ts.forEachChild(node, visit);
+	};
+	visit(file);
+	assert.equal(found.length, 1, "the host declares one backend registry, so one is all this has to read");
+	return { declaration: found[0]!, file };
+}
+
+test("the host registers claude, pi and codex by default, with the host's own registrations spread over them as they are", () => {
+	// Pinned out of the source before anything runs: the defaults first, each a factory call, and the host's own keys
+	// spread last with nothing between them and the lookup. A spread copies own keys only and copies an undefined one as
+	// undefined, so a key a host set to undefined is a backend left out, never this build's default in its place; a
+	// nullish fallback here would turn every `codex: undefined` of a test into a production codex app-server.
+	const { declaration, file } = hostRegistry();
+	assert.equal(
+		declaration.getText(file),
+		"backends: Partial<Record<BackendName, HostBackend>> = { claude: hostBackend(claudeBackend), pi: hostBackend(createPiBackend()), codex: hostBackend(createCodexBackend()), ...options.backends }",
+	);
+	assert.ok(ts.isVariableDeclarationList(declaration.parent) && (declaration.parent.flags & ts.NodeFlags.Const) !== 0, "the registry is a const: nothing reassigns it after the load");
+	const initializer = declaration.initializer!;
+	assert.ok(ts.isObjectLiteralExpression(initializer));
+	const last = initializer.properties.at(-1)!;
+	assert.ok(ts.isSpreadAssignment(last) && last.expression.getText(file) === "options.backends", "the host's own registrations come last and unwrapped");
+	// Every read of the registry is an index by a routed backend name or the list of what is registered, and none of
+	// them falls back to anything when the entry is undefined.
+	const source = file.getFullText();
+	const reads = [...source.matchAll(/\bbackends\[([^\]]+)\]/g)].map((match) => match[1]);
+	// The `0` is the settings editor's own local list of the backends a role runs on, not the registry.
+	assert.deepEqual(reads, ["route.backend", "0", "route.backend"], "a registry lookup is by the routed backend alone");
+	assert.equal([...source.matchAll(/backends\[route\.backend\]\s*(\?\?|\|\|)/g)].length, 0, "and no lookup falls back to a default");
+	// The same expression shape, evaluated over values that are not backends: the overlay semantics the audit relies on.
+	const marker = (name: string) => ({ name }) as never;
+	const own = { codex: undefined } as Partial<Record<string, unknown>>;
+	const overlaid: Record<string, unknown> = { claude: marker("claude"), pi: marker("pi"), codex: marker("codex"), ...own };
+	assert.ok(Object.hasOwn(overlaid, "codex") && overlaid.codex === undefined, "an explicit undefined removes the default");
+	const inherited: Record<string, unknown> = { claude: marker("claude"), pi: marker("pi"), codex: marker("codex"), ...(Object.create({ codex: undefined, pi: marker("inherited") }) as object) };
+	assert.deepEqual([(overlaid.claude as { name: string }).name, (inherited.pi as { name: string }).name, (inherited.codex as { name: string }).name], ["claude", "pi", "codex"], "an inherited key is never admitted over a default");
+});
+
+test("this build's default codex backend is lazy: constructing it reads, locates and starts nothing, even with no codex anywhere", () => {
+	// The production factory with no seams, exactly as the host calls it at load, under an environment that names no
+	// codex binary that exists and a PATH that holds none. Only its pure members are read; `run`, its one entry point,
+	// is never called, so nothing here could reach an app-server, a home or a login.
+	const kept = { PATH: process.env.PATH, PI_FUSION_CODEX_BIN: process.env.PI_FUSION_CODEX_BIN };
+	process.env.PATH = "";
+	process.env.PI_FUSION_CODEX_BIN = "/nowhere/codex";
+	try {
+		const backend = hostBackend(createCodexBackend());
+		assert.equal(backend.name, "codex");
+		assert.equal(backend.control().open, false, "a codex child takes no steer: its input is closed from the start");
+		assert.deepEqual(backend.session({ kind: "new" }), { kind: "new" });
+		assert.throws(() => backend.session({ kind: "resume", ref: { backend: "codex", sessionId: "thr-1", checkpoint: "turn-1" } }), new RegExp(`^Error: ${CODEX_FRESH_ONLY}$`));
+		assert.throws(() => backend.session({ kind: "fork", from: { backend: "codex", sessionId: "thr-1", checkpoint: "turn-1" } }), new RegExp(`^Error: ${CODEX_FRESH_ONLY}$`));
+	} finally {
+		for (const [name, value] of Object.entries(kept)) {
+			if (value === undefined) delete process.env[name];
+			else process.env[name] = value;
+		}
+	}
+	// And with every seam a recording one: constructing and mapping touch none of them.
+	const reached: string[] = [];
+	const seam = (name: string) => () => {
+		reached.push(name);
+		throw new Error(`${name} reached`);
+	};
+	const fenced = createCodexBackend({ readContract: seam("contract"), launch: seam("launch"), start: seam("start"), clientInfo: seam("clientInfo"), now: seam("now") });
+	fenced.control();
+	fenced.session({ kind: "new" });
+	assert.deepEqual(reached, []);
+});
+
+test("the codex transport is a transport over its own protocol readers: it takes only the line framer from pi, and only the codex backend reaches it", () => {
 	assert.deepEqual(dependenciesOf("backends/codex-protocol.ts"), ["node:path"], "the protocol readers are pure: no process, no stream and no package");
 	assert.deepEqual(dependenciesOf("backends/codex-transport.ts").sort(), ["../process-tree.ts", "./codex-protocol.ts", "./pi-transport.ts", "node:stream"]);
 	// What it takes from pi is the generic byte-capped framer and the timer ceiling, and no pi lifecycle, protocol or
@@ -124,7 +201,7 @@ test("the codex transport is a transport over its own protocol readers: it takes
 	assert.deepEqual(importers, ["backends/codex-outcome.ts", "backends/codex-transport.ts", "backends/codex.ts"], "only the codex backend's own composition and outcome mapping reach the codex transport and protocol");
 });
 
-test("the codex backend composes its own modules and nothing registers it yet: no host, other backend or package reaches it", () => {
+test("the codex backend composes its own modules, and the host reaches it only through its factory: no other backend or package does", () => {
 	assert.deepEqual(dependenciesOf("backends/codex.ts").sort(), ["../process-tree.ts", "./codex-binding.ts", "./codex-launch.ts", "./codex-outcome.ts", "./codex-protocol.ts", "./codex-transport.ts", "./types.ts", "node:fs", "node:path", "node:url"]);
 	// The mapping is pure: the boundary, the binding's role shape and the protocol and transport types, no process or file.
 	assert.deepEqual(dependenciesOf("backends/codex-outcome.ts").sort(), ["./codex-binding.ts", "./codex-protocol.ts", "./codex-transport.ts", "./types.ts"]);
@@ -132,7 +209,17 @@ test("the codex backend composes its own modules and nothing registers it yet: n
 		.filter((candidate) => modulesNamedIn(fs.readFileSync(candidate, "utf8")).some((name) => /(^|\/)codex(-outcome)?\.ts$/.test(name)))
 		.map((candidate) => path.relative(path.join(repoRoot, "extensions"), candidate))
 		.sort();
-	assert.deepEqual(importers, ["backends/codex.ts"], "the host registers no codex backend in this build");
+	assert.deepEqual(importers, ["backends/codex.ts", "fusion.ts"], "the host registers the codex backend, and nothing else reaches it");
+	// What the host takes from it is the factory and nothing else: no transport, outcome mapping or contract path.
+	const file = path.join(repoRoot, "extensions", "fusion.ts");
+	const source = ts.createSourceFile(file, fs.readFileSync(file, "utf8"), ts.ScriptTarget.Latest);
+	const fromCodex = source.statements
+		.filter((statement): statement is ts.ImportDeclaration => ts.isImportDeclaration(statement) && ts.isStringLiteral(statement.moduleSpecifier) && statement.moduleSpecifier.text === "./backends/codex.ts")
+		.flatMap((statement) => {
+			const bindings = statement.importClause?.namedBindings;
+			return bindings && ts.isNamedImports(bindings) ? bindings.elements.map((element) => element.name.text) : ["<not named>"];
+		});
+	assert.deepEqual(fromCodex, ["createCodexBackend"]);
 });
 
 test("the pi outcome mapping is pure: node's own path helper, this backend's own modules, and nothing else", () => {
@@ -261,7 +348,7 @@ const REGISTRATIONS_TOTAL = 10;
 
 test("every Fusion registration in the suite names the backends it takes, and the registrations are the ones pinned here", () => {
 	// A registration that names neither marker would run with the pi backend this build registers, which is a real
-	// harness, and with whatever codex backend a later build registers: a case that routed to one would start a child
+	// harness, and with the codex backend this build registers, which is a real app-server: a case that routed to one would start a child
 	// instead of failing in a way a test can read. So every registration has to say which of the two it is, and a bare
 	// one that somebody adds later fails here. The marker is the combined `tripwires()`: a registration that names only
 	// the pi tripwire leaves codex unfenced, and is no more acceptable than a bare one.
@@ -301,7 +388,7 @@ function tripwireFunction(name: string): ts.FunctionDeclaration {
 test("the production-default registration keeps the codex tripwire, because no missing-model refusal would stop a codex call there", () => {
 	// A codex role runs on the host's own default model when it names none, so the binding's missing-model refusal that
 	// keeps the two production-default cases away from a real pi child has no codex counterpart. What keeps them away
-	// from a production codex backend, whether this build registers one yet or not, is the tripwire, and it is read
+	// from the production codex backend this build registers is the tripwire, and it is read
 	// here out of the source: every value the function returns registers the codex tripwire and nothing over it.
 	const returns: ts.ReturnStatement[] = [];
 	const visit = (node: ts.Node): void => {
@@ -378,6 +465,57 @@ test("a reach of either tripwire that a case swallowed still fails its file, and
 	} finally {
 		fs.rmSync(dir, { recursive: true, force: true });
 	}
+});
+
+/**
+ * The words a POSIX shell would read from a command made of plain words, single-quoted spans and `\'`, and nothing else. It
+ * reads, it never runs: anything a shell would expand, substitute, escape or redirect outside single quotes is refused,
+ * so a hint that passes is one whose every argument is literal text.
+ */
+function literalShellWords(command: string): string[] {
+	const words: string[] = [];
+	let word: string | undefined;
+	for (let at = 0; at < command.length; at++) {
+		const char = command[at]!;
+		if (char === " ") {
+			if (word !== undefined) words.push(word);
+			word = undefined;
+		} else if (char === "'") {
+			const end = command.indexOf("'", at + 1);
+			if (end === -1) throw new Error(`an unclosed quote at ${at}`);
+			word = (word ?? "") + command.slice(at + 1, end);
+			at = end;
+		} else if (char === "\\" && command[at + 1] === "'") {
+			// The one escape the hint uses: a quote between two quoted spans.
+			word = (word ?? "") + "'";
+			at += 1;
+		} else if (/[\s$`"\\;&|<>()*?[\]{}~#!]/.test(char) || (char === "=" && word === undefined)) {
+			throw new Error(`${JSON.stringify(char)} at ${at} would be read by the shell, not as text`);
+		} else word = (word ?? "") + char;
+	}
+	if (word !== undefined) words.push(word);
+	return words;
+}
+
+test("a codex resume hint names a plain thread id as it is, and any other as one literal argument that cannot be an option", () => {
+	for (const plain of ["thr-1", "thread-1", "019a2b3c-4d5e-7f00-8000-0123456789ab", "a_b.c:d/e@f+g=h,i%j"]) {
+		assert.equal(codexResumeCommand(plain), `codex resume ${plain}`, "an ordinary id keeps the hint it always had");
+	}
+	const hostile = ["$(touch /tmp/pwned)", "`id`", "it's a thread", "thread 1", "a\tb", "x;rm -rf ~", '"quoted"', "line\nbreak", "~", "*", "-rf", "--help", "-", "'", "=ls"];
+	for (const id of hostile) {
+		const command = codexResumeCommand(id);
+		const words = literalShellWords(command);
+		const expected = id.startsWith("-") ? ["codex", "resume", "--", id] : ["codex", "resume", id];
+		assert.deepEqual(words, expected, `${JSON.stringify(id)} is read back as exactly one literal argument: ${command}`);
+	}
+	assert.equal(codexResumeCommand("$(touch /tmp/pwned)"), "codex resume '$(touch /tmp/pwned)'");
+	assert.equal(codexResumeCommand("it's"), "codex resume 'it'\\''s'");
+	assert.equal(codexResumeCommand("-rf"), "codex resume -- '-rf'");
+	// zsh expands a word that starts with `=` into a command path, so a leading one is quoted; an interior one is plain.
+	assert.equal(codexResumeCommand("=ls"), "codex resume '=ls'");
+	assert.equal(codexResumeCommand("a=b"), "codex resume a=b");
+	// The reader itself refuses what a shell would interpret, so the check above cannot pass by reading too little.
+	for (const unsafe of ["codex resume $(id)", "codex resume `id`", 'codex resume "x"', "codex resume a;b", "codex resume 'open", "codex resume =ls"]) assert.throws(() => literalShellWords(unsafe), unsafe);
 });
 
 test("a pi model is a provider and a model id split at the first slash, so a provider's own slashes survive", () => {

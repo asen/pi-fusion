@@ -13,7 +13,7 @@ A headless coding session doing work the host handed off: Claude Code or Pi, acc
 _Avoid_: subagent, worker, delegate
 
 **Backend**:
-The implementation that runs a child: `claude`, `pi`, or `codex`. Claude and Pi are registered; this build names Codex in settings and records and binds its roles, but registers no Codex backend, so a call routed there is refused as unavailable before anything starts. Fresh calls use the role's configured backend unless explicitly overridden; continuations stay on their recorded backend. A backend owns its session shape, binding, and protocol; the host owns handles, records, and scheduling. See [Profiles](docs/profiles.md).
+The implementation that runs a child: `claude`, `pi`, or `codex`. Claude, Pi and an experimental, fresh-only Codex backend are registered; Codex runs only when a call or the settings route a role there. Fresh calls use the role's configured backend unless explicitly overridden; continuations stay on their recorded backend. A backend owns its session shape, binding, and protocol; the host owns handles, records, and scheduling. See [Profiles](docs/profiles.md).
 _Avoid_: adapter, provider, harness, runtime (as synonyms for backend)
 
 **Role**:

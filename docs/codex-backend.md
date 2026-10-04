@@ -1,6 +1,28 @@
-# The Codex backend (runtime layer)
+# The Codex backend
 
-**Status: experimental, unqualified, and not registered.** This page covers the fresh-run Codex runtime layer: `extensions/backends/codex.ts`, which composes the run, and `codex-outcome.ts`, which maps its evidence. The host does not construct or register it yet, so a call routed to `codex` is still refused as unavailable before anything starts (see [Runs](runs.md)). Host registration is the next slice. Until then this page describes code that only the test suite runs.
+**Status: registered, experimental, and natively unqualified (stage 1).** The host registers this build's Codex backend by default beside Claude and Pi: `extensions/backends/codex.ts` composes a run and `codex-outcome.ts` maps its evidence. Nothing routes there unless a call names `backend: "codex"` or your settings put `implement` or `ask` on it; builtin routes no role to Codex. No real Codex app-server, provider, model or platform has been measured with it (see [Evidence](#evidence)), so treat every run as a trial of your own install.
+
+## What stage 1 runs
+
+| | Codex |
+| --- | --- |
+| Roles | `implement` (`workspace-write` sandbox) and `ask`, both modes (`read-only`), approval policy `never` |
+| Unavailable | `plan`, `ultracode`, `security`, the `fresh` parameter; each is refused before anything starts |
+| Sessions | Fresh threads only. A `continue` is refused: a Codex record has no trusted checkpoint and is kept for reading, and the backend refuses any resume or fork mapping before a contract read, binary lookup or spawn |
+| Questions and steers | None: no `ask_orchestrator`, and the input is closed from the start. A control `message` or `/fusion steer` to a running Codex run is refused at once; `wait`, `status` and `cancel` work as for any run |
+| Reviews | A manual or automatic review runs on Codex when the session's **ask** role is configured there, as a fresh read-only thread; it inherits nothing from the reviewed run, and disabled ask refuses manual review and skips automatic review quietly |
+| Writer slot | `implement` holds the single file-changing slot across Claude, Pi and Codex, like any coding run; `ask` runs beside it |
+| Follow-up | A new run carrying the report as context. The stats line, status and dashboard name `codex resume <thread id>`, from the accepted thread only, so you can open the thread in Codex yourself; an id a shell would not read as one plain word is single-quoted, and one starting with `-` follows `--` |
+
+Loading the extension constructs the backend and does nothing else: no binary is looked for, no contract, configuration or home is read, and nothing starts. A machine without `codex` loads Fusion, Claude and Pi as before, and a Codex run there fails with the launch's own sentence about the missing binary.
+
+## The host's own install
+
+A run uses the host's `codex`: `PI_FUSION_CODEX_BIN` (an absolute path) or the first executable `codex` on the inherited `PATH`, located when the run starts ([configuration](configuration.md)). The child gets the host's environment copied unchanged and runs in the host's working directory. It therefore uses the user's own Codex home (`CODEX_HOME`, else `~/.codex`), configuration, profiles and login: Fusion copies, writes and checks no auth or configuration file, and needs no API key of its own. The home is predicted only so the handshake can compare it with the one the child reports.
+
+The sandbox **mode** is named per thread and checked at start. Everything else about that mode — writable roots, network access, shell environment policy and any other policy the user's configuration sets for `workspace-write` or `read-only` — is inherited and neither set nor checked.
+
+**The request names no cwd (open native question Q2).** Neither thread/start nor turn/start names a working directory. Read in the 0.160.0 source, naming one can make Codex record a trust entry for an untrusted writable project in the user's configuration; leaving it out avoids that, and the reported cwd is checked against the launch's realpath instead. Whether that holds natively, and how a real app-server treats a project it does not trust when no cwd is named, is unmeasured (Q2). A fallback that names the cwd, and so may write a trust entry into the user's Codex configuration, is not implemented and would need the user's explicit consent first.
 
 ## Evidence
 
@@ -9,7 +31,7 @@ Keep these three apart:
 | Kind | What it covers |
 | --- | --- |
 | Source inspection | Every app-server shape (initialize, thread/start, turn/start, thread/read, notifications, approvals) as read in Codex **0.160.0**'s app-server protocol source. That includes the reading that `developerInstructions`, `Thread.model` and `Thread.reasoningEffort` are stable fields there. A later version may change any of it. |
-| Deterministic fake | `test/codex-backend.test.ts` drives the composition against `test/fake-codex.mjs`, a builtins-only node program that speaks literal JSON-RPC. It is launched by path through an injected launch, with no Codex binary, home, auth, `PATH` lookup or model. A pass shows that this host's sequencing, checks and mapping behave as written against those literals. |
+| Deterministic fake | `test/codex-backend.test.ts` drives the composition against `test/fake-codex.mjs`, a builtins-only node program that speaks literal JSON-RPC. It is launched by path through an injected launch, with no Codex binary, home, auth, `PATH` lookup or model. One lifecycle case registers this build's backend in a test host over the same fake, for a delegated run and an independently configured reviewer; host controls, records and presentation are otherwise tested with in-memory doubles. A pass shows that this host's sequencing, checks and mapping behave as written against those literals. |
 | Native measurement | **None.** No real app-server, provider, paid model request, platform or version has been qualified. Linux x64 is the intended qualification target. |
 
 ## One call
@@ -35,6 +57,8 @@ Requests never name a `cwd`, config map, base instructions, dynamic tools or an 
 A resume or fork is refused when the session is mapped, before any contract read, binary lookup or spawn. A Codex child has no question tool and takes no steer: its control is closed (`push` refuses), and a question or other unsupported server request fails the run. Approval requests are declined, and the run lists them as denied tools. With approval policy `never`, none is expected.
 
 ## Selection
+
+The model and effort come from the call, then the session's configuration, then `PI_FUSION_CODEX_<ROLE>_MODEL`/`_EFFORT`; with none of them the host's own Codex configuration chooses, and the run is shown as `host default`, then `host default -> <model>` once the child reports it. The label is never sent as a model.
 
 The **configured selection** is the thread's own: the model and provider from thread/start, confirmed by the post-turn thread/read.
 
@@ -68,9 +92,12 @@ A verified success whose shutdown was not clean is demoted. It keeps its thread 
 - Tokens are the fresh thread's final cumulative **total**: input (which already includes cached input), output, cache read (= cached input, shown and never added again) and cache write as reported. Context is the latest response's input, and the window appears only when the child reports one. With no window, no share is shown or guessed.
 - **Cache write vs input is unqualified (Q14).** Whether Codex's cache-write tokens are part of `inputTokens` is not settled by the 0.160.0 source and has not been measured natively. Fusion uses Codex's `inputTokens` unchanged and reports cache write beside it, with no sum, subtraction or clamp. No lifecycle, budget or context-cap behavior may rely on that relationship until Q14 is measured.
 - Usage covers the **parent thread only**. A subagent's threads are not included, and nothing claims they are. Codex reports no cost, so the cost is **unknown**: no USD figure or estimate is produced.
+- In the host, a Codex run's tokens count toward the session ledger and its dollar estimate leaves it out: no Codex run shows a cost, and `/fusion status`, the widget and the dashboard header add `cost unknown for N codex runs, not in the estimate`. With `PI_FUSION_BUDGET_WARN_USD` or `PI_FUSION_BUDGET_LIMIT_USD` set, the first Codex run admitted in an extension instance says once that Codex spend is outside the estimate. No budget refusal or estimate is specific to Codex; the existing limit refuses Codex runs exactly as any other once the priced Claude/Pi estimate reaches it.
+- A context share is shown only when the child reports a window; with a null window no share is guessed.
+- The host records the tagged thread reference and the verified selection only. The outcome's scalar `sessionId`, and any flat checkpoint, model or effort, are diagnostics the host never writes for a Codex run; `recordDecision` decides what is kept. A cancelled or failed run that already verified its selection stays a failure: it may be kept for reading with that selection, never read as a success.
 
 ## Inheritance, not isolation
 
-The child runs the host's `codex` (`PI_FUSION_CODEX_BIN` or `PATH`) with the host's environment copied unchanged. It therefore uses the user's Codex home, configuration, auth, MCP servers, multi-agent features and any remote-control settings. Fusion predicts the home only to compare it, and isolates nothing. The sandbox is the per-thread mode Codex reports for the role, checked at start. There is no historical sandbox record or comparison, so a later continuation guard against one does not exist.
+The child runs the host's `codex` (`PI_FUSION_CODEX_BIN` or `PATH`) with the host's environment copied unchanged. It therefore uses the user's Codex home, configuration, auth, MCP servers, multi-agent features (subagents) and any remote-control settings. Fusion predicts the home only to compare it, and isolates nothing: an MCP server or remote-control setting the user enabled is live in a delegated run, and a subagent's work and spend are outside what Fusion reports. The sandbox is the per-thread mode Codex reports for the role, checked at start. There is no historical sandbox record or comparison, so a later continuation guard against one does not exist.
 
 The live display filters the transport's notifications to the primary thread and its admitted turn. A subagent's or a foreign turn's final text, usage or tool calls never reach the report or the monitor.

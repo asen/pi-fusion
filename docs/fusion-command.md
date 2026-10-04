@@ -9,7 +9,7 @@ User commands act on the same runs as either control tool. Run-changing `steer`,
 | `/fusion on`, `/fusion off` | Switch delegation mode; neither starts or cancels a child |
 | `/fusion status [run-N]` | Show mode, runs, earlier-process runs, and session usage; a handle adds activity, tool count, changed files, and an accepted transcript/resume hint |
 | `/fusion cancel run-N` | Stop the run and mark it cancelled by the user; the host still gets its end notice |
-| `/fusion steer run-N <text>` | Queue text for a running child; a waiting child needs an answer instead |
+| `/fusion steer run-N <text>` | Queue text for a running child; a waiting child needs an answer instead, and a Codex child takes none (refused at once) |
 | `/fusion wait run-N` | Show activity/elapsed time until the run ends or asks a question; Esc leaves it going and never takes the report away from the host |
 | `/fusion answer [run-N] [text]` | Answer a waiting question; no text opens an editor; no handle selects the sole waiting run |
 | `/fusion review run-N` | Start an independent background review of eligible ended work |
@@ -29,7 +29,7 @@ run-N cancelled; cleaning up needs attention: leftovers; this call's storage is 
 
 The same warning appears once in the failure/report/history/dashboard. It carries no path or foreign error text. Cancellation does not undo files, and cleanup can need [manual attention](runs.md#aborting-a-run).
 
-Completion offers forms and relevant handles: all runs for status, active ones for cancel/wait, running ones for steer, waiting ones for answer, and reviewable ones for review. Profile completion uses the last-read saved names, with `builtin` for use/default.
+Completion offers forms and relevant handles: all runs for status, active ones for cancel/wait, running ones that take a steer (not Codex) for steer, waiting ones for answer, and reviewable ones for review. Profile completion uses the last-read saved names, with `builtin` for use/default.
 
 ### Turning Fusion on and off
 
@@ -90,6 +90,6 @@ Collapsed cards show the first three nonempty report lines, excluding stats/revi
 
 Terminal text strips escape sequences and control characters (except tab/newline), and cards respect the supplied width. This is terminal-output safety, not redaction or a transformation of the child text the host reads. Renderer tests cover fixed widths down to one column; no live-terminal qualification is claimed by those tests.
 
-The optional widget above the editor lists active handles, activity, tools, live changed-file count, and answer hints. With a budget configured it adds usage/thresholds. It disappears when the last run/session ends; `PI_FUSION_WIDGET=0` disables it without changing the footer. File counts sample Git at most once per ten seconds per coding run; ask runs are not sampled.
+The optional widget above the editor lists active handles, activity, tools, live changed-file count, and answer hints. With a budget configured it adds usage/thresholds, and names how many Codex runs the estimate leaves out because Codex reports no cost. It disappears when the last run/session ends; `PI_FUSION_WIDGET=0` disables it without changing the footer. File counts sample Git at most once per ten seconds per coding run; ask runs are not sampled.
 
 See [Questions](questions.md), [Independent reviews](reviews.md), and [Dashboard](dashboard.md) for their own operational details.

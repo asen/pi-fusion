@@ -5,9 +5,11 @@ import * as http from "node:http";
 import * as os from "node:os";
 import * as path from "node:path";
 import test, { after } from "node:test";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import type { BackendName, HostBackend, SessionIntent } from "../extensions/backends/types.ts";
+import { createCodexBackend } from "../extensions/backends/codex.ts";
+import { CODEX_APP_SERVER_ARGS } from "../extensions/backends/codex-launch.ts";
+import { type BackendName, type HostBackend, hostBackend, type SessionIntent } from "../extensions/backends/types.ts";
 import fusion from "../extensions/fusion.ts";
 import { memoryProfileStore, type ProfileStore } from "../extensions/profile-store.ts";
 import { History, type HistoryRecord } from "../extensions/history.ts";
@@ -2057,6 +2059,260 @@ test("a manual review by an ask role configured on codex is bound read-only on i
 });
 
 const OFF_REFUSAL = "fusion is off; turn it on with /fusion on, or ask for Fusion by name";
+
+test("a running codex run takes no steer: both control tools and /fusion steer say so at once, and status, wait and cancel act on it as on any run", async () => {
+	// An own in-memory double over the shared codex tripwire, with the input closed from the start as a codex child's is.
+	const verified = { model: "gpt-5.5", provider: "openai" };
+	const codex = fakeBackend({
+		name: "codex",
+		scripts: [codexScript("thread-1", { pending: true }), codexScript("thread-2", { pending: true, onAbort: { session: { backend: "codex", sessionId: "thread-2" }, selection: verified } })],
+	});
+	const host = makeHost({ backends: { codex: codex.backend } });
+	const started = await host.fusion({ role: "implement", task: "long work", backend: "codex", background: true });
+	assert.equal(started.text, "run-1 started in the background; you get the report when it ends");
+	const running = await codex.started();
+	// The reply comes while the run is still running: nothing waits for its end to say no steer was sent.
+	for (const [tool, control] of [["fusion_control", host.control], ["claude_control", host.claudeControl]] as const) {
+		const refused = await control({ action: "message", run: "run-1", message: "also fix the typo" });
+		assert.equal(
+			refused.text,
+			`run-1 (implement) runs on the codex backend, whose child takes no steer while it runs. The message was not sent. Wait for its report with ${tool} wait, or stop it with ${tool} cancel; to follow up, start a new fusion run that carries its report as context.`,
+		);
+		assert.deepEqual([refused.details.state, refused.details.sent], ["running", "none"], tool);
+	}
+	host.notices.length = 0;
+	await host.command("steer run-1 also fix the typo");
+	assert.deepEqual(host.notices, ["run-1 runs on the codex backend, whose child takes no steer while it runs; nothing was sent. Wait for it with /fusion wait run-1 or stop it with /fusion cancel run-1"]);
+	assert.deepEqual(running.steers, [], "nothing reached the child");
+	assert.equal(host.sent.filter(([message]) => message.details?.kind === "steer").length, 0, "and no notice told the host a steer was sent");
+	assert.match((await host.control({ action: "status", run: "run-1" })).text ?? "", /^run-1 · implement · host default · running · background · /);
+
+	const waiting = host.control({ action: "wait", run: "run-1" });
+	running.release();
+	const waited = await waiting;
+	assert.match(waited.text ?? "", /^run-1 \(implement\) done\.\n\n## Changed\nfoo\.ts\n\n\[run-1 · implement · host default -> gpt-5\.5 · .* · codex resume thread-1\]$/);
+
+	// A cancellation that lands after the child verified its selection is still a cancellation: failed() and the record
+	// decision say so, and the selection it carried is kept on a readable record, never read as a success.
+	await host.fusion({ role: "implement", task: "more work", backend: "codex", background: true });
+	await codex.started(2);
+	const cancelled = await host.control({ action: "cancel", run: "run-2" });
+	assert.deepEqual([cancelled.text, cancelled.details.state], ["run-2 cancelled", "cancelled"]);
+	await ended(host, "run-2");
+	assert.deepEqual(host.entries()[1], { run: "run-2", role: "implement", backend: "codex", hostSessionId: "host-1", session: { backend: "codex", sessionId: "thread-2" }, selection: verified });
+	assert.match(await statusOf(host, "run-2"), /^run-2 · implement · host default -> gpt-5\.5 · cancelled · background/);
+	assert.equal(
+		(await host.fusion({ continue: "run-2", task: "go on" })).error,
+		"run-2 ran on codex and recorded no trusted checkpoint, so it is kept for reading and not continued; open its thread with codex resume thread-2, and new work needs a new run without continue",
+	);
+	assert.equal(codex.starts.length, 2, "nothing continued the cancelled thread");
+});
+
+test("a codex outcome's scalar session id and flat checkpoint are diagnostics: after wait the record keeps the tagged thread and selection alone, readable and checkpointless", async () => {
+	const selection = { model: "gpt-5.5", provider: "openai", effort: "high" };
+	// The scalar and the flat checkpoint disagree with the tagged thread on purpose: a writer that read either would show.
+	const codex = fakeBackend({ name: "codex", scripts: [codexScript("thread-1", { sessionId: "codex-scalar", selection, extra: { modelId: "gpt-5.5", checkpoint: "codex-flat-checkpoint" } })] });
+	const host = makeHost({ backends: { codex: codex.backend } });
+	const ran = await host.fusion({ role: "implement", task: "do the thing", backend: "codex", effort: "high" });
+	assert.equal(ran.error, undefined);
+	await ended(host, "run-1");
+	assert.deepEqual(host.entries(), [{ run: "run-1", role: "implement", backend: "codex", hostSessionId: "host-1", session: { backend: "codex", sessionId: "thread-1" }, selection }]);
+	for (const field of ["sessionId", "checkpoint", "model", "effort"]) assert.equal(field in host.entries()[0]!, false, `no flat ${field} is written for a codex run`);
+	assert.equal(ran.details.sessionId, undefined, "no scalar reaches the host's details");
+	const status = await statusOf(host, "run-1");
+	for (const text of [ran.text, status]) {
+		assert.match(text ?? "", /codex resume thread-1/);
+		assert.doesNotMatch(text ?? "", /codex-scalar|codex-flat-checkpoint|claude --resume/);
+	}
+	// Kept for reading, and continued through neither tool pair; each names fusion or the thread to reopen.
+	const refusal = "run-1 ran on codex and recorded no trusted checkpoint, so it is kept for reading and not continued; open its thread with codex resume thread-1, and new work needs a new run without continue";
+	assert.equal((await host.fusion({ continue: "run-1", task: "more" })).error, refusal);
+	assert.equal((await host.claude({ continue: "run-1", task: "more" })).error, "run-1 ran on the codex backend, which the claude tool does not run; continue it with fusion and continue run-1");
+	for (const control of [host.control, host.claudeControl]) {
+		const left = await control({ action: "message", run: "run-1", message: "more" });
+		assert.ok((left.text ?? "").startsWith("run-1 (implement) has ended: done. The message was not sent."), left.text);
+		assert.ok((left.text ?? "").endsWith(`${refusal}.`), left.text);
+		assert.equal(left.details.refused, true);
+	}
+	assert.equal(codex.starts.length, 1, "nothing was continued");
+});
+
+test("a running codex implement run holds the one writer slot against every backend; off, settings and /tree wait for it, and shutdown cancels and records it", async () => {
+	await withEnv(piEnv(), async () => {
+		const codex = fakeBackend({ name: "codex", scripts: [codexScript("thread-1", { pending: true, onAbort: { session: { backend: "codex", sessionId: "thread-1" } } }), codexScript("thread-2", { text: "## Answer\nyes" })] });
+		const pi = fakeBackend();
+		const claude = fakeBackend({ name: "claude" });
+		const host = makeHost({ backends: { ...both(pi, claude), codex: codex.backend } });
+		await host.fusion({ role: "implement", task: "long work", backend: "codex", background: true });
+		await codex.started();
+		const busy = (control: string) => `run-1 (implement) is still active; wait for it, message it or cancel it with ${control} before you start or continue another run that can change files`;
+		assert.equal((await host.fusion({ role: "implement", task: "x", backend: "pi" })).error, busy("fusion_control"));
+		assert.equal((await host.fusion({ role: "implement", task: "x", backend: "codex" })).error, busy("fusion_control"));
+		assert.equal((await host.claude({ role: "implement", task: "x" })).error, busy("claude_control"));
+		// A read-only codex ask goes next to it.
+		assert.equal((await host.fusion({ role: "ask", task: "a question", backend: "codex" })).error, undefined);
+		assert.deepEqual([pi.starts.length, claude.starts.length, codex.starts.length], [0, 0, 2]);
+
+		host.notices.length = 0;
+		await host.command("off");
+		await host.command("profile use builtin");
+		assert.deepEqual(host.notices, [
+			"fusion stays on while runs are unfinished: run-1 (implement). Wait for each run or cancel it with /fusion cancel run-N, then retry /fusion off.",
+			"fusion settings stay as they are while runs are unfinished: run-1 (implement). Wait for each run or cancel it with /fusion cancel run-N, then retry.",
+		]);
+		assert.deepEqual(await host.tree(), { cancel: true });
+
+		await host.shutdown();
+		assert.deepEqual(
+			host.entries().map((entry) => [entry.run, entry.session]),
+			[
+				["run-2", { backend: "codex", sessionId: "thread-2" }],
+				["run-1", { backend: "codex", sessionId: "thread-1" }],
+			],
+			"shutdown cancelled the writer and awaited its record",
+		);
+		assert.equal((await host.control({ action: "status", run: "run-1" })).details.state, "cancelled");
+	});
+});
+
+test("fusion off and a disabled role refuse a codex call, and a disabled ask refuses a manual codex review and quietly skips an automatic one, before the codex backend is asked for anything", async () => {
+	const codex = fakeBackend({ name: "codex" });
+	const host = makeHost({ backends: { codex: codex.backend }, profiles: profileWith({ implement: { enabled: false, backend: "codex" }, ask: { enabled: true, backend: "codex" } }) });
+	assert.equal((await host.fusion({ role: "implement", task: "x" })).error, "role implement is disabled in profile work; change /fusion config or select another profile");
+	assert.equal((await host.fusion({ role: "implement", task: "x", backend: "codex" })).error, "role implement is disabled in profile work; change /fusion config or select another profile");
+	await host.command("off");
+	assert.equal((await host.fusion({ role: "ask", task: "x", backend: "codex" })).error, OFF_REFUSAL);
+	assert.deepEqual([codex.sessions, codex.starts.length], [[], 0]);
+
+	const dir = gitRepo("codex-ask-disabled");
+	await withEnv({ PI_FUSION_AUTO_REVIEW: "1" }, async () => {
+		const claude = fakeBackend({ name: "claude", scripts: [{ pending: true }] });
+		const quiet = fakeBackend({ name: "codex" });
+		const reviewing = makeHost({ backends: { claude: claude.backend, codex: quiet.backend }, cwd: dir, profiles: profileWith({ ask: { enabled: false, backend: "codex" } }) });
+		const done = await runThatChanged(reviewing, claude, dir, { role: "implement", task: "add the retry" });
+		assert.equal(done.details.reviewedBy, undefined, "a disabled ask role starts no review");
+		assert.deepEqual(reviewing.notices, [], "skipping it is not a warning");
+		await reviewing.command("review run-1");
+		assert.deepEqual(reviewing.notices, ["role ask is disabled in profile work, so nothing reviews run-1; change /fusion config or select another profile"]);
+		assert.deepEqual([quiet.sessions, quiet.starts.length], [[], 0]);
+	});
+});
+
+test("PI_FUSION_AUTO_REVIEW gives a claude run an ask reviewer configured on codex, bound read-only there and inheriting nothing from the run", async () => {
+	const dir = gitRepo("codex-auto-review");
+	await withEnv({ PI_FUSION_AUTO_REVIEW: "1" }, async () => {
+		const claude = fakeBackend({ name: "claude", scripts: [{ pending: true }] });
+		const codex = fakeBackend({ name: "codex", scripts: [codexScript("thread-9", { text: "## Verdict\nReady" })] });
+		const host = makeHost({ backends: { claude: claude.backend, codex: codex.backend }, cwd: dir, profiles: profileWith({ ask: { enabled: true, backend: "codex", model: "gpt-5-codex" } }) });
+		const done = await runThatChanged(host, claude, dir, { role: "implement", task: "add the retry" });
+		assert.equal(done.details.reviewedBy, "run-2");
+		const reviewer = await codex.started();
+		assert.deepEqual(reviewer.role, { name: "ask", model: "gpt-5-codex", contract: "ask-review.md", addendum: "codex-no-questions.md", mode: "review", sandboxMode: "read-only", approvalPolicy: "never" });
+		assert.deepEqual(reviewer.session, { kind: "new", intent: { kind: "new" } });
+		await ended(host, "run-2");
+		assert.deepEqual(host.entries()[1], { run: "run-2", role: "ask", mode: "review", backend: "codex", hostSessionId: "host-1", session: { backend: "codex", sessionId: "thread-9" }, selection: { model: "gpt-5.5", provider: "openai" } });
+		assert.equal(claude.starts.length, 1, "no claude child reviewed it");
+	});
+});
+
+test("a codex run admitted while a dollar warning or limit is set says once that codex spend is outside the estimate, and refuses or estimates nothing", async () => {
+	const notice = /codex runs report no cost/;
+	await withEnv({ PI_FUSION_BUDGET_WARN_USD: "5", PI_FUSION_BUDGET_LIMIT_USD: undefined }, async () => {
+		const codex = fakeBackend({ name: "codex", scripts: [codexScript("thread-1"), codexScript("thread-2")] });
+		const claude = fakeBackend({ name: "claude" });
+		const host = makeHost({ backends: { claude: claude.backend, codex: codex.backend } });
+		assert.equal((await host.claude({ role: "ask", task: "a question" })).error, undefined);
+		assert.equal(host.notified.filter((one) => notice.test(one.text)).length, 0, "a claude run is priced, and says nothing of codex");
+		const first = await host.fusion({ role: "ask", task: "a question", backend: "codex" });
+		assert.equal((await host.fusion({ role: "ask", task: "another", backend: "codex" })).error, undefined);
+		assert.deepEqual(host.notified.filter((one) => notice.test(one.text)), [
+			{ text: "fusion: codex runs report no cost, so the estimate PI_FUSION_BUDGET_WARN_USD and PI_FUSION_BUDGET_LIMIT_USD act on does not include what codex runs spend; their tokens are counted, and no codex cost is estimated", level: "warning" },
+		]);
+		assert.equal(first.details.costUsd, undefined, "no dollar figure is shown for a codex run");
+		assert.doesNotMatch(first.text ?? "", /\$/);
+		await host.command("status");
+		assert.match(host.notices.at(-1) ?? "", /\nsession usage: est\. \$0\.\d{4} · in .* · 3 calls · cost unknown for 2 codex runs, not in the estimate · warn at \$5\.00$/);
+	});
+	await withEnv({ PI_FUSION_BUDGET_WARN_USD: undefined, PI_FUSION_BUDGET_LIMIT_USD: undefined }, async () => {
+		const codex = fakeBackend({ name: "codex", scripts: [codexScript("thread-1")] });
+		const host = makeHost({ backends: { codex: codex.backend } });
+		assert.equal((await host.fusion({ role: "ask", task: "a question", backend: "codex" })).error, undefined);
+		assert.equal(host.notified.filter((one) => notice.test(one.text)).length, 0, "with no dollar control set there is nothing to qualify");
+	});
+});
+
+test("a codex thread id a shell would interpret is offered as one quoted literal argument wherever the host names it, and the scalar never stands in", async () => {
+	const hostile = "$(touch pwned) `id` it's";
+	const quoted = "codex resume '$(touch pwned) `id` it'\\''s'";
+	const codex = fakeBackend({ name: "codex", scripts: [codexScript(hostile, { sessionId: "codex-scalar" }), codexScript("-rf")] });
+	const host = makeHost({ backends: { codex: codex.backend } });
+	const ran = await host.fusion({ role: "ask", task: "a question", backend: "codex" });
+	assert.equal(ran.error, undefined);
+	await ended(host, "run-1");
+	assert.ok((ran.text ?? "").endsWith(` · ${quoted}]`), ran.text);
+	const status = await statusOf(host, "run-1");
+	assert.ok(status.endsWith(`\n${quoted}`), status);
+	const refused = await host.fusion({ continue: "run-1", task: "more" });
+	assert.ok((refused.error ?? "").includes(`open its thread with ${quoted}, and new work`), refused.error);
+	for (const text of [ran.text, status, refused.error]) assert.doesNotMatch(text ?? "", /codex-scalar|claude --resume/);
+	// The record keeps the id exactly as the child reported it: quoting is the hint's, never the identity's.
+	assert.deepEqual(host.entries()[0]!.session, { backend: "codex", sessionId: hostile });
+	const option = await host.fusion({ role: "ask", task: "another", backend: "codex" });
+	assert.ok((option.text ?? "").endsWith(" · codex resume -- '-rf']"), option.text);
+});
+
+/** The literal fake app-server, and the fence its node process imports first. Neither is Codex. */
+const FAKE_CODEX = path.join(repoRoot, "test", "fake-codex.mjs");
+const SDK_FENCE = path.join(repoRoot, "test", "sdk-fence.mjs");
+
+/**
+ * This build's own codex backend, composed by its own factory, over an explicit launch of the literal fake app-server
+ * by its own path under this node, with an environment of the case's own: no codex binary, `PATH` lookup, Codex home,
+ * auth or model is involved, and nothing here is evidence about a real app-server.
+ */
+function literalCodex(home: string): HostBackend {
+	return hostBackend(
+		createCodexBackend({
+			env: { FAKE_CODEX_SCENARIO: "ok", CODEX_HOME: home },
+			launch: (request) => ({
+				launch: { command: process.execPath, args: ["--import", pathToFileURL(SDK_FENCE).href, FAKE_CODEX, ...CODEX_APP_SERVER_ARGS], cwd: request.cwd, env: { ...request.env } },
+				executable: { command: process.execPath, prefix: [FAKE_CODEX], path: FAKE_CODEX, source: "override" },
+				expectedCwd: fs.realpathSync(request.cwd),
+				expectedCodexHome: home,
+			}),
+			cleanup: { exitGraceMs: 800, stopGraceMs: 1_000, leftoverGraceMs: 200, pipeGraceMs: 500, tableTimeoutMs: 3_000 },
+			bounds: { initializeMs: 10_000, requestMs: 10_000, shutdownStepMs: 1_500 },
+		}),
+	);
+}
+
+test("a full host call runs this build's codex backend against the literal fake app-server, and an independently configured codex reviewer reviews a claude run", async () => {
+	const dir = gitRepo("codex-literal");
+	const home = path.join(tempDir("codex-literal-home"), "codex-home");
+	const claude = fakeBackend({ name: "claude", scripts: [{ pending: true }] });
+	const host = makeHost({ backends: { claude: claude.backend, codex: literalCodex(home) }, cwd: dir, profiles: profileWith({ ask: { enabled: true, backend: "codex" } }) });
+	const selection = { model: "gpt-host-default", provider: "openai" };
+
+	const asked = await host.fusion({ role: "ask", task: "what does base.txt hold?" });
+	assert.equal(asked.error, undefined);
+	assert.match(asked.text ?? "", /^fake answer\n/);
+	assert.match(asked.text ?? "", /\[run-1 · ask · host default -> gpt-host-default · \d+s · \d+ tool calls · in 1\.2k out 130 · context 200\/200\.0k \(<1%\) · codex resume thr-1\]$/);
+	assert.equal(asked.details.costUsd, undefined);
+	await ended(host, "run-1");
+	assert.deepEqual(host.entries()[0], { run: "run-1", role: "ask", mode: "answer", backend: "codex", hostSessionId: "host-1", session: { backend: "codex", sessionId: "thr-1" }, selection, contextTokens: 200, contextWindow: 200_000 });
+
+	const done = await runThatChanged(host, claude, dir, { role: "implement", task: "add the retry", backend: "claude" });
+	assert.equal(done.error, undefined);
+	host.notices.length = 0;
+	await host.command("review run-2");
+	assert.deepEqual(host.notices, ["run-3 reviews run-2 in the background; its report arrives as a message"]);
+	const reviewed = await ended(host, "run-3");
+	assert.match(reviewed, /^run-3 \(ask, review of run-2\) done\.\n\nfake answer\n/);
+	assert.deepEqual(host.entries()[2], { run: "run-3", role: "ask", mode: "review", backend: "codex", hostSessionId: "host-1", session: { backend: "codex", sessionId: "thr-1" }, selection, contextTokens: 200, contextWindow: 200_000 });
+	assert.equal((await host.control({ action: "status", run: "run-2" })).details.reviewedBy, "run-3");
+	assert.equal(claude.starts.length, 1, "no claude child reviewed it");
+	assert.deepEqual(tripwireReaches("codex"), [], "the explicit registration stood in for the tripwire");
+});
 
 test("/fusion off hides the fusion tools and starts nothing, and /fusion on gives back the ones it hid", async () => {
 	await withEnv(piEnv(), async () => {
