@@ -397,6 +397,47 @@ body {
 	white-space: nowrap;
 }
 
+.archived {
+	border: 1px dashed var(--border);
+}
+
+.archive-more {
+	padding: 10px 12px 14px;
+}
+
+.archive-status {
+	margin: 0 0 8px;
+	color: var(--muted);
+	font-size: 12px;
+}
+
+.archive-load {
+	width: 100%;
+	padding: 5px 8px;
+	border: 1px solid var(--border);
+	border-radius: 4px;
+	background: var(--panel);
+	color: var(--text);
+	font: inherit;
+	font-size: 12px;
+	cursor: pointer;
+}
+
+.archive-load:hover {
+	color: var(--accent);
+}
+
+.archive-load[aria-disabled="true"] {
+	color: var(--muted);
+	cursor: progress;
+}
+
+.archive-note {
+	margin: 4px 0 0;
+	color: var(--warn);
+	font-size: 12px;
+}
+
 .status {
 	padding: 1px 7px;
 	border-radius: 9px;

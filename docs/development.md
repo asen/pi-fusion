@@ -25,6 +25,7 @@ fusion.ts                     host lifecycle and registration
   |     +-- codex.ts          Codex app-server composition (experimental, registered)
   +-- process-tree.ts         launch and descendant cleanup
   +-- cards/dashboard        terminal and browser monitoring
+  |     +-- dashboard-archive.ts  read-only history archive
   +-- changes/history/budget snapshots, persistence, accounting
   +-- handoff/review          prompts and eligibility
 ```
@@ -53,6 +54,7 @@ fusion.ts                     host lifecycle and registration
 | `backends/pi-outcome.ts`, `pi-backend.ts` | Pure diagnostics/disposition/demotion/progress mapping; composition and finalization |
 | `process-tree.ts` | SDK-independent process launching and legacy/owned descendant cleanup |
 | `cards.ts`, `dashboard.ts`, `dashboard/` | Terminal rendering/widget; bounded store, read-only HTTP server, plain DOM page |
+| `dashboard-archive.ts` | Archive eligibility from branch evidence (recorded or request lineage); bounded per-record summaries and identity cache; lazy detail re-read from disk; 30-entry keyset pages; reads through `History` and writes nothing |
 | `changes.ts`, `history.ts`, `budget.ts` | Git snapshots; opt-in host run history; running-total cost ledger |
 | `handoff.ts`, `review.ts` | Plan cap/model-change handoff; independent review eligibility and quoted prompt data |
 
@@ -73,7 +75,7 @@ Role behavior belongs in `contracts/*.md`. Review **selection** belongs in `fusi
 | Codex qualification harness | `codex-harness.test.ts`, `test/spikes/codex-app-server*.mjs` | CLI/guard and PASS/FAIL/UNPROVEN/SKIP rules, usage/steer/question verdicts, explicit `--fake` cases, request-shape parity and fixture retention. Guards never pass a case; fake passes are not native qualification |
 | Codex binding and host | `codex-binding.test.ts`, routing/lifecycle/profiles/dashboard/browser Codex cases | Pure role binding; routing/handoffs, controls, records, presentation, accounting and review with an in-memory double; delegated runs, failed resumes, reviews, steers and answered/cancelled questions with the fake-backed backend |
 | Configuration/mode | `profiles.test.ts` | Settings/store/commands, off-by-default, reminder, refresh/rollback, and allow-list preservation against a modeled host |
-| Presentation/persistence | Cards, dashboard, browser, history, changes, budget, review tests | Bounded/safe rendering and storage, Git snapshots, cost ledger, and review prompts/eligibility |
+| Presentation/persistence | Cards, dashboard, dashboard-archive, browser, history, changes, budget, review tests | Bounded/safe rendering and storage, archive eligibility/paging/pruning against real temporary history, Git snapshots, cost ledger, and review prompts/eligibility |
 
 ```text
 extension test host

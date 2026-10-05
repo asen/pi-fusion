@@ -16,6 +16,7 @@ User commands act on the same runs as either control tool. Run-changing `steer`,
 | `/fusion config` | Show/edit the session's role settings |
 | `/fusion profile [list \| use <name> \| save <name> \| default <name>]` | Choose/manage global named profiles |
 | `/fusion dashboard`, `/fusion dashboard stop` | Open/reuse or close the read-only monitoring page |
+| `/fusion dashboard limit [N]` | Inspect or set this instance's in-memory run-retention target; defaults to 30, never evicts active work. See [Dashboard](dashboard.md#rendering-and-retained-data) |
 
 Status offers continuation only for a usable record. A Pi transcript path appears only after the host accepts the outcome: not for a live run or a rejected result, and a fork names its new child file. Claude hints use `claude --resume <session id>`. See [Records](runs.md#backends-in-a-record).
 

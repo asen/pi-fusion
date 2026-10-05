@@ -7,10 +7,13 @@ import * as path from "node:path";
 import test, { afterEach } from "node:test";
 import { fileURLToPath } from "node:url";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import fusion, { builtinConfiguration, parseFusion } from "../extensions/fusion.ts";
-import { memoryProfileStore } from "../extensions/profile-store.ts";
+import { type ArchiveProvider, startDashboard } from "../extensions/dashboard.ts";
+import { ArchiveIndex } from "../extensions/dashboard-archive.ts";
+import fusion, { builtinConfiguration, type FusionOptions, parseFusion, runRecords } from "../extensions/fusion.ts";
 import { settingsTable } from "../extensions/profiles.ts";
-import { HISTORY_VERSION } from "../extensions/history.ts";
+import { memoryProfileStore } from "../extensions/profile-store.ts";
+import { History, HISTORY_ABORTED, HISTORY_VERSION, type HistoryRecord } from "../extensions/history.ts";
+import { fakeBackend } from "./fake-pi-backend.ts";
 import { toolList, turnOn } from "./host-tools.ts";
 import { tripwires } from "./tripwire.ts";
 
@@ -50,7 +53,8 @@ type WaitFactory = (tui: { requestRender: () => void }, theme: any, keybindings:
 type Renderer = (message: any, options: { expanded: boolean; outputPad: number }, theme: any) => { render: (width: number) => string[] } | undefined;
 
 const USAGE =
-	"Usage: /fusion dashboard | /fusion dashboard stop | /fusion status [run-N] | /fusion cancel run-N | /fusion wait run-N | /fusion steer run-N <text> | /fusion answer [run-N] [text] | /fusion review run-N | /fusion on | /fusion off | /fusion config | /fusion profile [list | use <name> | save <name> | default <name>]";
+	"Usage: /fusion dashboard | /fusion dashboard stop | /fusion dashboard limit [N] | /fusion status [run-N] | /fusion cancel run-N | /fusion wait run-N | /fusion steer run-N <text> | /fusion answer [run-N] [text] | /fusion review run-N | /fusion on | /fusion off | /fusion config | /fusion profile [list | use <name> | save <name> | default <name>]";
+const DASHBOARD_LIMIT_USAGE = "Usage: /fusion dashboard limit [N]; N must be a positive decimal safe integer";
 const PROFILE_USAGE = "Usage: /fusion profile [list | use <name> | save <name> | default <name>]; builtin names the built-in configuration for use and default";
 const STATUS_HEADER = ["fusion: on", "profile: builtin", "", ...settingsTable(builtinConfiguration().roles), "", ""].join("\n");
 const ESC = "\u001b";
@@ -78,7 +82,7 @@ afterEach(async () => {
 	}
 });
 
-function makeHost(cwd = repoRoot, mode: "tui" | "print" = "print", session: { id?: string; file?: string } = {}) {
+function makeHost(cwd = repoRoot, mode: "tui" | "print" = "print", session: { id?: string; file?: string } = {}, backends: FusionOptions["backends"] = {}, extra: Pick<FusionOptions, "dashboard"> = {}) {
 	const tools = new Map<string, Tool>();
 	const commands = new Map<string, Command>();
 	const handlers = new Map<string, (event: any, ctx: any) => Promise<unknown> | unknown>();
@@ -103,9 +107,8 @@ function makeHost(cwd = repoRoot, mode: "tui" | "print" = "print", session: { id
 		sendMessage: (message: unknown, options: unknown) => sent.push([message, options]),
 		registerMessageRenderer: (customType: string, renderer: Renderer) => renderers.set(customType, renderer),
 	} as unknown as ExtensionAPI;
-	// Every run of this file is a claude one, and the tripwires are what keep the pi and codex backends out of reach of
-	// a case that routed to one by accident.
-	fusion(api, { backends: { ...tripwires() }, profiles: memoryProfileStore() });
+	// These cases run only claude, through its fake protocol or an in-memory backend; accidental pi and codex routing stays fenced.
+	fusion(api, { ...extra, backends: { ...tripwires(), ...backends }, profiles: memoryProfileStore() });
 	const theme = { fg: (_color: string, text: string) => text, bold: (text: string) => text, dim: (text: string) => text };
 	const ui = {
 		setStatus(_key: string, _text: string | undefined) {},
@@ -608,6 +611,10 @@ test("parseFusion reads every /fusion form and answers anything else with the us
 		["dashboard", { kind: "dashboard" }],
 		["  dashboard  ", { kind: "dashboard" }],
 		["dashboard stop", { kind: "dashboard-stop" }],
+		["dashboard limit", { kind: "dashboard-limit" }],
+		["dashboard limit 200", { kind: "dashboard-limit", limit: 200 }],
+		["  dashboard\tlimit   1  ", { kind: "dashboard-limit", limit: 1 }],
+		["dashboard limit 9007199254740991", { kind: "dashboard-limit", limit: Number.MAX_SAFE_INTEGER }],
 		["status", { kind: "status" }],
 		["status run-2", { kind: "status", handle: "run-2" }],
 		["cancel run-1", { kind: "cancel", handle: "run-1" }],
@@ -661,6 +668,9 @@ test("parseFusion reads every /fusion form and answers anything else with the us
 		["profile use -x", { kind: "usage", message: `profile name "-x" must start with a letter or digit and use only letters, digits, dots, dashes and underscores, at most 64 characters. ${PROFILE_USAGE}` }],
 	] as const) {
 		assert.deepEqual(parseFusion(args), expected, JSON.stringify(args));
+	}
+	for (const args of ["dashboard limit 0", "dashboard limit -1", "dashboard limit 1.5", "dashboard limit 1e2", "dashboard limit Infinity", "dashboard limit NaN", "dashboard limit 0x20", "dashboard limit 9007199254740992", "dashboard limit 200oops", "dashboard limit 200 now"]) {
+		assert.deepEqual(parseFusion(args), { kind: "usage", message: DASHBOARD_LIMIT_USAGE }, args);
 	}
 });
 
@@ -1117,6 +1127,7 @@ test("/fusion completes the first word, and then the runs each command can still
 	assert.deepEqual(host.completions(""), [
 		{ value: "dashboard", label: "dashboard" },
 		{ value: "dashboard stop", label: "dashboard stop" },
+		{ value: "dashboard limit", label: "dashboard limit" },
 		{ value: "status", label: "status" },
 		{ value: "cancel", label: "cancel" },
 		{ value: "steer", label: "steer" },
@@ -1137,6 +1148,7 @@ test("/fusion completes the first word, and then the runs each command can still
 		{ value: "off", label: "off" },
 	]);
 	assert.deepEqual(host.completions("of"), [{ value: "off", label: "off" }]);
+	assert.deepEqual(host.completions("dashboard l"), [{ value: "dashboard limit", label: "dashboard limit" }]);
 	assert.equal(host.completions("status "), null, "nothing has run yet");
 	await withScenario("hang", () => host.claude({ role: "implement", task: "long work", background: true }));
 	await withScenario("question", () => host.claude({ role: "ask", task: "q" }));
@@ -1154,6 +1166,129 @@ test("/fusion completes the first word, and then the runs each command can still
 	await host.control({ action: "cancel", run: "run-1" });
 	await host.control({ action: "cancel", run: "run-2" });
 });
+
+/** The retention variable belongs to each new extension instance, and the test must leave the caller's environment alone. */
+async function withDashboardLimit<T>(limit: string | undefined, body: () => Promise<T>): Promise<T> {
+	const previous = process.env.PI_FUSION_DASHBOARD_MAX_RUNS;
+	if (limit === undefined) delete process.env.PI_FUSION_DASHBOARD_MAX_RUNS;
+	else process.env.PI_FUSION_DASHBOARD_MAX_RUNS = limit;
+	try {
+		return await body();
+	} finally {
+		if (previous === undefined) delete process.env.PI_FUSION_DASHBOARD_MAX_RUNS;
+		else process.env.PI_FUSION_DASHBOARD_MAX_RUNS = previous;
+	}
+}
+
+const limitNotice = (limit: number) => [`fusion: dashboard run limit is ${limit}; active runs are never evicted`, "info"];
+
+test("dashboard limits start at 30, work while off without a server, and reject invalid runtime changes", () =>
+	withDashboardLimit(undefined, async () => {
+		const host = makeHost();
+		await host.command("off");
+		host.notices.length = 0;
+		await host.command("dashboard limit");
+		assert.deepEqual(host.notices, [limitNotice(30)]);
+		host.notices.length = 0;
+		await host.command("dashboard limit 200");
+		assert.deepEqual(host.notices, [limitNotice(200)]);
+		for (const args of ["dashboard limit 0", "dashboard limit -1", "dashboard limit 1.5", "dashboard limit 1e2", "dashboard limit 0x20", "dashboard limit Infinity", "dashboard limit 9007199254740992", "dashboard limit 200 now"]) {
+			host.notices.length = 0;
+			await host.command(args);
+			assert.deepEqual(host.notices, [[DASHBOARD_LIMIT_USAGE, "warning"]], args);
+			await host.command("dashboard limit");
+			assert.deepEqual(host.notices.at(-1), limitNotice(200), "a refusal leaves the target unchanged");
+		}
+		host.notices.length = 0;
+		await host.command("dashboard stop");
+		assert.deepEqual(host.notices, [["fusion: the dashboard is not running", "info"]], "inspection and changes never start a server");
+		assert.deepEqual(host.activeTools, ["read", "bash", "fusion_activate"], "retention commands do not activate Fusion");
+		assert.deepEqual(host.sent, []);
+		assert.deepEqual(host.branch, []);
+	}));
+
+test("the dashboard environment limit is captured at load and a runtime override belongs only to that instance", () =>
+	withDashboardLimit("200", async () => {
+		const host = makeHost();
+		process.env.PI_FUSION_DASHBOARD_MAX_RUNS = "7";
+		await host.command("dashboard limit");
+		assert.deepEqual(host.notices, [limitNotice(200)], "later environment changes do not reach the store");
+		host.notices.length = 0;
+		await host.command("dashboard limit 50");
+		await host.command("dashboard limit");
+		assert.deepEqual(host.notices, [limitNotice(50), limitNotice(50)]);
+		const next = makeHost();
+		await next.command("dashboard limit");
+		assert.deepEqual(next.notices, [limitNotice(7)], "a replaced instance reads the environment, not the earlier override");
+	}));
+
+test("an invalid dashboard environment limit warns once and keeps 30", () =>
+	withDashboardLimit("0", async () => {
+		const host = makeHost();
+		await host.command("dashboard limit");
+		assert.deepEqual(host.notices, [
+			["fusion: PI_FUSION_DASHBOARD_MAX_RUNS=0 is not a positive decimal safe integer; the dashboard run limit stays at 30", "warning"],
+			limitNotice(30),
+		]);
+		host.notices.length = 0;
+		await host.command("dashboard limit");
+		assert.deepEqual(host.notices, [limitNotice(30)]);
+	}));
+
+test("runtime limits change the already-open dashboard, prune immediately, and do not recover evicted runs", () =>
+	withDashboardLimit(undefined, async () => {
+		const backend = fakeBackend({ name: "claude" });
+		const host = makeHost(repoRoot, "print", {}, { claude: backend.backend });
+		for (let i = 0; i < 35; i++) await host.claude({ role: "ask", task: "read the code" });
+		await host.command("dashboard");
+		const url = dashboardUrl(host);
+		const runs = async () => (await payload(`${url}api/runs`)).runs as Array<{ handle: string }>;
+		const initial = await runs();
+		assert.equal(initial.length, 30);
+		assert.ok(initial.some((run) => run.handle === "run-6"));
+		assert.ok(!initial.some((run) => run.handle === "run-1"));
+		await host.command("dashboard limit 200");
+		for (let i = 0; i < 5; i++) await host.claude({ role: "ask", task: "read more code" });
+		const raised = await runs();
+		assert.equal(raised.length, 35);
+		assert.ok(raised.some((run) => run.handle === "run-6"));
+		assert.ok(!raised.some((run) => run.handle === "run-1"), "evicted data is not recovered");
+		await host.command("dashboard limit 2");
+		assert.deepEqual((await runs()).map((run) => run.handle).sort(), ["run-39", "run-40"]);
+		await host.command("status run-6");
+		assert.match(host.notices.at(-1)![0], /^run-6 · ask · opus · done/, "eviction changes monitoring, not the host's run records");
+		await host.command("dashboard stop");
+		host.notices.length = 0;
+		await host.command("dashboard");
+		assert.equal((await payload(`${dashboardUrl(host)}api/runs`)).runs.length, 2);
+		host.notices.length = 0;
+		await host.command("dashboard limit");
+		assert.deepEqual(host.notices, [limitNotice(2)], "stopping the server does not reset its instance's retention limit");
+	}));
+
+test("a runtime reduction leaves running and waiting children alone and converges when they finish", () =>
+	withDashboardLimit("200", async () => {
+		const backend = fakeBackend({ name: "claude", scripts: [{ pending: true }] });
+		const host = makeHost(repoRoot, "print", {}, { claude: backend.backend });
+		await host.claude({ role: "ask", task: "long work", background: true });
+		await backend.started();
+		backend.script({ questions: ["Which name?"] });
+		await host.claude({ role: "ask", task: "ask a question" });
+		backend.script({});
+		await host.claude({ role: "ask", task: "finished work" });
+		await host.command("dashboard");
+		const url = dashboardUrl(host);
+		await host.command("dashboard limit 1");
+		const runs = (await payload(`${url}api/runs`)).runs as Array<{ handle: string; status: string }>;
+		assert.deepEqual(runs.map((run) => [run.handle, run.status]).sort(), [["run-1", "running"], ["run-2", "waiting"]]);
+		backend.starts[0]!.release();
+		await host.control({ action: "wait", run: "run-1" });
+		assert.deepEqual((await payload(`${url}api/runs`)).runs.map((run: any) => run.handle), ["run-2"]);
+		await host.control({ action: "message", run: "run-2", message: "Use foo" });
+		await host.control({ action: "wait", run: "run-2" });
+		assert.deepEqual(backend.starts[1]!.answers, ["Use foo"], "the waiting run is still answerable");
+		assert.equal((await payload(`${url}api/runs`)).runs[0].status, "done");
+	}));
 
 /** Runs the body with the budget variables set, as a Pi session that started with them in its environment does. */
 async function withBudget<T>(vars: Record<string, string>, body: () => Promise<T>): Promise<T> {
@@ -1710,11 +1845,31 @@ test("a later Pi process on the same host session shows the earlier runs, their 
 		await second.command("dashboard");
 		try {
 			const url = dashboardUrl(second);
-			const runs = (await payload(`${url}api/runs`)).runs as any[];
+			const listed = await payload(`${url}api/runs`);
+			const runs = listed.runs as any[];
+			assert.deepEqual(listed.archive, { available: true, pageSize: 30, revision: listed.archive.revision, total: 1 }, "one archived run, and no older page");
 			const restored = runs.find((run) => run.handle === "run-1");
 			assert.ok(restored, "the dashboard lists the earlier run");
+			assert.equal(runs.length, 1, "it is listed once");
 			assert.equal(restored.restored, true);
-			assert.equal((await payload(`${url}api/runs/${restored.id}`)).text, "## Changed\nfoo.ts");
+			assert.equal(restored.provenance, "history", "it comes from the archive, not the live store");
+			assert.equal(restored.history.provenance, "history");
+			assert.equal(restored.status, "done");
+			assert.equal(restored.costUsd, 0.25, "the spend it saved is the spend it shows");
+			assert.deepEqual(
+				[restored.tokensIn, restored.tokensOut, restored.workflowTokens, restored.toolCalls],
+				[written.records[0].usage.tokensIn, written.records[0].usage.tokensOut, 250, written.records[0].usage.toolCalls],
+				"every saved counter, as saved",
+			);
+			for (const absent of ["agentToolCalls", "toolErrors", "lastEventAt", "activity", "question"]) {
+				assert.ok(!(absent in restored), `${absent} was never saved`);
+				assert.ok(restored.unavailable.includes(absent), `${absent} is named unavailable`);
+			}
+			const detail = await payload(`${url}api/runs/${restored.id}`);
+			assert.equal(detail.text, "## Changed\nfoo.ts");
+			assert.equal(detail.provenance, "history");
+			assert.equal(detail.prompt, "do a thing");
+			assert.ok(!("log" in detail) && !("tasks" in detail) && !("models" in detail), "nobody watched it in this process");
 		} finally {
 			await second.command("dashboard stop");
 		}
@@ -1750,6 +1905,425 @@ test("one host session never reads another one's runs", () =>
 		assert.deepEqual(other.notices, [[`${STATUS_HEADER}no runs in this Pi session yet\nsession usage: est. $0.0000 · in 0 out 0 tokens · workflow agents 0 tokens · 0 calls`, "info"]]);
 		assert.equal(fs.existsSync(path.join(dir, "host-9.json")), false, "a session with nothing to keep writes nothing");
 	}));
+
+/**
+ * A host whose dashboard starter keeps the archive provider the host gives it and starts the real server with it.
+ * `archive` opens the dashboard the first time, as the user does, and asks the provider what the archive says now.
+ */
+function archiveHost(session: { id?: string; file?: string }, backends: FusionOptions["backends"] = {}) {
+	let provider: (() => ArchiveProvider | undefined) | undefined;
+	const host = makeHost(repoRoot, "print", session, backends, {
+		dashboard: (store, opts) => {
+			provider = opts.archive;
+			return startDashboard(store, opts);
+		},
+	});
+	const archive = async (): Promise<ArchiveProvider | undefined> => {
+		if (!provider) await host.command("dashboard");
+		assert.ok(provider, "the dashboard was given no archive");
+		return provider();
+	};
+	return { ...host, archive };
+}
+
+const durableArchive = (id: string, backends: FusionOptions["backends"] = {}) => archiveHost({ id, file: path.join(os.tmpdir(), `${id}.jsonl`) }, backends);
+
+/** What the /fusion status command says, which is what a user reads of every run, its handle and the session's spend. */
+const statusOf = async (host: ReturnType<typeof makeHost>): Promise<string> => {
+	host.notices.length = 0;
+	await host.command("status");
+	return host.notices.map(([text]) => text).join("\n");
+};
+
+test("a later Pi process reads the earlier runs from the archive, and the page serves the archive's view of them", () =>
+	withHistory(async (dir) => {
+		const first = durable("host-1");
+		await withScenario("ok", () => first.claude({ role: "ultracode", task: "do a thing" }));
+		const second = durableArchive("host-1");
+		second.branch.push(...first.branch);
+		const before = await statusOf(second);
+		const completions = second.completions("status ");
+		try {
+			const view = await second.archive();
+			assert.ok(view);
+			const [earlier] = view.summaries();
+			assert.equal(earlier?.handle, "run-1");
+			assert.equal(earlier.provenance, "history");
+			assert.equal(earlier.status, "done");
+			assert.equal(earlier.interrupted, undefined);
+			assert.equal(view.detail(earlier.id)?.report, "## Changed\nfoo.ts");
+			const url = dashboardUrl(second);
+			const runs = (await payload(`${url}api/runs`)).runs as any[];
+			const restored = runs.find((run) => run.handle === "run-1");
+			assert.equal(restored?.id, earlier.id);
+			assert.equal(restored.provenance, "history");
+			assert.deepEqual(restored.history, earlier, "the page carries the archive's own projection");
+			assert.equal(await statusOf(second), before, "reading the archive changes no status, handle or spend");
+			assert.deepEqual(second.completions("status "), completions);
+			const revision = view.revision;
+			assert.match(await withScenario("ok", () => second.text(second.claude({ role: "ultracode", task: "another thing" }))), /\[run-2 · ultracode · fable · /);
+			const after = await second.archive();
+			assert.deepEqual(after?.summaries().map((held) => [held.handle, held.status, held.interrupted]), [
+				["run-2", "done", undefined],
+				["run-1", "done", undefined],
+			]);
+			assert.ok(after.revision > revision, "the run's own history writes move the archive on");
+			assert.deepEqual((await second.control({ action: "status", run: "run-1" })).details, { handle: "run-1", state: "done", historical: true });
+		} finally {
+			await second.command("dashboard stop");
+		}
+	}));
+
+test("a run this process is still running is never archived as one a gone process left", () =>
+	withHistory(async (dir) => {
+		const host = durableArchive("host-1");
+		try {
+			await withScenario("question", () => host.claude({ role: "implement", task: "name it", background: true }));
+			await until("the question notice", () => host.sent.length > 0);
+			const [going] = heldFile(dir, "host-1").records;
+			assert.equal(going.state, "running", "its first history write says it is going");
+			const view = await host.archive();
+			assert.ok(view);
+			assert.deepEqual(view.summaries(), [], "the live store shows it, never the archive");
+			assert.equal(view.detail(going.id), undefined);
+			await host.control({ action: "message", run: "run-1", message: "bar" });
+			await host.control({ action: "wait", run: "run-1" });
+			const ended = (await host.archive())?.summaries() ?? [];
+			assert.deepEqual(ended.map((held) => [held.id, held.status, held.interrupted]), [[going.id, "done", undefined]], "once it ends it is archived as it ended");
+		} finally {
+			await host.command("dashboard stop");
+		}
+	}));
+
+test("a forked host session's archive holds what its branch recorded of the ancestor and nothing else", () =>
+	withHistory(async (dir) => {
+		const first = durable("host-1");
+		await withScenario("ok", () => first.claude({ role: "implement", task: "one" }));
+		const forkPoint = first.branch.length;
+		await withScenario("ok", () => first.claude({ role: "implement", task: "two" }));
+		const unrelated = durable("host-9");
+		await withScenario("ok", () => unrelated.claude({ role: "implement", task: "elsewhere" }));
+		assert.equal(heldFile(dir, "host-1").records.length, 2);
+		const fork = durableArchive("host-2");
+		fork.branch.push(...first.branch.slice(0, forkPoint));
+		try {
+			const view = await fork.archive();
+			assert.deepEqual(view?.summaries().map((held) => [held.hostSessionId, held.handle]), [["host-1", "run-1"]], "run-2 ran on a branch this fork left");
+			assert.equal(fs.existsSync(path.join(dir, "host-2.json")), false, "reading an ancestor writes nothing for this session");
+		} finally {
+			await fork.command("dashboard stop");
+		}
+	}));
+
+test("an interruption the host corrected on disk reads back interrupted from a fresh archive, with no measured end", () =>
+	withHistory(async (dir) => {
+		const going = (id: string, handle: string, state: "running" | "waiting", startedAt: number): HistoryRecord => ({
+			id,
+			handle,
+			role: "implement",
+			model: "opus",
+			hostSessionId: "host-1",
+			cwd: repoRoot,
+			origin: "tool",
+			state,
+			startedAt,
+			prompt: "do it",
+			backend: "claude",
+		});
+		new History(dir).saveAll("host-1", repoRoot, [going("raw-running", "run-1", "running", 1_000), going("raw-waiting", "run-2", "waiting", 2_000)]);
+		const host = durableArchive("host-1");
+		await host.command("status");
+		assert.deepEqual(
+			heldFile(dir, "host-1").records.map((held) => [held.id, held.state, held.failure, held.endedAt]),
+			[
+				["raw-running", "aborted", HISTORY_ABORTED, 1_000],
+				["raw-waiting", "aborted", HISTORY_ABORTED, 2_000],
+			],
+			"the host wrote its correction back as it always has",
+		);
+		const fresh = new ArchiveIndex(new History(dir));
+		fresh.refresh({ current: "host-1", evidence: [], started: new Set() });
+		try {
+			const view = await host.archive();
+			for (const source of [fresh, view!]) {
+				assert.deepEqual(
+					source.summaries().map((held) => [held.id, held.status, held.interrupted, held.endedAt, held.unavailable.includes("endedAt")]),
+					[
+						["raw-waiting", "aborted", true, undefined, true],
+						["raw-running", "aborted", true, undefined, true],
+					],
+				);
+				const detail = source.detail("raw-waiting")!;
+				assert.equal(detail.failure, HISTORY_ABORTED);
+				assert.ok(!("question" in detail), "nobody can answer it");
+			}
+			assert.match((await host.control({ action: "status", run: "run-2" })).content[0]!.text, /^run-2 \(implement\) ran in an earlier Pi process: aborted, 0s, 0 changed files\naborted when the earlier Pi process ended/);
+			const url = dashboardUrl(host);
+			const listed = (await payload(`${url}api/runs`)).runs as any[];
+			assert.deepEqual(listed.map((run) => [run.id, run.status, run.provenance, run.interrupted, "endedAt" in run, "question" in run]), [
+				["raw-waiting", "aborted", "history", true, false, false],
+				["raw-running", "aborted", "history", true, false, false],
+			], "history-only, aborted, with no measured end and nothing to answer");
+			const detail = await payload(`${url}api/runs/raw-waiting`);
+			assert.equal(detail.failure, HISTORY_ABORTED);
+			assert.ok(!("endedAt" in detail) && !("question" in detail));
+			assert.equal(await statusOf(host), "fusion: on\nno runs in this Pi session yet\nrun-1 · implement · opus · aborted · earlier Pi process\nrun-2 · implement · opus · aborted · earlier Pi process\nsession usage: est. $0.0000 · in 0 out 0 tokens · workflow agents 0 tokens · 0 calls", "no child is active");
+		} finally {
+			await host.command("dashboard stop");
+		}
+	}));
+
+test("more archived runs than one page are all reachable, whatever the live limit, without the store or the ancestor changing", () =>
+	withHistory(async (dir) => {
+		const record = (i: number, hostSessionId: string): HistoryRecord => ({
+			id: `${hostSessionId}-${String(i).padStart(2, "0")}`,
+			handle: `run-${(i % 20) + 1}`,
+			role: "implement",
+			model: "opus",
+			hostSessionId,
+			cwd: repoRoot,
+			origin: "tool",
+			state: "done",
+			startedAt: 1_000 + Math.floor(i / 3),
+			endedAt: 2_000 + i,
+			prompt: `task ${i}`,
+			report: `report ${i}`,
+			backend: "claude",
+			usage: { tokensIn: 1, tokensOut: 1, toolCalls: 1, costUsd: 0.01 },
+		});
+		const history = new History(dir);
+		history.saveAll("host-1", repoRoot, Array.from({ length: 40 }, (_, i) => record(i, "host-1")));
+		const ancestor = path.join(dir, "host-1.json");
+		const ancestorBytes = fs.readFileSync(ancestor);
+		// The fork's branch names one ancestor run; its own file has 45 runs whose handles repeat across invocations.
+		const fork = durableArchive("host-2");
+		fork.branch.push({ type: "custom", customType: "pi-fusion", data: { run: "run-1", role: "implement", backend: "claude", hostSessionId: "host-1" } });
+		history.saveAll("host-2", repoRoot, Array.from({ length: 45 }, (_, i) => record(i, "host-2")));
+		try {
+			const usage = await statusOf(fork);
+			const control = (await fork.control({ action: "status", run: "run-1" })).content[0]!.text;
+			const completions = fork.completions("review ");
+			await fork.archive();
+			const url = dashboardUrl(fork);
+			for (const limit of ["1", "200"]) {
+				await fork.command(`dashboard limit ${limit}`);
+				const ids: string[] = [];
+				let listed = await payload(`${url}api/runs`);
+				assert.equal(listed.runs.length, 30, `limit ${limit}: the archive page has its own size`);
+				assert.ok(listed.runs.every((run: any) => run.provenance === "history"), "the store holds nothing of these");
+				ids.push(...listed.runs.map((run: any) => run.id));
+				while (listed.archive.next) {
+					listed = await payload(`${url}api/archive?before=${listed.archive.next}`);
+					ids.push(...listed.runs.map((run: any) => run.id));
+				}
+				const expected = [...Array.from({ length: 45 }, (_, i) => `host-2-${String(i).padStart(2, "0")}`), "host-1-00", "host-1-20"];
+				assert.deepEqual([...ids].sort(), expected.sort(), `limit ${limit}: every eligible run once, the ancestor's only where the branch names it`);
+				assert.equal(listed.archive.total, 47);
+				const repeated = ids.filter((id) => id.startsWith("host-2-") && Number(id.slice(7)) % 20 === 0);
+				assert.equal(repeated.length, 3, "one handle, three invocations, three rows");
+			}
+			const detail = await payload(`${url}api/runs/host-1-20`);
+			assert.equal(detail.text, "report 20");
+			assert.equal(detail.hostSessionId, "host-1");
+			assert.equal((await new Promise<number>((resolve) => http.get(`${url}api/runs/host-1-05`, (response) => resolve(response.statusCode ?? 0)))), 404, "an ancestor run the branch never named is not readable");
+			assert.deepEqual(fs.readFileSync(ancestor), ancestorBytes, "reading the ancestor never writes it");
+			assert.equal(await statusOf(fork), usage, "browsing re-seeds no spend and changes no run the host knows");
+			assert.equal((await fork.control({ action: "status", run: "run-1" })).content[0]!.text, control, "a control reads what it read before");
+			assert.deepEqual(fork.completions("review "), completions, "and review offers what it offered before");
+		} finally {
+			await fork.command("dashboard stop");
+		}
+	}));
+
+test("after a modeled restart every invocation of one handle stays visible while the branch's latest one keeps authority", () =>
+	withHistory(async (dir) => {
+		const before = fakeBackend({ name: "claude", scripts: [{ text: "report one" }, { fail: "boom two" }, { text: "report three" }, { questions: ["Which name?"], text: "report four" }] });
+		const firstHost = makeHost(repoRoot, "print", { id: "host-1", file: path.join(os.tmpdir(), "host-1.jsonl") }, { claude: before.backend });
+		await firstHost.claude({ role: "implement", task: "first task" });
+		await assert.rejects(firstHost.claude({ continue: "run-1", task: "second task" }), /boom two/);
+		await firstHost.claude({ continue: "run-1", task: "third task" });
+		await firstHost.control({ action: "wait", run: "run-1" });
+		// A background run left waiting on a question when its Pi process is modeled as gone.
+		await firstHost.claude({ role: "ask", task: "ask me", background: true });
+		await until("the question", () => firstHost.sent.length > 0);
+		const saved = heldFile(dir, "host-1").records;
+		assert.deepEqual(saved.map((held) => [held.handle, held.state]), [
+			["run-1", "done"],
+			["run-1", "failed"],
+			["run-1", "done"],
+			["run-2", "running"],
+		]);
+		const latest = runRecords(firstHost.branch).runs.get("run-1");
+		assert.ok(latest?.session, "the branch names the last successful child of run-1");
+
+		// A fresh extension instance on the same durable host session and branch: startup first, then the dashboard.
+		const after = fakeBackend({ name: "claude", scripts: [{ text: "report five" }, { text: "other" }] });
+		const second = durableArchive("host-1", { claude: after.backend });
+		second.branch.push(...firstHost.branch);
+		await second.begin();
+		try {
+			await second.archive();
+			const url = dashboardUrl(second);
+			const listed = await payload(`${url}api/runs`);
+			assert.ok(listed.runs.every((run: any) => run.provenance === "history"), "a restarted page lists the archive and no live child");
+			assert.deepEqual(listed.runs.map((run: any) => [run.handle, run.status, run.interrupted === true, "endedAt" in run]), [
+				["run-2", "aborted", true, false],
+				["run-1", "done", false, true],
+				["run-1", "failed", false, true],
+				["run-1", "done", false, true],
+			]);
+			assert.ok(!listed.runs.some((run: any) => "question" in run), "no old question comes back");
+			const details = await Promise.all(listed.runs.slice(1).map((run: any) => payload(`${url}api/runs/${run.id}`)));
+			assert.deepEqual(details.map((detail) => [/(\w+ task)$/.exec(detail.prompt)?.[1], detail.text ?? null, detail.failure ?? null]), [
+				["third task", "report three", null],
+				["second task", "## Changed\nfoo.ts", details[1].failure],
+				["first task", "report one", null],
+			]);
+			assert.match(details[1].failure, /boom two/);
+			assert.equal(new Set(listed.runs.map((run: any) => run.id)).size, 4, "each invocation has its own id");
+			assert.match(await statusOf(second), /^fusion: on\nno runs in this Pi session yet\n/, "nothing of the earlier process is running here");
+			assert.match((await second.control({ action: "status", run: "run-1" })).content[0]!.text, /^run-1 \(implement\) ran in an earlier Pi process: done, .*\nreport three\ncontinue it with claude and continue run-1/);
+			assert.deepEqual(second.completions("status "), [{ value: "status run-1", label: "status run-1" }, { value: "status run-2", label: "status run-2" }], "one handle, one control target");
+
+			// Continuing the handle resumes the branch's latest child, whatever the archive lists.
+			await second.claude({ continue: "run-1", task: "fourth task" });
+			await second.control({ action: "wait", run: "run-1" });
+			assert.deepEqual(after.starts[0]!.intent, { kind: "resume", ref: latest.session });
+			const spent = await statusOf(second);
+			const grown = (await payload(`${url}api/runs`)).runs as any[];
+			assert.deepEqual(grown.filter((run) => run.handle === "run-1").map((run) => run.provenance), ["live", "history", "history", "history"]);
+			for (const run of grown) await payload(`${url}api/runs/${run.id}`);
+			assert.equal(await statusOf(second), spent, "browsing every row re-seeds no spend and changes no run");
+
+			// A smaller live cache lets the live row go to the archive; nothing on disk goes with it.
+			const records = heldFile(dir, "host-1").records.length;
+			await second.command("dashboard limit 1");
+			await second.claude({ role: "ask", task: "another" });
+			await second.control({ action: "wait", run: "run-3" });
+			const evicted = (await payload(`${url}api/runs`)).runs as any[];
+			assert.deepEqual(evicted.filter((run) => run.handle === "run-1").map((run) => run.provenance), ["history", "history", "history", "history"]);
+			assert.equal(heldFile(dir, "host-1").records.length, records + 1, "the live limit deletes nothing from the history");
+		} finally {
+			await second.command("dashboard stop");
+		}
+
+		// The same branch opened dashboard-first in yet another instance lists the same invocations.
+		const third = durableArchive("host-1");
+		third.branch.push(...second.branch);
+		try {
+			const view = await third.archive();
+			assert.equal(view?.summaries().length, 6);
+			assert.equal(view.summaries().filter((held) => held.handle === "run-1").length, 4);
+		} finally {
+			await third.command("dashboard stop");
+		}
+		await firstHost.control({ action: "message", run: "run-2", message: "foo" });
+		await firstHost.control({ action: "wait", run: "run-2" });
+	}));
+
+test("a history file the archive cannot use is said once, read-only, and costs the page nothing else", () =>
+	withHistory(async (dir) => {
+		fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+		const target = path.join(dir, "host-1.json");
+		fs.writeFileSync(target, "{ not json", { mode: 0o600 });
+		const ancestor = path.join(dir, "host-0.json");
+		fs.writeFileSync(ancestor, JSON.stringify({ version: HISTORY_VERSION + 1, hostSessionId: "host-0", cwd: repoRoot, records: [] }), { mode: 0o600 });
+		const host = durableArchive("host-1");
+		host.branch.push({ type: "custom", customType: "pi-fusion", data: { run: "run-1", role: "implement", backend: "claude", hostSessionId: "host-0", sessionId: "s-1" } });
+		try {
+			await host.archive();
+			const url = dashboardUrl(host);
+			for (let i = 0; i < 3; i++) assert.deepEqual((await payload(`${url}api/runs`)).archive, { available: true, pageSize: 30, revision: (await host.archive())!.revision, total: 0 });
+			const warnings = host.notices.filter(([text]) => text.startsWith("fusion history:"));
+			assert.equal(warnings.length, 1, "said once");
+			assert.match(warnings[0]![0], /is unreadable and will be replaced/);
+			assert.equal(fs.readFileSync(target, "utf8"), "{ not json", "reading never replaces it");
+			assert.match(fs.readFileSync(ancestor, "utf8"), /"version":2/, "and a newer pi-fusion's file is nobody's to touch");
+		} finally {
+			await host.command("dashboard stop");
+		}
+	}));
+
+test("a history file this process may not read is one warning, is never rewritten, and lists nothing in its place", (t) =>
+	withHistory(async (dir) => {
+		const saved: HistoryRecord = { id: "locked-1", handle: "run-1", role: "implement", model: "opus", hostSessionId: "host-1", cwd: repoRoot, origin: "tool", state: "done", startedAt: 1_000, endedAt: 2_000, prompt: "locked prompt", report: "locked report", backend: "claude", sessionId: "s-1" };
+		new History(dir).save("host-1", repoRoot, saved);
+		const target = path.join(dir, "host-1.json");
+		const bytes = fs.readFileSync(target);
+		fs.chmodSync(target, 0o000);
+		try {
+			let denied = false;
+			try {
+				fs.readFileSync(target);
+			} catch {
+				denied = true;
+			}
+			if (!denied) {
+				t.skip("this user reads a file of mode 000, so permission denial cannot be exercised here");
+				return;
+			}
+			const host = durableArchive("host-1");
+			host.branch.push({ type: "custom", customType: "pi-fusion", data: { run: "run-1", role: "implement", backend: "claude", hostSessionId: "host-1", sessionId: "s-1" } });
+			try {
+				await host.archive();
+				const url = dashboardUrl(host);
+				for (let i = 0; i < 3; i++) {
+					const listed = await payload(`${url}api/runs`);
+					assert.deepEqual(listed.runs, [], "nothing stands in for the runs it could not read");
+					assert.equal(listed.archive.total, 0);
+				}
+				assert.equal(await new Promise<number>((resolve) => http.get(`${url}api/runs/locked-1`, (response) => resolve(response.statusCode ?? 0))), 404);
+				const warnings = host.notices.filter(([text]) => text.startsWith("fusion history:"));
+				assert.equal(warnings.length, 1, "said once");
+				assert.match(warnings[0]![0], /host-1\.json could not be read/);
+				assert.match(await statusOf(host), /^fusion: on\nno runs in this Pi session yet\n/, "no run is made up from it");
+				assert.equal(fs.statSync(target).mode & 0o777, 0, "its mode is left alone");
+			} finally {
+				await host.command("dashboard stop");
+			}
+		} finally {
+			fs.chmodSync(target, 0o600);
+		}
+		assert.deepEqual(fs.readFileSync(target), bytes, "and so are its bytes");
+	}));
+
+test("the archive is there with Fusion off, and not at all with history off or a session Pi keeps no file for", async () => {
+	await withHistory(async (dir) => {
+		const off = durableArchive("host-1");
+		await off.command("off");
+		try {
+			assert.ok(await off.archive(), "the dashboard reads the archive whatever the mode");
+		} finally {
+			await off.command("dashboard stop");
+		}
+		const memory = archiveHost({ id: "host-1" });
+		try {
+			assert.equal(await memory.archive(), undefined);
+			const url = dashboardUrl(memory);
+			assert.deepEqual((await payload(`${url}api/runs`)).archive, { available: false, pageSize: 30 });
+			assert.deepEqual(await payload(`${url}api/archive`), { runs: [], archive: { available: false, pageSize: 30 } });
+			assert.equal(fs.existsSync(dir), false, "an in-memory session's archive reads and makes nothing");
+		} finally {
+			await memory.command("dashboard stop");
+		}
+	});
+	const root = fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), "pi-fusion-history-"));
+	const dir = path.join(root, "history");
+	process.env.PI_FUSION_HISTORY_DIR = dir;
+	try {
+		const host = durableArchive("host-1");
+		try {
+			assert.equal(await host.archive(), undefined);
+			assert.deepEqual((await payload(`${dashboardUrl(host)}api/runs`)).archive, { available: false, pageSize: 30 });
+			assert.equal(fs.existsSync(dir), false, "the archive stays off until PI_FUSION_HISTORY says 1");
+		} finally {
+			await host.command("dashboard stop");
+		}
+	} finally {
+		delete process.env.PI_FUSION_HISTORY_DIR;
+		fs.rmSync(root, { recursive: true, force: true });
+	}
+});
 
 test("nothing reaches the disk with the history off or with a session Pi keeps no file for", async () => {
 	await withHistory(async (dir) => {

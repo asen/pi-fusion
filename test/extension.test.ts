@@ -167,6 +167,7 @@ test("registers the sequential fusion and claude tool pairs and the two mode too
 	assert.deepEqual(command.getArgumentCompletions?.(""), [
 		{ value: "dashboard", label: "dashboard" },
 		{ value: "dashboard stop", label: "dashboard stop" },
+		{ value: "dashboard limit", label: "dashboard limit" },
 		{ value: "status", label: "status" },
 		{ value: "cancel", label: "cancel" },
 		{ value: "steer", label: "steer" },
@@ -183,6 +184,7 @@ test("registers the sequential fusion and claude tool pairs and the two mode too
 		{ value: "profile default", label: "profile default" },
 	]);
 	assert.deepEqual(command.getArgumentCompletions?.("dashboard s"), [{ value: "dashboard stop", label: "dashboard stop" }]);
+	assert.deepEqual(command.getArgumentCompletions?.("dashboard l"), [{ value: "dashboard limit", label: "dashboard limit" }]);
 	assert.deepEqual(command.getArgumentCompletions?.("s"), [
 		{ value: "status", label: "status" },
 		{ value: "steer", label: "steer" },
@@ -1062,7 +1064,7 @@ test("a later /fusion dashboard gets a fresh url and session_shutdown closes it,
 
 test("any other argument warns about the usage and starts nothing", async () => {
 	const usage =
-		"Usage: /fusion dashboard | /fusion dashboard stop | /fusion status [run-N] | /fusion cancel run-N | /fusion wait run-N | /fusion steer run-N <text> | /fusion answer [run-N] [text] | /fusion review run-N | /fusion on | /fusion off | /fusion config | /fusion profile [list | use <name> | save <name> | default <name>]";
+		"Usage: /fusion dashboard | /fusion dashboard stop | /fusion dashboard limit [N] | /fusion status [run-N] | /fusion cancel run-N | /fusion wait run-N | /fusion steer run-N <text> | /fusion answer [run-N] [text] | /fusion review run-N | /fusion on | /fusion off | /fusion config | /fusion profile [list | use <name> | save <name> | default <name>]";
 	for (const args of ["", "   ", "dashboard start", "status foo", "cancel", "steer run-1", "config now"]) {
 		const notices = await runCommand(args);
 		assert.deepEqual(notices, [{ message: usage, type: "warning" }], `for ${JSON.stringify(args)}`);
