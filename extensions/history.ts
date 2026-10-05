@@ -1,6 +1,7 @@
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { type BackendName, isBackendName, keptRef, keptSelection, type ResolvedSelection, type SessionRef } from "./backends/types.ts";
 import { cap, capBytes } from "./dashboard.ts";
 
 /** The layout of a history file. A file that names a higher version was written by a pi-fusion this one cannot read. */
@@ -30,6 +31,8 @@ const TEMPORARY_MS = 60 * 60 * 1_000;
 const HEAD_BYTES = 512;
 /** The version the head of a file names, wherever in the head it stands: another writer orders the keys as it likes. */
 const HEAD_VERSION = /"version"\s*:\s*(\d+)/;
+/** The stamp of a session that has no file. */
+const ABSENT = "absent";
 const STATES = new Set(["running", "waiting", "done", "failed", "aborted", "cancelled"]);
 const SESSION_KINDS = new Set(["new", "resume", "fork"]);
 
@@ -40,6 +43,8 @@ export interface HistoryRecord {
 	role: string;
 	mode?: string;
 	model: string;
+	/** The effort the run was admitted with; a Pi run that named none leaves it unset, and its `selection` says what ran. */
+	effort?: string;
 	hostSessionId: string;
 	cwd: string;
 	tool?: string;
@@ -62,9 +67,16 @@ export interface HistoryRecord {
 	files?: Array<{ path: string; status: string; added?: number; removed?: number }>;
 	/** How many files the run changed, which is more than `files` holds once the per-run cap cuts the list. */
 	filesTotal?: number;
+	/** The Claude session id and checkpoint. A Pi run leaves them unset: its identity is `ref`, never a bare id. */
 	sessionId?: string;
 	checkpoint?: string;
-	session?: { kind: "new" | "resume" | "fork"; id: string; from?: string; at?: string };
+	/** The backend the run went through. A record without one was written before backends were tagged, which means Claude. */
+	backend?: string;
+	session?: { kind: "new" | "resume" | "fork"; id?: string; from?: string; at?: string; file?: string; backend?: BackendName };
+	/** The session the backend verified the run ran in, which for Pi is the only identity a later reader may use. */
+	ref?: SessionRef;
+	/** What the child actually ran with, kept so a restored record still says which model and effort produced it. */
+	selection?: ResolvedSelection;
 	contract?: string;
 	title?: string;
 	usage?: { costUsd?: number; tokensIn: number; tokensOut: number; workflowTokens?: number; toolCalls: number };
@@ -79,10 +91,59 @@ export interface HistoryFile {
 }
 
 /** What a read gave: the records it could use, why it could use no more, and whether a save may replace the file. */
-interface Loaded {
+export interface HistoryLoad {
 	records: HistoryRecord[];
 	warning?: string;
 	writable: boolean;
+}
+
+/** A read that also says which file it found, as `stamp` said just before it, when `stamp` could say. */
+export interface StampedLoad extends HistoryLoad {
+	stamp?: string;
+}
+
+/** What became of a run whose Pi process ended while it was still going: nobody was left to finish it. */
+export const HISTORY_ABORTED = "aborted when the earlier Pi process ended";
+
+/** The child identity a host-branch entry records for a handle, as its reader gives it back; checkpoints play no part. */
+export interface BranchIdentity {
+	backend?: BackendName;
+	session?: SessionRef;
+	sessionId?: string;
+}
+
+/**
+ * A record of the branch's run and the history's run are the same run when neither names another child session.
+ * A Pi identity is the session id and the session file together, and only a verified reference carries it: a
+ * scalar id a Pi child reported is a diagnostic and is never read here, an identity on one side and none on the
+ * other is not a match, and two runs with no identity at all still match, which is all a diagnostic needs. The
+ * Claude comparison is unchanged, flat id and all, because that is the identity every Claude reader uses.
+ */
+export function sameChild(held: Pick<HistoryRecord, "backend" | "ref" | "sessionId">, branch: BranchIdentity): boolean {
+	const backend = held.backend ?? "claude";
+	if (branch.backend !== undefined && backend !== branch.backend) return false;
+	if (backend === "pi" || branch.backend === "pi") {
+		const one = held.ref?.backend === "pi" ? held.ref : undefined;
+		const other = branch.session?.backend === "pi" ? branch.session : undefined;
+		if (!one || !other) return !one && !other;
+		return one.sessionId === other.sessionId && one.sessionFile === other.sessionFile;
+	}
+	// A Codex thread is its id alone, and like a Pi session only a verified reference names it.
+	if (backend === "codex" || branch.backend === "codex") {
+		const one = held.ref?.backend === "codex" ? held.ref : undefined;
+		const other = branch.session?.backend === "codex" ? branch.session : undefined;
+		if (!one || !other) return !one && !other;
+		return one.sessionId === other.sessionId;
+	}
+	const one = held.ref?.sessionId ?? held.sessionId;
+	const other = branch.session?.sessionId ?? branch.sessionId;
+	return one === undefined || other === undefined || one === other;
+}
+
+/** The record of a run no process is running any more, or undefined when the record already ended: a run still going when its Pi process ended was finished by nobody. */
+export function asEnded(held: HistoryRecord): HistoryRecord | undefined {
+	if (held.state !== "running" && held.state !== "waiting") return undefined;
+	return { ...held, state: "aborted", endedAt: held.endedAt ?? held.startedAt, failure: HISTORY_ABORTED };
 }
 
 /** True when the user turned the on-disk run history on: it stays off unless PI_FUSION_HISTORY is exactly "1". */
@@ -120,7 +181,7 @@ const joined = (...warnings: Array<string | undefined>): string | undefined => {
 	return held.length ? held.join("; ") : undefined;
 };
 
-const STRING_FIELDS = ["mode", "tool", "toolCallId", "reviews", "reviewedBy", "sessionId", "checkpoint", "contract", "title"] as const;
+const STRING_FIELDS = ["mode", "effort", "tool", "toolCallId", "reviews", "reviewedBy", "sessionId", "checkpoint", "backend", "contract", "title"] as const;
 
 /** A copy of the record with every text, list and number a bounded one, so one run can never fill a session file. */
 export function boundRecord(record: HistoryRecord): HistoryRecord {
@@ -170,10 +231,24 @@ export function boundRecord(record: HistoryRecord): HistoryRecord {
 		if (filesTotal !== undefined) bound.filesTotal = filesTotal;
 	}
 	if (record.session !== undefined) {
-		const session: NonNullable<HistoryRecord["session"]> = { kind: record.session.kind, id: cap(String(record.session.id)) };
+		const session: NonNullable<HistoryRecord["session"]> = { kind: record.session.kind };
+		if (record.session.id !== undefined) session.id = cap(String(record.session.id));
 		if (record.session.from !== undefined) session.from = cap(String(record.session.from));
 		if (record.session.at !== undefined) session.at = cap(String(record.session.at));
+		if (record.session.file !== undefined) session.file = cap(String(record.session.file));
+		if (isBackendName(record.session.backend)) session.backend = record.session.backend;
 		bound.session = session;
+	}
+	// A reference and a selection are opaque and are kept exactly: a session file cut to fit names another file, and
+	// a model id cut to fit names another model. One field over the ceiling drops the whole value instead, and the
+	// host branch, which is what a continuation actually reads, is written elsewhere and is never bounded by this.
+	if (record.ref !== undefined) {
+		const ref = keptRef(record.ref, record.ref.backend);
+		if (ref) bound.ref = ref;
+	}
+	if (record.selection !== undefined) {
+		const selection = keptSelection(record.selection, isBackendName(record.backend) ? record.backend : "claude");
+		if (selection) bound.selection = selection;
 	}
 	if (record.usage !== undefined) {
 		const usage: NonNullable<HistoryRecord["usage"]> = {
@@ -229,10 +304,14 @@ function filesOf(value: unknown): HistoryRecord["files"] {
 
 function sessionOf(value: unknown): HistoryRecord["session"] {
 	const data = value as Record<string, unknown> | null;
-	if (!data || typeof data !== "object" || typeof data.kind !== "string" || !SESSION_KINDS.has(data.kind) || typeof data.id !== "string") return undefined;
-	const session: NonNullable<HistoryRecord["session"]> = { kind: data.kind as "new" | "resume" | "fork", id: data.id };
+	if (!data || typeof data !== "object" || typeof data.kind !== "string" || !SESSION_KINDS.has(data.kind)) return undefined;
+	// A Pi session a run started has no id until the child reports one, so only its kind is required here.
+	const session: NonNullable<HistoryRecord["session"]> = { kind: data.kind as "new" | "resume" | "fork" };
+	if (typeof data.id === "string") session.id = data.id;
 	if (typeof data.from === "string") session.from = data.from;
 	if (typeof data.at === "string") session.at = data.at;
+	if (typeof data.file === "string") session.file = data.file;
+	if (isBackendName(data.backend)) session.backend = data.backend;
 	return session;
 }
 
@@ -245,6 +324,16 @@ function usageOf(value: unknown): HistoryRecord["usage"] {
 	if (costUsd !== undefined) usage.costUsd = costUsd;
 	if (workflowTokens !== undefined) usage.workflowTokens = workflowTokens;
 	return usage;
+}
+
+/** A plain file's device, inode, size and change times, `ABSENT` for no file, or undefined for anything else there. */
+function stampOf(target: string): string | undefined {
+	try {
+		const stat = fs.lstatSync(target, { bigint: true });
+		return stat.isFile() ? `${stat.dev}:${stat.ino}:${stat.size}:${stat.mtimeNs}:${stat.ctimeNs}` : undefined;
+	} catch (error) {
+		return (error as NodeJS.ErrnoException)?.code === "ENOENT" ? ABSENT : undefined;
+	}
 }
 
 /** A record read back from disk, field by field, or undefined when the file holds something this cannot use. */
@@ -289,6 +378,11 @@ function recordOf(value: unknown): HistoryRecord | undefined {
 	if (filesTotal !== undefined) record.filesTotal = filesTotal;
 	const session = sessionOf(data.session);
 	if (session !== undefined) record.session = session;
+	const backend: BackendName = isBackendName(data.backend) ? data.backend : "claude";
+	const ref = keptRef(data.ref, backend);
+	if (ref !== undefined) record.ref = ref;
+	const selection = keptSelection(data.selection, backend);
+	if (selection !== undefined) record.selection = selection;
 	const usage = usageOf(data.usage);
 	if (usage !== undefined) record.usage = usage;
 	return boundRecord(record);
@@ -307,13 +401,37 @@ export class History {
 		this.dir = dir;
 	}
 
-	load(hostSessionId: string): Loaded {
+	load(hostSessionId: string): HistoryLoad {
 		if (!HOST_SESSION_ID.test(hostSessionId)) return { records: [], writable: false, warning: unusableId(hostSessionId) };
 		const trouble = this.dirTrouble();
 		if (!trouble.usable) return { records: [], writable: false, warning: trouble.warning };
 		const loaded = this.read(hostSessionId);
 		const warning = joined(trouble.warning, loaded.warning);
 		return warning === undefined ? loaded : { ...loaded, warning };
+	}
+
+	/** `load`, with the stamp taken before it: a write that lands between the two makes the next stamp differ, never match. */
+	loadStamped(hostSessionId: string): StampedLoad {
+		const stamp = this.stamp(hostSessionId);
+		const loaded = this.load(hostSessionId);
+		return stamp === undefined ? loaded : { ...loaded, stamp };
+	}
+
+	/**
+	 * Which file the session has, from its metadata alone, so a reader can tell the file it last read from one written
+	 * since without reading it again: every save renames a new file into place. Undefined when only a load can say,
+	 * because the id, the directory or the file is one a load refuses or would have to make private first; nothing
+	 * here changes or reads any file, so a load still does every check it always did before anything is used.
+	 */
+	stamp(hostSessionId: string): string | undefined {
+		if (!HOST_SESSION_ID.test(hostSessionId)) return undefined;
+		try {
+			const stat = fs.lstatSync(this.dir);
+			if (!stat.isDirectory() || (stat.mode & 0o077) !== 0) return undefined;
+		} catch (error) {
+			return (error as NodeJS.ErrnoException)?.code === "ENOENT" ? ABSENT : undefined;
+		}
+		return stampOf(this.file(hostSessionId));
 	}
 
 	save(hostSessionId: string, cwd: string, record: HistoryRecord): { warning?: string } | undefined {
@@ -462,7 +580,7 @@ export class History {
 		}
 	}
 
-	private read(hostSessionId: string): Loaded {
+	private read(hostSessionId: string): HistoryLoad {
 		const target = this.file(hostSessionId);
 		let text: string;
 		try {
@@ -481,7 +599,7 @@ export class History {
 			if ((error as NodeJS.ErrnoException)?.code === "ENOENT") return { records: [], writable: true };
 			return { records: [], writable: false, warning: `history file ${target} could not be read: ${reason(error)}` };
 		}
-		const unreadable: Loaded = { records: [], writable: true, warning: `history file ${target} is unreadable and will be replaced` };
+		const unreadable: HistoryLoad = { records: [], writable: true, warning: `history file ${target} is unreadable and will be replaced` };
 		let data: unknown;
 		try {
 			data = JSON.parse(text);

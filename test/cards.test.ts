@@ -8,7 +8,7 @@ const theme = { fg: (color: string, text: string) => `<${color}>${text}</${color
 
 const STATS = "[run-1 · implement · opus · 3s · 2 tool calls · in 10 out 5]";
 const REVIEW = "run-2 reviews this run in the background; its report arrives as a message.";
-const HINT = (handle: string) => `<muted>answer: /fusion answer ${handle} <text> or claude_control message</muted>`;
+const HINT = (handle: string) => `<muted>answer: /fusion answer ${handle} <text> or fusion_control message</muted>`;
 
 test("a header names the run, what became of it, its time, its files and its cost", () => {
 	assert.equal(
@@ -97,6 +97,19 @@ test("a collapsed card of a waiting run shows the question and how to answer it"
 		"<warning>Which name?</warning>",
 		HINT("run-1"),
 	]);
+});
+
+test("waiting cards keep the invoking control name, in either display mode, and reject unknown names", () => {
+	for (const control of ["fusion_control", "claude_control"] as const) {
+		assert.deepEqual(cardDetails({ control }), { control });
+		for (const expanded of [false, true]) {
+			assert.equal(bodyLines(theme, "", { expanded, question: "Which name?", handle: "run-1", control }).at(-1), `<muted>answer: /fusion answer run-1 <text> or ${control} message</muted>`);
+		}
+	}
+	for (const control of [null, 7, "some_other_tool", "claude_control\u001b[2J"]) {
+		assert.deepEqual(cardDetails({ control }), {});
+		assert.equal(bodyLines(theme, "", { expanded: false, question: "Which name?", handle: "run-1", control: control as any }).at(-1), HINT("run-1"), "even a caller's unchecked control name reaches no terminal line");
+	}
 });
 
 test("an expanded card marks the headings the host must act on and leaves the rest of the report alone", () => {
@@ -204,6 +217,10 @@ test("the widget names what every active run is doing, and what the session has 
 	assert.deepEqual(widgetLines(undefined, [running], usage).at(-1), "session usage: est. $0.2500 · warn at $0.1000, $0.2000 · limit $5.00");
 	assert.deepEqual(widgetLines(theme, [running], { ...usage, warnUsd: [], limitUsd: undefined }).at(-1), "<muted>session usage: est. $0.2500</muted>");
 	assert.equal(widgetLines(undefined, [running], usage).length, 2);
+	// Runs whose backend reports no cost are named beside the estimate, never folded into it as free.
+	assert.deepEqual(widgetLines(undefined, [running], { ...usage, unpricedRuns: 2 }).at(-1), "session usage: est. $0.2500 · cost unknown for 2 codex runs, not in the estimate · warn at $0.1000, $0.2000 · limit $5.00");
+	assert.deepEqual(widgetLines(undefined, [running], { ...usage, warnUsd: [], limitUsd: undefined, unpricedRuns: 1 }).at(-1), "session usage: est. $0.2500 · cost unknown for 1 codex run, not in the estimate");
+	assert.deepEqual(widgetLines(undefined, [running], { ...usage, unpricedRuns: 0 }).at(-1), "session usage: est. $0.2500 · warn at $0.1000, $0.2000 · limit $5.00");
 });
 
 const ESC = "\u001b";

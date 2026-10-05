@@ -2,29 +2,95 @@
 
 ## The /fusion command
 
-`/fusion` is the user's side of the same runs `claude_control` acts on for the host.
+User commands act on the same runs as either control tool. Run-changing `steer`, `answer`, and `review` actions notify the host as follow-ups without starting a turn, so you keep the floor.
 
-- `/fusion dashboard` starts or reopens the monitoring page, and `/fusion dashboard stop` closes it (see [Monitoring dashboard](dashboard.md)).
-- `/fusion status` lists every run of this Pi session, then the runs an earlier Pi process left behind, then what the session has cost. `/fusion status run-N` adds that run's activity, tool call count, the files it has changed so far and its `claude --resume` line.
-- `/fusion cancel run-N` stops the run and marks it `cancelled`. The failure text reads `implement cancelled by the user`, and the host still gets the background end notice carrying it, so the cancel never hides the end of a run from the host.
-- `/fusion steer run-N <text>` pushes the text to a running child, which reads it when it next takes input. A run that waits for an answer is not steered; the notice points at `/fusion answer` instead.
-- `/fusion wait run-N` shows the run's activity line and a clock that ticks once a second until the run ends or asks a question. Esc leaves the run running and says so. The wait never takes the report away from the host: a user wait and the host's own `claude_control wait` are counted apart, so the run's notice still goes out.
-- `/fusion answer [run-N] [text]` answers a waiting run's question, and opens an editor for the answer when no text follows the handle (see [Questions](questions.md)).
-- `/fusion review run-N` starts an independent review of a run that has ended (see [Independent reviews](reviews.md)).
+| Command | Effect |
+| --- | --- |
+| `/fusion on`, `/fusion off` | Switch delegation mode; neither starts or cancels a child |
+| `/fusion status [run-N]` | Show mode, current profile/role defaults, runs, earlier-process runs, and session usage; with a handle, show only that run's activity, tool count, changed files, and accepted transcript/resume hint |
+| `/fusion cancel run-N` | Stop the run and mark it cancelled by the user; the host still gets its end notice |
+| `/fusion steer run-N <text>` | Queue text for a running child; a waiting child needs an answer instead |
+| `/fusion wait run-N` | Show activity/elapsed time until the run ends or asks a question; Esc leaves it going and never takes the report away from the host |
+| `/fusion answer [run-N] [text]` | Answer a waiting question; no text opens an editor; no handle selects the sole waiting run |
+| `/fusion review run-N` | Start an independent background review of eligible ended work |
+| `/fusion config` | Show/edit the session's role settings |
+| `/fusion profile [list \| use <name> \| save <name> \| default <name>]` | Choose/manage global named profiles |
+| `/fusion dashboard`, `/fusion dashboard stop` | Open/reuse or close the read-only monitoring page |
+| `/fusion dashboard limit [N]` | Inspect or set this instance's in-memory run-retention target; defaults to 30, never evicts active work. See [Dashboard](dashboard.md#rendering-and-retained-data) |
 
-Argument completion offers the forms, and after a form that takes a handle it offers the handles that form can still act on: every run for `status`, this process's and an earlier one's, the active ones for `cancel` and `wait`, the running ones for `steer`, the waiting ones for `answer`, and the reviewable ones, this process's and an earlier one's that was made in this working directory, for `review`.
+Status offers continuation only for a usable record. A Pi transcript path appears only after the host accepts the outcome: not for a live run or a rejected result, and a fork names its new child file. Claude hints use `claude --resume <session id>`. See [Records](runs.md#backends-in-a-record).
 
-Everything the user does through `steer`, `answer` and `review` reaches the host as a message with `triggerTurn: false` and `deliverAs: "followUp"`: it starts no turn, so the user keeps the floor, and the host reads it with its next turn. The message names the run and what the user did, so the host does not repeat work the user has already settled.
-## The status line
+“Steer sent” means accepted for delivery, not consumed or acted on by the model; on Codex the notice says `steer queued for run-N` and that it goes once to the current turn, with no retry. A child whose input is still open but takes no more, as a full Codex queue does, gets `run-N did not accept the steer now`; one whose input has closed gets `run-N no longer takes input`. Neither sends, queues or retries anything, and neither is logged to the host. Ordinary editor text goes to the host, not automatically to the child. `/fusion steer` logs an accepted instruction to the host as well; nothing automatically resends an unread child steer.
 
-While a child runs, the status line shows `<handle> <role> · <seconds> · <n> tool calls · <activity>` for every active run, separated by `|`, and a foreground call's partial result shows its own line. The clock ticks every second. The activity is the tool the child is running, the latest line of the model's thinking, the tail of the text it is writing, or workflow progress, so a two-minute Fable turn at xhigh shows as `thinking · <latest summary>` rather than a frozen line. Streamed deltas update the line at most four times a second.
+A clean cancel notifies `run-N cancelled`. If stopping the Pi child left a cleanup concern or retained storage, the notice is a warning, for example:
 
-## Terminal cards and the run widget
+```text
+run-N cancelled; cleaning up needs attention: leftovers; this call's storage is left behind
+```
 
-In the Pi TUI a `claude` call, a `claude_control` result and the extension's background-run messages render as a card: one header line and a short body. The header reads `claude implement run-3 · done · 12s · 2 files · $0.2534`, with the state colored by what it means for the host (green done, yellow running or waiting, red failed, aborted or cancelled), and a review names the run it reviews: `ask, review of run-1`. A message header says whose action it was: `run`, `user steer`, `user answer` or `user review`.
+The same warning appears once in the failure/report/history/dashboard. It carries no path or foreign error text. Cancellation does not undo files, and cleanup can need [manual attention](runs.md#aborting-a-run).
 
-Collapsed, the body is the first three report lines that carry text, without the stats line and the review line, each cut to the width, with `… 4 more lines, ctrl+o to expand` under them when the report has more; a run that waits shows its question and `answer: /fusion answer run-3 <text> or claude_control message` instead. Ctrl+O expands the same card to the whole report, wrapped instead of cut, with the `Escalation`, `Review` and `Open questions` headings highlighted, up to 50 changed paths under a `files (n)` line, and the open question up to 400 characters. No card line is ever wider than the width the TUI gives it. Every piece of text a child wrote is stripped of escape sequences and of control characters, tab and newline apart, before it becomes a card line, a widget line, the footer status line or a `/fusion` notice, which is what Pi's own renderer does for a tool result it prints itself: a report, an activity line or a question cannot clear the screen, write the clipboard or hide a link in the transcript. What `claude_control` returns is left as the child wrote it: the host model reads it as data, not as terminal output.
+Completion offers forms and relevant handles: all runs for status, active ones for cancel/wait, running ones that take a steer for steer, waiting ones for answer, and reviewable ones for review. Profile completion uses the last-read saved names, with `builtin` for use/default.
 
-The cards were tested with the pi-tui renderer at fixed widths, from 1 column up, and not yet looked at in a live Pi terminal.
+### Turning Fusion on and off
 
-While runs are active, a widget over the editor names each one: `run-3 implement · 12s · 4 tool calls · Bash npm test · 2 files`, or `run-3 implement · waiting: Which name? · answer: /fusion answer run-3 <text>`. With `PI_FUSION_BUDGET_WARN_USD` or `PI_FUSION_BUDGET_LIMIT_USD` set it ends with `session usage: est. $0.2500 · warn at $0.1000 · limit $5.00`; without either, the widget shows the runs alone. The widget goes when the last run ends and when the session closes; the footer status line stays as it was. The file count comes from a `git status` sample taken at most once every ten seconds per run, and an `ask` run, which changes no files, is never sampled. `PI_FUSION_WIDGET=0` turns the widget off and leaves everything else as it is.
+```text
+extension loads -> OFF: fusion_activate available; workflow tools hidden
+                     |
+             /fusion on or explicit Fusion request
+                     v
+                  ON: workflow tools + fusion_deactivate
+                     |
+             /fusion off or explicit stop request
+             only when no run is unfinished
+                     v
+                  OFF
+```
+
+Fusion starts off every time the extension loads: starting Pi, `/new`, reload, resume, or fork. Its delegation/control descriptions and routing guidance are absent while off. Calls still attempted from older guidance refuse with `fusion is off; turn it on with /fusion on, or ask for Fusion by name`. Manual and automatic reviews start nothing while off; turning on starts no deferred review.
+
+To turn it on, type `/fusion on` or explicitly ask for Fusion, such as “use Fusion to implement this.” The host calls `fusion_activate`, which starts no child; workflow tools/guidance become available from its next step, in the same turn.
+
+A role/model/backend request alone (“plan this first,” “do a security audit,” “use ultracode,” “have Claude do it”) does not qualify. Nor do quoted instructions, discussion of Fusion, or earlier use in the conversation. These restrictions guide the host; they cannot prove a model followed them.
+
+Turn it off with `/fusion off` or a plain request such as “turn Fusion off and work directly,” carried out through `fusion_deactivate`. **Finishing a task never turns it off.** Repeating a switch changes nothing and reports the current state.
+
+After tool/natural-language activation, the host's next `agent_settled` shows one reminder:
+
+```text
+Fusion remains on. Use /fusion off or ask to turn it off when you're done.
+```
+
+The flag is cleared before notification. Background children may still be active; this is a host notification, not their completion or automatic deactivation. `/fusion on` suppresses the reminder, including when already on; successful off clears it.
+
+Off refuses **unfinished** runs: running, waiting, or ended but still recording/delivering, reviews included. It names them, marking final ones as finishing. Wait or cancel, then retry. The refusal cancels nothing and hides no control tools; a refused deactivation tells the host to wait for your next instruction rather than do the child's work itself.
+
+The mode exists only in this instance's memory. Status/dashboard/settings commands work while off and do not activate it. Profiles and mode are independent; neither mode tool enables a role. In particular, turning Fusion on does not enable security in `builtin`. Existing records remain and can be continued after activation when their role/record permits it.
+
+#### Active tools and allow lists
+
+A switch changes only Fusion's active tools. On restores the saved workflow subset, including an empty subset, while preserving unrelated tools' state. One that was inactive stays inactive. Off leaves only activation; on leaves only deactivation among the mode tools.
+
+Pi's allow list/exclusions decide what can be activated; Fusion never bypasses them. Include both mode tools for natural-language switching, and a delegation/control pair for usable workflows. Without mode tools, the commands still work. Reload does not preserve a pre-reload saved subset, and a model request already in flight keeps the tools/guidance it was sent. A host prompt override or another extension's tool changes are not overwritten into a guaranteed Fusion setup.
+
+Settings can be applied while off: guidance refreshes but stays hidden until on. See [Profiles](profiles.md) for unfinished-run guards and rollback attempts.
+
+## Status line, cards, and widget
+
+The footer shows each active run as:
+
+```text
+run-3 implement · 12s · 4 tool calls · Bash npm test
+```
+
+The clock ticks each second. Activity can be a tool, thinking/text preview, or workflow progress; streamed deltas update at most four times a second. Foreground partial results show their own activity too.
+
+Delegations, controls, and background/user messages render as terminal cards. A header names the invoked tool, handle, role, state, elapsed time, changed-file count, and estimated cost. Reviews name the run they review. Done is green, running/waiting yellow, and failed/aborted/cancelled red.
+
+Collapsed cards show the first three nonempty report lines, excluding stats/review-link lines. **Ctrl+O** expands the wrapped report, highlighted Escalation/Review/Open questions sections, up to 50 changed paths, and the open question (up to 400 characters). Waiting cards show `/fusion answer` plus the appropriate `fusion_control message` or `claude_control message` hint. Background cards retain their run's pair; control results follow the control called. Both aliases manage every run, but Pi continuation hints always name `fusion`.
+
+Terminal text strips escape sequences and control characters (except tab/newline), and cards respect the supplied width. This is terminal-output safety, not redaction or a transformation of the child text the host reads. Renderer tests cover fixed widths down to one column; no live-terminal qualification is claimed by those tests.
+
+The optional widget above the editor lists active handles, activity, tools, live changed-file count, and answer hints. With a budget configured it adds usage/thresholds, and names how many Codex runs the estimate leaves out because Codex reports no cost. It disappears when the last run/session ends; `PI_FUSION_WIDGET=0` disables it without changing the footer. File counts sample Git at most once per ten seconds per coding run; ask runs are not sampled.
+
+See [Questions](questions.md), [Independent reviews](reviews.md), and [Dashboard](dashboard.md) for their own operational details.

@@ -6,6 +6,8 @@ import * as path from "node:path";
 import test, { after } from "node:test";
 import { setTimeout as delay } from "node:timers/promises";
 import { type Dashboard, RunStore, startDashboard } from "../extensions/dashboard.ts";
+import { ArchiveIndex, type ArchiveReader, type BranchEvidence } from "../extensions/dashboard-archive.ts";
+import type { HistoryRecord } from "../extensions/history.ts";
 
 /** Where a Chromium build sits when it was installed the usual way for the platform. */
 const CHROME_PATHS: Record<string, readonly string[]> = {
@@ -80,6 +82,8 @@ const SELECTED_TAB = "(document.querySelector('.tab[aria-selected=\"true\"]') ||
 const VISIBLE_PANEL = "(document.querySelector('.panel:not(.hidden)') || { dataset: {} }).dataset.tab || ''";
 const TAB = (label: string) => `Array.from(document.querySelectorAll('.tab')).find((node) => node.firstChild.textContent === ${JSON.stringify(label)})`;
 const CLICK_TAB = (label: string) => `(() => { const tab = ${TAB(label)}; if (!tab) return 'missing'; tab.click(); return 'clicked'; })()`;
+const CLICK_RUN = (role: string) =>
+	`(() => { const item = Array.from(document.querySelectorAll('.run')).find((node) => node.querySelector('.run-role').textContent === ${JSON.stringify(role)}); if (!item) return 'missing'; item.click(); return 'clicked'; })()`;
 const TAB_BADGE = (label: string) => `(() => { const tab = ${TAB(label)}; const badge = tab && tab.querySelector('.badge'); return badge ? badge.textContent + (badge.classList.contains('badge-hot') ? '*' : '') : ''; })()`;
 const PANEL = (tab: string) => `document.querySelector('.panel[data-tab="${tab}"]')`;
 const PANEL_SCROLL = (tab: string) => `(${PANEL(tab)} || {}).scrollTop`;
@@ -183,6 +187,7 @@ interface Page {
 	send(method: string, params?: Record<string, unknown>): Promise<Record<string, unknown>>;
 	evaluate<T>(expression: string): Promise<T>;
 	open(url: string): Promise<void>;
+	refresh(): Promise<void>;
 	until<T>(what: string, expression: string, ok: (value: T) => boolean, ms?: number): Promise<T>;
 }
 
@@ -214,7 +219,9 @@ function makePage(cdp: Cdp, sessionId: string, redact: (text: string) => string)
 		await send("Page.navigate", { url });
 		await until<string>("the page loads", READY, (value) => value === "ready", COMMAND_MS);
 	};
-	return { send, evaluate, open, until };
+	/** Layout checks use the normal refresh path immediately rather than waiting for the next one-second poll. */
+	const refresh = () => evaluate<void>("pollRuns()");
+	return { send, evaluate, open, refresh, until };
 }
 
 function report(): string {
@@ -494,6 +501,7 @@ test("repeated live refreshes keep the log where the reader left it and count ro
 			for (let i = 1; i <= REFRESHES; i++) {
 				const rows = await page.evaluate<number>(LOG_ROWS);
 				store.event("live", { type: "tool_call", name: "Read", brief: `${viewport.name} away ${i}` });
+				await page.refresh();
 				await page.until<number>(`${viewport.name}: refresh ${i} arrives`, LOG_ROWS, (count) => count === rows + 1);
 				assert.equal(await page.evaluate<number>(LOG_SCROLL), 100, `${viewport.name}: refresh ${i} must not move a log scrolled up`);
 				await page.until<string>(`${viewport.name}: refresh ${i} is counted`, JUMP_TEXT, (text) => text === `${i} new ↓`);
@@ -509,6 +517,7 @@ test("repeated live refreshes keep the log where the reader left it and count ro
 			for (let i = 1; i <= REFRESHES; i++) {
 				const rows = await page.evaluate<number>(LOG_ROWS);
 				store.event("live", { type: "tool_call", name: "Read", brief: `${viewport.name} hidden ${i}` });
+				await page.refresh();
 				await page.until<number>(`${viewport.name}: hidden refresh ${i} arrives`, LOG_ROWS, (count) => count === rows + 1);
 				assert.equal(await page.evaluate<number>(PANEL_SCROLL("overview")), middle, `${viewport.name}: hidden refresh ${i} must not move the Overview tab`);
 				await page.until<string>(`${viewport.name}: hidden refresh ${i} is counted on the Log tab`, TAB_BADGE("Log"), (text) => text === `+${i}*`);
@@ -562,6 +571,7 @@ test("the Log tab holds still while tasks, the timeline and thinking grow on the
 				const rows = await page.evaluate<number>(LOG_ROWS);
 				store.event("live", { type: "task_started", taskId, name: `${taskId} ${WORDS(20)}`, taskType: "local_agent", subagentType: "general-purpose" });
 				tasks.push(taskId);
+				await page.refresh();
 				await page.until<number>(`${taskId}: the task's log row arrives`, LOG_ROWS, (count) => count === rows + 1);
 				assert.equal(await page.evaluate<string>(TAB_BADGE("Tasks")), `${tasks.length} running*`, `${taskId}: the Tasks tab counts the running tasks`);
 				await kept(`${taskId} starting`, pinned, pinned ? "" : "1 new ↓");
@@ -580,12 +590,14 @@ test("the Log tab holds still while tasks, the timeline and thinking grow on the
 						{ label: "b", state: "start" },
 					],
 				});
+				await page.refresh();
 				await page.until<string[]>(`${taskId}: the summary arrives`, TASK_SUMMARIES, (summaries) => summaries.some((text) => text.startsWith(marker)));
 				await kept(`${taskId} progress`, pinned, pinned ? "" : "1 new ↓");
 
 				toolCalls++;
 				thoughts.push(`${taskId} thinking ${WORDS(12)}`);
 				store.progress("live", { toolCalls, tokensIn: 5, tokensOut: 1, thinking: [...thoughts] });
+				await page.refresh();
 				await page.until<string>(`${taskId}: the thinking arrives`, TOOL_CALLS_FACT, (value) => value === String(toolCalls));
 				await kept(`${taskId} thinking`, pinned, pinned ? "" : "1 new ↓");
 			};
@@ -1166,13 +1178,36 @@ test("a run's tasks are drawn on a timeline of the run", { skip }, async () => {
 	shift(4_000);
 	store.finish("gantt", { status: "done" });
 	await page.open((await fixture()).url);
-	await page.evaluate<string>("(() => { Array.from(document.querySelectorAll('.run')).find((node) => node.querySelector('.run-role').textContent === 'gantt-role').click(); return 'ok'; })()");
+	await page.until<string>("the gantt run is listed and clicked", CLICK_RUN("gantt-role"), (result) => result === "clicked");
 	await page.until<string>("the gantt run is shown", DETAIL_TITLE, (title) => title === "gantt-role");
 	const bars = await page.evaluate<string[]>(
 		"Array.from(document.querySelectorAll('.timeline-row')).filter((row) => row.querySelector('.timeline-bar')).map((row) => { const bar = row.querySelector('.timeline-bar'); return [row.querySelector('.timeline-label').textContent, Math.round(parseFloat(bar.style.left)), Math.round(parseFloat(bar.style.width)), bar.className].join(' '); })",
 	);
 	assert.deepEqual(bars, ["probe 40 20 timeline-bar bar-completed", "verify 60 40 timeline-bar bar-stopped"]);
 	assert.equal(await page.evaluate<string>("document.querySelector('.timeline-axis').textContent"), "0s10s");
+});
+
+test("a run's backend is in the list and its facts, beside the model and effort it ran with", { skip }, async () => {
+	const { page, store, url } = await fixture();
+	store.start({ id: "shown-claude", backend: "claude", role: "shown-claude-role", model: "opus", effort: "high" });
+	store.start({ id: "shown-pi", backend: "pi", role: "shown-pi-role", model: "deepseek/deepseek-chat" });
+	await page.open(url);
+	const MODEL_OF = (role: string) =>
+		`(() => { const item = Array.from(document.querySelectorAll('.run')).find((node) => node.querySelector('.run-role').textContent === ${JSON.stringify(role)}); return item ? item.querySelector('.run-model').textContent : ''; })()`;
+	await page.until<string>("the claude run names its backend", MODEL_OF("shown-claude-role"), (text) => text === "claude · opus");
+	assert.equal(await page.evaluate<string>(MODEL_OF("shown-pi-role")), "pi · deepseek/deepseek-chat");
+
+	await page.until<string>("the claude run is listed and clicked", CLICK_RUN("shown-claude-role"), (result) => result === "clicked");
+	await page.until<string>("the claude run is shown", DETAIL_TITLE, (title) => title === "shown-claude-role");
+	assert.equal(await page.evaluate<string>(FACT_VALUE("Backend")), "claude");
+	assert.equal(await page.evaluate<string>(FACT_VALUE("Effort")), "high");
+
+	await page.until<string>("the pi run is listed and clicked", CLICK_RUN("shown-pi-role"), (result) => result === "clicked");
+	await page.until<string>("the pi run is shown", DETAIL_TITLE, (title) => title === "shown-pi-role");
+	assert.equal(await page.evaluate<string>(FACT_VALUE("Backend")), "pi");
+	assert.equal(await page.evaluate<string>(FACT_VALUE("Effort")), "", "a pi run that named no effort shows none until its child confirms one");
+	store.progress("shown-pi", { toolCalls: 0, tokensIn: 0, tokensOut: 0, modelId: "deepseek/deepseek-chat", selection: { model: "deepseek/deepseek-chat", effort: "medium" } });
+	await page.until<string>("the confirmed effort appears", FACT_VALUE("Effort"), (text) => text === "medium");
 });
 
 const COUNT_TEXT = "(document.querySelector('.log-count') || {}).textContent || ''";
@@ -1200,12 +1235,13 @@ test("the log stays in place when its entry count gains a digit", { skip }, asyn
 	const { page, store } = await fixture();
 	store.start({ id: "digits", role: "digits-role", model: "opus" });
 	await page.open((await fixture()).url);
-	await page.evaluate<string>("(() => { Array.from(document.querySelectorAll('.run')).find((node) => node.querySelector('.run-role').textContent === 'digits-role').click(); return 'ok'; })()");
+	await page.until<string>("the digits run is listed and clicked", CLICK_RUN("digits-role"), (result) => result === "clicked");
 	await page.until<string>("the digits run is shown", DETAIL_TITLE, (title) => title === "digits-role");
 	let added = 0;
 	const fill = async (entries: number, brief: string): Promise<void> => {
 		const shown = Number.parseInt(await page.evaluate<string>(COUNT_TEXT), 10) || 0;
 		for (let i = shown; i < entries; i++) store.event("digits", { type: "tool_call", name: "Read", brief: `${brief} ${++added}` });
+		await page.refresh();
 	};
 	const crossing = async (what: string, from: string, to: string, brief: string): Promise<void> => {
 		await page.until<string>(`${what}: the count reads ${from}`, COUNT_TEXT, (text) => text === from);
@@ -1213,11 +1249,13 @@ test("the log stays in place when its entry count gains a digit", { skip }, asyn
 		assert.ok(slack >= 0, `${what}: the count must end at the edge of the filter row`);
 		const top = await page.evaluate<number>(LOG_TOP);
 		store.event("digits", { type: "tool_call", name: "Read", brief: `${brief} ${++added}` });
+		await page.refresh();
 		await page.until<string>(`${what}: the count reads ${to}`, COUNT_TEXT, (text) => text === to);
 		assert.equal(await page.evaluate<number>(LOG_TOP), top, `${what}: the log moved when the count changed from ${from} to ${to}`);
 	};
 	try {
 		store.event("digits", { type: "tool_call", name: "Read", brief: `row ${++added}` });
+		await page.refresh();
 		await page.until<string>("the digits log is rendered", HAS_LOG, (has) => has === "yes");
 		await fill(9, "row");
 		await crossing("desktop", "9 entries", "10 entries", "row");
@@ -1227,6 +1265,7 @@ test("the log stays in place when its entry count gains a digit", { skip }, asyn
 		await page.send("Emulation.setDeviceMetricsOverride", NARROW);
 		await page.evaluate<string>(SET_QUERY("marker"));
 		for (let i = 0; i < 9; i++) store.event("digits", { type: "tool_call", name: "Read", brief: `marker ${++added}` });
+		await page.refresh();
 		await crossing("mobile filtered", "9 of 100 entries", "10 of 100 entries", "marker");
 	} finally {
 		await page.evaluate<string>("(() => { document.querySelector('.log-filter').style.width = ''; return 'ok'; })()").catch(() => undefined);
@@ -1262,4 +1301,527 @@ test("a run restored from an earlier Pi process is labelled in the list and in i
 	await page.until<string>("the restored run is shown", DETAIL_TITLE, (title) => title === "held-role");
 	assert.equal(await page.evaluate<string>(FACT_VALUE("Restored")), "from an earlier Pi process");
 	assert.equal(await page.evaluate<string>(FACT_VALUE("Tool calls")), "7");
+});
+
+const RESUME_TEXT = "(document.querySelector('.resume .resume-command') || {}).textContent || ''";
+/** A realistic Pi transcript path past every display cap this page has, and well under the platform's own limit. */
+const LONG_PI_FILE = `/home/asen/.pi/agent/sessions/${"a-deeply-nested-project-directory/".repeat(12)}0199c9e2-1b3a-7f00-8000-0123456789ab.jsonl`;
+const FACT = (label: string) =>
+	`(() => { const keys = Array.from(document.querySelectorAll('.fact-key')); const key = keys.find((node) => node.textContent === ${JSON.stringify(label)}); return key && key.nextElementSibling ? key.nextElementSibling.textContent : ''; })()`;
+/** Takes the clipboard over, so a click on Copy says what the page would have put there rather than asking Chrome for it. */
+const TAKE_CLIPBOARD = "(() => { window.__copied = []; Object.defineProperty(navigator, 'clipboard', { configurable: true, value: { writeText: (text) => { window.__copied.push(text); return Promise.resolve(); } } }); return 'ok'; })()";
+const COPY_RESUME = "(() => { const button = document.querySelector('.resume .copy'); if (!button) return 'missing'; button.click(); return 'clicked'; })()";
+const COPIED = "(window.__copied || []).join('|')";
+const SELECT_ROLE = (role: string) => `(() => { const item = Array.from(document.querySelectorAll('.run')).find((node) => node.querySelector('.run-role').textContent === ${JSON.stringify(role)}); if (!item) return 'missing'; item.click(); return 'ok'; })()`;
+
+test("a pi run's transcript is the file its outcome verified, and a fork's launch request is not offered as one", { skip }, async () => {
+	const { page, store, url } = await fixture();
+	const forked = { backend: "pi" as const, sessionId: "pi-2", sessionFile: "/sessions/pi-2.jsonl", checkpoint: "entry-9" };
+	const request = { kind: "fork" as const, backend: "pi" as const, from: "pi-1", file: "/sessions/pi-1.jsonl", at: "entry-9" };
+	store.start({ id: "pi-fresh", backend: "pi", role: "pi-fresh-role", model: "deepseek/deepseek-chat", session: { kind: "new", backend: "pi" } });
+	store.start({ id: "pi-fork", backend: "pi", role: "pi-fork-role", model: "deepseek/deepseek-chat", session: request });
+	// A fork that failed before it read a selection back still verified the child it made, and that is its transcript.
+	store.finish("pi-fork", { status: "failed", failure: "the provider dropped the connection", ref: forked });
+	store.start({ id: "pi-invalid", backend: "pi", role: "pi-invalid-role", model: "deepseek/deepseek-chat", session: { kind: "new", backend: "pi" } });
+	store.finish("pi-invalid", { status: "failed", failure: "invalid session postcondition: run-9 succeeded without reporting the session it ran in" });
+	store.restore({ id: "pi-held", backend: "pi", role: "pi-held-role", model: "deepseek/deepseek-chat", state: "failed", startedAt: Date.now() - 10_000, session: request, ref: forked });
+	store.start({ id: "pi-long", backend: "pi", role: "pi-long-role", model: "deepseek/deepseek-chat", session: { kind: "new", backend: "pi" } });
+	store.finish("pi-long", { status: "done", text: "done", ref: { backend: "pi", sessionId: "0199c9e2-1b3a-7f00-8000-0123456789ab", sessionFile: LONG_PI_FILE, checkpoint: "entry-1" } });
+	await page.open(url);
+	await page.until<number>("the pi runs are listed", RUN_BUTTONS, (count) => count >= 7);
+	await page.evaluate<string>(TAKE_CLIPBOARD);
+
+	// A run that has reported nothing yet has no transcript to offer, and none is invented from its request.
+	assert.equal(await page.evaluate<string>(SELECT_ROLE("pi-fresh-role")), "ok");
+	await page.until<string>("the new pi run is shown", DETAIL_TITLE, (title) => title === "pi-fresh-role");
+	assert.equal(await page.evaluate<string>(RESUME_TEXT), "");
+	assert.equal(await page.evaluate<string>(FACT("Pi session request")), "new");
+
+	// Its outcome lands, and the page names the file that outcome verified.
+	store.finish("pi-fresh", { status: "done", text: "done", ref: { backend: "pi", sessionId: "pi-1", sessionFile: "/sessions/pi-1.jsonl", checkpoint: "entry-1" } });
+	await page.until<string>("the verified transcript appears", RESUME_TEXT, (text) => text === "/sessions/pi-1.jsonl");
+
+	// A fork shows its parent as the request it was launched with, and its own child as the transcript.
+	assert.equal(await page.evaluate<string>(SELECT_ROLE("pi-fork-role")), "ok");
+	await page.until<string>("the fork is shown", DETAIL_TITLE, (title) => title === "pi-fork-role");
+	assert.equal(await page.evaluate<string>(FACT("Pi session request")), "fork of pi-1 at entry-9 in /sessions/pi-1.jsonl");
+	assert.equal(await page.evaluate<string>(RESUME_TEXT), "/sessions/pi-2.jsonl");
+	assert.equal(await page.evaluate<string>(COPY_RESUME), "clicked");
+	assert.equal(await page.evaluate<string>(COPIED), "/sessions/pi-2.jsonl", "Copy takes the verified child, never the parent the fork was launched from");
+
+	// The same run as an earlier Pi process left it, restored from the history.
+	assert.equal(await page.evaluate<string>(SELECT_ROLE("pi-held-role")), "ok");
+	await page.until<string>("the restored run is shown", DETAIL_TITLE, (title) => title === "pi-held-role");
+	assert.equal(await page.evaluate<string>(RESUME_TEXT), "/sessions/pi-2.jsonl");
+
+	// A long transcript path is copied whole: a page that shortened it would hand over a path to somewhere else.
+	assert.equal(await page.evaluate<string>(SELECT_ROLE("pi-long-role")), "ok");
+	await page.until<string>("the long path is shown", DETAIL_TITLE, (title) => title === "pi-long-role");
+	assert.equal(await page.evaluate<string>(RESUME_TEXT), LONG_PI_FILE);
+	assert.equal(await page.evaluate<string>(COPY_RESUME), "clicked");
+	assert.equal(await page.evaluate<string>("(window.__copied || []).slice(-1)[0] || ''"), LONG_PI_FILE, "Copy takes the whole path the child reported");
+
+	// An outcome the host refused passes no reference, so there is nothing to show and nothing to copy.
+	assert.equal(await page.evaluate<string>(SELECT_ROLE("pi-invalid-role")), "ok");
+	await page.until<string>("the refused run is shown", DETAIL_TITLE, (title) => title === "pi-invalid-role");
+	assert.equal(await page.evaluate<string>(RESUME_TEXT), "");
+	assert.equal(await page.evaluate<string>(COPY_RESUME), "missing", "a run with no verified session has no copyable transcript");
+	assert.equal(await page.evaluate<string>(COPIED), `/sessions/pi-2.jsonl|${LONG_PI_FILE}`, "and nothing was copied for the run that has no verified session");
+});
+
+test("a codex run's thread is reopened with codex resume from its verified reference alone, never from the scalar id its child reported", { skip }, async () => {
+	const { page, store, url } = await fixture();
+	store.start({ id: "codex-fresh", backend: "codex", role: "codex-fresh-role", model: "host default", session: { kind: "new", backend: "codex" } });
+	// The child names its thread as it starts, and the snapshot carries that scalar: a diagnostic, not a resume command.
+	store.event("codex-fresh", { type: "init", sessionId: "thr-diagnostic" });
+	store.progress("codex-fresh", { role: { name: "implement" }, text: "", toolCalls: 1, tokensIn: 5, tokensOut: 1, cacheRead: 0, cacheWrite: 0, ms: 1, exitCode: null, signal: null, aborted: false, stderr: "", sessionId: "thr-diagnostic" } as never);
+	store.start({ id: "codex-refused", backend: "codex", role: "codex-refused-role", model: "host default", session: { kind: "new", backend: "codex" } });
+	store.event("codex-refused", { type: "init", sessionId: "thr-claimed" });
+	store.finish("codex-refused", { status: "failed", failure: "invalid session postcondition: run-9 succeeded without reporting the configured model and provider it ran with" });
+	await page.open(url);
+	await page.evaluate<string>(TAKE_CLIPBOARD);
+
+	assert.equal(await page.evaluate<string>(SELECT_ROLE("codex-fresh-role")), "ok");
+	await page.until<string>("the codex run is shown", DETAIL_TITLE, (title) => title === "codex-fresh-role");
+	assert.equal(await page.evaluate<string>(FACT("Codex thread request")), "new");
+	assert.equal(await page.evaluate<string>(FACT("Claude session")), "", "a codex run's request is never labelled a claude session");
+	assert.equal(await page.evaluate<string>(RESUME_TEXT), "", "a scalar the child reported in progress is no command to offer");
+
+	// Its outcome lands with the verified thread, and that thread is the one command offered and copied.
+	store.finish("codex-fresh", { status: "done", text: "done", ref: { backend: "codex", sessionId: "thr-1" } });
+	await page.until<string>("the verified thread appears", RESUME_TEXT, (text) => text === "codex resume thr-1");
+	assert.equal(await page.evaluate<string>(COPY_RESUME), "clicked");
+	assert.equal(await page.evaluate<string>(COPIED), "codex resume thr-1");
+
+	// An outcome the host refused passed no reference: no codex command, and no claude one built from the scalar.
+	assert.equal(await page.evaluate<string>(SELECT_ROLE("codex-refused-role")), "ok");
+	await page.until<string>("the refused codex run is shown", DETAIL_TITLE, (title) => title === "codex-refused-role");
+	assert.equal(await page.evaluate<string>(RESUME_TEXT), "");
+	assert.equal(await page.evaluate<string>(COPY_RESUME), "missing");
+	assert.equal(await page.evaluate<string>(COPIED), "codex resume thr-1", "nothing was copied for the refused run");
+
+	// A restored thread whose id a shell would interpret is offered and copied as one quoted literal argument, and the
+	// scalar the restored record carries is never what it falls back to.
+	const hostile = "$(touch pwned) `id` it's";
+	store.restore({ id: "codex-hostile", backend: "codex", role: "codex-hostile-role", model: "host default", state: "done", startedAt: Date.now() - 5_000, sessionId: "codex-scalar", ref: { backend: "codex", sessionId: hostile } });
+	store.restore({ id: "codex-equals", backend: "codex", role: "codex-equals-role", model: "host default", state: "done", startedAt: Date.now() - 4_500, ref: { backend: "codex", sessionId: "=ls" } });
+	store.restore({ id: "codex-option", backend: "codex", role: "codex-option-role", model: "host default", state: "done", startedAt: Date.now() - 4_000, ref: { backend: "codex", sessionId: "-rf" } });
+	await page.until<string>("the restored codex runs are listed", SELECT_ROLE("codex-option-role"), (found) => found === "ok");
+	await page.until<string>("the option-like thread is shown", DETAIL_TITLE, (title) => title === "codex-option-role");
+	assert.equal(await page.evaluate<string>(RESUME_TEXT), "codex resume -- '-rf'");
+	assert.equal(await page.evaluate<string>(SELECT_ROLE("codex-equals-role")), "ok");
+	await page.until<string>("the =-led thread is shown", DETAIL_TITLE, (title) => title === "codex-equals-role");
+	assert.equal(await page.evaluate<string>(RESUME_TEXT), "codex resume '=ls'", "zsh would expand a bare leading =");
+	assert.equal(await page.evaluate<string>(SELECT_ROLE("codex-hostile-role")), "ok");
+	await page.until<string>("the hostile thread is shown", DETAIL_TITLE, (title) => title === "codex-hostile-role");
+	const quoted = "codex resume '$(touch pwned) `id` it'\\''s'";
+	assert.equal(await page.evaluate<string>(RESUME_TEXT), quoted);
+	assert.equal(await page.evaluate<string>(COPY_RESUME), "clicked");
+	assert.equal(await page.evaluate<string>("(window.__copied || []).slice(-1)[0] || ''"), quoted, "Copy takes the quoted command, exactly as shown");
+	assert.doesNotMatch(await page.evaluate<string>(RESUME_TEXT), /codex-scalar|claude --resume/);
+
+	// The session estimate names the runs it cannot price rather than reading as though they cost nothing.
+	const usage = USAGE as typeof USAGE & { unpricedRuns?: number };
+	usage.unpricedRuns = 2;
+	try {
+		await page.until<string>(
+			"the header names the unpriced runs",
+			USAGE_TEXT,
+			(text) => text === "Session usage: $1.25 est. · 1,200 in · 340 out · 250 workflow tokens · 3 calls · cost unknown for 2 codex runs, not in the estimate · warn at $1.00, $2.00 · limit $5.00",
+		);
+	} finally {
+		delete usage.unpricedRuns;
+	}
+	await page.until<string>("the header is back as it was", USAGE_TEXT, (text) => !text.includes("codex"));
+});
+
+const ARCHIVE_HOST = "host-archive-1";
+const NOT_SAVED = "Not saved in history";
+
+/** One record of the archive's host session; its role names it in the list, and every tenth one repeats a handle. */
+const archivedRecord = (i: number, over: Partial<HistoryRecord> = {}): HistoryRecord => ({
+	id: `arch-${String(i).padStart(3, "0")}`,
+	handle: `run-${(i % 10) + 1}`,
+	role: `archived-${i}`,
+	model: "opus",
+	hostSessionId: ARCHIVE_HOST,
+	cwd: CWD,
+	origin: "tool",
+	state: "done",
+	startedAt: 1_000_000 + i * 1_000,
+	endedAt: 1_000_000 + i * 1_000 + 4_000,
+	prompt: `archived prompt ${i}`,
+	report: `archived report ${i}`,
+	backend: "claude",
+	usage: { tokensIn: 10 + i, tokensOut: 2, toolCalls: 3 },
+	...over,
+});
+
+/**
+ * A dashboard of its own over a real archive of one in-memory session file, which `replace` rewrites as another
+ * writer would; the store's clock stands still unless a case moves it. The shared page is pointed at it.
+ */
+async function archiveServer(records: HistoryRecord[], setup: (store: RunStore) => void = () => {}, limit = 30, withArchive = true, evidence: BranchEvidence[] = []) {
+	let file = records;
+	let version = 0;
+	const reader: ArchiveReader = {
+		loadStamped: () => ({ records: file.map((record) => structuredClone(record)), writable: false, stamp: String(version) }),
+		stamp: () => String(version),
+	};
+	const index = new ArchiveIndex(reader);
+	const clock = { now: Date.now() };
+	const store = new RunStore(() => clock.now, limit);
+	setup(store);
+	const archive = withArchive
+		? () => {
+				index.refresh({ current: ARCHIVE_HOST, evidence });
+				return index;
+			}
+		: undefined;
+	const dashboard = await startDashboard(store, { cwd: CWD, ...(archive ? { archive } : {}) });
+	return {
+		store,
+		clock,
+		url: dashboard.url,
+		replace: (next: HistoryRecord[]) => {
+			file = next;
+			version++;
+		},
+		close: () => dashboard.close(),
+	};
+}
+
+const MORE_TEXT = "(document.querySelector('.archive-status') || {}).textContent || ''";
+const MORE_BUTTON = "(() => { const button = document.querySelector('.archive-load'); return button && !button.classList.contains('hidden') ? button.textContent + (button.getAttribute('aria-disabled') === 'true' ? '*' : '') : ''; })()";
+const CLICK_MORE = "(() => { document.querySelector('.archive-load').click(); return 'clicked'; })()";
+const ARCHIVED_ROWS = "document.querySelectorAll('.run .archived').length";
+const ROLES = "Array.from(document.querySelectorAll('.run .run-role')).map((node) => node.textContent)";
+const GROUPS = "Array.from(document.querySelectorAll('.run-group')).map((node) => node.textContent)";
+const FOCUSED = "(() => { const node = document.activeElement; return node ? (node.classList.contains('archive-load') ? 'load' : node.classList.contains('run') ? 'run:' + node.dataset.id : node.tagName) : ''; })()";
+const PANEL_TEXT = (tab: string) => `(${PANEL(tab)} || {}).textContent || ''`;
+const SECTION_TEXT = (title: string) => `(() => { const node = document.querySelector('.section[data-section="${title}"]'); return node ? node.textContent : ''; })()`;
+const RUN_CLOCK = (role: string) =>
+	`(() => { const item = Array.from(document.querySelectorAll('.run')).find((node) => node.querySelector('.run-role').textContent === ${JSON.stringify(role)}); return item ? item.querySelector('.run-clock').textContent : 'missing'; })()`;
+/** Holds or fails the page's archive requests: a held one is computed at once and answered only when released. */
+const WRAP_FETCH =
+	"(() => { window.__held = []; window.__hold = false; window.__fail = 0; const real = window.fetch.bind(window); window.fetch = (path, options) => { if (String(path).startsWith('api/archive')) { if (window.__fail > 0) { window.__fail--; return Promise.reject(new TypeError('offline')); } if (window.__hold) { const answer = real(path, options); return new Promise((resolve) => window.__held.push(() => resolve(answer))); } } return real(path, options); }; return 'ok'; })()";
+const RELEASE = "(() => { window.__hold = false; const held = window.__held.splice(0); for (const release of held) release(); return held.length; })()";
+
+test("older archived runs load page by page from a keyboard control and stay loaded through polls", { skip }, async () => {
+	const { page } = await fixture();
+	const served = await archiveServer(
+		Array.from({ length: 70 }, (_, i) => archivedRecord(i)),
+		(store) => store.start({ id: "live-now", role: "live-role", model: "opus", hostSessionId: ARCHIVE_HOST }),
+	);
+	try {
+		await page.open(served.url);
+		await page.until<number>("the first archived page", ARCHIVED_ROWS, (count) => count === 30);
+		assert.equal(await page.evaluate<string>(MORE_TEXT), "30 of 70 archived runs loaded.");
+		assert.equal(await page.evaluate<string>(MORE_BUTTON), "Load older runs");
+		assert.deepEqual(await page.evaluate<string[]>(GROUPS), ["Pi session host-arc · 31 loaded runs"], "the count is of loaded runs, not the session's");
+		await page.evaluate<string>("(() => { document.querySelector('.archive-load').focus(); return 'ok'; })()");
+		await press(page, "Enter");
+		await page.until<number>("the second page", ARCHIVED_ROWS, (count) => count === 60);
+		assert.equal(await page.evaluate<string>(FOCUSED), "load", "the control keeps the focus while there is more");
+		await press(page, "Enter");
+		await page.until<number>("the last page", ARCHIVED_ROWS, (count) => count === 70);
+		assert.equal(await page.evaluate<string>(MORE_TEXT), "No older runs in history.");
+		assert.equal(await page.evaluate<string>(MORE_BUTTON), "", "nothing is left to load");
+		assert.equal(await page.evaluate<string>(FOCUSED), "run:arch-000", "the focus moves to the last run, not to the page");
+		await delay(2_500);
+		assert.equal(await page.evaluate<number>(ARCHIVED_ROWS), 70, "polls keep every loaded page");
+		assert.ok((await page.evaluate<string[]>(ROLES)).includes("live-role"));
+		const repeated = await page.evaluate<number>("Array.from(document.querySelectorAll('.run .run-handle')).filter((node) => node.textContent === 'run-1').length");
+		assert.equal(repeated, 7, "one handle, seven invocations, seven rows");
+		for (const role of ["archived-10", "archived-20"]) {
+			assert.equal(await page.evaluate<string>(CLICK_RUN(role)), "clicked");
+			await page.until<string>(`${role} is shown`, DETAIL_TITLE, (title) => title === role);
+			assert.equal(await page.evaluate<string>("document.querySelector('.detail-model').textContent"), "run-1 · opus");
+		}
+	} finally {
+		await served.close();
+	}
+});
+
+test("an archived run shows what history saved and says what it did not save", { skip }, async () => {
+	const { page } = await fixture();
+	const zero = archivedRecord(1, {
+		id: "arch-zero",
+		role: "zero-role",
+		usage: { tokensIn: 0, tokensOut: 0, toolCalls: 0, costUsd: 0 },
+		filesTotal: 3,
+		prompt: "the saved prompt",
+		promptTruncated: true,
+		report: "## Changed\nfoo.ts",
+		reportTruncated: true,
+	});
+	const gone = archivedRecord(2, { id: "arch-gone", role: "gone-role", state: "waiting" });
+	delete gone.endedAt;
+	delete gone.report;
+	delete gone.usage;
+	const pi = archivedRecord(3, {
+		id: "arch-pi",
+		role: "pi-arch-role",
+		backend: "pi",
+		ref: { backend: "pi", sessionId: "pi-9", sessionFile: "/sessions/arch.jsonl", checkpoint: "entry-2" },
+		session: { kind: "fork", backend: "pi", from: "pi-0", file: "/sessions/parent.jsonl" },
+		selection: { model: "deepseek/deepseek-chat", effort: "high" },
+	});
+	const served = await archiveServer([zero, gone, pi]);
+	try {
+		await page.open(served.url);
+		await page.until<number>("the archived runs", ARCHIVED_ROWS, (count) => count === 3);
+		assert.equal(await page.evaluate<number>("document.querySelectorAll('.run-question, .run-stalled').length"), 0, "an archived run has no question and no stall");
+		assert.equal(await page.evaluate<string>(CLICK_RUN("zero-role")), "clicked");
+		await page.until<string>("the zero run is shown", DETAIL_TITLE, (title) => title === "zero-role");
+		await page.until<string>("its report", SELECTED_TAB, (tab) => tab.startsWith("Report"));
+		assert.match(await page.evaluate<string>(PANEL_TEXT("report")), /truncated when it was saved to history/);
+		assert.equal(await page.evaluate<string>("document.querySelector('.report').textContent"), "Changedfoo.ts");
+		assert.match(await page.evaluate<string>("document.querySelector('.archive-note').textContent"), /only its saved input, output and basic facts/);
+		assert.equal(await page.evaluate<string>(CLICK_TAB("Overview")), "clicked");
+		const facts: Record<string, string> = {
+			"Tool calls": "0",
+			"Tokens in": "0",
+			"Tokens out": "0",
+			"Cost (estimate)": "$0.0000",
+			"Agent tool calls": NOT_SAVED,
+			"Tool errors": NOT_SAVED,
+			"Last event": NOT_SAVED,
+			"Cache read": NOT_SAVED,
+			"Cache write": NOT_SAVED,
+			"Model usage": NOT_SAVED,
+			"Model turns": NOT_SAVED,
+			Elapsed: "4s",
+		};
+		for (const [key, value] of Object.entries(facts)) assert.equal(await page.evaluate<string>(FACT_VALUE(key)), value, key);
+		assert.match(await page.evaluate<string>(SECTION_TEXT("Files changed")), /3 files changed; the list was omitted and not saved in history\./);
+		assert.match(await page.evaluate<string>(SECTION_TEXT("Prompt")), /truncated when it was saved to history/);
+		assert.equal(await page.evaluate<string>(PROMPT_TEXT), "the saved prompt");
+		await page.evaluate<string>(TAKE_CLIPBOARD);
+		await page.evaluate<string>("(() => { document.querySelector('.section[data-section=\"Prompt\"] .copy').click(); return 'ok'; })()");
+		await page.until<string>("the prompt is copied", COPIED, (text) => text === "the saved prompt");
+		assert.equal(await page.evaluate<string>(CLICK_TAB("Log")), "clicked");
+		assert.match(await page.evaluate<string>(PANEL_TEXT("log")), /^Not saved in history: the log and tool calls/);
+		assert.equal(await page.evaluate<string>(CLICK_TAB("Tasks")), "clicked");
+		assert.match(await page.evaluate<string>(PANEL_TEXT("tasks")), /^Not saved in history: the tasks, timeline and thinking/);
+
+		assert.equal(await page.evaluate<string>(CLICK_RUN("gone-role")), "clicked");
+		await page.until<string>("the interrupted run is shown", DETAIL_TITLE, (title) => title === "gone-role");
+		assert.equal(await page.evaluate<string>(CLICK_TAB("Overview")), "clicked");
+		assert.equal(await page.evaluate<string>(FACT_VALUE("Elapsed")), "not recorded");
+		assert.equal(await page.evaluate<string>(FACT_VALUE("Tool calls")), NOT_SAVED, "no usage saved is no zero");
+		assert.equal(await page.evaluate<string>(FACT_VALUE("Cost (estimate)")), NOT_SAVED);
+		assert.match(await page.evaluate<string>(FACT_VALUE("Ended")), /^interrupted/);
+		assert.equal(await page.evaluate<string>("document.querySelector('.detail-title-row .status').textContent"), "aborted");
+		assert.equal(await page.evaluate<string>(RUN_CLOCK("gone-role")), "not recorded");
+		await delay(1_500);
+		assert.equal(await page.evaluate<string>(FACT_VALUE("Elapsed")), "not recorded", "no clock runs for a run nobody finished");
+		assert.equal(await page.evaluate<string>(RUN_CLOCK("gone-role")), "not recorded");
+		assert.equal(await page.evaluate<number>("document.querySelectorAll('.question').length"), 0);
+
+		assert.equal(await page.evaluate<string>(CLICK_RUN("pi-arch-role")), "clicked");
+		await page.until<string>("the pi run is shown", DETAIL_TITLE, (title) => title === "pi-arch-role");
+		assert.equal(await page.evaluate<string>(CLICK_TAB("Overview")), "clicked");
+		assert.equal(await page.evaluate<string>(RESUME_TEXT), "/sessions/arch.jsonl", "the transcript is the reference it saved");
+		assert.equal(await page.evaluate<string>(FACT_VALUE("Pi session request")), "fork of pi-0 in /sessions/parent.jsonl", "and the launch request stays the request");
+		assert.equal(await page.evaluate<string>(FACT_VALUE("Model id")), "deepseek/deepseek-chat");
+	} finally {
+		await served.close();
+	}
+});
+
+test("a live run the store lets go is shown from history at the same start time", { skip }, async () => {
+	const { page } = await fixture();
+	const at = Date.now() - 10_000;
+	const served = await archiveServer(
+		[archivedRecord(1, { id: "moving", role: "moving-role", startedAt: at, endedAt: at + 2_000, report: "the saved report" })],
+		(store) => {
+			store.start({ id: "moving", role: "moving-role", model: "opus", hostSessionId: ARCHIVE_HOST });
+			store.finish("moving", { status: "done", text: "the live report" });
+		},
+		1,
+	);
+	served.clock.now = at;
+	try {
+		await page.open(served.url);
+		await page.until<string>("the live run is shown", DETAIL_TITLE, (title) => title === "moving-role");
+		assert.equal(await page.evaluate<string>(CLICK_RUN("moving-role")), "clicked");
+		await page.until<string>("its live report", "(document.querySelector('.report') || {}).textContent || ''", (text) => text === "the live report");
+		assert.equal((await page.evaluate<string[]>(ROLES)).filter((role) => role === "moving-role").length, 1, "one id, one row, the live one");
+		assert.equal(await page.evaluate<number>(ARCHIVED_ROWS), 0);
+		served.store.start({ id: "other", role: "other-role", model: "opus", hostSessionId: ARCHIVE_HOST });
+		served.store.finish("other", { status: "done" });
+		await page.until<string>("the saved report", "(document.querySelector('.report') || {}).textContent || ''", (text) => text === "the saved report");
+		assert.equal(await page.evaluate<string>(DETAIL_TITLE), "moving-role", "the selection stays on the run");
+		assert.ok(await page.evaluate<boolean>("Boolean(document.querySelector('.archive-note'))"), "and it now says it is archived");
+		assert.equal((await page.evaluate<string[]>(ROLES)).filter((role) => role === "moving-role").length, 1);
+	} finally {
+		await served.close();
+	}
+});
+
+test("a waiting child keeps its banner current while an older archived run is selected", { skip }, async () => {
+	const { page } = await fixture();
+	const served = await archiveServer(Array.from({ length: 40 }, (_, i) => archivedRecord(i)), (store) => {
+		store.start({ id: "asks-1", role: "asking-role", model: "opus", hostSessionId: ARCHIVE_HOST });
+		store.question("asks-1", "Which name?");
+	});
+	try {
+		await page.open(served.url);
+		await page.until<Attention>("the banner", ATTENTION, (value) => !value.hidden);
+		assert.equal(await page.evaluate<string>(CLICK_MORE), "clicked");
+		await page.until<number>("the older page", ARCHIVED_ROWS, (count) => count === 40);
+		assert.equal(await page.evaluate<string>(CLICK_RUN("archived-3")), "clicked");
+		await page.until<string>("the older run is shown", DETAIL_TITLE, (title) => title === "archived-3");
+		served.store.start({ id: "asks-2", role: "second-asker", model: "opus", hostSessionId: ARCHIVE_HOST });
+		served.store.question("asks-2", "Which file?");
+		const shown = await page.until<Attention>("both questions", ATTENTION, (value) => value.waiting.length === 2);
+		assert.equal(shown.title, "(2) pi-fusion dashboard");
+		assert.equal(await page.evaluate<string>(DETAIL_TITLE), "archived-3", "a question does not move an archived selection");
+		assert.equal(await page.evaluate<number>(ARCHIVED_ROWS), 40, "and the loaded range stays loaded");
+	} finally {
+		await served.close();
+	}
+});
+
+test("a pinned older run survives new arrivals and a refresh of the loaded range, and pruning lets it go", { skip }, async () => {
+	const { page } = await fixture();
+	const records = Array.from({ length: 70 }, (_, i) => archivedRecord(i));
+	const served = await archiveServer(records, (store) => store.start({ id: "live-now", role: "live-role", model: "opus", hostSessionId: ARCHIVE_HOST }));
+	try {
+		await page.open(served.url);
+		await page.until<number>("the first page", ARCHIVED_ROWS, (count) => count === 30);
+		assert.equal(await page.evaluate<string>(CLICK_MORE), "clicked");
+		await page.until<number>("the second page", ARCHIVED_ROWS, (count) => count === 60);
+		assert.equal(await page.evaluate<string>(CLICK_RUN("archived-15")), "clicked");
+		await page.until<string>("the pinned run", DETAIL_TITLE, (title) => title === "archived-15");
+		await page.evaluate<string>("(() => { Array.from(document.querySelectorAll('.run')).find((node) => node.dataset.id === 'arch-015').focus(); return 'ok'; })()");
+		const newer = Array.from({ length: 40 }, (_, i) => archivedRecord(100 + i));
+		served.replace([...records, ...newer]);
+		await page.until<number>("the refreshed range", ARCHIVED_ROWS, (count) => count === 110);
+		assert.equal(await page.evaluate<string>(DETAIL_TITLE), "archived-15", "new arrivals keep the pinned run");
+		assert.equal(await page.evaluate<string>(CURRENT_RUN), "archived-15");
+		assert.equal(await page.evaluate<string>(FOCUSED), "run:arch-015", "and the focus where it was");
+		const roles = await page.evaluate<string[]>(ROLES);
+		assert.equal(new Set(roles).size, roles.length, "no run is listed twice");
+		served.replace([...records, ...newer].filter((record) => record.id !== "arch-015"));
+		await page.until<string>("the pruned run lets go", DETAIL_TITLE, (title) => title === "live-role");
+		assert.ok(!(await page.evaluate<string[]>(ROLES)).includes("archived-15"));
+	} finally {
+		await served.close();
+	}
+});
+
+test("history off and an exhausted archive say so instead of offering more", { skip }, async () => {
+	const { page } = await fixture();
+	const off = await archiveServer([], (store) => store.start({ id: "only", role: "only-role", model: "opus", hostSessionId: ARCHIVE_HOST }), 30, false);
+	try {
+		await page.open(off.url);
+		await page.until<string>("the unavailable note", MORE_TEXT, (text) => text !== "");
+		assert.equal(await page.evaluate<string>(MORE_TEXT), "Older runs are not available: this session keeps no run history.");
+		assert.equal(await page.evaluate<string>(MORE_BUTTON), "");
+		assert.deepEqual(await page.evaluate<string[]>(GROUPS), ["Pi session host-arc · 1 run"]);
+	} finally {
+		await off.close();
+	}
+	const few = await archiveServer(Array.from({ length: 5 }, (_, i) => archivedRecord(i)));
+	try {
+		await page.open(few.url);
+		await page.until<number>("the archived runs", ARCHIVED_ROWS, (count) => count === 5);
+		assert.equal(await page.evaluate<string>(MORE_TEXT), "No older runs in history.");
+		assert.equal(await page.evaluate<string>(MORE_BUTTON), "");
+	} finally {
+		await few.close();
+	}
+});
+
+test("a failed older page offers a retry without a disconnect, and a stale page is never shown", { skip }, async () => {
+	const { page } = await fixture();
+	const records = Array.from({ length: 70 }, (_, i) => archivedRecord(i));
+	const served = await archiveServer(records, (store) => store.start({ id: "live-now", role: "live-role", model: "opus", hostSessionId: ARCHIVE_HOST }));
+	try {
+		await page.open(served.url);
+		await page.until<number>("the first page", ARCHIVED_ROWS, (count) => count === 30);
+		await page.evaluate<string>(WRAP_FETCH);
+		await page.evaluate<number>("window.__fail = 1");
+		assert.equal(await page.evaluate<string>(CLICK_MORE), "clicked");
+		await page.until<string>("the failure", MORE_TEXT, (text) => text === "Could not load older runs.");
+		assert.equal(await page.evaluate<string>(MORE_BUTTON), "Retry loading older runs");
+		assert.equal(await page.evaluate<boolean>("document.getElementById('banner').classList.contains('hidden')"), true, "the live dashboard is still connected");
+		assert.equal(await page.evaluate<number>(ARCHIVED_ROWS), 30, "what was shown stays shown");
+		assert.ok((await page.evaluate<string[]>(ROLES)).includes("live-role"));
+		assert.equal(await page.evaluate<string>(CLICK_MORE), "clicked");
+		await page.until<number>("the retried page", ARCHIVED_ROWS, (count) => count === 60);
+
+		// A page computed before a run was pruned and answered after a poll saw the prune is read again, never shown.
+		await page.evaluate<boolean>("window.__hold = true");
+		assert.equal(await page.evaluate<string>(CLICK_MORE), "clicked");
+		await page.until<number>("the held request", "window.__held.length", (count) => count === 1);
+		const seen = await page.evaluate<number>("state.archive.revision");
+		served.replace(records.filter((record) => record.id !== "arch-005"));
+		await page.until<number>("a poll sees the prune", "state.archive.revision", (revision) => revision > seen);
+		assert.equal(await page.evaluate<number>(RELEASE), 1);
+		await page.until<string>("the load settles", MORE_TEXT, (text) => text === "No older runs in history.");
+		const roles = await page.evaluate<string[]>(ROLES);
+		assert.ok(!roles.includes("archived-5"), "the pruned run never comes back");
+		assert.ok(roles.includes("archived-0") && roles.includes("archived-4"));
+		assert.equal(new Set(roles).size, roles.length, "and nothing is listed twice");
+	} finally {
+		await served.close();
+	}
+});
+
+const DIAGNOSTIC_TEXT = "(document.querySelector('.resume-diagnostic') || {}).textContent || ''";
+const PAGE_RESUMES = "Array.from(document.querySelectorAll('.resume-command')).map((node) => node.textContent).join('|') + '#' + (document.body.textContent.match(/claude --resume [\\w-]+/g) || []).join('|')";
+
+test("a claude id only a failed continuation reported is readable but never offered to resume, and confirmed ids still are", { skip }, async () => {
+	const { page } = await fixture();
+	const evidence = (handle: string, sessionId: string): BranchEvidence => ({ handle, hostSessionId: ARCHIVE_HOST, backend: "claude", session: { backend: "claude", sessionId }, sessionId });
+	const request = { kind: "resume" as const, backend: "claude" as const, id: "c-1", at: "cp-1" };
+	const legacy = archivedRecord(4, { id: "arch-legacy", handle: "run-3", role: "legacy-role", state: "failed", failure: "legacy broke", sessionId: "l-1" });
+	delete legacy.backend;
+	const served = await archiveServer(
+		[
+			archivedRecord(1, { id: "arch-first", handle: "run-1", role: "first-role", sessionId: "c-1" }),
+			archivedRecord(2, { id: "arch-failed", handle: "run-1", role: "failed-role", state: "failed", failure: "boom two", report: "## Changed\nfoo.ts", sessionId: "c-2", session: request }),
+			archivedRecord(3, { id: "arch-third", handle: "run-1", role: "third-role", sessionId: "c-3", session: request }),
+			legacy,
+			archivedRecord(5, { id: "arch-accepted", handle: "run-2", role: "accepted-role", state: "failed", failure: "late", sessionId: "d-9", ref: { backend: "claude", sessionId: "d-9" }, session: { kind: "resume", backend: "claude", id: "d-1" } }),
+		],
+		() => {},
+		30,
+		true,
+		[evidence("run-1", "c-1"), evidence("run-1", "c-3"), evidence("run-2", "d-1")],
+	);
+	try {
+		await page.open(served.url);
+		await page.until<number>("the archived runs", ARCHIVED_ROWS, (count) => count === 5);
+		await page.evaluate<string>(TAKE_CLIPBOARD);
+
+		assert.equal(await page.evaluate<string>(CLICK_RUN("failed-role")), "clicked");
+		await page.until<string>("the failed continuation is shown", DETAIL_TITLE, (title) => title === "failed-role");
+		assert.equal(await page.evaluate<string>(CLICK_TAB("Overview")), "clicked");
+		await page.until<string>("its reported id", DIAGNOSTIC_TEXT, (text) => text !== "");
+		assert.match(await page.evaluate<string>(DIAGNOSTIC_TEXT), /^Claude session c-2 was reported by this run but never confirmed, so no resume command is offered\.$/);
+		assert.equal(await page.evaluate<string>(RESUME_TEXT), "", "no command for the reported id");
+		assert.equal(await page.evaluate<string>(COPY_RESUME), "missing", "and nothing to copy");
+		assert.equal(await page.evaluate<string>(PAGE_RESUMES), "#", "and no resume of the parent its request named either");
+		assert.equal(await page.evaluate<string>(FACT("Claude session")), "resume c-1 at cp-1", "the request is shown as the request");
+		assert.equal(await page.evaluate<string>(PROMPT_TEXT), "archived prompt 2");
+		assert.equal(await page.evaluate<string>(CLICK_TAB("Failure")), "clicked");
+		assert.match(await page.evaluate<string>(PANEL_TEXT("report")), /boom two/);
+		assert.equal(await page.evaluate<string>("document.querySelector('.report').textContent"), "Changedfoo.ts");
+
+		for (const [role, id] of [["third-role", "c-3"], ["first-role", "c-1"], ["legacy-role", "l-1"], ["accepted-role", "d-9"]] as const) {
+			assert.equal(await page.evaluate<string>(CLICK_RUN(role)), "clicked");
+			await page.until<string>(`${role} is shown`, DETAIL_TITLE, (title) => title === role);
+			assert.equal(await page.evaluate<string>(CLICK_TAB("Overview")), "clicked");
+			await page.until<string>(`${role}'s resume`, RESUME_TEXT, (text) => text === `claude --resume ${id}`);
+			assert.equal(await page.evaluate<string>(DIAGNOSTIC_TEXT), "", role);
+			assert.equal(await page.evaluate<string>(COPY_RESUME), "clicked", role);
+		}
+		assert.equal(await page.evaluate<string>(COPIED), "claude --resume c-3|claude --resume c-1|claude --resume l-1|claude --resume d-9", "a failed run its entries allow and a failed run with an accepted reference keep theirs");
+	} finally {
+		await served.close();
+	}
 });

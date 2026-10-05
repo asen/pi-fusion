@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import * as fs from "node:fs";
+import * as http from "node:http";
 import * as os from "node:os";
 import * as path from "node:path";
 import test from "node:test";
@@ -7,7 +8,14 @@ import { fileURLToPath } from "node:url";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { visibleWidth } from "@earendil-works/pi-tui";
 import { CARD_REPORT_LINES } from "../extensions/cards.ts";
+import { CODEX_CONTRACT_FILES, CODEX_MODES, CODEX_ROLE_NAMES, codexRole } from "../extensions/backends/codex-binding.ts";
+import { PI_CONTRACT_FILES, PI_ROLE_NAMES, piRole } from "../extensions/backends/pi-binding.ts";
+import { PI_CHILD_MARKER, PI_CHILD_VARIABLE } from "../extensions/backends/pi-launch.ts";
 import fusion from "../extensions/fusion.ts";
+import { memoryProfileStore } from "../extensions/profile-store.ts";
+import { fakeBackend } from "./fake-pi-backend.ts";
+import { PRODUCTION_DEFAULT_VARIABLES, productionDefaults, tripwires } from "./tripwire.ts";
+import { toolList, turnOn } from "./host-tools.ts";
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 process.env.PI_FUSION_CLAUDE_BIN = path.join(repoRoot, "test", "fake-claude.mjs");
@@ -54,9 +62,14 @@ const commands = new Map<string, RegisteredCommand>();
 const renderers = new Map<string, Renderer>();
 const handlers = new Map<string, (event: any, ctx: any) => Promise<void> | void>();
 let appendedEntries = 0;
+const { activeTools: _active, ...toolAccess } = toolList(() => tools.map((tool) => tool.name));
 const api = {
+	...toolAccess,
+	// A tool registered again under its own name replaces the one before it, as the SDK does.
 	registerTool: (tool: RegisteredTool) => {
-		tools.push(tool);
+		const at = tools.findIndex((candidate) => candidate.name === tool.name);
+		if (at === -1) tools.push(tool);
+		else tools[at] = tool;
 	},
 	registerCommand: (name: string, options: RegisteredCommand) => {
 		commands.set(name, options);
@@ -72,7 +85,11 @@ const api = {
 	},
 } as unknown as ExtensionAPI;
 
-fusion(api);
+// The tripwires in place of the pi and codex backends: nothing in this file runs a pi or codex child, and the one case
+// that reads the production registration makes its own below.
+fusion(api, { backends: { ...tripwires() }, profiles: memoryProfileStore() });
+// Fusion starts off; the cases here delegate, so the host turns it on as a user's request for Fusion does.
+void turnOn(tools.find((tool) => tool.name === "fusion_activate"));
 
 const ctx = {
 	cwd: repoRoot,
@@ -137,28 +154,37 @@ function assertCommon(run: Invocation, contract: string) {
 	assert.match(run.text, /\n\n\[.+ · \d+ tool calls · in \d+ out \d+ · context [\d.]+k\/[\d.]+M \(<1%\) · workflow agents 250 tokens · claude --resume [^\]]+\]$/);
 }
 
-test("registers the sequential claude and claude_control tools, the fusion command, one session_shutdown handler and one session_before_tree handler", () => {
+test("registers the sequential fusion and claude tool pairs and the two mode tools, the fusion command and the session and settlement handlers", () => {
 	assert.deepEqual(
 		tools.map((tool) => tool.name),
-		["claude", "claude_control"],
+		["fusion", "claude", "fusion_control", "claude_control", "fusion_activate", "fusion_deactivate"],
 	);
-	assert.equal(byName("claude").executionMode, "sequential");
-	assert.equal(byName("claude_control").executionMode, "sequential");
-	assert.deepEqual([...handlers.keys()], ["session_shutdown", "session_before_tree"]);
+	for (const name of ["fusion", "claude", "fusion_control", "claude_control", "fusion_activate", "fusion_deactivate"]) assert.equal(byName(name).executionMode, "sequential", name);
+	assert.deepEqual([...handlers.keys()], ["session_start", "agent_settled", "session_shutdown", "session_before_tree"]);
 	const command = commands.get("fusion");
 	assert.ok(command, "the fusion command is not registered");
 	assert.ok(command.description, "the command needs a description for the command list");
 	assert.deepEqual(command.getArgumentCompletions?.(""), [
 		{ value: "dashboard", label: "dashboard" },
 		{ value: "dashboard stop", label: "dashboard stop" },
+		{ value: "dashboard limit", label: "dashboard limit" },
 		{ value: "status", label: "status" },
 		{ value: "cancel", label: "cancel" },
 		{ value: "steer", label: "steer" },
 		{ value: "wait", label: "wait" },
 		{ value: "answer", label: "answer" },
 		{ value: "review", label: "review" },
+		{ value: "on", label: "on" },
+		{ value: "off", label: "off" },
+		{ value: "config", label: "config" },
+		{ value: "profile", label: "profile" },
+		{ value: "profile list", label: "profile list" },
+		{ value: "profile use", label: "profile use" },
+		{ value: "profile save", label: "profile save" },
+		{ value: "profile default", label: "profile default" },
 	]);
 	assert.deepEqual(command.getArgumentCompletions?.("dashboard s"), [{ value: "dashboard stop", label: "dashboard stop" }]);
+	assert.deepEqual(command.getArgumentCompletions?.("dashboard l"), [{ value: "dashboard limit", label: "dashboard limit" }]);
 	assert.deepEqual(command.getArgumentCompletions?.("s"), [
 		{ value: "status", label: "status" },
 		{ value: "steer", label: "steer" },
@@ -217,6 +243,23 @@ test("the claude and claude_control tools render their call and result as cards 
 	noWiderThan(card.render(80), 80);
 	const thrown = control.renderResult({ content: [{ type: "text", text: "unknown run run-9" }] }, { expanded: false, isPartial: false }, renderTheme, renderContext(args2, { isError: true }));
 	assert.match(thrown.render(200)[0]!, /<error>failed<\/error>/, "a tool that threw carries no state, so the row's error names one");
+});
+
+test("waiting tool cards use the invoking control pair, while background cards preserve the run's pair", () => {
+	const result = { content: [{ type: "text", text: "Which name?" }], details: { handle: "run-1", state: "waiting", question: "Which name?", control: "claude_control" } };
+	for (const name of ["fusion", "claude", "fusion_control", "claude_control"]) {
+		const control = name.startsWith("claude") ? "claude_control" : "fusion_control";
+		for (const expanded of [false, true]) {
+			const card = byName(name).renderResult!(result, { expanded, isPartial: false }, renderTheme, renderContext({ action: "wait" }, { expanded }));
+			assert.equal(card.render(200).at(-1), `<muted>answer: /fusion answer run-1 <text> or ${control} message</muted>`);
+		}
+	}
+	const renderer = renderers.get("pi-fusion-run")!;
+	const message = { content: "Background run asks", details: result.details };
+	for (const expanded of [false, true]) {
+		const card = renderer(message, { expanded, outputPad: 0 }, renderTheme)!;
+		assert.equal(card.render(200).at(-1), "<muted>answer: /fusion answer run-1 <text> or claude_control message</muted>");
+	}
 });
 
 test("a call renders before its arguments have arrived, and an argument of the wrong type draws nothing", () => {
@@ -284,39 +327,225 @@ test("the extension registers a renderer for its run notices, and it fits any wi
 	}
 });
 
-test("the role and effort parameters are plain string enums", () => {
+test("the claude tool keeps the exact schema it had: four roles, five efforts and no backend", () => {
 	const properties = byName("claude").parameters.properties;
+	assert.deepEqual(Object.keys(properties), ["role", "task", "continue", "context", "background", "fresh", "mode", "model", "effort"]);
 	assert.deepEqual(properties.role.enum, ["plan", "implement", "ultracode", "ask"]);
 	assert.deepEqual(properties.mode.enum, ["answer", "review"]);
 	assert.equal(properties.mode.type, "string");
 	assert.equal(properties.role.type, "string");
+	// Exactly the Claude levels, as a plain string enum: the compatibility tool runs on claude alone, so its schema is that grammar.
 	assert.deepEqual(properties.effort.enum, ["low", "medium", "high", "xhigh", "max"]);
+	assert.equal(properties.effort.type, "string");
 	assert.equal(properties.continue.type, "string");
+	assert.equal(properties.backend, undefined, "the compatibility tool advertises no backend at all");
 	assert.deepEqual(byName("claude").parameters.required, ["task"]);
 });
 
-test("every prompt guideline names the claude tool, and together they name every role", () => {
-	const guidelines = byName("claude").promptGuidelines ?? [];
-	assert.ok(guidelines.length, "claude contributes no guidelines");
-	for (const guideline of guidelines) assert.ok(guideline.includes("claude"), `a guideline never names claude: ${guideline}`);
-	for (const role of ["plan", "implement", "ultracode", "ask"]) {
-		assert.ok(guidelines.some((guideline) => guideline.includes(`role ${role}`)), `no guideline names role ${role}`);
+test("the fusion tool advertises every role a backend runs and a backend as plain string enums, and its effort as a string each backend checks", () => {
+	const properties = byName("fusion").parameters.properties;
+	assert.deepEqual(Object.keys(properties), ["role", "task", "continue", "context", "background", "fresh", "mode", "backend", "model", "effort"]);
+	assert.deepEqual(properties.role.enum, ["plan", "implement", "ultracode", "ask", "security"], "the primary tool advertises security, which runs on pi alone");
+	assert.deepEqual(byName("claude").parameters.properties.role.enum, ["plan", "implement", "ultracode", "ask"], "and the compatibility tool advertises the four roles claude runs");
+	assert.match(properties.role.description, /^plan, implement, ultracode, ask or security\. Required unless continue is set\.$/);
+	assert.deepEqual(properties.backend.enum, ["claude", "pi", "codex"]);
+	assert.equal(properties.backend.type, "string");
+	// No enum: a codex level is the model's own, so the schema cannot list it, and each backend's binding checks its own grammar.
+	assert.equal(properties.effort.type, "string");
+	assert.equal(properties.effort.enum, undefined, "the fusion effort is not an enum");
+	assert.equal(properties.effort.anyOf, undefined, "nor a union of literals");
+	for (const named of [/low, medium, high, xhigh or max/, /off, minimal, low, medium, high, xhigh or max/, /codex backend one level with no whitespace/, /codex model or server may still refuse/, /before anything starts/]) {
+		assert.match(properties.effort.description, named);
 	}
-	for (const pattern of [/do not edit files yourself/, /choice wins/, /^Report to the user/, /Escalation/, /continue set to its handle/, /background true/]) {
-		assert.equal(guidelines.filter((guideline) => pattern.test(guideline)).length, 1, `${pattern} must match one guideline`);
+	assert.deepEqual(properties.mode.enum, ["answer", "review"]);
+	assert.equal(properties.model.type, "string");
+	assert.deepEqual(byName("fusion").parameters.required, ["task"]);
+	for (const name of ["fusion_control", "claude_control"]) {
+		const control = byName(name).parameters;
+		assert.deepEqual(Object.keys(control.properties), ["action", "run", "message"], name);
+		assert.deepEqual(control.properties.action.enum, ["status", "wait", "message", "cancel"], name);
+		assert.deepEqual(control.required, ["action"], name);
 	}
-	assert.ok(!guidelines.some((guideline) => /tool list/.test(guideline)), "all roles are always available");
+});
+
+/** What one registration advertised and appended. The case below makes two of its own beside this file's. */
+interface RecordedHost {
+	tools: Map<string, RegisteredTool>;
+	entries: number;
+}
+
+const recordedHost = (): { into: RecordedHost; api: ExtensionAPI } => {
+	const into: RecordedHost = { tools: new Map(), entries: 0 };
+	const { activeTools: _active, ...toolAccess } = toolList(() => into.tools.keys());
+	const api = {
+		...toolAccess,
+		registerTool: (tool: RegisteredTool) => into.tools.set(tool.name, tool),
+		registerCommand: () => {},
+		on: () => {},
+		appendEntry: () => {
+			into.entries++;
+		},
+		registerMessageRenderer: () => {},
+	} as unknown as ExtensionAPI;
+	return { into, api };
+};
+
+test("the fusion tool says which harness runs what, and the pi backend it registers binds a call before anything starts", async () => {
+	const fusionTool = byName("fusion");
+	// The generic tool no longer advertises one harness: it names the default, the roles the pi backend runs, where a
+	// pi selection comes from and that a call with none is refused. The compatibility tool stays Claude's own.
+	assert.doesNotMatch(fusionTool.description, /claude backend only/);
+	assert.doesNotMatch(fusionTool.description, /no configuration makes one available here/);
+	assert.match(fusionTool.description, /backend pi runs plan, implement, ask and security on the user's own Pi provider configuration/);
+	assert.match(fusionTool.description, /PI_FUSION_PI_<ROLE>_MODEL/);
+	assert.match(fusionTool.description, /a provider and a model id, such as deepseek\/deepseek-chat/);
+	assert.match(fusionTool.description, /refused before anything starts/);
+	assert.match(fusionTool.description, /role ultracode runs on the claude backend alone/);
+	assert.match(fusionTool.description, /role security on the pi backend alone/);
+	assert.match(fusionTool.description, /naming claude for it is refused before anything starts/);
+	assert.match(fusionTool.description, /leave backend unset unless the user names one, and a fresh run goes to the backend the configuration above names for its role/);
+	// What the configuration is, said in the description rather than as fixed model names a profile would make false.
+	assert.match(fusionTool.description, /In this session's configuration plan runs on claude with model fable at effort xhigh; implement runs on claude with model opus at effort high; ultracode runs on claude with model fable; ask runs on claude with model opus at effort high; security is disabled\./);
+	assert.doesNotMatch(fusionTool.description, /Claude Fable|Claude Opus with/);
+	// The one role whose work the user has to have asked for, said in the description as well as in the guideline.
+	assert.match(fusionTool.description, /only when the user asks for a security investigation, audit or fix/);
+	assert.doesNotMatch(fusionTool.promptGuidelines?.join("\n") ?? "", /security investigation, audit or fix/, "a disabled role is not recommended in routing guidance");
+	assert.match(fusionTool.description, /never puts a secret in its report by value/);
+	assert.match(fusionTool.description, /with none it reports findings and changes no application code/);
+	assert.doesNotMatch(byName("claude").description, /\bsecurity\b/, "the compatibility tool advertises a role it cannot run nowhere");
+	// Pi's tools are Pi's own, so the generic tool says what each pi role actually has rather than letting the claude
+	// lists above stand for them. What the sentence promises is read back out of it and compared with the lists the
+	// binding itself builds, rather than pinned as a second copy of them: a tool added to or taken from a pi role
+	// fails here instead of leaving the help text saying what the roles used to run with.
+	const piTools = (role: string): string[] => piRole({ role, model: "deepseek/deepseek-chat" }, undefined, {} as NodeJS.ProcessEnv).tools;
+	const named = (prose: string): string[] =>
+		prose
+			.split(/,\s*|\s+and\s+/)
+			.map((tool) => tool.trim())
+			.filter((tool) => tool !== "");
+	const promised = /roles plan, implement and security run with (.+?), role ask runs with (.+?) and has no web search or web fetch tool at all/.exec(fusionTool.description);
+	assert.ok(promised, `the fusion description no longer says what the pi roles run with: ${fusionTool.description}`);
+	assert.deepEqual(named(promised[1]), piTools("plan"), "the plan, implement and security sentence promises another tool list than the pi binding builds");
+	assert.deepEqual(piTools("implement"), piTools("plan"), "and that sentence says one list for all three of them");
+	assert.deepEqual(piTools("security"), piTools("implement"), "a security child investigates and, when its task authorizes one, writes the fix");
+	assert.deepEqual(named(promised[2]), piTools("ask"), "the ask sentence promises another tool list than the pi binding builds");
+	// Said directly beside the parse, because it is the limitation a caller gets wrong: whatever the prose calls them,
+	// no web tool of any name is in what a pi ask child runs with.
+	assert.deepEqual(piTools("ask").filter((tool) => /web|fetch|search/i.test(tool)), [], "a pi ask role must have no web search or web fetch tool at all");
+	assert.deepEqual([...PI_ROLE_NAMES].sort(), ["ask", "implement", "plan", "security"], "the sentence accounts for four pi roles, so a fifth this build binds has to be written into it");
+	assert.match(fusionTool.description, /every pi role also gets ask_orchestrator/);
+	assert.doesNotMatch(byName("claude").description, /find and ls/, "the compatibility tool advertises claude's own tools and no pi list");
+	const backendParameter = fusionTool.parameters.properties.backend.description as string;
+	assert.match(backendParameter, /claude, which runs every role but security/);
+	assert.match(backendParameter, /Leave it unset to run the role on the backend this session's configuration names for it/);
+	assert.match(backendParameter, /pi, which runs plan, implement, ask and security/);
+	assert.match(backendParameter, /role security goes to pi whether or not this names it/);
+	assert.ok(
+		(fusionTool.promptGuidelines ?? []).some((guideline) => /backend parameter/.test(guideline) && /leave backend unset otherwise/.test(guideline)),
+		"no fusion guideline says where the harness the user named goes",
+	);
+	assert.doesNotMatch(byName("claude").description, /\bbackend\b/, "the compatibility tool advertises no backend and says nothing about one");
+
+	// One of exactly two registrations in the suite that take the production defaults on purpose, the pi backend this
+	// build registers included and no tripwire over it; codex keeps its tripwire there, because no missing-model refusal
+	// would stop a codex call. With nothing configured for any pi role, an explicit pi call is refused by the binding
+	// before that backend is asked for a session, a control or a run: no child of any harness is started and nothing is
+	// recorded. Every variable a pi role could resolve a model from, and every codex one, is deleted first, and
+	// `productionDefaults` refuses the registration outright if one of them is still set, so the refusal below is the
+	// binding's own and never this process's environment.
+	const kept = PRODUCTION_DEFAULT_VARIABLES.map((name) => [name, process.env[name]] as const);
+	for (const [name] of kept) delete process.env[name];
+	try {
+		const defaults = recordedHost();
+		fusion(defaults.api, productionDefaults());
+		void turnOn(defaults.into.tools.get("fusion_activate"));
+		const defaultFusion = defaults.into.tools.get("fusion");
+		assert.ok(defaultFusion, "the production-default registration advertises no fusion tool");
+		await assert.rejects(defaultFusion.execute("call-1", { role: "implement", task: "x", backend: "pi" }, undefined, undefined, ctx), {
+			message:
+				"role implement has no model for the pi backend: set PI_FUSION_PI_IMPLEMENT_MODEL to a provider and a model id, such as deepseek/deepseek-chat, or name one in the call's model parameter. The pi backend has no default model and resolves none for you",
+		});
+		// Security is disabled by default and is refused before model binding.
+		await assert.rejects(defaultFusion.execute("call-2", { role: "security", task: "audit the token check" }, undefined, undefined, ctx), {
+			message:
+				"role security is disabled in profile builtin; change /fusion config or select another profile",
+		});
+		assert.equal(defaults.into.entries, 0, "a call the binding refused records nothing");
+	} finally {
+		for (const [name, value] of kept) if (value !== undefined) process.env[name] = value;
+	}
+
+	// And a host that registers a backend of its own in place of the default runs one explicit pi call through the same
+	// lifecycle. The fake is in-memory and starts nothing: no pi child, process, protocol or provider is behind it.
+	const fake = fakeBackend();
+	const injected = recordedHost();
+	fusion(injected.api, { backends: { ...tripwires(), pi: fake.backend }, profiles: memoryProfileStore() });
+	void turnOn(injected.into.tools.get("fusion_activate"));
+	const injectedFusion = injected.into.tools.get("fusion");
+	assert.ok(injectedFusion, "the registration that injected a pi backend advertises no fusion tool");
+	const ran = await injectedFusion.execute("call-1", { role: "implement", task: "do the pi thing", backend: "pi", model: "deepseek/deepseek-chat" }, undefined, undefined, ctx);
+	assert.match(ran.content[0]!.text, /^## Changed\nfoo\.ts/);
+	assert.equal(fake.starts.length, 1, "one explicit pi call starts exactly one child on the backend the host registered");
+	assert.deepEqual([fake.starts[0]!.role.name, fake.starts[0]!.role.model], ["implement", "deepseek/deepseek-chat"]);
+	assert.equal(injected.into.entries, 1, "and that run recorded its own handle");
+});
+
+test("every prompt guideline names the tool that carries it, and together they name every role", () => {
+	for (const [tool, control] of [
+		["fusion", "fusion_control"],
+		["claude", "claude_control"],
+	]) {
+		const guidelines = byName(tool).promptGuidelines ?? [];
+		assert.ok(guidelines.length, `${tool} contributes no guidelines`);
+		for (const guideline of guidelines) assert.ok(guideline.includes(tool), `a ${tool} guideline never names ${tool}: ${guideline}`);
+		assert.ok(guidelines.some((guideline) => guideline.includes(control)), `no ${tool} guideline names ${control}`);
+		if (tool === "fusion") {
+			for (const guideline of guidelines) assert.ok(!/\bclaude\b/.test(guideline), `a fusion guideline still routes through the claude tool: ${guideline}`);
+		}
+		for (const role of ["plan", "implement", "ultracode", "ask"]) {
+			assert.ok(guidelines.some((guideline) => guideline.includes(`role ${role}`)), `no ${tool} guideline names role ${role}`);
+		}
+		for (const pattern of [/do not edit files yourself/, /choice wins/, /^Report to the user/, /Escalation/, /continue set to its handle/, /background true/]) {
+			assert.equal(guidelines.filter((guideline) => pattern.test(guideline)).length, 1, `${pattern} must match one ${tool} guideline`);
+		}
+		assert.ok(!guidelines.some((guideline) => /tool list/.test(guideline)), "all roles are always available");
+	}
 });
 
 test("no tool metadata routes by file count or names the old tools", () => {
 	const routing = /multi-file|one small task|non-trivial/i;
-	const tool = byName("claude");
-	const properties = Object.values(tool.parameters.properties ?? {}) as Array<{ description?: string }>;
-	const metadata = [tool.description, tool.promptSnippet ?? "", ...(tool.promptGuidelines ?? []), ...properties.map((property) => property.description ?? "")];
-	for (const text of metadata) {
-		assert.ok(!routing.test(text), `claude still routes by file count: ${text}`);
-		assert.ok(!/fable_consolidate|opus_implement|fable_implement/.test(text), `claude metadata names an old tool: ${text}`);
+	for (const name of ["fusion", "claude"]) {
+		const tool = byName(name);
+		const properties = Object.values(tool.parameters.properties ?? {}) as Array<{ description?: string }>;
+		const metadata = [tool.description, tool.promptSnippet ?? "", ...(tool.promptGuidelines ?? []), ...properties.map((property) => property.description ?? "")];
+		for (const text of metadata) {
+			assert.ok(!routing.test(text), `${name} still routes by file count: ${text}`);
+			assert.ok(!/fable_consolidate|opus_implement|fable_implement/.test(text), `${name} metadata names an old tool: ${text}`);
+		}
 	}
+});
+
+test("a fusion call with no backend runs the role's claude defaults and records the run as a claude one", async () => {
+	const before = appendedEntries;
+	const run = await invoke("fusion", { role: "implement", task: "rename x" });
+	assertCommon(run, "implement.md");
+	assert.equal(valueOf(run.argv, "--model"), "opus");
+	assert.equal(valueOf(run.argv, "--effort"), "high");
+	assert.equal(run.prompt, "rename x");
+	assert.equal(appendedEntries, before + 1);
+	// ultracode runs on claude and nowhere else, whether or not the call says so.
+	const ultracode = await invoke("fusion", { role: "ultracode", task: "do a thing", backend: "claude" });
+	assert.equal(valueOf(ultracode.argv, "--effort"), "ultracode");
+	await assert.rejects(byName("fusion").execute("call-1", { role: "ultracode", task: "x", backend: "pi" }, undefined, undefined, ctx), {
+		message: "role ultracode does not run on the pi backend; use one of claude",
+	});
+	// Security's disabled flag wins over a backend override; the compatibility tool still refuses the role by name.
+	await assert.rejects(byName("fusion").execute("call-1", { role: "security", task: "x", backend: "claude" }, undefined, undefined, ctx), {
+		message: "role security is disabled in profile builtin; change /fusion config or select another profile",
+	});
+	await assert.rejects(byName("claude").execute("call-1", { role: "security", task: "x" }, undefined, undefined, ctx), {
+		message: "unknown role security; use one of plan, implement, ultracode, ask",
+	});
 });
 
 test("role implement takes a direct task and records its run in the host session", async () => {
@@ -325,6 +554,122 @@ test("role implement takes a direct task and records its run in the host session
 	assertCommon(run, "implement.md");
 	assert.equal(run.prompt, "rename x\n\n## Context\nasked directly");
 	assert.equal(appendedEntries, before + 1, "every run records its handle so the host can continue it");
+});
+
+test("a marked pi child registers nothing at all, and any other value registers the ordinary surface", () => {
+	/** What one call of the extension registered, whatever it registered it with. */
+	const registered = (marker: string | undefined) => {
+		const seen = { tools: [] as string[], commands: [] as string[], events: [] as string[], renderers: [] as string[], entries: 0 };
+		const recorder = {
+			registerTool: (tool: { name: string }) => seen.tools.push(tool.name),
+			registerCommand: (name: string) => seen.commands.push(name),
+			on: (event: string) => seen.events.push(event),
+			appendEntry: () => {
+				seen.entries++;
+			},
+			registerMessageRenderer: (customType: string) => seen.renderers.push(customType),
+		} as unknown as ExtensionAPI;
+		const before = process.env[PI_CHILD_VARIABLE];
+		if (marker === undefined) delete process.env[PI_CHILD_VARIABLE];
+		else process.env[PI_CHILD_VARIABLE] = marker;
+		try {
+			// What is registered is what this case reads, so the tripwires stand in for pi and codex here too: nothing
+			// below runs a call, and a registration that took the production one would still be one more of them.
+			fusion(recorder, { backends: { ...tripwires() }, profiles: memoryProfileStore() });
+		} finally {
+			if (before === undefined) delete process.env[PI_CHILD_VARIABLE];
+			else process.env[PI_CHILD_VARIABLE] = before;
+		}
+		return seen;
+	};
+	const host = registered(undefined);
+	assert.ok(host.tools.length && host.commands.length && host.events.length && host.renderers.length, "an unmarked host registers the tools, the command, the handlers and the renderer");
+	// The marker `piLaunch` sets, read from the module that sets it: nothing is registered and nothing is thrown, which
+	// is what a child needs — a throw here would fail the child's own startup instead of leaving it its role's tools.
+	assert.deepEqual(registered(PI_CHILD_MARKER), { tools: [], commands: [], events: [], renderers: [], entries: 0 });
+	for (const marker of ["", "1", "claude", "PI", "pi ", "0"]) {
+		assert.deepEqual(registered(marker), host, `marker ${JSON.stringify(marker)} changed what the extension registers, and only the pi marker means anything`);
+	}
+});
+
+test("the loader refuses a child, a missing contract and a missing bootstrap in that order, before it builds the pi backend", () => {
+	// A static read of the source and no more. It says the four are written in this order; it does not run the loader
+	// with a file missing, and nothing in this suite removes a contract or the bootstrap from this repository to watch
+	// one throw. A smoke of a real install with one of them gone stays a manual check.
+	// The third of them is only reachable because no module of this host imports the program a child runs, which is
+	// `test/backends.test.ts`'s own static read: while one did, an install missing that program failed as node's module
+	// error at import time instead of here. A missing source of this host's own still fails that way, and the two
+	// constants the transport shares with a child are in one of them, `backends/pi-bootstrap-protocol.mjs`.
+	const source = fs.readFileSync(path.join(repoRoot, "extensions", "fusion.ts"), "utf8");
+	const MISSING_BOOTSTRAP = "throw new Error(`pi-fusion: missing pi bootstrap ${PI_BOOTSTRAP_PATH}`)";
+	const steps = [
+		["the child marker guard", 'if (process.env.PI_FUSION_CHILD === "pi") return;'],
+		["the contract validation", "if (!fs.existsSync(contract)) throw new Error(`pi-fusion: missing contract ${contract}`);"],
+		["the bootstrap validation", `if (!fs.existsSync(PI_BOOTSTRAP_PATH)) ${MISSING_BOOTSTRAP};`],
+		["the pi backend registration", "hostBackend(createPiBackend())"],
+	] as const;
+	const found = steps.map(([what, snippet]) => {
+		const at = source.indexOf(snippet);
+		assert.notEqual(at, -1, `${what} is no longer written in extensions/fusion.ts as ${snippet}`);
+		return [what, at] as const;
+	});
+	for (const [index, [what, at]] of found.entries()) {
+		if (index === 0) continue;
+		const [earlier, position] = found[index - 1]!;
+		assert.ok(position < at, `${what} is written before ${earlier}, and each of these must refuse a broken install before the next one costs anything`);
+	}
+	assert.equal(source.split(MISSING_BOOTSTRAP).length - 1, 1, "the missing-bootstrap refusal must be written in exactly one place, or one of them can drift");
+});
+
+test("the load-time contract check covers every contract any backend's roles name, the pi-only one and the codex addendum included", () => {
+	// What the loader adds to the claude roles' own contracts is the binding's own list, so a contract only a pi role
+	// names is checked at load for the same reason: it is a broken install whichever backend would have run it. The
+	// loader is read here rather than run with a file gone, as the order case above reads it.
+	assert.deepEqual([...PI_CONTRACT_FILES].sort(), ["ask-answer.md", "ask-review.md", "implement.md", "plan.md", "security.md"]);
+	for (const role of PI_ROLE_NAMES) {
+		const bound = piRole({ role, model: "deepseek/deepseek-chat" }, undefined, {} as NodeJS.ProcessEnv);
+		assert.ok(PI_CONTRACT_FILES.includes(bound.contract), `the loader never checks the contract role ${role} runs under: ${bound.contract}`);
+	}
+	for (const name of PI_CONTRACT_FILES) assert.ok(fs.existsSync(path.join(repoRoot, "contracts", name)), `this install ships no contracts/${name}`);
+	// Codex names the shared contracts and two addenda of its own, each checked at load like any other contract.
+	assert.deepEqual([...CODEX_CONTRACT_FILES].sort(), ["ask-answer.md", "ask-review.md", "codex-continued-questions.md", "codex-no-questions.md", "implement.md", "plan.md"]);
+	for (const role of CODEX_ROLE_NAMES) {
+		for (const mode of role === "ask" ? CODEX_MODES : [undefined]) {
+			const bound = codexRole({ role, ...(mode === undefined ? {} : { mode }) }, undefined, {} as NodeJS.ProcessEnv);
+			assert.ok(CODEX_CONTRACT_FILES.includes(bound.contract), `the loader never checks the contract role ${role} runs under on codex: ${bound.contract}`);
+			assert.ok(CODEX_CONTRACT_FILES.includes(bound.addendum), `the loader never checks the addendum role ${role} runs under on codex: ${bound.addendum}`);
+		}
+	}
+	for (const name of CODEX_CONTRACT_FILES) assert.ok(fs.existsSync(path.join(repoRoot, "contracts", name)), `this install ships no contracts/${name}`);
+	const source = fs.readFileSync(path.join(repoRoot, "extensions", "fusion.ts"), "utf8");
+	const check = "new Set([...Object.values(ROLES).map((role) => role.contract), ...Object.values(ASK_CONTRACTS), ...PI_CONTRACT_FILES, ...CODEX_CONTRACT_FILES])";
+	assert.ok(source.includes(check), "the load-time check no longer reads the pi and codex bindings' own contracts beside the claude roles'");
+	// After the internal child's early return, so a pi child registers nothing before any contract is read.
+	assert.ok(source.indexOf('if (process.env.PI_FUSION_CHILD === "pi") return;') < source.indexOf(check), "the contract check is written before the internal child guard, which must return first");
+});
+
+test("the security contract scopes one investigation, says where the authorization to fix comes from, and fixes its sections", () => {
+	const text = fs.readFileSync(path.join(repoRoot, "contracts", "security.md"), "utf8");
+	// The exact sections, in this order: a reader of a security report has to find the evidence under each finding.
+	const headings = ["## Findings", "## Evidence", "## Changed", "## Verification", "## Unresolved", "## Escalation"];
+	let at = -1;
+	for (const heading of headings) {
+		const found = text.indexOf(`\n${heading}\n`);
+		assert.ok(found > at, `${heading} is missing from contracts/security.md or written out of order`);
+		at = found;
+	}
+	assert.match(text, /^## Findings$/m);
+	assert.match(text, /The task says whether fixes are authorized/);
+	assert.match(text, /reports findings and changes no application code|report what you found and change no application code/);
+	assert.match(text, /ask_orchestrator/, "an ambiguous authorization is a question for the orchestrator, not a guess");
+	assert.match(text, /severity — high, medium or low — and say whether it is confirmed or inferred/);
+	assert.match(text, /Confirm a finding where you can/);
+	assert.match(text, /Never put a secret in your report by value/);
+	assert.match(text, /`path:line`/);
+	assert.match(text, /Do not commit/);
+	assert.match(text, /do not widen the task/);
+	assert.match(text, /Verify every change you make/);
+	assert.match(text, /^## Escalation$/m);
 });
 
 test("the contracts carry the escalation and route sections the tool promises", () => {
@@ -342,10 +687,44 @@ test("the contracts carry the escalation and route sections the tool promises", 
 	}
 	assert.match(contract("ask-review.md"), /^## Findings$/m);
 	assert.match(contract("ask-review.md"), /most severe first/);
-	for (const name of ["plan.md", "implement.md", "ultracode.md", "ask-answer.md", "ask-review.md"]) {
+	for (const name of ["plan.md", "implement.md", "ultracode.md", "ask-answer.md", "ask-review.md", "security.md"]) {
 		assert.ok(!/multi-file|one small task/i.test(contract(name)), `${name} still routes by file count`);
 		assert.ok(!/fable_consolidate|opus_implement|fable_implement|workhorse|consolidator/.test(contract(name)), `${name} still uses an old name`);
 	}
+});
+
+test("the common contracts read as prose any backend's child can run, and say the same things they said", () => {
+	const contract = (name: string) => fs.readFileSync(path.join(repoRoot, "contracts", name), "utf8");
+	// `security.md` is in this list though only the pi binding names it: it is prose about the job and not about a
+	// harness, so the day another backend runs the role it needs no rewrite.
+	const common = ["plan.md", "implement.md", "ask-answer.md", "ask-review.md", "security.md"];
+	for (const name of common) {
+		const text = contract(name);
+		// A vendor, a model or a harness's own tool name: a Pi child runs this prose too, and none of these mean
+		// anything to it. `contracts/ultracode.md` is Claude's alone and is not in this list.
+		for (const named of [/Claude/i, /\bOpus\b/i, /\bFable\b/i, /\bAstra\b/i, /\bGPT/i, /\bGlob\b/, /WebSearch/, /WebFetch/, /AskUserQuestion/]) {
+			assert.ok(!named.test(text), `${name} still names ${named.source}`);
+		}
+		assert.match(text, /ask_orchestrator/, `${name} no longer says how a child asks its question`);
+	}
+	// What replaced a named tool still names a capability, so no rule lost the thing it was about. `implement.md` is
+	// not in this list: it never named a tool, and it still verifies with the commands the task names.
+	for (const name of ["plan.md", "ask-answer.md", "ask-review.md"]) {
+		assert.match(contract(name), /your (shell|search|file-editing) tools?/, `${name} names no tool a child of any backend has`);
+	}
+	// The rules each contract is relied on for, kept word for word where a caller or a test reads them.
+	assert.match(contract("plan.md"), /Do not implement the plan and do not change the project's source, tests or configuration/);
+	assert.match(contract("plan.md"), /scratch files/, "the plan contract still bounds what it may write");
+	assert.match(contract("implement.md"), /Stay inside the task's scope/);
+	assert.match(contract("implement.md"), /Do not commit\./);
+	assert.match(contract("implement.md"), /project's conventions and its agent instruction files/, "the implement contract still points at the project's own rules");
+	assert.match(contract("implement.md"), /start another coding session/, "the implement contract still refuses to start another session of its own");
+	for (const name of ["ask-answer.md", "ask-review.md"]) {
+		assert.match(contract(name), /Do not change files\. Do not use your shell tool to write, move or delete files, to change git state, to install packages or to start anything that keeps running\./, `${name} weakened its read-only rule`);
+	}
+	assert.match(contract("ask-answer.md"), /name the source/, "the answer contract still requires a source for a fact from outside the project");
+	assert.match(contract("ask-review.md"), /`git diff`, `git log`, the tests, a build or a type check/);
+	assert.match(contract("ultracode.md"), /AskUserQuestion/, "role ultracode is Claude's own and keeps the tool names it runs with");
 });
 
 test("role plan runs at xhigh in its own Claude Code session", async () => {
@@ -539,20 +918,17 @@ async function getJson(target: string): Promise<any> {
 
 /**
  * The dashboard is gone when the port refuses the connection, not when it answers 404. A pooled keep-alive socket
- * that closing destroyed reports a reset instead, so a reset is retried on a fresh connection.
+ * that closing destroyed proves nothing about the port, so the probe opens its own connection every time and reads
+ * the code the kernel gives it.
  */
 async function refused(target: string): Promise<string> {
-	let code = "";
-	for (let attempt = 0; attempt < 5; attempt++) {
-		try {
-			await fetch(target);
-			return "answered";
-		} catch (error) {
-			code = (error as { cause?: { code?: string } }).cause?.code ?? (error as Error).message;
-			if (code !== "ECONNRESET") return code;
-		}
-	}
-	return code;
+	return new Promise<string>((resolve) => {
+		const request = http.get(target, { agent: false }, (response) => {
+			response.resume();
+			resolve("answered");
+		});
+		request.on("error", (error: NodeJS.ErrnoException) => resolve(error.code ?? error.message));
+	});
 }
 
 let dashboardUrl = "";
@@ -678,6 +1054,7 @@ test("a later /fusion dashboard gets a fresh url and session_shutdown closes it,
 	const url = urlIn(await runCommand("dashboard"));
 	assert.notEqual(url, dashboardUrl, "a restart must not reuse the closed server's token or port");
 	assert.equal(((await getJson(`${url}api/runs`)) as { cwd: string }).cwd, ctx.cwd);
+	assert.equal(await refused(`${url}api/runs`), "answered", "the refusal probe must answer a live listener, or ECONNREFUSED proves nothing");
 	const shutdown = handlers.get("session_shutdown");
 	assert.ok(shutdown, "no session_shutdown handler is registered");
 	await shutdown({ reason: "quit" }, ctx);
@@ -686,8 +1063,9 @@ test("a later /fusion dashboard gets a fresh url and session_shutdown closes it,
 });
 
 test("any other argument warns about the usage and starts nothing", async () => {
-	const usage = "Usage: /fusion dashboard | /fusion dashboard stop | /fusion status [run-N] | /fusion cancel run-N | /fusion wait run-N | /fusion steer run-N <text> | /fusion answer [run-N] [text] | /fusion review run-N";
-	for (const args of ["", "   ", "dashboard start", "status foo", "cancel", "steer run-1"]) {
+	const usage =
+		"Usage: /fusion dashboard | /fusion dashboard stop | /fusion dashboard limit [N] | /fusion status [run-N] | /fusion cancel run-N | /fusion wait run-N | /fusion steer run-N <text> | /fusion answer [run-N] [text] | /fusion review run-N | /fusion on | /fusion off | /fusion config | /fusion profile [list | use <name> | save <name> | default <name>]";
+	for (const args of ["", "   ", "dashboard start", "status foo", "cancel", "steer run-1", "config now"]) {
 		const notices = await runCommand(args);
 		assert.deepEqual(notices, [{ message: usage, type: "warning" }], `for ${JSON.stringify(args)}`);
 	}

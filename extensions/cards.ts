@@ -29,6 +29,7 @@ export interface CardDetails {
 	reviewedBy?: string;
 	reviews?: string;
 	question?: string;
+	control?: "fusion_control" | "claude_control";
 	background?: boolean;
 	kind?: string;
 	by?: string;
@@ -116,6 +117,7 @@ export function cardDetails(value: unknown): CardDetails {
 		if (typeof read === "number" && Number.isFinite(read)) details[field] = read;
 	}
 	if (Array.isArray(source.files)) details.files = source.files.filter((file): file is string => typeof file === "string" && file !== "").slice(0, CARD_FILES).map(plainText);
+	if (source.control === "fusion_control" || source.control === "claude_control") details.control = source.control;
 	if (typeof source.background === "boolean") details.background = source.background;
 	if (typeof source.historical === "boolean") details.historical = source.historical;
 	if (source.usage !== undefined) details.usage = source.usage;
@@ -140,8 +142,8 @@ export function headerLine(theme: CardTheme, parts: { label: string; details: Ca
 }
 
 /** Both ways to answer a run that waits, so the card says it wherever the question shows. */
-function answerHint(handle: string | undefined): string {
-	return `answer: /fusion answer ${handle ?? "run-N"} <text> or claude_control message`;
+function answerHint(handle: string | undefined, control: CardDetails["control"]): string {
+	return `answer: /fusion answer ${handle ?? "run-N"} <text> or ${control === "claude_control" ? "claude_control" : "fusion_control"} message`;
 }
 
 /** A Markdown heading as a card shows it: the headings the host must act on stand out from the rest. */
@@ -155,11 +157,11 @@ function heading(theme: CardTheme, line: string): string {
  * The body under a card's header: the first report lines collapsed, the whole report with its changed paths and its
  * open question expanded. Nothing here knows the width; the card wraps or truncates what it gets.
  */
-export function bodyLines(theme: CardTheme, text: string, opts: { expanded: boolean; question?: string; handle?: string; files?: string[]; filesChanged?: number }): string[] {
+export function bodyLines(theme: CardTheme, text: string, opts: { expanded: boolean; question?: string; handle?: string; control?: CardDetails["control"]; files?: string[]; filesChanged?: number }): string[] {
 	const body = plainText(text);
 	const question = opts.question === undefined ? undefined : plainText(opts.question);
 	if (!opts.expanded) {
-		if (question) return [theme.fg("warning", firstLine(question)), theme.fg("muted", answerHint(opts.handle))];
+		if (question) return [theme.fg("warning", firstLine(question)), theme.fg("muted", answerHint(opts.handle, opts.control))];
 		const report = body
 			.split("\n")
 			.map((line) => line.trimEnd())
@@ -176,7 +178,7 @@ export function bodyLines(theme: CardTheme, text: string, opts: { expanded: bool
 		lines.push(theme.fg("muted", `files (${opts.filesChanged ?? files.length})`), ...shown);
 		if (rest > 0) lines.push(theme.fg("muted", `… ${rest} more`));
 	}
-	if (question) lines.push(...painted(theme, "warning", cap(question, CARD_QUESTION_CHARS)), theme.fg("muted", answerHint(opts.handle)));
+	if (question) lines.push(...painted(theme, "warning", cap(question, CARD_QUESTION_CHARS)), theme.fg("muted", answerHint(opts.handle, opts.control)));
 	return lines;
 }
 
@@ -256,7 +258,12 @@ export interface WidgetUsage {
 	calls: number;
 	warnUsd: number[];
 	limitUsd?: number;
+	/** Runs whose backend reports no cost, a codex one, which the estimate leaves out rather than counting as free. */
+	unpricedRuns?: number;
 }
+
+/** What the estimate leaves out, said beside it, so a session of runs with no known cost never reads as a free one. */
+export const unpricedText = (runs: number | undefined): string | undefined => (runs ? `cost unknown for ${runs} codex ${runs === 1 ? "run" : "runs"}, not in the estimate` : undefined);
 
 function widgetRunLine(theme: CardTheme, run: WidgetRun): string {
 	const handle = plainText(run.handle);
@@ -272,6 +279,8 @@ function widgetRunLine(theme: CardTheme, run: WidgetRun): string {
 
 function widgetUsageLine(usage: WidgetUsage): string {
 	const parts = [`session usage: est. ${usd(usage.costUsd)}`];
+	const unpriced = unpricedText(usage.unpricedRuns);
+	if (unpriced) parts.push(unpriced);
 	if (usage.warnUsd.length) parts.push(`warn at ${usage.warnUsd.map((threshold) => usd(threshold)).join(", ")}`);
 	if (usage.limitUsd !== undefined) parts.push(`limit ${usd(usage.limitUsd)}`);
 	return parts.join(" · ");

@@ -2,13 +2,22 @@ import assert from "node:assert/strict";
 import * as fs from "node:fs";
 import * as http from "node:http";
 import * as net from "node:net";
+import * as os from "node:os";
 import * as path from "node:path";
 import test from "node:test";
 import { setTimeout } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
 import * as vm from "node:vm";
+import { ARCHIVE_NOT_SAVED, ArchiveIndex, type ArchiveReader, type BranchEvidence } from "../extensions/dashboard-archive.ts";
+import { History, HISTORY_PROMPT_CAP_BYTES, HISTORY_REPORT_CAP_BYTES, type HistoryRecord, MAX_HISTORY_FILE_BYTES, MAX_HISTORY_RECORDS } from "../extensions/history.ts";
 import {
+	ARCHIVE_PAGE_SIZE,
+	archiveCursor,
+	archiveKey,
+	type ArchiveProvider,
 	type Dashboard,
+	dashboardMaxRuns,
+	dashboardProblems,
 	CALL_CAP_BYTES,
 	FAILURE_CAP_BYTES,
 	type LogEntry,
@@ -22,8 +31,10 @@ import {
 	MAX_THINKING_BLOCKS,
 	MAX_STRING_CHARS,
 	MAX_TASKS_PER_RUN,
+	parseRunLimit,
 	type RunDetail,
 	type RunStatus,
+	restoredView,
 	RunStore,
 	type RunSummary,
 	startDashboard,
@@ -56,12 +67,37 @@ const detailOf = (store: RunStore, id = "run-1") => {
 	return detail;
 };
 
+test("dashboard retention defaults to 30 and accepts positive decimal safe integers", () => {
+	assert.equal(MAX_RUNS, 30, "the built-in default has not changed");
+	for (const value of [undefined, "", " \t "]) {
+		const env = { PI_FUSION_DASHBOARD_MAX_RUNS: value };
+		assert.equal(dashboardMaxRuns(env), 30);
+		assert.deepEqual(dashboardProblems(env), []);
+	}
+	for (const [text, limit] of [["1", 1], ["30", 30], [" 200 ", 200], ["0200", 200], [String(Number.MAX_SAFE_INTEGER), Number.MAX_SAFE_INTEGER]] as const) {
+		const env = { PI_FUSION_DASHBOARD_MAX_RUNS: text };
+		assert.equal(parseRunLimit(text), limit, text);
+		assert.equal(dashboardMaxRuns(env), limit, text);
+		assert.deepEqual(dashboardProblems(env), [], text);
+	}
+});
+
+test("unusable dashboard limits retain the default and explain the bad environment value", () => {
+	for (const text of ["0", "-1", "1.5", "1e2", "0x20", "Infinity", "NaN", "1,000", "200oops", "9007199254740992", "+200", "1_000", "200\n10"]) {
+		const env = { PI_FUSION_DASHBOARD_MAX_RUNS: ` ${text} ` };
+		assert.equal(parseRunLimit(text), undefined, text);
+		assert.equal(dashboardMaxRuns(env), MAX_RUNS, text);
+		assert.deepEqual(dashboardProblems(env), [`PI_FUSION_DASHBOARD_MAX_RUNS=${text} is not a positive decimal safe integer; the dashboard run limit stays at 30`], text);
+	}
+});
+
 test("a started run is running with its role, model and title and zero counters", () => {
 	const { store } = makeStore();
 	store.start({ id: "run-1", role: "fable-implement", model: "fable", title: "add the thing" });
 	assert.deepEqual(store.summaries(), [
 		{
 			id: "run-1",
+			backend: "claude",
 			role: "fable-implement",
 			model: "fable",
 			title: "add the thing",
@@ -150,6 +186,40 @@ test("finish records each terminal status with its text, failure and end time", 
 		assert.equal(detail.failure, status === "done" ? undefined : `opus ${status}`);
 		assert.deepEqual(bare(detail.log.at(-1)), { at: START + 20, kind: "run", text: status === "done" ? "done" : `${status}: opus ${status}` });
 	}
+});
+
+test("a finish told to clear the activity drops the line its snapshot carried, and one that is not keeps it", () => {
+	// A backend may mirror what its ending left behind into the activity of the outcome it returns, and a host that
+	// has already put that sentence in the failure asks for the line to go rather than be shown twice.
+	const warning = "cleaning up needs attention: leftovers; this call's storage is left behind";
+	const failure = `implement cancelled; ${warning}`;
+	const snapshot = { activity: warning, toolCalls: 2, tokensIn: 10, tokensOut: 5 };
+
+	const cleared = started();
+	cleared.store.progress("run-1", { activity: "bash npm test", toolCalls: 1, tokensIn: 5, tokensOut: 1 });
+	cleared.tick(20);
+	cleared.store.finish("run-1", { status: "cancelled", failure, snapshot, clearActivity: true });
+	const clearedDetail = detailOf(cleared.store);
+	assert.equal(clearedDetail.activity, undefined, "the mirrored line is gone, so the monitor does not say it twice");
+	assert.equal(cleared.store.summaries()[0]!.activity, undefined);
+	assert.equal(clearedDetail.failure, failure, "and the failure is the one place it is shown");
+	assert.equal(clearedDetail.failure?.split(warning).length, 2, `exactly one copy of the warning: ${clearedDetail.failure}`);
+	// Everything else the snapshot carried is applied as it always was: this drops one line and nothing else.
+	assert.deepEqual([clearedDetail.toolCalls, clearedDetail.tokensIn, clearedDetail.tokensOut], [2, 10, 5]);
+
+	// Without the flag nothing changes: the snapshot's own line is what a finished run shows.
+	const kept = started();
+	kept.store.progress("run-1", { activity: "bash npm test", toolCalls: 1, tokensIn: 5, tokensOut: 1 });
+	kept.tick(20);
+	kept.store.finish("run-1", { status: "cancelled", failure: "implement cancelled", snapshot });
+	assert.equal(detailOf(kept.store).activity, warning);
+	assert.equal(kept.store.summaries()[0]!.activity, warning);
+
+	// And a finish that clears nothing keeps the line the run was last on, snapshot or no snapshot.
+	const untouched = started();
+	untouched.store.progress("run-1", { activity: "bash npm test", toolCalls: 1, tokensIn: 5, tokensOut: 1 });
+	untouched.store.finish("run-1", { status: "done", clearActivity: false });
+	assert.equal(detailOf(untouched.store).activity, "bash npm test");
 });
 
 test("finish stops the tasks still running and leaves the ended ones exactly as they were", () => {
@@ -341,6 +411,23 @@ test("progress copies cost, cache, context, model usage and thinking, and caps t
 	assert.equal(summary.modelId, "claude-fable-5-1[1m]");
 	assert.equal(summary.contextTokens, 1_206);
 	assert.ok(!("thinking" in summary) && !("models" in summary), "the run list stays small");
+});
+
+test("a run keeps the backend and effort it was admitted with, and a pi run takes the effort its child confirmed", () => {
+	const { store } = makeStore();
+	store.start({ id: "claude-run", backend: "claude", role: "implement", model: "opus", effort: "high" });
+	store.start({ id: "pi-run", backend: "pi", role: "security", model: "deepseek/deepseek-chat" });
+	store.start({ id: "plain-run", role: "ask", model: "sonnet" });
+	assert.equal(detailOf(store, "claude-run").backend, "claude");
+	assert.equal(detailOf(store, "claude-run").effort, "high");
+	assert.equal(detailOf(store, "pi-run").backend, "pi");
+	assert.ok(!("effort" in detailOf(store, "pi-run")), "a pi run that named no effort has none until its child confirms one");
+	assert.ok(!("effort" in detailOf(store, "plain-run")));
+	store.progress("pi-run", { toolCalls: 0, tokensIn: 0, tokensOut: 0, modelId: "deepseek/deepseek-chat", selection: { model: "deepseek/deepseek-chat", effort: "medium" } });
+	assert.equal(detailOf(store, "pi-run").effort, "medium");
+	assert.equal(store.summaries().find((run) => run.id === "pi-run")?.effort, "medium", "the run list carries it too");
+	assert.equal(store.restore({ id: "held", backend: "pi", role: "plan", model: "deepseek/deepseek-chat", effort: "low", state: "done", startedAt: 1 }), true);
+	assert.equal(detailOf(store, "held").effort, "low");
 });
 
 test("a tool call keeps its input and result and marks its log entry", () => {
@@ -563,6 +650,76 @@ test("a run that stays running is never evicted, even past the cap", () => {
 	assert.equal(store.summaries().length, MAX_RUNS + 5);
 });
 
+test("each store owns its limit, with 30 left as the default", () => {
+	const store = new RunStore(() => START, 200);
+	const other = new RunStore();
+	assert.equal(store.maxRuns, 200);
+	assert.equal(other.maxRuns, 30);
+	store.setMaxRuns(2);
+	assert.equal(store.maxRuns, 2);
+	assert.equal(other.maxRuns, 30);
+});
+
+test("a bad numeric limit changes neither the target nor retained data", () => {
+	const { store } = started();
+	for (const limit of [0, -1, 1.5, Number.NaN, Number.POSITIVE_INFINITY, Number.MAX_SAFE_INTEGER + 1]) {
+		assert.throws(() => store.setMaxRuns(limit), /must be a positive safe integer/);
+		assert.throws(() => new RunStore(Date.now, limit), /must be a positive safe integer/);
+		assert.equal(store.maxRuns, 30);
+		assert.equal(store.summaries().length, 1);
+	}
+});
+
+test("lowering the limit immediately evicts the oldest finished runs of every terminal status", () => {
+	const { store, tick } = makeStore();
+	for (const [i, status] of (["done", "failed", "aborted", "cancelled"] as const).entries()) {
+		store.start({ id: `run-${i}`, role: "ask", model: "opus" });
+		store.finish(`run-${i}`, { status });
+		tick();
+	}
+	store.start({ id: "keep-running", role: "ask", model: "opus" });
+	store.setMaxRuns(2);
+	assert.deepEqual(store.summaries().map((run) => run.id), ["keep-running", "run-3"]);
+	assert.equal(store.detail("run-0"), undefined);
+});
+
+test("raising the limit keeps more subsequent runs but does not recover evicted data", () => {
+	let clock = START;
+	const store = new RunStore(() => clock++, 2);
+	for (let i = 1; i <= 3; i++) {
+		store.start({ id: `run-${i}`, role: "ask", model: "opus" });
+		store.finish(`run-${i}`, { status: "done", text: `report ${i}` });
+	}
+	store.setMaxRuns(4);
+	assert.equal(store.detail("run-1"), undefined);
+	assert.equal(store.summaries().length, 2);
+	for (let i = 4; i <= 5; i++) {
+		store.start({ id: `run-${i}`, role: "ask", model: "opus" });
+		store.finish(`run-${i}`, { status: "done", text: `report ${i}` });
+	}
+	assert.deepEqual(store.summaries().map((run) => run.id), ["run-5", "run-4", "run-3", "run-2"]);
+	assert.equal(detailOf(store, "run-2").text, "report 2");
+});
+
+test("lowered limits protect running and waiting runs and are enforced as those runs finish", () => {
+	const { store, tick } = makeStore();
+	store.start({ id: "running", role: "ask", model: "opus" });
+	tick();
+	store.start({ id: "waiting", role: "ask", model: "opus" });
+	store.question("waiting", "Which name?");
+	tick();
+	store.start({ id: "finished", role: "ask", model: "opus" });
+	store.finish("finished", { status: "done" });
+	store.setMaxRuns(1);
+	assert.deepEqual(store.summaries().map((run) => run.id), ["waiting", "running"]);
+	assert.equal(detailOf(store, "waiting").question, "Which name?");
+	store.finish("running", { status: "cancelled" });
+	assert.equal(store.detail("running"), undefined, "the store converges without needing another run to start");
+	store.question("waiting", undefined);
+	store.finish("waiting", { status: "done" });
+	assert.deepEqual(store.summaries().map((run) => run.id), ["waiting"]);
+});
+
 test("unknown ids are ignored", () => {
 	const { store } = started();
 	store.progress("nope", { toolCalls: 9, tokensIn: 9, tokensOut: 9 });
@@ -681,6 +838,68 @@ test("restored runs count towards the cap as the finished runs they are", () => 
 	assert.ok(ids.includes(`held-${MAX_RUNS + 4}`));
 });
 
+test("restored runs obey the configured limit and an immediate runtime reduction", () => {
+	const store = new RunStore(() => START, 2);
+	for (let i = 0; i < 3; i++) store.restore({ ...restored, id: `held-${i}`, startedAt: START + i });
+	assert.deepEqual(store.summaries().map((run) => run.id), ["held-2", "held-1"]);
+	store.setMaxRuns(1);
+	assert.deepEqual(store.summaries().map((run) => run.id), ["held-2"]);
+	assert.equal(detailOf(store, "held-2").restored, true);
+});
+
+test("a restore keeps the history's truncation flags even for text short enough to fit here", () => {
+	const { store } = makeStore();
+	assert.equal(store.restore({ ...restored, promptTruncated: true, reportTruncated: true, failure: "it broke", failureTruncated: true }), true);
+	const detail = detailOf(store, "held-1");
+	assert.equal(detail.prompt, "add the retry");
+	assert.equal(detail.promptTruncated, true, "the history cut the prompt on its way to disk");
+	assert.equal(detail.textTruncated, true);
+	assert.equal(detail.failureTruncated, true);
+	assert.equal(store.restore({ ...restored, id: "held-2", promptTruncated: false }), true);
+	const plain = detailOf(store, "held-2");
+	assert.equal(plain.promptTruncated, false);
+	assert.equal(plain.textTruncated, false);
+	assert.equal(plain.failureTruncated, false);
+	assert.equal(store.restore({ ...restored, id: "held-3", report: "x".repeat(TEXT_CAP_BYTES + 1) }), true);
+	assert.equal(detailOf(store, "held-3").textTruncated, true, "a cut this store makes still says so");
+});
+
+test("a restored view keeps what the history saved and nothing it did not", () => {
+	const ref = { backend: "pi" as const, sessionId: "pi-2", sessionFile: "/sessions/pi-2.jsonl", checkpoint: "entry-4" };
+	const launch = { kind: "fork" as const, backend: "pi" as const, from: "pi-1", file: "/sessions/pi-1.jsonl", at: "entry-9" };
+	const view = restoredView(
+		{
+			...restored,
+			backend: "pi",
+			session: launch,
+			sessionId: undefined,
+			ref,
+			selection: { model: "deepseek/deepseek-chat", effort: "high" },
+			promptTruncated: true,
+			usage: { tokensIn: 40, tokensOut: 9, toolCalls: 7 },
+			files: undefined,
+		},
+		1,
+	);
+	assert.ok(view);
+	assert.deepEqual(view.session, launch, "the launch request is kept as the request it was");
+	assert.deepEqual(view.ref, ref, "the verified reference is kept apart from it");
+	assert.deepEqual(view.selection, { model: "deepseek/deepseek-chat", effort: "high" });
+	assert.equal(view.sessionId, undefined);
+	assert.deepEqual(view.usage, { tokensIn: 40, tokensOut: 9, toolCalls: 7 }, "no cost was saved, so none is shown");
+	assert.equal(view.files, undefined);
+	assert.equal(view.filesTotal, 3, "the count survives a record that lost its list");
+	assert.equal(view.promptTruncated, true);
+	assert.equal(view.report, restored.report);
+	assert.deepEqual(view.reportFlags, ["Escalation"]);
+	const bare = restoredView({ id: "bare", role: "implement", model: "opus", state: "failed", startedAt: 2 }, 1);
+	assert.deepEqual(bare, { id: "bare", backend: "claude", role: "implement", model: "opus", status: "failed", startedAt: 2, promptTruncated: false, reportTruncated: false, failureTruncated: false });
+	// A launch request alone is no verified session: nothing is read across from one to the other.
+	const requested = restoredView({ id: "req", backend: "pi", role: "implement", model: "m", state: "failed", startedAt: 2, session: launch }, 1);
+	assert.equal(requested?.ref, undefined);
+	for (const state of ["running", "waiting", "gone"]) assert.equal(restoredView({ ...restored, state }, 1), undefined, state);
+});
+
 test("summaries are newest first", () => {
 	const { store, tick } = makeStore();
 	store.start({ id: "old", role: "opus", model: "opus-4" });
@@ -707,6 +926,7 @@ test("returned views are copies with only the contracted keys", () => {
 	assert.deepEqual(Object.keys(detail).sort(), [
 		"activity",
 		"agentToolCalls",
+		"backend",
 		"cacheRead",
 		"cacheWrite",
 		"deniedTools",
@@ -757,6 +977,7 @@ test("returned views are copies with only the contracted keys", () => {
 	assert.deepEqual(Object.keys(store.summaries()[0]!).sort(), [
 		"activity",
 		"agentToolCalls",
+		"backend",
 		"deniedTools",
 		"endedAt",
 		"id",
@@ -1308,9 +1529,535 @@ test("the dashboard script cannot inject markup or run generated code", () => {
 	assert.doesNotThrow(() => new vm.Script(source, { filename: "app.js" }), "app.js must parse as a script");
 });
 
+test("the dashboard script reads older runs through the relative archive path with an encoded cursor", () => {
+	const source = asset("app.js");
+	assert.ok(source.includes('fetchJson("api/archive?before=" + encodeURIComponent(cursor))'), "a cursor is the server's own text, sent encoded on the relative path");
+	assert.ok(!source.includes("/api/archive"), "an absolute path would escape the token directory");
+	assert.ok(source.includes('const NOT_SAVED = "Not saved in history"'), "an archived run says what history did not keep");
+	assert.ok(!/setInterval\([^)]*loadOlder|setTimeout\([^)]*loadOlder/.test(source), "older pages load only when asked for");
+});
+
 test("the stylesheet fetches nothing", () => {
 	const css = asset("app.css");
 	for (const forbidden of ["url(", "@import", "expression("]) {
 		assert.ok(!css.includes(forbidden), `app.css must not use ${forbidden}: the page must load nothing beyond its own three files`);
 	}
+});
+
+test("a run says which backend it went through, and a record from before backends were tagged is a claude run", () => {
+	const { store } = makeStore();
+	store.start({ id: "run-1", role: "implement", model: "opus" });
+	store.start({ id: "run-2", backend: "pi", role: "implement", model: "deepseek/deepseek-chat" });
+	store.restore({ id: "run-3", role: "implement", model: "opus", state: "done", startedAt: START });
+	store.restore({ id: "run-4", backend: "pi", role: "security", model: "deepseek/deepseek-chat", state: "done", startedAt: START });
+	store.restore({ id: "run-5", backend: "elsewhere", role: "implement", model: "opus", state: "done", startedAt: START });
+	const backends = Object.fromEntries(store.summaries().map((run) => [run.id, run.backend]));
+	assert.deepEqual(backends, { "run-1": "claude", "run-2": "pi", "run-3": "claude", "run-4": "pi", "run-5": "claude" });
+	assert.equal(detailOf(store, "run-2").backend, "pi");
+});
+
+test("a pi session is shown by its file, with no id for a new one and none guessed for a fork", () => {
+	const { store } = makeStore();
+	store.start({ id: "run-1", backend: "pi", role: "implement", model: "deepseek/deepseek-chat", session: { kind: "new", backend: "pi" } });
+	store.start({
+		id: "run-2",
+		backend: "pi",
+		role: "implement",
+		model: "deepseek/deepseek-chat",
+		session: { kind: "resume", backend: "pi", id: "pi-1", file: "/sessions/pi-1.jsonl", at: "entry-9" },
+	});
+	store.start({
+		id: "run-3",
+		backend: "pi",
+		role: "implement",
+		model: "deepseek/deepseek-chat",
+		session: { kind: "fork", backend: "pi", from: "pi-1", file: "/sessions/pi-1.jsonl", at: "entry-9" },
+	});
+	assert.deepEqual(detailOf(store, "run-1").session, { kind: "new", backend: "pi" });
+	assert.deepEqual(detailOf(store, "run-2").session, { kind: "resume", backend: "pi", id: "pi-1", file: "/sessions/pi-1.jsonl", at: "entry-9" });
+	assert.deepEqual(detailOf(store, "run-3").session, { kind: "fork", backend: "pi", from: "pi-1", file: "/sessions/pi-1.jsonl", at: "entry-9" });
+	assert.equal(detailOf(store, "run-3").sessionId, undefined, "a pi fork's new id is the child's to report, never the host's to guess");
+});
+
+test("a pi run's transcript path is the session its outcome verified, never the one its launch asked for", () => {
+	const { store } = makeStore();
+	const forked = { backend: "pi" as const, sessionId: "pi-2", sessionFile: "/sessions/pi-2.jsonl", checkpoint: "entry-9" };
+	// A new run has no session until its outcome lands, so nothing names one for it while it runs.
+	store.start({ id: "fresh", backend: "pi", role: "implement", model: "deepseek/deepseek-chat", session: { kind: "new", backend: "pi" } });
+	assert.equal(detailOf(store, "fresh").ref, undefined, "a run that has reported nothing has no verified session");
+	store.finish("fresh", { status: "done", ref: { backend: "pi", sessionId: "pi-1", sessionFile: "/sessions/pi-1.jsonl", checkpoint: "entry-1" } });
+	assert.deepEqual(detailOf(store, "fresh").ref, { backend: "pi", sessionId: "pi-1", sessionFile: "/sessions/pi-1.jsonl", checkpoint: "entry-1" });
+
+	// A fork keeps its launch request, which names the parent, and its result, which names the child it made.
+	store.start({ id: "forked", backend: "pi", role: "implement", model: "deepseek/deepseek-chat", session: { kind: "fork", backend: "pi", from: "pi-1", file: "/sessions/pi-1.jsonl", at: "entry-9" } });
+	store.finish("forked", { status: "failed", failure: "the provider dropped the connection", ref: forked });
+	assert.deepEqual(detailOf(store, "forked").session, { kind: "fork", backend: "pi", from: "pi-1", file: "/sessions/pi-1.jsonl", at: "entry-9" }, "the launch request is unchanged");
+	assert.deepEqual(detailOf(store, "forked").ref, forked, "and the verified child is a field of its own, even on a failure with no selection");
+
+	// An outcome the host refused passes no reference, so nothing is offered for it.
+	store.start({ id: "invalid", backend: "pi", role: "implement", model: "deepseek/deepseek-chat", session: { kind: "new", backend: "pi" } });
+	store.finish("invalid", { status: "failed", failure: "invalid session postcondition" });
+	assert.equal(detailOf(store, "invalid").ref, undefined);
+
+	// A reference of another backend, or one missing half a pi identity, is no reference this store keeps.
+	store.start({ id: "mixed", backend: "pi", role: "implement", model: "deepseek/deepseek-chat" });
+	store.finish("mixed", { status: "done", ref: { backend: "claude", sessionId: "s-1" } });
+	assert.equal(detailOf(store, "mixed").ref, undefined, "a claude reference is not a pi run's session");
+	store.start({ id: "half", backend: "pi", role: "implement", model: "deepseek/deepseek-chat" });
+	store.finish("half", { status: "done", ref: { backend: "pi", sessionId: "pi-3" } as never });
+	assert.equal(detailOf(store, "half").ref, undefined, "a pi reference without its file is no identity");
+
+	// A restored run reads its reference from the history record, not from the session its launch asked for.
+	store.restore({
+		id: "held",
+		backend: "pi",
+		role: "implement",
+		model: "deepseek/deepseek-chat",
+		state: "failed",
+		startedAt: START,
+		session: { kind: "fork", backend: "pi", from: "pi-1", file: "/sessions/pi-1.jsonl", at: "entry-9" },
+		ref: forked,
+	});
+	assert.deepEqual(detailOf(store, "held").ref, forked);
+	store.restore({ id: "held-none", backend: "pi", role: "implement", model: "deepseek/deepseek-chat", state: "failed", startedAt: START, session: { kind: "fork", backend: "pi", from: "pi-1", file: "/sessions/pi-1.jsonl", at: "entry-9" } });
+	assert.equal(detailOf(store, "held-none").ref, undefined, "a history record with no verified reference gains none from its launch");
+});
+
+/** A realistic Pi transcript path that is well past the display cap and well under any platform's path limit. */
+const LONG_FILE = `/home/asen/.pi/agent/sessions/${"a-deeply-nested-project-directory/".repeat(12)}0199c9e2-1b3a-7f00-8000-0123456789ab.jsonl`;
+const OVER_LIMIT = `/sessions/${"x".repeat(33_000)}.jsonl`;
+
+test("a session reference is kept exactly or not at all, so a long transcript path is never shortened into another", () => {
+	const { store } = makeStore();
+	assert.ok(LONG_FILE.length > 400 && LONG_FILE.length < 4_096, `the path under test is ${LONG_FILE.length} characters`);
+	const long = { backend: "pi" as const, sessionId: "0199c9e2-1b3a-7f00-8000-0123456789ab", sessionFile: LONG_FILE, checkpoint: "entry-9" };
+	store.start({ id: "long", backend: "pi", role: "implement", model: "deepseek/deepseek-chat" });
+	store.finish("long", { status: "done", ref: long });
+	assert.deepEqual(detailOf(store, "long").ref, long, "the file a run is opened with is the file the child reported, whole");
+
+	// The same through a restore, because a reference cut on the way back is as wrong as one cut on the way in.
+	store.restore({ id: "long-held", backend: "pi", role: "implement", model: "deepseek/deepseek-chat", state: "done", startedAt: START, ref: long });
+	assert.deepEqual(detailOf(store, "long-held").ref, long);
+
+	// Past the ceiling the whole reference goes, rather than a field of it becoming a path to somewhere else.
+	store.start({ id: "over", backend: "pi", role: "implement", model: "deepseek/deepseek-chat" });
+	store.finish("over", { status: "done", ref: { backend: "pi", sessionId: "pi-1", sessionFile: OVER_LIMIT, checkpoint: "entry-9" } });
+	assert.equal(detailOf(store, "over").ref, undefined);
+	store.restore({ id: "over-held", backend: "pi", role: "implement", model: "deepseek/deepseek-chat", state: "done", startedAt: START, ref: { backend: "pi", sessionId: "x".repeat(33_000), sessionFile: "/sessions/pi-1.jsonl" } });
+	assert.equal(detailOf(store, "over-held").ref, undefined);
+
+	// What is kept is a reference this store built, not the caller's object: nothing else on it comes along, and a
+	// later change to what the caller held does not reach the page.
+	const mutable = { backend: "pi" as const, sessionId: "pi-2", sessionFile: "/sessions/pi-2.jsonl", secret: "not a field of a reference" };
+	store.start({ id: "extra", backend: "pi", role: "implement", model: "deepseek/deepseek-chat" });
+	store.finish("extra", { status: "done", ref: mutable as never });
+	mutable.sessionFile = "/sessions/moved.jsonl";
+	assert.deepEqual(detailOf(store, "extra").ref, { backend: "pi", sessionId: "pi-2", sessionFile: "/sessions/pi-2.jsonl" });
+	assert.equal((detailOf(store, "extra").ref as unknown as { secret?: string }).secret, undefined);
+});
+
+test("the page names a pi transcript from the verified result alone, and its request as a request", () => {
+	const source = asset("app.js");
+	const resume = source.slice(source.indexOf("const appendResume"), source.indexOf("const appendChain"));
+	assert.ok(resume.includes("resultRef(detail)"), "the pi path reads the verified result reference");
+	assert.ok(!/session\.file/.test(resume), "and never falls back to the launch request's file, which for a fork is the parent's");
+	assert.ok(source.includes('"Pi session request"'), "the launch request is labelled as one");
+});
+
+test("the page offers a claude resume only for a claude run", () => {
+	const source = asset("app.js");
+	const resume = source.slice(source.indexOf("const appendResume"), source.indexOf("const appendChain"));
+	assert.ok(resume.includes("claude --resume"), "the resume command is built here and nowhere else");
+	assert.equal(source.split("claude --resume").length - 1, 2, "no other part of the page writes a resume command");
+	assert.ok(
+		resume.indexOf('backendOf(detail) === "pi"') < resume.indexOf("claude --resume"),
+		"a pi run must leave before a claude resume command is built: its session is a file, not a claude session id",
+	);
+});
+
+test("the page offers codex resume only from a verified codex reference, before any claude command is built", () => {
+	const source = asset("app.js");
+	const resume = source.slice(source.indexOf("const appendResume"), source.indexOf("const appendChain"));
+	const codex = resume.slice(resume.indexOf('backendOf(detail) === "codex"'), resume.indexOf('backendOf(detail) === "pi"'));
+	assert.ok(codex.includes("resultRef(detail)") && codex.includes('str(ref.backend) === "codex"'), "the thread comes from the verified codex reference");
+	assert.ok(!/detail\.sessionId|session\.id/.test(codex), "and never from the scalar the child reported or the launch request");
+	assert.ok(resume.indexOf('backendOf(detail) === "codex"') < resume.indexOf("claude --resume"), "a codex run leaves before a claude resume command is built");
+	assert.ok(codex.includes("codexResumeCommand(thread)") && !codex.includes('"codex resume " + thread'), "the hint is the quoting formatter's, never the raw id glued on");
+	const formatter = source.slice(source.indexOf("const codexResumeCommand"), source.indexOf("const appendResume"));
+	assert.ok(formatter.includes("/^[A-Za-z0-9_@%+:,./][A-Za-z0-9_@%+=:,./-]*$/"), "a leading = is not a plain first character, since zsh expands it; an interior one is");
+	assert.ok(formatter.includes("'\\\\''") && formatter.includes('"codex resume -- "'), "an id is single-quoted with its quotes escaped, and one starting with - goes after --");
+	assert.ok(source.includes('"Codex thread request"'), "the launch request is labelled as a codex one");
+});
+
+/** A history record of host session `host-1` as the archive reads one. */
+const held = (over: Partial<HistoryRecord> = {}): HistoryRecord => ({
+	id: "held-1",
+	handle: "run-1",
+	role: "implement",
+	model: "opus",
+	hostSessionId: "host-1",
+	cwd: CWD,
+	origin: "tool",
+	state: "done",
+	startedAt: 100,
+	endedAt: 200,
+	prompt: "do it",
+	report: "## Changed\nfoo.ts",
+	backend: "claude",
+	sessionId: "s-1",
+	...over,
+});
+
+/**
+ * A real archive over one in-memory session file, refreshed as the host does on every request, so the server's own
+ * paging, merging and fallback are what these cases read. `asked` counts the requests that asked for it.
+ */
+function memoryArchive(records: HistoryRecord[], evidence: BranchEvidence[] = []) {
+	let version = 0;
+	const file = { records };
+	const reader: ArchiveReader = {
+		loadStamped: () => ({ records: file.records.map((record) => structuredClone(record)), writable: false, stamp: String(version) }),
+		stamp: () => String(version),
+	};
+	const index = new ArchiveIndex(reader);
+	const state = { asked: 0, fail: false };
+	const provider = (): ArchiveProvider | undefined => {
+		state.asked++;
+		if (state.fail) throw new Error("/private/history/host-1.json is gone");
+		index.refresh({ current: "host-1", evidence });
+		return index;
+	};
+	const replace = (next: HistoryRecord[]) => {
+		file.records = next;
+		version++;
+	};
+	return { provider, state, replace };
+}
+
+async function serveArchive(store: RunStore, archive: () => ArchiveProvider | undefined, body: (get: (target: string, method?: string) => Promise<Answer>) => Promise<void>): Promise<void> {
+	const dashboard = await startDashboard(store, { cwd: CWD, archive });
+	try {
+		await body((target, method) => ask(dashboard.port, { path: `/${tokenOf(dashboard)}/${target}`, ...(method ? { method } : {}) }));
+	} finally {
+		await dashboard.close();
+	}
+}
+
+const json = (answer: Answer): any => {
+	assert.equal(answer.status, 200, answer.body);
+	return JSON.parse(answer.body);
+};
+
+test("an archive cursor names one position, spelled one way, and nothing else reads as one", () => {
+	const key = { startedAt: 1_234.5, id: "3b0c-id" };
+	assert.deepEqual(archiveKey(archiveCursor(key)), key);
+	const cursor = archiveCursor(key);
+	const bad = [
+		"",
+		"not a cursor!",
+		"x".repeat(1_025),
+		Buffer.from("[1]").toString("base64url"),
+		Buffer.from('[1,"a",2]').toString("base64url"),
+		Buffer.from('["1","a"]').toString("base64url"),
+		Buffer.from('[1,""]').toString("base64url"),
+		Buffer.from(`[1,"${"a".repeat(401)}"]`).toString("base64url"),
+		Buffer.from('{"startedAt":1,"id":"a"}').toString("base64url"),
+		Buffer.from('[1, "a"]').toString("base64url"),
+		Buffer.from("[1e999,\"a\"]").toString("base64url"),
+		Buffer.from("../../etc/passwd").toString("base64url"),
+		`${cursor}A`,
+	];
+	for (const text of bad) assert.equal(archiveKey(text), undefined, text);
+});
+
+test("api/runs lists every live run and the newest archived page, with what the page is told about the archive", async () => {
+	const records = Array.from({ length: 45 }, (_, i) => held({ id: `held-${String(i).padStart(2, "0")}`, handle: `run-${i + 1}`, startedAt: 100 + i, endedAt: 150 + i }));
+	const archive = memoryArchive(records);
+	for (const limit of [1, 200]) {
+		const store = new RunStore(() => 10_000, limit);
+		store.start({ id: "live-running", role: "implement", model: "opus" });
+		store.start({ id: "live-waiting", role: "ask", model: "opus" });
+		store.question("live-waiting", "Which?");
+		await serveArchive(store, archive.provider, async (get) => {
+			const asked = archive.state.asked;
+			const payload = json(await get("api/runs"));
+			assert.equal(archive.state.asked, asked + 1, "every request asks the host for the archive afresh");
+			const live = payload.runs.filter((run: any) => run.provenance === "live");
+			assert.deepEqual(live.map((run: any) => [run.id, run.status]), [["live-running", "running"], ["live-waiting", "waiting"]], `limit ${limit}: live children are always polled`);
+			const archived = payload.runs.filter((run: any) => run.provenance === "history");
+			assert.equal(archived.length, ARCHIVE_PAGE_SIZE, `limit ${limit}: the archive page is its own size`);
+			assert.deepEqual(archived.map((run: any) => run.id), records.slice(-ARCHIVE_PAGE_SIZE).reverse().map((record) => record.id));
+			assert.deepEqual(payload.archive, { available: true, pageSize: ARCHIVE_PAGE_SIZE, revision: payload.archive.revision, total: 45, next: archiveCursor({ startedAt: 115, id: "held-15" }) });
+			assert.equal(store.summaries().length, 2, "reading the archive puts nothing in the store");
+			const older = json(await get(`api/archive?before=${payload.archive.next}`));
+			assert.deepEqual(older.runs.map((run: any) => run.id), records.slice(0, 15).reverse().map((record) => record.id));
+			assert.deepEqual(older.archive, { available: true, pageSize: ARCHIVE_PAGE_SIZE, revision: payload.archive.revision, total: 45 });
+			const first = json(await get("api/archive?x=1"));
+			assert.deepEqual(first.runs.map((run: any) => run.id), archived.map((run: any) => run.id), "no cursor is the newest page, and an unknown parameter is ignored");
+		});
+	}
+});
+
+test("an archived run in the list carries what the history saved under a live run's names, and no counter it never saved", async () => {
+	const archive = memoryArchive([
+		held({ id: "saved", usage: { costUsd: 0.25, tokensIn: 40, tokensOut: 9, toolCalls: 7 }, filesTotal: 3, selection: { model: "fable-5", effort: "max" }, effort: "high", reviewedBy: "run-2", background: true }),
+		(() => {
+			const bare = held({ id: "bare", handle: "run-2", state: "failed", failure: "it broke", startedAt: 50 });
+			delete bare.report;
+			delete bare.endedAt;
+			return bare;
+		})(),
+	]);
+	await serveArchive(new RunStore(), archive.provider, async (get) => {
+		const [saved, bare] = json(await get("api/runs")).runs;
+		assert.equal(saved.id, "saved");
+		assert.equal(saved.restored, true);
+		assert.equal(saved.provenance, "history");
+		assert.equal(saved.history.provenance, "history");
+		assert.deepEqual(saved.unavailable, saved.history.unavailable);
+		for (const [field, value] of Object.entries({ costUsd: 0.25, tokensIn: 40, tokensOut: 9, toolCalls: 7, filesChanged: 3, modelId: "fable-5", effort: "max", reviewedBy: "run-2", background: true, endedAt: 200, hostSessionId: "host-1" })) {
+			assert.deepEqual(saved[field], value, field);
+		}
+		for (const field of ["agentToolCalls", "toolErrors", "updatedAt", "lastEventAt", "activity", "question", "workflowTokens", "contextTokens", "deniedTools", "sessionId", "interrupted"]) {
+			assert.ok(!(field in saved), `${field} was never saved`);
+		}
+		for (const field of ["tokensIn", "tokensOut", "toolCalls", "costUsd", "filesChanged", "endedAt", "reportFlags", "modelId"]) assert.ok(!(field in bare), `bare has no ${field}`);
+		for (const absent of [...ARCHIVE_NOT_SAVED, "usage", "files", "fileList", "report", "endedAt"]) assert.ok(bare.unavailable.includes(absent), absent);
+		const detail = json(await get("api/runs/saved"));
+		assert.equal(detail.provenance, "history");
+		assert.equal(detail.text, "## Changed\nfoo.ts", "the saved report is the text the page reads");
+		assert.equal(detail.textTruncated, false);
+		assert.equal(detail.prompt, "do it");
+		assert.equal(detail.sessionId, "s-1");
+		assert.equal(detail.history.report, "## Changed\nfoo.ts");
+		for (const field of ["log", "tasks", "models", "thinking", "cacheRead", "cacheWrite", "numTurns", "apiMs", "ref", "question"]) assert.ok(!(field in detail), `${field} was never saved`);
+		const failed = json(await get("api/runs/bare"));
+		assert.equal(failed.failure, "it broke");
+		assert.ok(!("text" in failed) && !("textTruncated" in failed), "no report was saved");
+		assert.equal((await get("api/runs/saved/calls/tool-1")).status, 404, "an archived run has no tool calls to read");
+	});
+});
+
+test("a run the store holds is shown from the store, and the archive's paging does not shift around it", async () => {
+	const records = Array.from({ length: 32 }, (_, i) => held({ id: `held-${String(i).padStart(2, "0")}`, startedAt: 100, endedAt: 101 }));
+	const archive = memoryArchive(records);
+	let clock = 100;
+	const store = new RunStore(() => clock, 1);
+	store.start({ id: "held-31", role: "implement", model: "opus" });
+	store.finish("held-31", { status: "done", text: "the live one" });
+	await serveArchive(store, archive.provider, async (get) => {
+		const payload = json(await get("api/runs"));
+		const ids = payload.runs.map((run: any) => [run.id, run.provenance]);
+		assert.deepEqual(ids.filter(([id]: [string]) => id === "held-31"), [["held-31", "live"]], "one id, one row, the store's");
+		assert.equal(ids.length, ARCHIVE_PAGE_SIZE, "the hidden archived copy still took its place on the page");
+		assert.equal(json(await get("api/runs/held-31")).text, "the live one");
+		assert.equal(json(await get("api/runs/held-31")).provenance, "live");
+		const older = json(await get(`api/archive?before=${payload.archive.next}`));
+		assert.deepEqual(older.runs.map((run: any) => run.id), ["held-01", "held-00"], "equal start times page by id with no repeat and no gap");
+		// The store lets the run go: the same id now reads from the archive, and the page says so even at the same time.
+		clock = 100;
+		store.start({ id: "other", role: "implement", model: "opus" });
+		store.finish("other", { status: "done" });
+		const moved = json(await get("api/runs/held-31"));
+		assert.equal(moved.provenance, "history");
+		assert.equal(moved.startedAt, 100);
+		assert.equal(json(await get("api/runs")).runs.find((run: any) => run.id === "held-31").provenance, "history");
+	});
+});
+
+test("runs archived after a page was read never repeat on the next one, and pruned runs leave without a stale detail", async () => {
+	const records = Array.from({ length: 35 }, (_, i) => held({ id: `held-${String(i).padStart(2, "0")}`, startedAt: 100 + i }));
+	const archive = memoryArchive(records);
+	await serveArchive(new RunStore(), archive.provider, async (get) => {
+		const first = json(await get("api/runs"));
+		const seen = new Set(first.runs.map((run: any) => run.id));
+		archive.replace([...records, held({ id: "newer-1", startedAt: 500 }), held({ id: "newer-2", startedAt: 501 })]);
+		const older = json(await get(`api/archive?before=${first.archive.next}`));
+		assert.deepEqual(older.runs.map((run: any) => run.id), ["held-04", "held-03", "held-02", "held-01", "held-00"]);
+		for (const run of older.runs) assert.ok(!seen.has(run.id), `${run.id} repeated`);
+		assert.ok(older.archive.revision > first.archive.revision, "the archive moved on since the first page");
+		assert.equal(older.archive.total, 37);
+		assert.equal(json(await get("api/runs")).runs[0].id, "newer-2");
+		archive.replace(records.filter((record) => record.id !== "held-34"));
+		assert.equal((await get("api/runs/held-34")).status, 404, "a pruned run has no detail left to show");
+		assert.ok(!json(await get("api/runs")).runs.some((run: any) => run.id === "held-34"));
+	});
+});
+
+test("the archive endpoint refuses what is not its cursor, answers HEAD, and leaks nothing when the archive fails", async () => {
+	const archive = memoryArchive([held()]);
+	const store = new RunStore();
+	store.start({ id: "live-running", role: "implement", model: "opus" });
+	await serveArchive(store, archive.provider, async (get) => {
+		const cursor = archiveCursor({ startedAt: 1, id: "a" });
+		for (const query of ["before=", "before=nope!", `before=${cursor}&before=${cursor}`, `before=${Buffer.from("../../etc/passwd").toString("base64url")}`]) {
+			const answer = await get(`api/archive?${query}`);
+			assert.equal(answer.status, 400, query);
+			assert.equal(answer.body, "Bad request\n");
+			assertSecure(answer, query);
+		}
+		const answer = await get(`api/archive?before=${cursor}`);
+		assert.equal(answer.status, 200);
+		assertSecure(answer, "an archive page");
+		assert.deepEqual(JSON.parse(answer.body).runs, [], "nothing is older than the oldest run");
+		const head = await get(`api/archive?before=${cursor}`, "HEAD");
+		assert.equal(head.status, 200);
+		assert.equal(head.body, "");
+		assert.equal(head.headers["content-length"], answer.headers["content-length"]);
+		for (const id of ["nope", "held-1x", "..%2F..%2Fetc"]) assert.equal((await get(`api/runs/${id}`)).status, 404, id);
+		assert.equal((await get("api/archive/extra")).status, 404);
+		archive.state.fail = true;
+		const failing = await get("api/runs");
+		assert.equal(failing.status, 200, "a failing archive costs the page its older runs, never its live ones");
+		const payload = JSON.parse(failing.body);
+		assert.deepEqual(payload.runs.map((run: any) => run.id), ["live-running"]);
+		assert.deepEqual(payload.archive, { available: false, pageSize: ARCHIVE_PAGE_SIZE });
+		assert.ok(!failing.body.includes("/private"), "the archive's failure never reaches the page");
+		assert.equal((await get("api/runs/held-1")).status, 404);
+		assert.deepEqual(json(await get("api/archive")), { runs: [], archive: { available: false, pageSize: ARCHIVE_PAGE_SIZE } });
+	});
+	await serveArchive(seeded(), () => undefined, async (get) => {
+		const payload = json(await get("api/runs"));
+		assert.deepEqual(payload.archive, { available: false, pageSize: ARCHIVE_PAGE_SIZE }, "no history kept is said, not guessed");
+		assert.deepEqual(payload.runs.map((run: any) => [run.id, run.provenance]), [["run-new", "live"], ["run-old", "live"]]);
+	});
+});
+
+/** What a pi-fusion entry of host session `host-1` says about a Claude child, as `branchEvidence` gives it back. */
+const claudeEvidence = (handle: string, sessionId: string): BranchEvidence => ({ handle, hostSessionId: "host-1", backend: "claude", session: { backend: "claude", sessionId }, sessionId });
+
+test("a claude id only the run reported reaches the page as a marked diagnostic, and every confirmed one as before", async () => {
+	const legacy = held({ id: "legacy", handle: "run-3", state: "failed", failure: "it broke", sessionId: "l-1", startedAt: 104 });
+	delete legacy.backend;
+	const archive = memoryArchive(
+		[
+			held({ id: "first", sessionId: "c-1", startedAt: 101 }),
+			held({ id: "failed", state: "failed", failure: "boom two", sessionId: "c-2", session: { kind: "resume", backend: "claude", id: "c-1", at: "cp-1" }, startedAt: 102 }),
+			held({ id: "third", sessionId: "c-3", session: { kind: "resume", backend: "claude", id: "c-1", at: "cp-1" }, startedAt: 103 }),
+			legacy,
+			held({ id: "accepted", handle: "run-2", state: "failed", failure: "late", sessionId: "d-9", ref: { backend: "claude", sessionId: "d-9" }, session: { kind: "resume", backend: "claude", id: "d-1" }, startedAt: 105 }),
+		],
+		[claudeEvidence("run-1", "c-1"), claudeEvidence("run-1", "c-3"), claudeEvidence("run-2", "d-1")],
+	);
+	await serveArchive(new RunStore(), archive.provider, async (get) => {
+		const listed = json(await get("api/runs")).runs;
+		assert.deepEqual(listed.map((run: any) => run.id), ["accepted", "legacy", "third", "failed", "first"]);
+		assert.ok(listed.every((run: any) => !("diagnosticSessionId" in run) && !("diagnosticSessionId" in run.history)), "the list is not marked");
+		const failed = json(await get("api/runs/failed"));
+		assert.equal(failed.history.diagnosticSessionId, true);
+		assert.equal(failed.sessionId, "c-2", "the reported id stays readable");
+		assert.equal(failed.history.sessionId, "c-2");
+		assert.ok(!("ref" in failed), "no reference is made for it");
+		assert.deepEqual(failed.session, { kind: "resume", backend: "claude", id: "c-1", at: "cp-1" }, "the request stays the request");
+		assert.equal(failed.failure, "boom two");
+		assert.equal(failed.text, "## Changed\nfoo.ts");
+		for (const id of ["first", "third", "legacy", "accepted"]) {
+			const detail = json(await get(`api/runs/${id}`));
+			assert.ok(!("diagnosticSessionId" in detail.history), id);
+			assert.ok(detail.sessionId, id);
+		}
+		assert.equal(json(await get("api/runs/legacy")).status, "failed", "a failed run its own entries allow is not marked");
+		assert.deepEqual(json(await get("api/runs/accepted")).ref, { backend: "claude", sessionId: "d-9" });
+	});
+});
+
+test("the page leaves out a claude resume for a marked diagnostic id alone, never for a failed run as such", () => {
+	const source = asset("app.js");
+	const resume = source.slice(source.indexOf("const appendResume"), source.indexOf("const appendChain"));
+	const claude = resume.slice(resume.indexOf("const sessionId"));
+	assert.ok(claude.includes("detail.history.diagnosticSessionId === true"), "the history's mark is what leaves the command out");
+	assert.ok(claude.indexOf("diagnosticSessionId") < claude.indexOf("claude --resume"), "and it is read before the command is built");
+	assert.ok(!/status|failure|failed|session\.(id|from)/.test(claude), "neither the run's status nor its request decides or replaces the command");
+});
+
+/** A real history in a private temporary directory, removed afterwards, with an archive over it as the host refreshes one. */
+async function diskArchive(body: (history: History, provider: () => ArchiveProvider, target: string) => Promise<void>): Promise<void> {
+	const root = fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), "pi-fusion-archive-api-"));
+	try {
+		const history = new History(path.join(root, "history"));
+		const index = new ArchiveIndex(history);
+		const provider = (): ArchiveProvider => {
+			index.refresh({ current: "host-1", evidence: [] });
+			return index;
+		};
+		await body(history, provider, path.join(root, "history", "host-1.json"));
+	} finally {
+		fs.rmSync(root, { recursive: true, force: true });
+	}
+}
+
+/** Every archived id the page can reach, newest first, by following the archive's own cursors to the end. */
+async function everyArchived(get: (target: string) => Promise<Answer>): Promise<string[]> {
+	let listed = json(await get("api/runs"));
+	const ids = listed.runs.filter((run: any) => run.provenance === "history").map((run: any) => run.id);
+	while (listed.archive.next) {
+		listed = json(await get(`api/archive?before=${listed.archive.next}`));
+		ids.push(...listed.runs.map((run: any) => run.id));
+	}
+	return ids;
+}
+
+const numbered = (i: number, over: Partial<HistoryRecord> = {}) => held({ id: `disk-${String(i).padStart(3, "0")}`, handle: `run-${(i % 7) + 1}`, startedAt: 1_000 + i, endedAt: 1_500 + i, ...over });
+
+test("runs the history pruned past its record cap leave every list, page and detail, and a smaller live store prunes nothing", async () => {
+	await diskArchive(async (history, provider, target) => {
+		history.saveAll("host-1", CWD, Array.from({ length: MAX_HISTORY_RECORDS }, (_, i) => numbered(i)));
+		const store = new RunStore(() => 5_000, 30);
+		store.start({ id: "live-1", role: "implement", model: "opus" });
+		store.finish("live-1", { status: "done", text: "live" });
+		await serveArchive(store, provider, async (get) => {
+			const before = await everyArchived(get);
+			assert.equal(before.length, MAX_HISTORY_RECORDS);
+			const first = json(await get("api/runs"));
+			assert.equal(json(await get("api/runs/disk-000")).prompt, "do it");
+			// A smaller live store lets live runs go and leaves the file, and so the archive, exactly as they were.
+			const bytes = fs.readFileSync(target);
+			store.setMaxRuns(1);
+			store.start({ id: "live-2", role: "implement", model: "opus" });
+			store.finish("live-2", { status: "done" });
+			assert.deepEqual(fs.readFileSync(target), bytes, "the live limit writes nothing");
+			assert.deepEqual(await everyArchived(get), before);
+			// Five newer runs push the five oldest out of the file, one write at a time, as the host writes them.
+			for (let i = MAX_HISTORY_RECORDS; i < MAX_HISTORY_RECORDS + 5; i++) history.save("host-1", CWD, numbered(i));
+			const after = await everyArchived(get);
+			const expected = Array.from({ length: MAX_HISTORY_RECORDS }, (_, i) => `disk-${String(MAX_HISTORY_RECORDS + 4 - i).padStart(3, "0")}`);
+			assert.deepEqual(after, expected, "the archive is what the file holds now, newest first, each id once");
+			for (let i = 0; i < 5; i++) assert.equal((await get(`api/runs/disk-00${i}`)).status, 404, `disk-00${i} was pruned`);
+			assert.equal(json(await get("api/runs/disk-005")).prompt, "do it");
+			// A cursor read before the pruning still walks on, past what is gone, with no repeat and no stale row.
+			let older = json(await get(`api/archive?before=${first.archive.next}`));
+			assert.equal(older.archive.total, MAX_HISTORY_RECORDS);
+			const walked = older.runs.map((run: any) => run.id);
+			while (older.archive.next) {
+				older = json(await get(`api/archive?before=${older.archive.next}`));
+				walked.push(...older.runs.map((run: any) => run.id));
+			}
+			assert.deepEqual(walked, expected.slice(expected.indexOf("disk-069")));
+			assert.deepEqual(store.summaries().map((run) => run.id), ["live-2"], "the archive put nothing back in the store");
+		});
+	});
+});
+
+test("runs the history pruned to fit its byte budget leave the archive too, with far fewer than the record cap kept", async () => {
+	await diskArchive(async (history, provider, target) => {
+		const large = (i: number) => numbered(i, { prompt: "p".repeat(HISTORY_PROMPT_CAP_BYTES), report: "r".repeat(HISTORY_REPORT_CAP_BYTES) });
+		for (let i = 0; i < 10; i++) history.save("host-1", CWD, large(i));
+		await serveArchive(new RunStore(), provider, async (get) => {
+			assert.equal((await everyArchived(get)).length, 10);
+			assert.equal(json(await get("api/runs/disk-000")).prompt.length, HISTORY_PROMPT_CAP_BYTES);
+			for (let i = 10; i < 30; i++) history.save("host-1", CWD, large(i));
+			const kept = history.load("host-1").records.map((record) => record.id);
+			assert.ok(fs.statSync(target).size <= MAX_HISTORY_FILE_BYTES, "the file is within its byte budget");
+			assert.ok(kept.length > 1 && kept.length < 30 && kept.length < MAX_HISTORY_RECORDS, `the byte budget kept ${kept.length}`);
+			assert.equal(kept.at(-1), "disk-029");
+			const shown = await everyArchived(get);
+			assert.deepEqual(shown, [...kept].reverse(), "the archive lists what the file kept, newest first");
+			const gone = Array.from({ length: 30 }, (_, i) => `disk-${String(i).padStart(3, "0")}`).filter((id) => !kept.includes(id));
+			assert.ok(gone.includes("disk-000"));
+			for (const id of gone) assert.equal((await get(`api/runs/${id}`)).status, 404, `${id} was pruned`);
+			const newest = json(await get("api/runs/disk-029"));
+			assert.equal(newest.text.length, HISTORY_REPORT_CAP_BYTES);
+			assert.equal(json(await get("api/runs")).archive.total, kept.length);
+		});
+	});
 });

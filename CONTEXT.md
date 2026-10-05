@@ -1,61 +1,65 @@
-# pi-fusion
+# pi-fusion vocabulary
 
-A Pi extension in which the host model hands work to headless Claude Code sessions and manages them while they work.
+Use these terms consistently in code, tool messages, and documentation. Behavioral detail belongs in the linked topic pages, not in competing definitions here.
 
 ## Language
 
 **Host**:
-The Pi model that talks with the user and decides which work to hand off.
+The Pi model that talks with the user and decides which work to hand off. No particular model/provider is required.
 _Avoid_: orchestrator, main model, parent
 
 **Child**:
-A headless Claude Code session that does work the host handed off.
+A headless coding session doing work the host handed off: Claude Code, Pi, or Codex, according to its backend.
 _Avoid_: subagent, worker, delegate
 
+**Backend**:
+The implementation that runs a child: `claude`, `pi`, or `codex`. A backend owns its session shape, binding, and protocol; the host owns handles, records, and scheduling. See [Profiles](docs/profiles.md#what-a-call-runs-on) for selection and [Codex evidence](docs/codex-backend.md#evidence) for its experimental scope.
+_Avoid_: adapter, provider, harness, runtime (as synonyms for backend)
+
 **Role**:
-The job a child does: `plan`, `implement`, `ultracode` or `ask`. A role fixes the child's contract, tools and default model and effort.
+The job a child does: `plan`, `implement`, `ultracode`, `ask`, or `security`. Role metadata defines capabilities; session settings choose enabled state, backend, model, and effort. See [Routing](docs/routing.md#choosing-a-role) for role selection and [Profiles](docs/profiles.md) for settings.
 _Avoid_: agent type, tool, persona
 
 **Run**:
-One piece of work a child does for the host, from the host's call to the child's report or failure. Continuing a run adds a turn to the same child session.
-_Avoid_: job, task, call
+One piece of work from delegation to report or failure. Continuing a handle adds a turn to the recorded child session, through a new backend invocation.
+_Avoid_: job, task, call (as synonyms for run)
 
 **Handle**:
-The short name the host uses to refer to a run, such as `run-3`.
+The short name used to refer to a run, such as `run-3`. It is not the child's session identity.
 _Avoid_: session id, run id, ticket
 
 **Background run**:
-A run that goes on after the host's tool call returns, so the host can keep talking with the user.
+A run that goes on after the host's delegation call returns, so the host can keep talking with the user.
 _Avoid_: async run, detached run
 
 **Question**:
-A request for a decision that a child sends to the host while it works.
+A request for a small decision a child sends while it works. It is not an escalation that ends the run. See [Questions](docs/questions.md) for waiting, answering, and backend-specific limits.
 _Avoid_: escalation, prompt, elicitation
 
 **Waiting**:
-The state of a run whose child has an open question and does no work until it gets an answer.
+The state of a run with an open question; its child waits for an answer and retains the active file-changing slot when applicable.
 _Avoid_: blocked, paused, suspended
 
 **Answer**:
-The reply a question gets, from the host through `claude_control message` or from the user through `/fusion answer`. A question takes one answer; whoever is second is told who answered first.
-_Avoid_: reply, response, decision
+The text supplied to a question through a control tool's `message` action or `/fusion answer`. Exactly one answer wins; a later attempt is told who answered first.
+_Avoid_: reply, response, decision (as synonyms for answer)
 
 **Handoff**:
-A `plan` call that starts a fresh run, carrying the replaced run's last report, rather than continue a plan run whose context has passed its cap. A `continue` call names its run and is warned instead, never handed off.
+An implicit `plan` continuation replaced by a fresh run on the same backend because of the context cap or an explicitly changed model. It carries the last agreed report, not the old transcript. Explicit `continue` is never handed off. See [The context cap](docs/runs.md#the-context-cap) for selection and warnings.
 _Avoid_: rollover, compaction, reset
 
 **Escalation**:
-The part of an `implement` report that says the task needs a wider scope or a design decision. The run ends; it does not wait.
+The part of an `implement` report saying the task needs wider scope or an unresolved design decision. The run ends rather than waiting or widening its brief.
 _Avoid_: question, blocker
 
 **Steer**:
-A message from the host to a running child when the child has no open question. The child reads it at its next model turn.
+Text sent to a running child with no open question. Acceptance for delivery does not prove model consumption or action; a late steer can remain unread. Ordinary editor text targets the host. See [Background controls](docs/runs.md#background-runs) for delivery, refusal, and queue rules.
 _Avoid_: interrupt, nudge, follow-up
 
 **Review run**:
-A background `ask` run that reviews the working-tree change of an ended `implement` or `ultracode` run. The user starts one with `/fusion review`, or the extension starts it with `PI_FUSION_AUTO_REVIEW`. It gets its own handle and links to the run it reviews.
+A fresh background `ask` run in review mode, linked to the ended `implement`, `ultracode`, or `security` run it reviews. It uses this session's configured **ask** backend, model, and effort, inheriting nothing from the reviewed run. `/fusion review` starts one manually; `PI_FUSION_AUTO_REVIEW` can start one automatically. See [Independent reviews](docs/reviews.md).
 _Avoid_: self-review, verification, QA run
 
 **History**:
-The opt-in on-disk record of a Pi session's runs that a later Pi process on the same session reads: the earlier processes' runs, what they spent and their dashboard entries.
+The opt-in disk record of a durable host Pi session's runs, used by later processes for reports, usage, and dashboard restoration. Continuation authority remains the custom entries on the host's current branch.
 _Avoid_: log, cache, transcript

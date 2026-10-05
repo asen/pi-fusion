@@ -1,18 +1,106 @@
 # Questions a child asks
 
+A child uses `ask_orchestrator(question)` for a small decision missing from its brief. The call stays open, retaining context, until an answer arrives. On Codex, tool availability depends on how the thread was started ([below](#on-codex)). Wider scope or an unresolved design decision belongs in an implementer's **Escalation** report, which ends the run.
 
-Every child gets an in-process MCP tool, `ask_orchestrator(question)`, which the extension serves through the SDK's `createSdkMcpServer`. The child calls it when a small decision inside its task blocks it, such as a name or a choice between options the brief leaves open. The tool call stays open until the host answers, so the child keeps its context and any running workflow. The contracts keep a wider scope or an open design decision out of it: the `implement` child still reports those under Escalation and ends the run, and an `ask` child asks only when the question it got is unclear.
+```text
+child asks -> run waiting -> host or user supplies one answer
+                               |
+                     child sees tool result and continues
 
-While a question is open the run is `waiting`. A foreground `claude` call returns at once with the handle and the question, and the run goes on as a background run. A background run sends the host a `pi-fusion-run` message with the question, the same way it reports its end, unless a `claude_control wait` is blocked on it, which then returns the question. The host answers with `claude_control message`, after it asks the user when the decision is theirs, and the answer is the tool result the child sees. A waiting run counts as active: no other run that can change files starts until it ends. When a child has several questions open, the host answers them in order, and the reply to each answer carries the next question.
+cancellation / fatal Pi dialog failure -> child stopped, run ends
+```
 
-The user can answer without going through the host. `/fusion answer run-3 <text>` sends the text to that run's child. `/fusion answer run-3` with no text opens an editor titled with the question; an empty answer sends nothing and leaves the run waiting. Without a handle the command answers the one run that waits, and asks for a handle when several do.
+## Waiting and answering
 
-Each question is answered exactly once. A question carries an id, and whoever gets there first answers it: the second attempt sends nothing and says who answered, the host or the user, and with what. A user answer that lands while the host is still composing its `claude_control message` makes that message return `The user already answered run-3's question with: ...` instead of reaching the child as a steer; the host can send it again, and then it goes as a steer, or as the answer if the child has asked another question by then. `claude_control status` and `claude_control wait` both report it as `answered by the user: <text>`, under the status, the question or the report they carry, and the run drops it as soon as its child asks the next question.
+A foreground delegation returns early with the handle/question and becomes background work. A background run announces its question unless a host control `wait` is collecting it; that wait returns the question instead. Waiting still occupies the file-changing slot when the role has one, so another coding run cannot start beside it.
 
-The host is told about a user answer through a message with `triggerTurn: false` and `deliverAs: "followUp"`, which starts no turn and arrives with the host's next one. When the answer uncovers a question the child had queued behind it, that question is announced to the host as any other question is, because the answer message on its own starts no turn.
+The host uses a control `message` action, asking you first when the decision is yours. Generated hints use `fusion_control` for a `fusion` delegation or `claude_control` for `claude`; either control can answer every run. Further queued questions are answered in order, and an answer reply can carry the next question.
 
-The server sets `timeout: 2147483647` ms (about 24.8 days), the largest MCP tool timeout Claude Code accepts, because that timeout is a hard wall-clock limit and a question has no time limit. The roles with a fixed tool list keep `--strict-mcp-config`, so their only MCP server is this one; `ultracode` gets it next to the user's servers. `allowedTools` names `mcp__pi-fusion__ask_orchestrator`, so a permission mode other than `bypassPermissions` still lets the child call it.
+You can answer directly:
 
-`ultracode` also has Claude Code's own `AskUserQuestion`. A `PreToolUse` hook, not `canUseTool`, sends its questions down the same path: the children run with `permissionPrompts: "none"`, and with that setting the SDK never calls `canUseTool`. The hook joins the questions and their options into one question, numbered when there are several, and waits for the host's answer. It then allows the call with `updatedInput` set to the original input plus `answers`, a map from each question's text to its answer. When the answer has one line per question, each line answers its question; otherwise every question gets the whole answer. The hook matcher sets `timeout: 2147483` s, because a callback hook otherwise times out after 10 minutes.
+```text
+/fusion answer run-3 Use the existing public name
+/fusion answer run-3
+/fusion answer
+```
 
-The timeout values come from reading the Claude Code 2.1.273 binary, not from a run against it. The tests drive both paths through the fake binary, which sends the same control requests Claude Code sends.
+No text opens an editor titled with the question. An empty user-editor answer sends nothing and leaves the run waiting. No handle chooses the sole waiting run; when several wait, supply one.
+
+A user answer notifies the host as a follow-up **without starting a turn**. The host reads it with its next response. A newly exposed queued question is still announced separately so that the answer notification cannot hide it.
+
+## Exactly one answer wins
+
+Each question has an id. Whoever answers first wins; the second attempt sends nothing and names who answered and what they supplied.
+
+If your answer lands while the host is composing a control `message`, that message returns `The user already answered run-3's question with: ...` rather than accidentally steering the child. The host may explicitly resend if still appropriate; it then becomes a steer, or an answer if another question is now open. There is no automatic resend.
+
+Control `status` and `wait` report `answered by the user: <text>` until the child asks its next question. Ordinary editor instructions go to the host, not directly to the waiting child. Use `/fusion answer` for an answer and `/fusion steer` for a running child with no open question.
+
+## On Claude Code
+
+The question tool is an in-process MCP server served by the Agent SDK. Fixed-tool roles keep strict MCP configuration with only this server; ultracode gets it beside the user's servers. Its name is allowed even outside `bypassPermissions`.
+
+Ultracode's native `AskUserQuestion` also follows this flow through a `PreToolUse` hook. With unattended `permissionPrompts: "none"`, the SDK does not call `canUseTool`, so that is not the bridge. The hook joins questions/options into one numbered request, then supplies the original input with an answer map. One answer line per question maps separately; otherwise all questions receive the whole answer.
+
+The MCP tool timeout is `2147483647` ms and hook timeout `2147483` seconds, about 24.8 days; these avoid ordinary short timeouts, not a literally infinite wall-clock limit. The hook otherwise defaults to ten minutes. These limits were read from Claude Code 2.1.273, not measured against its real binary; deterministic tests drive the control requests through the fake binary.
+
+## On the pi backend
+
+Pi's tool opens one blocking `ctx.ui.input` dialog with its call signal and no timeout, routed to the same host question flow. Text, including an empty string returned by an internal callback, is an answer; a dialog returning no answer fails the tool call.
+
+Native UI requests contain no extension-origin identity. While questions are enabled, every eligible blocking input dialog inside the child is routed this way; Fusion cannot distinguish its own tool from other trusted code opening the same dialog shape. Unsupported methods, active timeouts, invalid/duplicate requests, and closed routing are refused rather than guessed at. All shipped delegated Pi runs have questions enabled; internal callers without a callback do not.
+
+A Pi dialog outcome other than an admitted answer is fatal: the run stops its child and reports fixed wording with the dialog end/admission, not the question, answer, or foreign error. A cancelled run remains cancellation—cancellation outranks a simultaneous fatal question—and the recorded dialog outcome remains evidence beside it.
+
+Manual Linux cases have measured an answered native question with a steer admitted while held, and a question held into cancellation, using a scripted loopback model. They do not qualify real providers or every version/platform. See [Pi backend evidence](pi-backend.md#evidence-and-limits); the default suite's routing doubles prove host arbitration, not native dialogs.
+
+## On Codex
+
+**Experimental.** Shapes come from Codex 0.160.0 source. Native questions were measured for `ask` only ([G3](codex-backend.md#g3-cases)); `plan`/`implement` questions, the continued-questions fallback and host answer races remain fake-tested.
+
+Sources: [`codex.ts`](../extensions/backends/codex.ts), [`codex-transport.ts`](../extensions/backends/codex-transport.ts), and the two `contracts/codex-*questions.md` addenda.
+
+```text
+delegated run -> question callback (no separate setting)
+  -> initialize: capabilities.experimentalApi = true
+     WHOLE connection opts in, not just the question tool
+  -> fresh thread: register ask_orchestrator
+  -> resume/fork: register nothing; Codex restores original tools
+
+thread started without tool -> still has no tool; never upgraded
+```
+
+Running a role on Codex opts into that experimental connection shape. The fresh thread's only dynamic tool has the shared question description and one required string `question`. Stable resume/fork requests cannot add it to an older thread; G3 observed restoration on one resume and one fork.
+
+| Run | Developer instructions | Tool availability |
+| --- | --- | --- |
+| Fresh, with callback | Role contract | Register `ask_orchestrator` |
+| Continued, with callback | Role contract + `codex-continued-questions.md` | Only if originally registered |
+| No callback (internal only) | Role contract + `codex-no-questions.md` | No registration or experimental opt-in; restored calls get a fixed refusal |
+
+Both fallbacks say to stop rather than ask in output or proceed as if answered when no tool is available. Report the question, options and recommendation in:
+
+| Role/mode | Report section |
+| --- | --- |
+| `implement` | **Escalation** |
+| `plan`, `ask` answer | **Open questions** |
+| `ask` review | **Notes** |
+
+Continuation authority is unchanged; adding a callback upgrades no record or thread. If a tool-less thread needs a question, start a new run without `continue`, carrying its report (`plan` needs `fresh: true`).
+
+```text
+item/tool/call: ask_orchestrator, no namespace, non-empty question
+  +-- before turn/start answer -> hold until admitted turn is named
+  +-- own live turn            -> host question queue (off read loop)
+  |                               -> one answer as one text tool result
+  +-- foreign/ended turn       -> success: false; run may continue
+  +-- namespace/empty question -> success: false; run may continue
+
+other tool / unsupported server request -> run fails
+```
+
+Several questions use the ordinary host queue. Notifications and turn completion continue to be read while answers wait; each call receives one result. A subagent's question is foreign and refused, not forwarded.
+
+Cancellation aborts the question's signal. Owned shutdown sends one failed tool reply ahead of the turn interrupt; a turn ending with a question open also closes it with a failed reply. This is the code order, not a natively measured ordering/acknowledgement guarantee ([Q16](codex-backend.md#g3-cases)). No lost answer is resent, no question retried, and the backend keeps/logs no answer text.
+
+A control `message` while waiting is the answer. With no question open it is a [Codex steer](codex-backend.md#steers): one attempt to the admitted turn, with delivery not proof of consumption.

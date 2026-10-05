@@ -7,6 +7,9 @@ import { fileURLToPath } from "node:url";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import fusion, { nextSession, runRecords } from "../extensions/fusion.ts";
 import { planContextPct, planProblems } from "../extensions/handoff.ts";
+import { memoryProfileStore } from "../extensions/profile-store.ts";
+import { tripwires } from "./tripwire.ts";
+import { toolList, turnOn } from "./host-tools.ts";
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 process.env.PI_FUSION_CLAUDE_BIN = path.join(repoRoot, "test", "fake-claude.mjs");
@@ -37,7 +40,9 @@ interface Extension {
 
 function makeExtension(): Extension {
 	const ext: Extension = { tools: new Map(), commands: new Map(), handlers: new Map(), appended: [] };
+	const { activeTools: _active, ...toolAccess } = toolList(() => ext.tools.keys());
 	const api = {
+		...toolAccess,
 		registerTool: (tool: Tool) => {
 			ext.tools.set(tool.name, tool);
 		},
@@ -52,7 +57,9 @@ function makeExtension(): Extension {
 		},
 		registerMessageRenderer: () => {},
 	} as unknown as ExtensionAPI;
-	fusion(api);
+	// Nothing here runs a pi or codex child, so the tripwires stand where those backends would be registered.
+	fusion(api, { backends: { ...tripwires() }, profiles: memoryProfileStore() });
+	void turnOn(ext.tools.get("fusion_activate"));
 	return ext;
 }
 
@@ -105,12 +112,22 @@ function entry(data: Record<string, unknown>) {
 	return { type: "custom", customType: "pi-fusion", data };
 }
 
+/** The model and effort each Claude role runs on by default, which every run this build writes records. */
+const DEFAULTS: Record<string, { model: string; effort: string }> = {
+	plan: { model: "fable", effort: "xhigh" },
+	implement: { model: "opus", effort: "high" },
+	ultracode: { model: "fable", effort: "ultracode" },
+	ask: { model: "opus", effort: "high" },
+};
+
 const recorded = (run: string, role: string, sessionId: string | undefined, hostSessionId: string, checkpoint?: string) => ({
 	run,
 	role,
+	backend: "claude",
 	hostSessionId,
 	...(sessionId ? { sessionId } : {}),
 	...(checkpoint ? { checkpoint } : {}),
+	...DEFAULTS[role],
 });
 
 const legacy = (generation: number, sessionId: string, hostSessionId: string, checkpoint?: string) => ({
@@ -368,7 +385,7 @@ test("continue rejects an unknown handle, another role, fresh, and a parameter t
 });
 
 test("runRecords keeps the last entry per handle, the last plan run and the highest handle", () => {
-	assert.deepEqual(runRecords([]), { runs: new Map(), highest: 0 });
+	assert.deepEqual(runRecords([]), { runs: new Map(), lastPlan: new Map(), highest: 0 });
 	const records = runRecords([
 		{ type: "message" },
 		entry(legacy(0, "s-0", "h-1", "c-0")),
@@ -380,11 +397,11 @@ test("runRecords keeps the last entry per handle, the last plan run and the high
 		{ type: "custom", customType: "other", data: recorded("run-9", "plan", "s-9", "h-1") },
 	]);
 	assert.equal(records.highest, 4);
-	assert.equal(records.lastPlan, "run-2");
+	assert.deepEqual([...records.lastPlan], [["claude", "run-2"]]);
 	assert.deepEqual([...records.runs.values()], [
-		{ handle: "run-1", role: "plan", sessionId: "s-0", hostSessionId: "h-1", checkpoint: "c-0" },
-		{ handle: "run-4", role: "implement", sessionId: "s-4", hostSessionId: "h-1", checkpoint: "c-5" },
-		{ handle: "run-2", role: "plan", sessionId: "s-2", hostSessionId: "h-1" },
+		{ handle: "run-1", role: "plan", backend: "claude", sessionId: "s-0", hostSessionId: "h-1", checkpoint: "c-0", session: { backend: "claude", sessionId: "s-0", checkpoint: "c-0" } },
+		{ handle: "run-4", role: "implement", backend: "claude", sessionId: "s-4", hostSessionId: "h-1", checkpoint: "c-5", model: "opus", effort: "high", session: { backend: "claude", sessionId: "s-4", checkpoint: "c-5" } },
+		{ handle: "run-2", role: "plan", backend: "claude", sessionId: "s-2", hostSessionId: "h-1", model: "fable", effort: "xhigh", session: { backend: "claude", sessionId: "s-2" } },
 	]);
 });
 
@@ -463,10 +480,31 @@ test("a plan call's model is recorded, and a later plan call that names none con
 	assert.equal(valueOf(same.argv, "--resume"), data.sessionId);
 });
 
-test("a run on the role's default model records no model", async () => {
+test("a run on the role's default model and effort records both, so a later default cannot move it", async () => {
 	const ext = makeExtension();
 	await invoke(ext, { role: "plan", task: "the goal" }, makeCtx({}));
-	assert.equal((ext.appended[0] as [string, Record<string, unknown>])[1].model, undefined);
+	const [, data] = ext.appended[0] as [string, Record<string, unknown>];
+	assert.deepEqual([data.model, data.effort], ["fable", "xhigh"]);
+	await invoke(ext, { role: "implement", task: "the change", effort: "low" }, makeCtx({}));
+	const [, implement] = ext.appended[1] as [string, Record<string, unknown>];
+	assert.deepEqual([implement.model, implement.effort], ["opus", "low"], "an effort the call named is what the run keeps");
+	// A continuation keeps the recorded effort rather than falling back to the role's default.
+	const again = await invoke(makeExtension(), { continue: "run-2", task: "more" }, makeCtx({ branch: [entry(implement)] }));
+	assert.equal(valueOf(again.argv, "--effort"), "low");
+	assert.equal(valueOf(again.argv, "--model"), "opus");
+});
+
+test("a claude entry from before settings were kept continues on the defaults this Pi process started with, and says so", async () => {
+	const old = { run: "run-1", role: "implement", backend: "claude", hostSessionId: "host-1", sessionId: S1, checkpoint: "ckpt-1" };
+	const { argv, text } = await invoke(makeExtension(), { continue: "run-1", task: "more" }, makeCtx({ branch: [entry(old)] }));
+	assert.equal(valueOf(argv, "--model"), "opus");
+	assert.equal(valueOf(argv, "--effort"), "high");
+	assert.match(text ?? "", /^run-1 was recorded before its settings were kept, so it runs on the default this Pi process started with: model \(opus\), effort \(high\)/);
+	// An old entry that kept a chosen model is short of its effort alone, and a call that names the effort needs no stand-in.
+	const chosen = await invoke(makeExtension(), { continue: "run-1", task: "more", effort: "max" }, makeCtx({ branch: [entry({ ...old, model: "sonnet" })] }));
+	assert.equal(valueOf(chosen.argv, "--model"), "sonnet");
+	assert.equal(valueOf(chosen.argv, "--effort"), "max");
+	assert.doesNotMatch(chosen.text ?? "", /was recorded before/);
 });
 
 test("a plan call that names another model starts a fresh run that carries the last report", async () => {

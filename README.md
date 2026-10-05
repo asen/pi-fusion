@@ -1,80 +1,109 @@
 # pi-fusion
 
-A [Pi](https://pi.dev) extension that gives the host model two tools: `claude`, which hands a job to a headless Claude Code session, and `claude_control`, which manages the sessions that run in the background. One model orchestrates, others do the thinking and the work.
+A [Pi](https://pi.dev) extension for handing work to headless Claude Code, Pi, or (experimental) Codex sessions. The **host** talks with you; a **child** plans, implements, answers, or reviews a bounded task.
 
-## Roles
+Fusion starts **off**. Type `/fusion on`, or ask “use Fusion to implement this.” It stays on until `/fusion off`, an explicit request to turn it off, or the extension reloads. Turning it on starts no child. After natural-language activation, one reminder tells you that Fusion remains on; finishing a task does not turn it off.
 
-The `role` parameter of `claude` picks the job.
-
-| Role | Model and effort | Tools given to the child | Purpose |
-| --- | --- | --- | --- |
-| `plan` | `fable` (the host picks `opus` for bounded design), xhigh | Read, Bash, Edit, Write, Grep, Glob | Challenge a plan and return an agreed, numbered task list. |
-| `implement` | `opus`, high | Read, Bash, Edit, Write, Grep, Glob | Implement one clear, bounded task. |
-| `ultracode` | `fable`, ultracode | Claude Code's own, plus Workflow, Agent and the user's MCP servers | Complex, uncertain or high-risk work, or a whole agreed plan. The host uses it only when you ask for it. |
-| `ask` | `opus`, high | Read, Bash, Grep, Glob, WebSearch, WebFetch | Answer a question about the code, or review a change with `mode: "review"`. Changes no files. |
-
-## Parameters
-
-`role` and `task` carry the job; the rest are optional.
-
-| Parameter | Applies to | Meaning |
-| --- | --- | --- |
-| `role` | all | Required unless `continue` is set. |
-| `task` | all | The brief, or the follow-up message for a continued run. |
-| `context` | all | Appended to the task under `## Context`. |
-| `continue` | all | A run's handle. Sends the task to that run as a follow-up. |
-| `background` | all | `true` returns the handle at once and lets the run go on. |
-| `fresh` | `plan` | Start a new plan run. Not allowed with `continue`. |
-| `mode` | `ask` | `answer` (default) sends `contracts/ask-answer.md`, `review` sends `contracts/ask-review.md`. |
-| `model` | `plan`, `implement`, `ask` | Replaces the role's model. The run keeps it for later calls that name no model. |
-| `effort` | `plan`, `implement`, `ask` | `low`, `medium`, `high`, `xhigh` or `max`. |
-
-`ultracode` takes neither `model` nor `effort`, because any other effort turns its workflows off. A parameter the role does not take fails the call before a child starts, with an error such as `effort is not allowed for role ultracode`. Both tools are registered `executionMode: "sequential"`, so their calls run one at a time: Pi runs every tool call in a turn sequentially as soon as one of them is sequential.
-
-## How a child runs
-
-Every child is a headless Claude Code session in the host's working directory, started through the [Claude Agent SDK](https://code.claude.com/docs/en/agent-sdk/overview). The SDK bundles its own Claude Code binary, so nothing has to be on `PATH`. The child uses the Claude Code login on this machine and that subscription, loads the user's settings, plugins and the project's CLAUDE.md, and leaves a normal session behind, so `claude --resume <session id>` opens any child's transcript. Each tool result ends with a stats line naming the handle, the role, the model and that command.
-
-`plan`, `implement` and `ask` children get the tools listed above plus `ask_orchestrator`, and no other MCP servers whatever the configuration says. An `ultracode` child is a full Claude Code session. The role contracts under `contracts/` are appended to the system prompt. The `ask` child has no Edit or Write, and its contract forbids changing files through Bash; that is an instruction to the model, not enforcement.
-
-While a child runs, the status line shows `<handle> <role> · <seconds> · <n> tool calls · <activity>` for each active run. Esc aborts a foreground call: the extension sends SIGTERM to the child's process group and every descendant, then SIGKILL 5 s later, so a Bash command the child started dies with it.
-
-## Routing
-
-The host model is the orchestrator. Its guidelines ask one question: is the design unresolved. The host sends all implementation to `implement` and uses `ultracode` only when you ask for it. That leaves three routes: straight to `implement`; `plan` first, then `implement` task by task; or `ultracode`, with or without `plan`, on your request.
-
-Your explicit choice wins. Ask for Opus and the host uses `implement`, ask for Fable or ultracode and it uses `ultracode`, and ask for or skip planning as you like. For an independent review, the host calls `ask` with `mode: "review"`. See [Routing](docs/routing.md).
-
-## Requirements
-
-- Pi 0.85.1 or newer.
-- `npm install` in this directory. It installs `@anthropic-ai/claude-agent-sdk` and the Claude Code binary for this platform, about 200 MB. The pinned SDK bundles Claude Code 2.1.273.
-- Claude Code logged in on this machine to a Max, Team or Enterprise plan, for Fable and 1M-context Opus.
-- ChatGPT subscription login in Pi for `openai-codex/gpt-6-astra`.
-
-Anthropic's [help center](https://support.claude.com/en/articles/15036540-use-the-claude-agent-sdk-with-your-claude-plan) says the Agent SDK draws from the subscription's usage limits. Every child counts against them.
-
-## Install
+## Install and quick start
 
 ```bash
+cd /path/to/pi-fusion
 npm install
-pi install ~/eng/pi-fusion
-pi --model openai-codex/gpt-6-astra --thinking high
+pi install /path/to/pi-fusion
+cd /path/to/your-project
+pi
 ```
 
-Pi activates every extension tool at startup, so `claude` and `claude_control` sit next to Pi's built-ins. To pin the list down, pass `--tools read,grep,find,ls,bash,claude,claude_control`. `--tools` is a strict allowlist: leaving `claude` out leaves the host with no delegation, and leaving `claude_control` out leaves background runs unmanaged.
+Use whichever host model you normally use in Pi; Fusion does not require a particular host model or provider.
 
-The guidelines tell the host to delegate every implementation task and not to edit files itself. That is an instruction, not enforcement: the host still has bash. To enforce it, drop bash from the tool list. The cost is that the host can no longer run git itself.
+In Pi:
+
+```text
+/fusion on
+Use Fusion to implement the agreed change and verify it. Do not commit.
+/fusion status
+/fusion dashboard
+/fusion off
+```
+
+Off is refused while a run is running, waiting for an answer, or finishing its record/report. Wait or cancel it, then retry.
+
+### Requirements
+
+- Pi with the required extension/public SDK APIs. Tests pin 1.0.2; [manual qualification](docs/pi-backend.md#evidence-and-limits) covers 0.85.1 and 1.0.1 only. Incompatible child APIs refuse startup.
+- `npm install` installs the Claude Agent SDK and its bundled Claude Code binary (about 200 MB). A separate `claude` executable on `PATH` is not required.
+- For Claude children, Claude Code authentication on this machine and access to the configured models. Children use that account's capacity; the SDK's dollar estimate is not a subscription charge. See Anthropic's [subscription guidance](https://support.claude.com/en/articles/15036540-use-the-claude-agent-sdk-with-your-claude-plan).
+- For Pi children, an importable npm installation of Pi, `node` on `PATH`, and a configured/authenticated provider and model. A compiled Pi binary cannot supply the package a child imports. See [Pi backend requirements and limits](docs/pi-backend.md).
+- For Codex children (optional, experimental), an installed `codex` with its own login/configuration. Located only at run start via `PATH` or absolute `PI_FUSION_CODEX_BIN`; Fusion installs/authenticates nothing and adds no dependency. Missing Codex does not prevent extension load; Windows runs refuse. See [inherited install](docs/codex-backend.md#inheritance-not-isolation) and [qualification limits](docs/codex-backend.md#evidence).
+
+## Roles and backends
+
+Claude and Pi are registered, with an experimental Codex backend beside them. Profiles select the backend, model, effort, and enabled setting of each role.
+
+| Role | Purpose | Supported backends | Built-in setting |
+| --- | --- | --- | --- |
+| `plan` | Challenge a design and agree numbered tasks with acceptance criteria | Claude, Pi, Codex | Claude `fable`, `xhigh` |
+| `implement` | Implement and verify one clear, bounded task | Claude, Pi, Codex | Claude `opus`, `high` |
+| `ultracode` | Use Claude workflows to implement, verify, and self-review larger work, only when requested | Claude only | Claude `fable`, fixed `ultracode` effort |
+| `ask` | Answer a code question, or independently review with `mode: "review"` | Claude, Pi, Codex | Claude `opus`, `high` |
+| `security` | Investigate a scoped security concern; fix application code only when the task authorizes it | Pi only | **Disabled**, no model default |
+
+Enable `security` through `/fusion config` or a saved profile. Setting its model does not enable it, and even when enabled the host uses it only for an explicit security investigation, audit, or fix request.
+
+Pi roles have no model default. For example, the host can call `fusion` with:
+
+```json
+{ "role": "implement", "task": "Implement and test the agreed change", "backend": "pi", "model": "deepseek/deepseek-chat" }
+```
+
+Alternatively, configure that role through `/fusion config` or `PI_FUSION_PI_IMPLEMENT_MODEL`. A profile can route fresh runs to Pi without a `backend` parameter. Continuations stay on their recorded backend and selection unless a permitted model/effort override is supplied. Nothing falls back to Claude when a Pi call fails.
+
+Codex is **experimental** and opt-in: name `backend: "codex"` or configure a role there; builtin routes nothing to it. Model and effort may be omitted to use your own Codex defaults. Children inherit your Codex home, configuration, and login, and delegated connections opt into its experimental question API. Cost is unknown and excluded from the dollar estimate. See [Codex behavior and qualification limits](docs/codex-backend.md).
+
+The host's routing guidance is: plan when the design is unresolved, implement bounded tasks in dependency order, and use `ultracode` only when you ask. [Role settings](docs/profiles.md) can disable any role. The [contracts](contracts/) define each child's behavior; these instructions are not a sandbox or permission boundary.
+
+## Tools and controls
+
+- `fusion` delegates; `fusion_control` manages background runs through `status`, `wait`, `message`, and `cancel`.
+- `claude` is the compatibility delegation tool, forced to Claude Code. `claude_control` is the same control executor under its older name. Either control manages every run; Pi continuations and Codex runs require `fusion`.
+- `fusion_activate` and `fusion_deactivate` switch mode and start no child. Only the tool that leaves the current mode is active.
+
+Generated hints follow the tool pair called. The user commands always remain `/fusion ...`:
+
+```text
+/fusion status run-3
+/fusion answer run-3 Use the existing public name
+/fusion steer run-3 Also check the migration test
+/fusion wait run-3
+/fusion cancel run-3
+/fusion review run-3
+```
+
+Ordinary editor text goes to the host, not automatically to a child. A steer accepted for delivery is not proof that the child's model consumed or acted on it. Only one file-changing run can be active across all backends; `ask` runs can run beside it.
+
+To use a strict Pi tool allow list, include the delegation/control pair and both mode tools, for example:
+
+```bash
+pi --tools read,grep,find,ls,bash,fusion,fusion_control,fusion_activate,fusion_deactivate
+```
+
+Fusion never bypasses that list. Omitting the mode tools leaves `/fusion on` and `/fusion off` available, but prevents switching by natural-language tool calls. Add `claude,claude_control` if you want the compatibility pair too.
+
+While on, the host is instructed to delegate implementation and not edit files itself. That is guidance: its shell tool can still write files. Removing that tool also removes the host's ability to run Git. Cancellation does not undo changes, and descendant cleanup is bounded best effort, not process isolation.
 
 ## Documentation
 
-- [Runs, handles and background work](docs/runs.md) — handles, `continue`, resumes and forks, the context cap, `claude_control`, and runs an earlier Pi process left behind.
-- [Questions](docs/questions.md) — how a child asks the host or the user for a decision and waits for the answer.
-- [The /fusion command and the terminal UI](docs/fusion-command.md) — the user's own controls, the run cards and the widget.
-- [Independent reviews](docs/reviews.md) — `/fusion review` and `PI_FUSION_AUTO_REVIEW`.
-- [Monitoring dashboard](docs/dashboard.md) — the local read-only web page.
-- [The ultracode role](docs/ultracode.md) — what the workflow opt-in does and what it costs.
-- [Configuration](docs/configuration.md) — every environment variable, and the session cost estimate with its warnings and limit.
-- [Development](docs/development.md) — the test suite and the fake Claude Code binary.
+- [Routing](docs/routing.md): planning, implementation, escalation, and explicit opt-ins.
+- [Runs and tool parameters](docs/runs.md): handles, continuation, forks, background controls, cancellation, and history.
+- [Questions](docs/questions.md): the child's waiting state and exactly-one-answer flow.
+- [User commands and terminal UI](docs/fusion-command.md): activation, reminders, cards, and the widget.
+- [Profiles and role settings](docs/profiles.md): configure roles and save named profiles.
+- [Configuration](docs/configuration.md): environment variables and the session budget.
+- [Independent reviews](docs/reviews.md): manual and automatic `ask` review runs.
+- [Ultracode](docs/ultracode.md): Claude workflows, permission modes, and cost.
+- [Dashboard](docs/dashboard.md): local, read-only monitoring and sensitive-output limits.
+- [Pi backend](docs/pi-backend.md): architecture, storage, runtime checks, and qualification limits.
+- [Codex backend](docs/codex-backend.md): inherited install, lifecycle, continuation, steers, and recorded qualification limits.
+- [Development](docs/development.md): module map, deterministic tests, and manual harness commands.
 
-The role contracts are the Markdown files under `contracts/`. Edit them to change how a role behaves.
+Change role behavior in `contracts/*.md`. Children are instructed not to commit; the host commits only when you ask.

@@ -4,7 +4,7 @@
   "private": true,
   "license": "MIT",
   "type": "module",
-  "description": "Pi extension: Astra orchestrates through one claude tool; Fable plans, Opus implements and answers, and Fable runs ultracode.",
+  "description": "Pi extension for delegating planning, implementation, questions and reviews to headless Claude Code, Pi or (experimental) Codex sessions.",
   "keywords": [
     "pi-package"
   ],
@@ -14,7 +14,7 @@
     ]
   },
   "scripts": {
-    "test": "node --test \"test/*.test.ts\"",
+    "test": "node --test --test-timeout=60000 \"test/*.test.ts\"",
     "typecheck": "tsc -p ."
   },
   "peerDependencies": {
@@ -23,10 +23,10 @@
     "typebox": "*"
   },
   "devDependencies": {
-    "@earendil-works/pi-coding-agent": "0.85.1",
-    "@earendil-works/pi-tui": "0.85.1",
+    "@earendil-works/pi-coding-agent": "1.0.2",
+    "@earendil-works/pi-tui": "1.0.2",
     "@types/node": "^24",
-    "typebox": "1.3.7",
+    "typebox": "1.3.27",
     "typescript": "^5"
   },
   "dependencies": {

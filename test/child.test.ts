@@ -294,6 +294,17 @@ test("child killed by signal reports the signal", async () => {
 	assert.match(failureMessage(child), /SIGKILL/);
 });
 
+test("a null exit code reports failure without guessing whether the child started", async () => {
+	const child = await run("ok", { role: implementRole });
+	for (const detail of ["failed to spawn", "readiness timed out", "the pi child could not be stopped after its turn"]) {
+		assert.equal(failureMessage({ ...child, exitCode: null, errorMessage: detail }), `implement failed: ${detail}`);
+	}
+	assert.equal(failureMessage({ ...child, exitCode: null, errorMessage: "", stderr: "", text: "" }), "implement failed");
+	assert.equal(failureMessage({ ...child, exitCode: 7, errorMessage: "exit detail" }), "implement exited 7: exit detail");
+	assert.equal(failureMessage({ ...child, exitCode: null, signal: "SIGTERM", errorMessage: "signal detail" }), "implement killed by SIGTERM: signal detail");
+	assert.equal(failureMessage({ ...child, exitCode: null, aborted: true, activity: "reading" }), "implement aborted while reading");
+});
+
 test("a missing executable reports the spawn failure", async () => {
 	const saved = process.env.PI_FUSION_CLAUDE_BIN;
 	try {
@@ -302,7 +313,7 @@ test("a missing executable reports the spawn failure", async () => {
 		assert.equal(failed(child), true);
 		assert.equal(child.exitCode, null);
 		const message = failureMessage(child);
-		assert.match(message, /did not start/);
+		assert.match(message, /^ultracode failed:/);
 		assert.match(message, /nonexistent/);
 	} finally {
 		process.env.PI_FUSION_CLAUDE_BIN = saved;

@@ -76,14 +76,16 @@ test("the prompt lists at most 500 changed paths and counts the rest", () => {
 	assert.ok(reviewPrompt(source({ files: files.slice(0, 500) })).endsWith("M src/file-499.ts"), "a list at the cap counts nothing more");
 });
 
-test("reviewable takes an implement or ultracode run that ended with changed files and names why it takes no other", () => {
+test("reviewable takes an implement, ultracode or security run that ended with changed files and names why it takes no other", () => {
 	const files = [{ path: "a.ts", status: "M" }];
 	assert.equal(reviewable({ state: "done", role: "implement", files }), undefined);
 	assert.equal(reviewable({ state: "failed", role: "ultracode", files }), undefined);
+	assert.equal(reviewable({ state: "done", role: "security", files }), undefined, "a security run is reviewed like the other roles that change files");
 	assert.equal(reviewable({ state: "running", role: "implement", files }), "is still active; review it when it has ended");
 	assert.equal(reviewable({ state: "waiting", role: "implement", files }), "is still active; review it when it has ended");
-	assert.equal(reviewable({ state: "done", role: "ask", files }), "is an ask run; only implement and ultracode runs are reviewed");
-	assert.equal(reviewable({ state: "done", role: "plan", files }), "is a plan run; only implement and ultracode runs are reviewed");
+	assert.equal(reviewable({ state: "done", role: "ask", files }), "is an ask run; only implement, ultracode and security runs are reviewed");
+	assert.equal(reviewable({ state: "done", role: "plan", files }), "is a plan run; only implement, ultracode and security runs are reviewed");
+	assert.equal(reviewable({ state: "done", role: "security", files: [] }), "changed no files", "and an investigation that changed nothing is reviewed like any other run that did not");
 	assert.equal(reviewable({ state: "cancelled", role: "implement", files }), "ended cancelled without a report to review");
 	assert.equal(reviewable({ state: "aborted", role: "implement", files }), "ended aborted without a report to review");
 	assert.equal(reviewable({ state: "done", role: "implement", files: [] }), "changed no files");

@@ -1,4 +1,5 @@
 import { capBytes } from "./dashboard.ts";
+import { isReviewable } from "./roles.ts";
 
 /** How much of the source run's task, report and failure a review prompt carries, each on its own. */
 export const REVIEW_TEXT_CAP_BYTES = 32_768;
@@ -55,7 +56,8 @@ export function reviewPrompt(source: ReviewSource): string {
 /** Why the run cannot be reviewed, without its handle, or undefined when it can be. The caller puts the handle in front. */
 export function reviewable(run: { state: string; role: string; files?: ReadonlyArray<unknown> }): string | undefined {
 	if (run.state === "running" || run.state === "waiting") return "is still active; review it when it has ended";
-	if (run.role !== "implement" && run.role !== "ultracode") return `is ${article(run.role)} ${run.role} run; only implement and ultracode runs are reviewed`;
+	// Which roles a review reads is role metadata; the wording names the reviewable roles the host runs today.
+	if (!isReviewable(run.role)) return `is ${article(run.role)} ${run.role} run; only implement, ultracode and security runs are reviewed`;
 	if (run.state !== "done" && run.state !== "failed") return `ended ${run.state} without a report to review`;
 	if (!run.files?.length) return "changed no files";
 	return undefined;
