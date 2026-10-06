@@ -27,7 +27,7 @@ Use [profiles and role settings](profiles.md) for session configuration; environ
 | `PI_FUSION_BUDGET_LIMIT_USD` | Unset; amount at/above which no new run, continuation, or review starts; cancels nothing |
 | `PI_FUSION_PLAN_CONTEXT_PCT` | `35`; plan cap-handoff and continuation-warning percentage; `0` disables those context-based actions |
 | `PI_FUSION_AUTO_REVIEW` | Unset; `1` reviews completed coding runs with changed files, using configured `ask` settings |
-| `PI_FUSION_HISTORY` | Unset; `1` saves prompts/reports/usage to private version-1 JSON files for durable host sessions, and lets the dashboard list [archived runs](dashboard.md#archived-runs); see [History](runs.md#runs-across-pi-processes) |
+| `PI_FUSION_HISTORY` | Unset; compatibility fallback captured at instance start: `1` turns [history](runs.md#turning-history-on-and-off) on when no preference is saved in [the settings file](#the-fusion-settings-file). History saves prompts/reports/usage to private version-1 JSON files for durable host sessions, and lets the dashboard list [archived runs](dashboard.md#archived-runs) |
 | `PI_FUSION_HISTORY_DIR` | Unset; default `<agent dir>/pi-fusion/history` |
 
 Role model/effort variables are read once when the extension instance starts. Changing the shell afterwards requires a new instance. A profile is a complete snapshot and never falls back to a variable for an omitted configured field. An explicit call naming another backend uses that backend's captured legacy defaults, not the model of the configured backend.
@@ -37,6 +37,20 @@ The built-in configuration enables every role except **security**, whose backend
 Claude plan effort defaults to `xhigh`; there is no plan-effort environment variable, but a profile or call can set it. Ultracode effort is fixed to `ultracode`, not plain `xhigh`, because the latter drops the workflow opt-in. Its workflow agents' model/effort live in `contracts/ultracode.md`, not a variable.
 
 Role contracts are appended system-prompt instructions in `contracts/*.md`. Their no-commit and file-change rules are guidance, not enforced permissions.
+
+## The Fusion settings file
+
+`<agent dir>/pi-fusion/settings.json`, with agent dir resolved by Pi (`PI_CODING_AGENT_DIR`, normally `~/.pi/agent`). It belongs to Fusion and is separate from Pi's own `settings.json` and from [`profiles.json`](profiles.md#the-profiles-file). It holds one user-global preference, used by every project and Pi process of this user:
+
+```json
+{ "version": 1, "history": { "enabled": true } }
+```
+
+`history.enabled` is `true` or `false`. A missing file, or no `history.enabled`, means nothing is saved. Fusion reads the file once per instance, at startup. Only the `/fusion history on|off` commands write it. See [Turning history on and off](runs.md#turning-history-on-and-off).
+
+Validation is local. A non-object, a version other than `1`, an unknown field or a non-boolean `enabled` makes the whole file unreadable. At startup that leaves the file untouched, `PI_FUSION_HISTORY` decides, and one warning says so. A save over such a file, or over a file from a newer pi-fusion, is refused so you can fix it by hand.
+
+Writes follow the [profiles file](profiles.md#how-the-file-is-written) rules. A missing file creates nothing until a save. A save creates the private directory (`0700`) and file (`0600`) where platform modes apply. It rereads the file, changes only the history preference, and replaces the file through a private temporary sibling and a rename. A failed write leaves the old file. Writes are queued within one process. Separate Pi processes and manual edits have **no lock**: the last rename wins, and nothing watches the file.
 
 ## The pi backend's variables
 

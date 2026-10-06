@@ -57,6 +57,7 @@ import { ArchiveIndex } from "./dashboard-archive.ts";
 import { contextShare, continueNote, handoffBlocked, handoffNote, handoffPrompt, handoffShare, planContextPct, planProblems, sharePercent, type HandoffReason } from "./handoff.ts";
 import { asEnded, History, type HistoryRecord, historyDir, historyEnabled, sameChild } from "./history.ts";
 import { hostProfileStore, type ProfileStore } from "./profile-store.ts";
+import { hostSettingsStore, type SettingsStore } from "./settings-store.ts";
 import {
 	type Baseline,
 	BUILTIN,
@@ -1391,11 +1392,12 @@ function handleNumber(handle: string): number {
 	return Number(HANDLE.exec(handle)?.[1] ?? 0);
 }
 
-const FUSION_ARGS = ["dashboard", "dashboard stop", "dashboard limit", "status", "cancel", "steer", "wait", "answer", "review", "on", "off", "config", "profile", "profile list", "profile use", "profile save", "profile default"];
+const FUSION_ARGS = ["dashboard", "dashboard stop", "dashboard limit", "status", "cancel", "steer", "wait", "answer", "review", "on", "off", "config", "profile", "profile list", "profile use", "profile save", "profile default", "history", "history on", "history off"];
 const USAGE =
-	"Usage: /fusion dashboard | /fusion dashboard stop | /fusion dashboard limit [N] | /fusion status [run-N] | /fusion cancel run-N | /fusion wait run-N | /fusion steer run-N <text> | /fusion answer [run-N] [text] | /fusion review run-N | /fusion on | /fusion off | /fusion config | /fusion profile [list | use <name> | save <name> | default <name>]";
+	"Usage: /fusion dashboard | /fusion dashboard stop | /fusion dashboard limit [N] | /fusion status [run-N] | /fusion cancel run-N | /fusion wait run-N | /fusion steer run-N <text> | /fusion answer [run-N] [text] | /fusion review run-N | /fusion on | /fusion off | /fusion config | /fusion profile [list | use <name> | save <name> | default <name>] | /fusion history [on | off]";
 const DASHBOARD_LIMIT_USAGE = "Usage: /fusion dashboard limit [N]; N must be a positive decimal safe integer";
 const PROFILE_USAGE = "Usage: /fusion profile [list | use <name> | save <name> | default <name>]; builtin names the built-in configuration for use and default";
+const HISTORY_USAGE = "Usage: /fusion history [on | off]; on and off save the run history preference for new Fusion instances and leave this one as it started";
 /** A /fusion profile argument list that names a profile, as far as it is typed, for completion. */
 const PROFILE_ARG = /^profile\s+(use|save|default)\s+(\S*)$/;
 /** A /fusion argument list that names a run, as far as it is typed, for completion. */
@@ -1419,6 +1421,8 @@ export type FusionCommand =
 	| { kind: "profile-use"; name: string }
 	| { kind: "profile-save"; name: string }
 	| { kind: "profile-default"; name: string }
+	| { kind: "history" }
+	| { kind: "history-set"; enabled: boolean }
 	| { kind: "usage"; message: string };
 
 /** The command a /fusion argument list names, or the usage when it names none. */
@@ -1448,6 +1452,10 @@ export function parseFusion(args: string): FusionCommand {
 			return second === "use" ? { kind: "profile-use", name } : second === "save" ? { kind: "profile-save", name } : { kind: "profile-default", name };
 		}
 		return { kind: "usage", message: PROFILE_USAGE };
+	}
+	if (first === "history") {
+		if (tokens.length === 1) return { kind: "history" };
+		return tokens.length === 2 && (second === "on" || second === "off") ? { kind: "history-set", enabled: second === "on" } : { kind: "usage", message: HISTORY_USAGE };
 	}
 	if (first === "on") return tokens.length === 1 ? { kind: "on" } : usage;
 	if (first === "off") return tokens.length === 1 ? { kind: "off" } : usage;
@@ -1628,6 +1636,11 @@ export interface FusionOptions {
 	 * resolved on first use; every test host passes a store of its own so no case reads or writes that file.
 	 */
 	profiles?: ProfileStore;
+	/**
+	 * Where Fusion's own settings are read and saved. Left out, it is the user's own `pi-fusion/settings.json` under the
+	 * host agent directory, resolved on first use; every test host passes a store of its own so no case reads or writes it.
+	 */
+	settings?: SettingsStore;
 	/** How the dashboard server starts. Left out, it is this build's own; a test host passes one that sees what it is given. */
 	dashboard?: typeof startDashboard;
 }
@@ -1734,9 +1747,11 @@ export default function fusion(pi: ExtensionAPI, options: FusionOptions = {}) {
 	 */
 	const initialize = (): Promise<void> =>
 		(initializing ??= (async () => {
+			const choosing = chooseHistory();
 			try {
 				await loadDefault();
 			} finally {
+				await choosing;
 				initialized = true;
 			}
 		})());
@@ -1762,6 +1777,41 @@ export default function fusion(pi: ExtensionAPI, options: FusionOptions = {}) {
 			profileWarning = `the default profile ${name} was not applied: ${error instanceof Error ? error.message : String(error)}; this session uses the ${BUILTIN} configuration`;
 		}
 	};
+
+	/**
+	 * Settles once per instance whether it keeps run history: a saved preference, else PI_FUSION_HISTORY as it was
+	 * when the instance was created, else off. A file that cannot be read is left alone, the variable decides, and the
+	 * user is told once which it was. Nothing reads or writes history before this has settled.
+	 */
+	const chooseHistory = (): Promise<void> =>
+		(choosingHistory ??= (async () => {
+			let saved: boolean | undefined;
+			let trouble: string | undefined;
+			try {
+				saved = (await settingsStore.read()).history?.enabled;
+			} catch (error) {
+				trouble = error instanceof Error ? error.message : String(error);
+			}
+			if (saved !== undefined) {
+				historyOn = saved;
+				historySource = "from the saved preference";
+			} else {
+				historyOn = historyVariable;
+				historySource = historyVariable ? "from PI_FUSION_HISTORY=1" : trouble === undefined ? "no preference is saved and PI_FUSION_HISTORY is not 1" : "PI_FUSION_HISTORY is not 1";
+			}
+			if (trouble !== undefined) historyWarning = `${trouble}; run history is ${historyOn ? "on" : "off"} in this instance (${historySource})`;
+		})());
+
+	/** Says once, where a notice can be shown, that the saved history preference could not be read at startup. */
+	const noteHistory = (ctx: any): void => {
+		if (historyWarning === undefined) return;
+		const warning = historyWarning;
+		historyWarning = undefined;
+		record(() => ctx.ui.notify(`fusion: ${warning}`, "warning"));
+	};
+
+	/** This instance's run history as a line says it: the choice it started with, and where that came from. */
+	const historyActive = (): string => `${historyOn ? "on" : "off"} in this instance (${historySource})`;
 
 	/** Says once, where a notice can be shown, that the default profile was not what this session started with. */
 	const noteProfiles = (ctx: any): void => {
@@ -1819,8 +1869,20 @@ export default function fusion(pi: ExtensionAPI, options: FusionOptions = {}) {
 	let variablesNoted = false;
 	/** Whether an implement, ultracode or security run that changed files gets an independent review without being asked. */
 	const autoReview = process.env.PI_FUSION_AUTO_REVIEW?.trim() === "1";
-	/** Whether this Pi session keeps its runs on disk, so a later process on the same host session can show them. */
-	const historyOn = historyEnabled();
+	const settingsStore = options.settings ?? hostSettingsStore(hostAgentDir);
+	/** What PI_FUSION_HISTORY said when this instance was created: the fallback when no preference is saved. */
+	const historyVariable = historyEnabled();
+	/**
+	 * Whether this instance keeps its runs on disk, so a later process on the same host session can show them. It is
+	 * undefined until the startup read of the saved preference settles, and every history read, write and archive treats
+	 * that as off; it is set once and never again, so neither saving a preference nor an edit of the file changes it.
+	 */
+	let historyOn: boolean | undefined;
+	/** Where `historyOn` came from, as the history command and status say it. */
+	let historySource = "";
+	/** Why the saved preference was not what this instance started with, said once where a notice can be shown. */
+	let historyWarning: string | undefined;
+	let choosingHistory: Promise<void> | undefined;
 	let history: History | undefined;
 	/** The runs an earlier Pi process left in this host session's file, the newest record per handle. */
 	const historical = new Map<string, HistoryRecord>();
@@ -2040,7 +2102,8 @@ export default function fusion(pi: ExtensionAPI, options: FusionOptions = {}) {
 
 	/**
 	 * Loads this host session's runs from disk once per runtime, so a later Pi process on the same session shows what
-	 * ran before it. A session Pi keeps no file for keeps no history, and nothing here is worth a failed call.
+	 * ran before it. A session Pi keeps no file for keeps no history, and nothing here is worth a failed call. Before the
+	 * startup choice has settled this loads nothing and marks nothing, so the first call after it still loads.
 	 */
 	const ensureHistory = (ctx: any): void => {
 		lastCtx = ctx;
@@ -2901,7 +2964,52 @@ export default function fusion(pi: ExtensionAPI, options: FusionOptions = {}) {
 			startup = `unknown (${error instanceof Error ? error.message : String(error)})`;
 		}
 		const where = await profileStore.where().catch(() => "unknown");
-		return [`fusion configuration: ${configurationLabel(configuration)} · new sessions start with ${startup}`, ...settingsTable(configuration.roles), `profiles file: ${where}`];
+		return [`fusion configuration: ${configurationLabel(configuration)} · new sessions start with ${startup}`, ...settingsTable(configuration.roles), `profiles file: ${where}`, ...(await historyLines())];
+	};
+
+	/** The saved history preference as a line says it, read again now, or why it could not be read. */
+	const savedHistory = async (): Promise<string> => {
+		let saved: boolean | undefined;
+		try {
+			saved = (await settingsStore.read()).history?.enabled;
+		} catch (error) {
+			return `unknown (${error instanceof Error ? error.message : String(error)})`;
+		}
+		return saved === undefined ? "unset (new instances use PI_FUSION_HISTORY=1 if set, else off)" : saved ? "on" : "off";
+	};
+
+	/** This instance's history and the saved preference, kept apart: only a new instance reads the saved one. */
+	const historyLines = async (): Promise<string[]> => {
+		const where = await settingsStore.where().catch(() => "unknown");
+		return [`run history: ${historyActive()}`, `saved history preference for new instances: ${await savedHistory()}`, `settings file: ${where}`];
+	};
+
+	/**
+	 * What /fusion history does: say this instance's history and the saved preference, or save a preference for the
+	 * instances that start after it. A save never changes this instance's history, whatever it was and whatever is saved.
+	 */
+	const historyCommand = async (command: Extract<FusionCommand, { kind: "history" | "history-set" }>, ctx: any, notice: (text: string, level: "info" | "warning" | "error") => void): Promise<void> => {
+		if (historyOn === undefined) await chooseHistory();
+		noteHistory(ctx);
+		if (command.kind === "history") {
+			notice([...(await historyLines()), "Change the saved preference with /fusion history on|off; it applies after restarting Pi, /reload or a new session."].join("\n"), "info");
+			return;
+		}
+		const wanted = command.enabled ? "on" : "off";
+		const where = await settingsStore.where().catch(() => "the settings file");
+		let before: boolean | undefined;
+		try {
+			await settingsStore.update((current) => {
+				before = current.history?.enabled;
+				return { ...current, history: { enabled: command.enabled } };
+			});
+		} catch (error) {
+			notice(`the run history preference was not saved: ${error instanceof Error ? error.message : String(error)}`, "error");
+			return;
+		}
+		const saved = before === command.enabled ? `run history preference was already saved ${wanted}` : `saved run history ${wanted} for new Fusion instances`;
+		const active = historyOn === command.enabled ? `this instance already keeps run history ${wanted}` : `this instance keeps run history ${historyOn ? "on" : "off"}; ${wanted} takes effect after restarting Pi, /reload or replacing the session`;
+		notice(`fusion: ${saved} in ${where}; ${active}`, "info");
 	};
 
 	/** The roles a configuration disables, as a notice ends with them, so a switch says what it turned off. */
@@ -3208,6 +3316,11 @@ export default function fusion(pi: ExtensionAPI, options: FusionOptions = {}) {
 				else notice("fusion is on", "info");
 				return;
 			}
+			// The history preference is for instances yet to start, so saving it needs neither Fusion on nor every run finished.
+			if (command.kind === "history" || command.kind === "history-set") {
+				await historyCommand(command, ctx, notice);
+				return;
+			}
 			// Retention is independent of role settings and may change with Fusion off or runs still unfinished.
 			if (command.kind === "dashboard-limit") {
 				if (command.limit !== undefined) store.setMaxRuns(command.limit);
@@ -3218,6 +3331,8 @@ export default function fusion(pi: ExtensionAPI, options: FusionOptions = {}) {
 			// profile as a call does; once that has loaded, nothing here yields.
 			if (!initialized) await initialize();
 			noteProfiles(ctx);
+			noteHistory(ctx);
+			ensureHistory(ctx);
 			if (
 				command.kind === "config" ||
 				command.kind === "profile" ||
@@ -3262,7 +3377,7 @@ export default function fusion(pi: ExtensionAPI, options: FusionOptions = {}) {
 				if (command.handle === undefined) {
 					const all = [...runs.values()];
 					const earlier = heldRuns(ctx).map((held) => `${held.handle} · ${held.role} · ${held.model} · ${held.state} · earlier Pi process`);
-					notice([`fusion: ${enabled ? "on" : "off"}`, `profile: ${configurationLabel(configuration)}`, "", ...settingsTable(configuration.roles), "", ...(all.length ? all.map(statusLine) : ["no runs in this Pi session yet"]), ...earlier, usageLine()].join("\n"), "info");
+					notice([`fusion: ${enabled ? "on" : "off"}`, `profile: ${configurationLabel(configuration)}`, `history: ${historyActive()}`, "", ...settingsTable(configuration.roles), "", ...(all.length ? all.map(statusLine) : ["no runs in this Pi session yet"]), ...earlier, usageLine()].join("\n"), "info");
 					return;
 				}
 				const run = live(command.handle);
@@ -3450,6 +3565,7 @@ export default function fusion(pi: ExtensionAPI, options: FusionOptions = {}) {
 		mask();
 		await initialize();
 		noteProfiles(ctx);
+		noteHistory(ctx);
 	});
 
 	pi.on("agent_settled", (_event, ctx) => {
@@ -3503,6 +3619,7 @@ export default function fusion(pi: ExtensionAPI, options: FusionOptions = {}) {
 		// here yields before the run registers, which is what lets a cancel issued right after the call find it.
 		if (!initialized) await initialize();
 		noteProfiles(ctx);
+		noteHistory(ctx);
 		ensureHistory(ctx);
 		noteVariables(ctx);
 		// A run whose state has just turned terminal records its branch entry when its end path lands; a continue reads it.
@@ -3740,6 +3857,9 @@ export default function fusion(pi: ExtensionAPI, options: FusionOptions = {}) {
 	const control = async (tool: NonNullable<CardDetails["control"]>, params: { action: string; run?: string; message?: string }, signal: AbortSignal | undefined, ctx: any) => {
 		mask();
 		ui = ctx.ui;
+		// A control waits for nothing but the history choice: the runs it names may be ones only the history kept.
+		if (historyOn === undefined) await chooseHistory();
+		noteHistory(ctx);
 		ensureHistory(ctx);
 		noteVariables(ctx);
 		const reply = (text: string, details: Record<string, unknown> = {}) => ({ content: [{ type: "text" as const, text }], details: { ...details, ...(details.question === undefined ? {} : { control: tool }) } });

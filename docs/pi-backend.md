@@ -112,6 +112,7 @@ The root is the host's agent directory (`PI_CODING_AGENT_DIR`, normally `~/.pi/a
   bin/                          existing host helpers; reused through child PATH
   pi-fusion/
     profiles.json               named role settings, separate from child storage
+    settings.json               Fusion's own saved preferences (history), not Pi's settings.json
     history/                    optional host run history
     children/                   stable child agent directory
       bin/                      helpers Pi downloads for children

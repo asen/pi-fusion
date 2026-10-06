@@ -61,5 +61,5 @@ A fresh background `ask` run in review mode, linked to the ended `implement`, `u
 _Avoid_: self-review, verification, QA run
 
 **History**:
-The opt-in disk record of a durable host Pi session's runs, used by later processes for reports, usage, and dashboard restoration. Continuation authority remains the custom entries on the host's current branch.
+The opt-in disk record of a durable host Pi session's runs, used by later processes for reports, usage, and dashboard restoration. Each Fusion instance decides once at startup whether to keep it: a saved preference (`/fusion history on|off`), else `PI_FUSION_HISTORY`. Continuation authority remains the custom entries on the host's current branch.
 _Avoid_: log, cache, transcript

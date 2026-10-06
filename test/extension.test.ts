@@ -13,6 +13,7 @@ import { PI_CONTRACT_FILES, PI_ROLE_NAMES, piRole } from "../extensions/backends
 import { PI_CHILD_MARKER, PI_CHILD_VARIABLE } from "../extensions/backends/pi-launch.ts";
 import fusion from "../extensions/fusion.ts";
 import { memoryProfileStore } from "../extensions/profile-store.ts";
+import { memorySettingsStore } from "../extensions/settings-store.ts";
 import { fakeBackend } from "./fake-pi-backend.ts";
 import { PRODUCTION_DEFAULT_VARIABLES, productionDefaults, tripwires } from "./tripwire.ts";
 import { toolList, turnOn } from "./host-tools.ts";
@@ -24,6 +25,8 @@ process.env.PI_FUSION_DASHBOARD_OPEN = "0";
 /** Where this file's runs would be kept if the history were on, so a test can show that nothing writes it. */
 const historyHome = path.join(fs.realpathSync(os.tmpdir()), `pi-fusion-history-${process.pid}`);
 process.env.PI_FUSION_HISTORY_DIR = historyHome;
+// The host below captures the variable when it is made, so the case that says it is unset makes it so, whatever the shell says.
+delete process.env.PI_FUSION_HISTORY;
 
 /** What a renderer gives back: the component Pi draws in the transcript. */
 interface Rendered {
@@ -87,7 +90,7 @@ const api = {
 
 // The tripwires in place of the pi and codex backends: nothing in this file runs a pi or codex child, and the one case
 // that reads the production registration makes its own below.
-fusion(api, { backends: { ...tripwires() }, profiles: memoryProfileStore() });
+fusion(api, { backends: { ...tripwires() }, profiles: memoryProfileStore(), settings: memorySettingsStore() });
 // Fusion starts off; the cases here delegate, so the host turns it on as a user's request for Fusion does.
 void turnOn(tools.find((tool) => tool.name === "fusion_activate"));
 
@@ -182,6 +185,9 @@ test("registers the sequential fusion and claude tool pairs and the two mode too
 		{ value: "profile use", label: "profile use" },
 		{ value: "profile save", label: "profile save" },
 		{ value: "profile default", label: "profile default" },
+		{ value: "history", label: "history" },
+		{ value: "history on", label: "history on" },
+		{ value: "history off", label: "history off" },
 	]);
 	assert.deepEqual(command.getArgumentCompletions?.("dashboard s"), [{ value: "dashboard stop", label: "dashboard stop" }]);
 	assert.deepEqual(command.getArgumentCompletions?.("dashboard l"), [{ value: "dashboard limit", label: "dashboard limit" }]);
@@ -479,7 +485,7 @@ test("the fusion tool says which harness runs what, and the pi backend it regist
 	// lifecycle. The fake is in-memory and starts nothing: no pi child, process, protocol or provider is behind it.
 	const fake = fakeBackend();
 	const injected = recordedHost();
-	fusion(injected.api, { backends: { ...tripwires(), pi: fake.backend }, profiles: memoryProfileStore() });
+	fusion(injected.api, { backends: { ...tripwires(), pi: fake.backend }, profiles: memoryProfileStore(), settings: memorySettingsStore() });
 	void turnOn(injected.into.tools.get("fusion_activate"));
 	const injectedFusion = injected.into.tools.get("fusion");
 	assert.ok(injectedFusion, "the registration that injected a pi backend advertises no fusion tool");
@@ -575,7 +581,7 @@ test("a marked pi child registers nothing at all, and any other value registers 
 		try {
 			// What is registered is what this case reads, so the tripwires stand in for pi and codex here too: nothing
 			// below runs a call, and a registration that took the production one would still be one more of them.
-			fusion(recorder, { backends: { ...tripwires() }, profiles: memoryProfileStore() });
+			fusion(recorder, { backends: { ...tripwires() }, profiles: memoryProfileStore(), settings: memorySettingsStore() });
 		} finally {
 			if (before === undefined) delete process.env[PI_CHILD_VARIABLE];
 			else process.env[PI_CHILD_VARIABLE] = before;
@@ -1064,7 +1070,7 @@ test("a later /fusion dashboard gets a fresh url and session_shutdown closes it,
 
 test("any other argument warns about the usage and starts nothing", async () => {
 	const usage =
-		"Usage: /fusion dashboard | /fusion dashboard stop | /fusion dashboard limit [N] | /fusion status [run-N] | /fusion cancel run-N | /fusion wait run-N | /fusion steer run-N <text> | /fusion answer [run-N] [text] | /fusion review run-N | /fusion on | /fusion off | /fusion config | /fusion profile [list | use <name> | save <name> | default <name>]";
+		"Usage: /fusion dashboard | /fusion dashboard stop | /fusion dashboard limit [N] | /fusion status [run-N] | /fusion cancel run-N | /fusion wait run-N | /fusion steer run-N <text> | /fusion answer [run-N] [text] | /fusion review run-N | /fusion on | /fusion off | /fusion config | /fusion profile [list | use <name> | save <name> | default <name>] | /fusion history [on | off]";
 	for (const args of ["", "   ", "dashboard start", "status foo", "cancel", "steer run-1", "config now"]) {
 		const notices = await runCommand(args);
 		assert.deepEqual(notices, [{ message: usage, type: "warning" }], `for ${JSON.stringify(args)}`);

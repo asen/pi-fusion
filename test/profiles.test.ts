@@ -10,6 +10,7 @@ import type { PiRole } from "../extensions/backends/pi-binding.ts";
 import type { BackendName, HostBackend } from "../extensions/backends/types.ts";
 import fusion, { builtinConfiguration, type Configuration, claudeRoute, fusionCall, fusionRoute, roleFor, type RunRecords, runRecords } from "../extensions/fusion.ts";
 import { fileProfileStore, memoryProfileStore, PROFILES_FILE, type ProfileStore } from "../extensions/profile-store.ts";
+import { memorySettingsStore } from "../extensions/settings-store.ts";
 import {
 	BUILTIN,
 	builtinSettings,
@@ -505,7 +506,7 @@ function sdkHost(options: SdkHostOptions = {}) {
 		sendMessage: () => {},
 		registerMessageRenderer: () => {},
 	} as unknown as ExtensionAPI;
-	fusion(api, { backends: { ...tripwires(), ...options.backends }, profiles: options.profiles ?? memoryProfileStore() });
+	fusion(api, { backends: { ...tripwires(), ...options.backends }, profiles: options.profiles ?? memoryProfileStore(), settings: memorySettingsStore() });
 	const answer = (options: string[]) => {
 		const next = dialogs.shift();
 		return typeof next === "function" ? next(options) : next;
@@ -600,7 +601,8 @@ test("the default profile loads as the session starts, and the host's guidance a
 	assert.match(host.tools.get("claude")!.description, /ultracode is disabled/);
 	assert.deepEqual(host.active, ["read", "bash", "fusion_activate"], "and fusion starts off, with only its way in offered");
 	await host.command("status");
-	assert.deepEqual(host.last()?.split("\n").slice(0, 9), ["fusion: off", "profile: work", "", ...settingsTable(WORK)]);
+	// The history line is the instance's own, whatever profile it runs, and is checked where history is the subject.
+	assert.deepEqual(host.last()?.split("\n").slice(0, 10).filter((line) => !line.startsWith("history: ")), ["fusion: off", "profile: work", "", ...settingsTable(WORK)]);
 	await host.on();
 	assert.equal((await host.fusion({ role: "implement", task: "x" })).error, undefined);
 	assert.deepEqual([claude.starts[0]!.role.model, claude.starts[0]!.role.effort], ["sonnet", "low"]);
@@ -749,7 +751,10 @@ test("profile save, list, use and default each do one thing, and only use change
 	await host.command("profile");
 	assert.match(host.last() ?? "", /^builtin \(current; default for new sessions\)\nwork\nUsage: \/fusion profile/);
 	await host.command("config");
-	assert.deepEqual(host.last()?.split("\n"), ["fusion configuration: builtin · new sessions start with builtin", ...settingsTable(LEGACY), "profiles file: (in memory)"]);
+	const shown = host.last()?.split("\n") ?? [];
+	assert.deepEqual(shown.slice(0, -3), ["fusion configuration: builtin · new sessions start with builtin", ...settingsTable(LEGACY), "profiles file: (in memory)"]);
+	// The run history is this instance's own and says where the saved preference lives, apart from the profiles.
+	assert.match(shown.slice(-3).join("\n"), /^run history: (on|off) in this instance \([^)]*\)\nsaved history preference for new instances: unset \([^)]*\)\nsettings file: \(in memory\)$/);
 	// Completion offers what the last read found.
 	assert.deepEqual(host.completions("profile use w"), [{ value: "profile use work", label: "profile use work" }]);
 	assert.deepEqual(host.completions("profile save "), [{ value: "profile save work", label: "profile save work" }], "save never offers builtin");
@@ -1302,7 +1307,7 @@ test("fusion starts off: only the activation tool is offered, a direct call star
 	assert.equal(claude.starts.length, 0);
 	assert.deepEqual(host.branch, []);
 	await host.command("status");
-	assert.match(host.last() ?? "", /^fusion: off\nprofile: builtin\n\n[\s\S]*?\n\nno runs in this Pi session yet/);
+	assert.match(host.last() ?? "", /^fusion: off\nprofile: builtin\nhistory: [^\n]*\n\n[\s\S]*?\n\nno runs in this Pi session yet/);
 	// Neither config nor a profile command, nor a second session_start, turns it on.
 	await host.command("profile list");
 	await host.start();

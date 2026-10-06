@@ -14,6 +14,7 @@ import { CODEX_QUESTION_UNANSWERED } from "../extensions/backends/codex-transpor
 import { type BackendName, type HostBackend, hostBackend, type SessionIntent } from "../extensions/backends/types.ts";
 import fusion from "../extensions/fusion.ts";
 import { memoryProfileStore, type ProfileStore } from "../extensions/profile-store.ts";
+import { memorySettingsStore } from "../extensions/settings-store.ts";
 import { History, type HistoryRecord } from "../extensions/history.ts";
 import { type FakeBackend, fakeBackend, type FakeScript } from "./fake-pi-backend.ts";
 import { securityProfiles, toolList, turnOn } from "./host-tools.ts";
@@ -106,7 +107,7 @@ function makeHost(options: HostOptions = {}) {
 	} as unknown as ExtensionAPI;
 	// The tripwires under whatever the case registered: a host here that named only claude still gets no pi or codex
 	// backend it could run, and a case that injects one of its own puts it over these.
-	fusion(api, { backends: { ...tripwires(), ...options.backends }, profiles: options.profiles ?? memoryProfileStore() });
+	fusion(api, { backends: { ...tripwires(), ...options.backends }, profiles: options.profiles ?? memoryProfileStore(), settings: memorySettingsStore() });
 	const sessionManager: Record<string, unknown> = { getSessionId: () => options.sessionId ?? "host-1", getBranch: () => branch };
 	if (options.sessionFile !== undefined) sessionManager.getSessionFile = () => options.sessionFile;
 	const editors: Array<{ title: string; prefill?: string }> = [];
@@ -2582,7 +2583,7 @@ test("/fusion off hides the fusion tools and starts nothing, and /fusion on give
 		assert.equal(host.notices.at(-1), "fusion is already off; turn it on with /fusion on");
 		assert.deepEqual(host.activeTools, ["read", "bash", "fusion_activate"], "a second off changes nothing");
 		await host.command("status");
-		assert.match(host.notices.at(-1) ?? "", /^fusion: off\nprofile: builtin\n\n[\s\S]*?\n\nrun-1 · implement · /);
+		assert.match(host.notices.at(-1) ?? "", /^fusion: off\nprofile: builtin\nhistory: [^\n]*\n\n[\s\S]*?\n\nrun-1 · implement · /);
 
 		// A call already in the host's turn when off was accepted still reaches the tools, and every one of them is refused.
 		assert.equal((await host.fusion({ role: "implement", task: "second", backend: "pi" })).error, OFF_REFUSAL);

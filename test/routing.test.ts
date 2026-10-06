@@ -15,6 +15,7 @@ import fusion, { builtinConfiguration, claudeCall, claudeRoute, type FusionParam
 import { KNOWN_ROLE_NAMES, roleSpec } from "../extensions/roles.ts";
 import { History } from "../extensions/history.ts";
 import { memoryProfileStore, type ProfileStore } from "../extensions/profile-store.ts";
+import { memorySettingsStore } from "../extensions/settings-store.ts";
 import { builtinSettings, captureBaseline, serializeDocument } from "../extensions/profiles.ts";
 import { PRODUCTION_DEFAULT_VARIABLES, productionDefaults, tripwires } from "./tripwire.ts";
 import { securityProfiles, toolList, turnOn } from "./host-tools.ts";
@@ -469,7 +470,7 @@ function recorder(): { ext: Extension; api: ExtensionAPI } {
  */
 const makeExtension = (backends: Partial<Record<BackendName, HostBackend>> = {}, profiles: ProfileStore = memoryProfileStore()): Extension => {
 	const { ext, api } = recorder();
-	fusion(api, { backends: { ...tripwires(), ...backends }, profiles });
+	fusion(api, { backends: { ...tripwires(), ...backends }, profiles, settings: memorySettingsStore() });
 	void turnOn(ext.tools.get("fusion_activate"));
 	return ext;
 };

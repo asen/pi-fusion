@@ -189,11 +189,36 @@ Generated questions/cards/handoffs use the invoking tool pair (`fusion`/`fusion_
 
 ## Runs across Pi processes
 
-An earlier process's branch-recorded run is not active. Controls explain that distinction; `fusion` can continue it only when its record is usable. Reports live in memory unless `PI_FUSION_HISTORY=1` saves them for a durable host session. No history is written for `--no-session`.
+An earlier process's branch-recorded run is not active. Controls explain that distinction; `fusion` can continue it only when its record is usable. Reports live in memory unless [history is on](#turning-history-on-and-off) for this instance, which saves them for a durable host session. No history is written for `--no-session`.
 
 History writes on start, token updates, and end. On its first delegation, control or command, a later process restores earlier usage and the reports that status and review read. Branch entries remain continuation authority. For those lookups a history record must name the same child as the branch's latest entry for its handle: Claude session id, Pi id **and file**, or Codex thread id. A mismatched identity is not reported or reviewed as that run. A fork reads ancestor history but never writes to that ancestor's file. A run left active by a dead process restores as `aborted`, and the host writes that correction back to its own session's file. The dashboard lists earlier runs through a separate, read-only [archive](dashboard.md#archived-runs).
 
 Detailed earlier-run status shows its state, elapsed time, changed-file count, and first 600 report/failure characters. It offers continuation only with a usable branch record and review only for work made in this working directory. Restored usage seeds the session ledger, and handles are not reused.
+
+### Turning history on and off
+
+History is off unless turned on. Each Fusion instance decides once, when it starts, and keeps that choice for its whole life:
+
+```text
+saved preference in <agent dir>/pi-fusion/settings.json   history.enabled true/false
+  -> otherwise PI_FUSION_HISTORY, as captured when the instance was created   exactly "1" (trimmed) = on
+  -> otherwise off
+```
+
+A saved `false` turns history off even with `PI_FUSION_HISTORY=1`. The variable stays as a compatibility fallback for when nothing is saved.
+
+| Command | Effect |
+| --- | --- |
+| `/fusion history` | Show this instance's history (on/off and where that came from), the saved preference read now (`on`, `off`, `unset`, or `unknown` with the file's problem), and the settings file path |
+| `/fusion history on`, `/fusion history off` | Save the preference for **new** Fusion instances only |
+
+Saving never changes the running instance. The notice says what was saved and what this instance keeps, for example `this instance keeps run history off; on takes effect after restarting Pi, /reload or replacing the session` (`/new`, `/resume`, `/fork`). Saving a value that already matches says so and claims no restart. Neither command needs Fusion on or every run finished, and neither changes the mode, the role configuration or profiles. Editing the file, or changing `PI_FUSION_HISTORY` in the shell, does not affect a running instance either.
+
+`/fusion status` shows this instance's line, such as `history: off in this instance (from the saved preference)`. `/fusion config`, when it prints rather than opens the editor, adds the saved preference and file path. See [the Fusion settings file](configuration.md#the-fusion-settings-file) for its schema and write rules.
+
+Startup reads the settings file once, before anything reads or writes history, on every path: session start, delegation, `/fusion` commands, and control tools reached before session start. If the file cannot be read, is malformed or comes from a newer pi-fusion, it is left untouched, `PI_FUSION_HISTORY` decides, and one warning names the problem and the resulting behavior. A save into such a file is refused.
+
+Turning history on writes the [project content listed below](#history-data-and-limits) for durable host sessions only. `--no-session` writes no history whatever the preference. The preference file itself can still be saved from such a session. Turning history off stops writes in later instances. It does not delete existing history files or child transcripts, and nothing fills in runs from an instance that kept no history. Delete those files by hand if you want them gone.
 
 ### Archive eligibility
 
