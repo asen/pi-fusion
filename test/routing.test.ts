@@ -774,9 +774,9 @@ test("a backend a host left out is refused without asking the user to configure 
 const bareConfiguration = () => builtinConfiguration(captureBaseline({} as NodeJS.ProcessEnv));
 
 /** What every codex role carries beside its selection, by role and mode. */
-const CODEX_IMPLEMENT = { name: "implement", contract: "implement.md", addendum: "codex-no-questions.md", sandboxMode: "workspace-write", approvalPolicy: "never" };
-const CODEX_PLAN = { name: "plan", contract: "plan.md", addendum: "codex-no-questions.md", sandboxMode: "workspace-write", approvalPolicy: "never" };
-const codexAsk = (mode: "answer" | "review") => ({ name: "ask", contract: `ask-${mode}.md`, addendum: "codex-no-questions.md", mode, sandboxMode: "read-only", approvalPolicy: "never" });
+const CODEX_IMPLEMENT = { name: "implement", contract: "implement.md", sandboxMode: "workspace-write", approvalPolicy: "never" };
+const CODEX_PLAN = { name: "plan", contract: "plan.md", sandboxMode: "workspace-write", approvalPolicy: "never" };
+const codexAsk = (mode: "answer" | "review") => ({ name: "ask", contract: `ask-${mode}.md`, mode, sandboxMode: "read-only", approvalPolicy: "never" });
 
 test("codex runs plan, implement and ask, and its route binds each role with the parameters it takes and refuses the rest", () => {
 	const config = bareConfiguration();
@@ -1138,7 +1138,7 @@ test("every role the tools advertise has capabilities and a binding on each back
 				const bound = codexRole({ role }, undefined, {} as NodeJS.ProcessEnv);
 				assert.equal(bound.name, role, `the codex binding of ${role} bound another role`);
 				assert.equal(bound.model, undefined, `the codex binding of ${role} invented a model rather than leave it to the host`);
-				for (const contract of [bound.contract, bound.addendum]) assert.ok(fs.existsSync(path.join(repoRoot, "contracts", contract)), `the codex binding of ${role} names a contract that is not there: ${contract}`);
+				assert.ok(fs.existsSync(path.join(repoRoot, "contracts", bound.contract)), `the codex binding of ${role} names a contract that is not there: ${bound.contract}`);
 				continue;
 			}
 			const bound = backend === "claude" ? roleFor({ role, task: "x" }) : piRole({ role }, undefined, env);

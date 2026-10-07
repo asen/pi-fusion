@@ -1653,9 +1653,8 @@ export default function fusion(pi: ExtensionAPI, options: FusionOptions = {}) {
 	// registers the ordinary surface, because a marker this build does not know is not a child of this build.
 	if (process.env.PI_FUSION_CHILD === "pi") return;
 	// Every contract any role of any backend can run under, in one check: the Claude roles' own, the ask modes', the Pi
-	// bindings' and the Codex bindings', addendum included, which is where a contract no Claude role names comes from. An
-	// install missing one of them is a broken install whichever backend would have run it, so none of them waits for a
-	// call to find out.
+	// bindings' and the Codex bindings'. An install missing one is broken whichever backend would have run it, so none
+	// waits for a call to find out.
 	for (const name of new Set([...Object.values(ROLES).map((role) => role.contract), ...Object.values(ASK_CONTRACTS), ...PI_CONTRACT_FILES, ...CODEX_CONTRACT_FILES])) {
 		const contract = path.join(CONTRACTS_DIR, name);
 		if (!fs.existsSync(contract)) throw new Error(`pi-fusion: missing contract ${contract}`);

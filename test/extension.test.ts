@@ -627,7 +627,7 @@ test("the loader refuses a child, a missing contract and a missing bootstrap in 
 	assert.equal(source.split(MISSING_BOOTSTRAP).length - 1, 1, "the missing-bootstrap refusal must be written in exactly one place, or one of them can drift");
 });
 
-test("the load-time contract check covers every contract any backend's roles name, the pi-only one and the codex addendum included", () => {
+test("the load-time contract check covers every backend's shared role contracts and the pi-only security contract", () => {
 	// What the loader adds to the claude roles' own contracts is the binding's own list, so a contract only a pi role
 	// names is checked at load for the same reason: it is a broken install whichever backend would have run it. The
 	// loader is read here rather than run with a file gone, as the order case above reads it.
@@ -637,13 +637,13 @@ test("the load-time contract check covers every contract any backend's roles nam
 		assert.ok(PI_CONTRACT_FILES.includes(bound.contract), `the loader never checks the contract role ${role} runs under: ${bound.contract}`);
 	}
 	for (const name of PI_CONTRACT_FILES) assert.ok(fs.existsSync(path.join(repoRoot, "contracts", name)), `this install ships no contracts/${name}`);
-	// Codex names the shared contracts and two addenda of its own, each checked at load like any other contract.
-	assert.deepEqual([...CODEX_CONTRACT_FILES].sort(), ["ask-answer.md", "ask-review.md", "codex-continued-questions.md", "codex-no-questions.md", "implement.md", "plan.md"]);
+	// Codex names only the shared contracts; questions are an admission requirement, not a prompt-level fallback.
+	assert.deepEqual([...CODEX_CONTRACT_FILES].sort(), ["ask-answer.md", "ask-review.md", "implement.md", "plan.md"]);
 	for (const role of CODEX_ROLE_NAMES) {
 		for (const mode of role === "ask" ? CODEX_MODES : [undefined]) {
 			const bound = codexRole({ role, ...(mode === undefined ? {} : { mode }) }, undefined, {} as NodeJS.ProcessEnv);
 			assert.ok(CODEX_CONTRACT_FILES.includes(bound.contract), `the loader never checks the contract role ${role} runs under on codex: ${bound.contract}`);
-			assert.ok(CODEX_CONTRACT_FILES.includes(bound.addendum), `the loader never checks the addendum role ${role} runs under on codex: ${bound.addendum}`);
+			assert.equal("addendum" in bound, false, "no backend-specific question instructions are injected");
 		}
 	}
 	for (const name of CODEX_CONTRACT_FILES) assert.ok(fs.existsSync(path.join(repoRoot, "contracts", name)), `this install ships no contracts/${name}`);
