@@ -22,7 +22,7 @@ fusion.ts                     host lifecycle and registration
   +-- backends/types.ts       SDK-neutral boundary
   |     +-- claude.ts         Claude SDK and stream/questions
   |     +-- pi-backend.ts     Pi composition (see below)
-  |     +-- codex.ts          Codex app-server composition (experimental, registered)
+  |     +-- codex.ts          Codex app-server composition (registered)
   +-- process-tree.ts         launch and descendant cleanup
   +-- cards/dashboard        terminal and browser monitoring
   |     +-- dashboard-archive.ts  read-only history archive
@@ -59,7 +59,7 @@ fusion.ts                     host lifecycle and registration
 | `changes.ts`, `history.ts`, `budget.ts` | Git snapshots; opt-in host run history; running-total cost ledger |
 | `handoff.ts`, `review.ts` | Plan cap/model-change handoff; independent review eligibility and quoted prompt data |
 
-Role behavior belongs in `contracts/*.md`. Review **selection** belongs in `fusion.ts`: every review uses the session's configured `ask` backend/model/effort, not the reviewed role's backend or model. Architecture, storage, and runtime limitations are in [Pi backend](pi-backend.md); the experimental Codex backend is in [Codex backend](codex-backend.md).
+Role behavior belongs in `contracts/*.md`. Review **selection** belongs in `fusion.ts`: every review uses the session's configured `ask` backend/model/effort, not the reviewed role's backend or model. Backend architecture, storage, and runtime limitations are in [Pi backend](pi-backend.md) and [Codex backend](codex-backend.md).
 
 ## Test strategy
 

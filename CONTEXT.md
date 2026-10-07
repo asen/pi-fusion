@@ -13,7 +13,7 @@ A headless coding session doing work the host handed off: Claude Code, Pi, or Co
 _Avoid_: subagent, worker, delegate
 
 **Backend**:
-The implementation that runs a child: `claude`, `pi`, or `codex`. A backend owns its session shape, binding, and protocol; the host owns handles, records, and scheduling. See [Profiles](docs/profiles.md#what-a-call-runs-on) for selection and [Codex evidence](docs/codex-backend.md#evidence) for its experimental scope.
+The implementation that runs a child: `claude`, `pi`, or `codex`. A backend owns its session shape, binding, and protocol; the host owns handles, records, and scheduling. See [Profiles](docs/profiles.md#what-a-call-runs-on) for selection and [Codex evidence](docs/codex-backend.md#evidence) for its qualification limits.
 _Avoid_: adapter, provider, harness, runtime (as synonyms for backend)
 
 **Role**:

@@ -663,15 +663,15 @@ test("mixed-profile guidance recommends each role's configured backend", async (
 	}
 });
 
-test("roles configured on codex are described as runs that can ask experimentally, take one unconfirmed steer per message and continue from their exact turn, in each tool's own name", async () => {
+test("roles configured on codex are described as runs that can ask, take one unconfirmed steer per message and continue from their exact turn, in each tool's own name", async () => {
 	const codexRoles = settings({ plan: { enabled: true, backend: "codex" }, implement: { enabled: true, backend: "codex" }, ask: { enabled: true, backend: "codex", model: "gpt-5-codex", effort: "high" } });
 	const host = sdkHost({ profiles: memoryProfileStore(document({ work: codexRoles }, "work")) });
 	await host.start();
 	const fusionGuidance = host.tools.get("fusion")!.promptGuidelines!;
 	const codexLine = fusionGuidance.find((guideline) => guideline.startsWith("Role plan, role implement and role ask run on codex in this session."));
 	assert.ok(codexLine, "the fusion guidance does not say what a codex run is");
-	assert.match(codexLine, /A codex child can ask you a question, experimentally, and waits for your answer as any child does\./);
-	assert.doesNotMatch(codexLine, /cannot ask/, "a codex child is no longer described as one that cannot ask");
+	assert.match(codexLine, /A codex child can ask you a question and waits for your answer as any child does\./);
+	assert.doesNotMatch(codexLine, /cannot ask|experimental/i, "questions are available without an experimental status label");
 	assert.match(codexLine, /one steer to its current turn, sent once and never retried: a steer the turn took is queued input, not proof the child read it/);
 	assert.match(codexLine, /Continue a codex run with fusion and continue, as any run: it goes on only from the exact turn its record names/);
 	assert.doesNotMatch(codexLine, /takes no message|not with continue|cannot be continued/, "a codex run is no longer described as fresh-only or unsteerable");
@@ -683,7 +683,8 @@ test("roles configured on codex are described as runs that can ask experimentall
 	assert.ok(claudeGuidance.some((guideline) => guideline.startsWith("Call fusion with role plan")));
 	const description = host.tools.get("fusion")!.description;
 	assert.match(description, /plan runs on codex with the host's default codex model; implement runs on codex with the host's default codex model; .*ask runs on codex with model gpt-5-codex at effort high/);
-	assert.match(description, /backend codex is experimental: it runs plan and implement in a workspace-write sandbox, and ask read-only, under the same contracts/);
+	assert.match(description, /backend codex runs plan and implement in a workspace-write sandbox, and ask read-only, under the same contracts/);
+	assert.doesNotMatch(description, /backend codex is experimental|experimentally/i);
 	assert.match(description, /with no ultracode or security role;/);
 	assert.match(description, /A codex child also gets ask_orchestrator, through codex's experimental API, and asks you a question as a pi child does\./);
 	assert.doesNotMatch(description, /codex child gets no ask_orchestrator/);
@@ -693,7 +694,8 @@ test("roles configured on codex are described as runs that can ask experimentall
 	assert.doesNotMatch(description, /cannot be continued|takes no message while it runs|as fresh runs|no plan, ultracode or security role|no fresh parameter/, "nothing still calls codex fresh-only or unsteerable");
 	assert.doesNotMatch(description, /registers no codex backend|refused as unavailable/, "codex is registered in this build");
 	const parameters = host.tools.get("fusion")!.parameters as { properties: Record<string, { description: string }> };
-	assert.match(parameters.properties.backend!.description, /codex runs plan, implement and ask through the user's own codex install, experimentally\./);
+	assert.match(parameters.properties.backend!.description, /codex runs plan, implement and ask through the user's own codex install\./);
+	assert.doesNotMatch(parameters.properties.backend!.description, /experimental/i);
 	assert.doesNotMatch(parameters.properties.backend!.description, /cannot be continued/);
 	assert.match(parameters.properties.model!.description, /on the codex backend a model id with no whitespace, for plan, implement and ask,/);
 	assert.match(parameters.properties.effort!.description, /on the codex backend one level with no whitespace, for plan, implement and ask,/);

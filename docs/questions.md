@@ -56,7 +56,7 @@ Manual Linux cases have measured an answered native question with a steer admitt
 
 ## On Codex
 
-**Experimental.** Shapes come from Codex 0.160.0 source. Questions on a native app-server were measured for `ask` only ([G3](codex-backend.md#g3-cases)); `plan`/`implement` questions, callback admission, shared-contract-only continuations and host answer races remain fake-tested.
+Shapes come from Codex 0.160.0 source. Questions on a native app-server were measured for `ask` only ([G3](codex-backend.md#g3-cases)); `plan`/`implement` questions, callback admission, shared-contract-only continuations and host answer races remain fake-tested.
 
 Sources: [`codex.ts`](../extensions/backends/codex.ts) and [`codex-transport.ts`](../extensions/backends/codex-transport.ts).
 

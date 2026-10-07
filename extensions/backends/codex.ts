@@ -45,7 +45,7 @@ import { type Backend, type ChildControl, type ChildEvent, failed, type RunReque
  * outcome mapping. It decides the order and owns the child between its start and its one shutdown; every judgement of
  * evidence is `codex-outcome.ts`'s, and every wire and process concern the transport's.
  *
- * **Experimental and narrowly qualified.** Every shape this reads is a source reading of Codex 0.160.0's
+ * **Qualification scope.** Every shape this reads is a source reading of Codex 0.160.0's
  * app-server. Native qualification, on one host under its default model, covers only a fresh `implement` and `ask` (G1),
  * an `ask` resume, current-tip fork, moved-tip refusal, one steer and per-call usage on connections with no question
  * callback (G2), and `ask` questions on fresh, resumed and forked threads plus a cancellation while one waited (G3); the
