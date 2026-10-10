@@ -166,7 +166,7 @@ function makeHost(cwd = repoRoot, mode: "tui" | "print" = "print", session: { id
 		openEditor = undefined;
 		resolve(typed);
 	};
-	return { activeTools, branch, sent, handlers, notices, waits, renders, finished, ctx, ui, editors, widgets, renderers, claude, control, text, tree, command, completions, closeEditor, failSends, begin };
+	return { activeTools, branch, sent, handlers, notices, waits, renders, finished, ctx, ui, editors, widgets, renderers, call, claude, control, text, tree, command, completions, closeEditor, failSends, begin };
 }
 
 /** A run's details without the three a test cannot pin down: how long it ran and what it had changed by then. */
@@ -2895,6 +2895,109 @@ test("the saved preference is read before any history is, on the control, comman
 		assert.equal(heldCount(dir, "host-1"), 2);
 	}));
 
+/** Keeps plan-cap cases independent of the shell and restores its value after each case. */
+async function withPlanVariable<T>(value: string | undefined, body: () => Promise<T>): Promise<T> {
+	const before = process.env.PI_FUSION_PLAN_CONTEXT_PCT;
+	if (value === undefined) delete process.env.PI_FUSION_PLAN_CONTEXT_PCT;
+	else process.env.PI_FUSION_PLAN_CONTEXT_PCT = value;
+	try {
+		return await body();
+	} finally {
+		if (before === undefined) delete process.env.PI_FUSION_PLAN_CONTEXT_PCT;
+		else process.env.PI_FUSION_PLAN_CONTEXT_PCT = before;
+	}
+}
+
+test("saved plan caps govern handoffs and continuation warnings, with non-blank variables taking precedence", async (t) => {
+	const cases = [
+		{ saved: undefined, variable: undefined, cap: 35 },
+		{ saved: 60, variable: undefined, cap: 60 },
+		{ saved: 50, variable: undefined, cap: 50 },
+		{ saved: 0, variable: undefined, cap: 0 },
+		{ saved: 20, variable: "60", cap: 60 },
+		{ saved: 60, variable: "20", cap: 20 },
+		{ saved: 20, variable: "0", cap: 0 },
+		{ saved: 60, variable: "  ", cap: 60 },
+		{ saved: 60, variable: "35%", cap: 35 },
+	];
+	for (const tool of ["fusion", "claude"]) for (const { saved, variable, cap } of cases) {
+		await t.test(`${tool}: saved ${saved}, variable ${JSON.stringify(variable)} -> ${cap}%`, () => withPlanVariable(variable, async () => {
+			const settings = memorySettingsStore(serializeSettings({ version: 1, ...(saved === undefined ? {} : { plan: { contextPct: saved } }) }));
+			const backend = fakeBackend({ name: "claude", scripts: [{ text: "Agreed plan", contextTokens: 50, contextWindow: 100 }] });
+			const host = makeHost(repoRoot, "print", {}, { claude: backend.backend }, { settings });
+			await host.call(tool, { role: "plan", task: "the goal" });
+			await host.control({ action: "wait", run: "run-1" });
+			const handedOff = cap > 0 && cap <= 50;
+			const handle = handedOff ? "run-2" : "run-1";
+			const next = await host.text(host.call(tool, { role: "plan", task: "follow up" }));
+			await host.control({ action: "wait", run: handle });
+			assert.equal(backend.starts[1]?.intent?.kind, handedOff ? "new" : "resume");
+			assert.equal(next.includes("is a fresh plan run"), handedOff);
+			if (handedOff) assert.match(backend.starts[1]!.prompt, /Agreed plan/);
+			const explicit = await host.text(host.call(tool, { continue: handle, task: "one more step" }));
+			await host.control({ action: "wait", run: handle });
+			assert.equal(backend.starts[2]?.intent?.kind, "resume", "an explicit continuation is never handed off");
+			assert.equal(explicit.includes(`past the ${cap}% cap`), handedOff, "zero disables warnings too");
+			const warnings = host.notices.filter(([text]) => text.includes("PI_FUSION_PLAN_CONTEXT_PCT="));
+			assert.equal(warnings.length, variable === "35%" ? 1 : 0, "an invalid variable keeps the default, not the saved cap");
+		}));
+	}
+});
+
+test("the plan cap captures the variable at creation and the file at startup, and history saves preserve it", () =>
+	withPlanVariable(undefined, async () => {
+		const settings = memorySettingsStore(serializeSettings({ version: 1, plan: { contextPct: 20 } }));
+		const backend = fakeBackend({ name: "claude", scripts: [{ contextTokens: 50, contextWindow: 100 }] });
+		const host = makeHost(repoRoot, "print", {}, { claude: backend.backend }, { settings });
+		process.env.PI_FUSION_PLAN_CONTEXT_PCT = "0";
+		await host.begin();
+		await settings.update((current) => ({ ...current, plan: { contextPct: 60 } }));
+		await host.command("history off");
+		assert.deepEqual(await settings.read(), { version: 1, history: { enabled: false }, plan: { contextPct: 60 } });
+		await host.claude({ role: "plan", task: "the goal" });
+		await host.control({ action: "wait", run: "run-1" });
+		await host.claude({ role: "plan", task: "follow up" });
+		await host.control({ action: "wait", run: "run-2" });
+		assert.equal(backend.starts[1]?.intent?.kind, "new", "the existing instance keeps its 20% cap");
+
+		delete process.env.PI_FUSION_PLAN_CONTEXT_PCT;
+		const reloaded = makeHost(repoRoot, "print", {}, { claude: backend.backend }, { settings });
+		await reloaded.claude({ role: "plan", task: "the goal" });
+		await reloaded.control({ action: "wait", run: "run-1" });
+		await reloaded.claude({ role: "plan", task: "follow up" });
+		await reloaded.control({ action: "wait", run: "run-1" });
+		assert.equal(backend.starts[3]?.intent?.kind, "resume", "a new instance reads the saved 60% cap");
+	}));
+
+test("delegation waits for the same startup settings read as controls before weighing the plan cap", () =>
+	withPlanVariable(undefined, async () => {
+		const inner = memorySettingsStore(serializeSettings({ version: 1, plan: { contextPct: 60 } }));
+		let open!: () => void;
+		let reading!: () => void;
+		const gate = new Promise<void>((resolve) => (open = resolve));
+		const readStarted = new Promise<void>((resolve) => (reading = resolve));
+		let reads = 0;
+		const settings: SettingsStore = { ...inner, read: async () => {
+			reads += 1;
+			reading();
+			await gate;
+			return inner.read();
+		} };
+		const backend = fakeBackend({ name: "claude", scripts: [{ contextTokens: 50, contextWindow: 100 }] });
+		const host = makeHost(repoRoot, "print", {}, { claude: backend.backend }, { settings });
+		const status = host.control({ action: "status" });
+		const run = host.call("fusion", { role: "plan", task: "the goal" });
+		await readStarted;
+		assert.equal(backend.starts.length, 0, "no backend runs before the cap is resolved");
+		open();
+		await Promise.all([status, run]);
+		await host.control({ action: "wait", run: "run-1" });
+		await host.call("fusion", { role: "plan", task: "follow up" });
+		await host.control({ action: "wait", run: "run-1" });
+		assert.equal(backend.starts[1]?.intent?.kind, "resume", "routing uses the saved 60%, not the default 35%");
+		assert.equal(reads, 1, "controls and delegation share one startup read");
+	}));
+
 test("a settings file this cannot read is left alone: startup warns once with the behavior it chose, and a save refuses to replace it", async () => {
 	await withVariable("1", async (dir) => {
 		const settings = memorySettingsStore("{ not json");
@@ -2902,7 +3005,7 @@ test("a settings file this cannot read is left alone: startup warns once with th
 		await host.begin();
 		const warnings = () => host.notices.filter(([, type]) => type === "warning").map(([text]) => text);
 		assert.equal(warnings().length, 1);
-		assert.match(warnings()[0]!, /^fusion: settings file \(in memory\) is not valid JSON \(.*\); fix it by hand; run history is on in this instance \(from PI_FUSION_HISTORY=1\)$/);
+		assert.match(warnings()[0]!, /^fusion: settings file \(in memory\) is not valid JSON \(.*\); fix it by hand; run history is on in this instance \(from PI_FUSION_HISTORY=1\); plan context cap is \d+(?:\.\d+)?%$/);
 		await ok(host);
 		assert.equal(heldCount(dir, "host-1"), 1, "the variable decides when the file cannot be read");
 		host.notices.length = 0;
@@ -2923,7 +3026,7 @@ test("a settings file this cannot read is left alone: startup warns once with th
 		assert.equal(fs.existsSync(dir), false);
 		const warnings = host.notices.filter(([, type]) => type === "warning").map(([text]) => text);
 		assert.equal(warnings.length, 1);
-		assert.match(warnings[0]!, /written by a newer pi-fusion.*; run history is off in this instance \(PI_FUSION_HISTORY is not 1\)$/);
+		assert.match(warnings[0]!, /written by a newer pi-fusion.*; run history is off in this instance \(PI_FUSION_HISTORY is not 1\); plan context cap is \d+(?:\.\d+)?%$/);
 		await host.command("history on");
 		assert.equal(settings.text(), text, "a newer file is never replaced");
 	});

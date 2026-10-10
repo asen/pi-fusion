@@ -148,7 +148,7 @@ The warning is composed once and carried consistently through controls, user not
 
 ## The context cap
 
-`PI_FUSION_PLAN_CONTEXT_PCT` defaults to **35%**. It compares the last model call's prompt tokens with its context window. On Codex that is the latest response's input against the reported model window, an estimate used only when both are positive: never the thread's cumulative total or the call's own usage, and not an exact occupancy. A run that recorded no positive pair has no share and is never capped. An implicit plan continuation at/above the cap starts a fresh plan, carrying the previous report (up to 32 KiB) as quoted agreed-plan data, not instructions. The result names both handles. Explicitly naming a different model also hands off, on any backend.
+The plan context cap defaults to **35%**. Set `plan.contextPct` in [Fusion's settings file](configuration.md#the-fusion-settings-file); a non-blank `PI_FUSION_PLAN_CONTEXT_PCT` overrides it. It compares the last model call's prompt tokens with its context window. On Codex that is the latest response's input against the reported model window, an estimate used only when both are positive: never the thread's cumulative total or the call's own usage, and not an exact occupancy. A run that recorded no positive pair has no share and is never capped. An implicit plan continuation at/above the cap starts a fresh plan, carrying the previous report (up to 32 KiB) as quoted agreed-plan data, not instructions. The result names both handles. Explicitly naming a different model also hands off, on any backend.
 
 A cap handoff keeps the old planner's model unless overridden. Its effort differs:
 

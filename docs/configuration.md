@@ -25,7 +25,7 @@ Use [profiles and role settings](profiles.md) for session configuration; environ
 | `PI_FUSION_WIDGET` | Unset; `0` hides the run widget, not the footer status |
 | `PI_FUSION_BUDGET_WARN_USD` | Unset; amount or comma-separated amounts, e.g. `5,20`, warning once at each threshold |
 | `PI_FUSION_BUDGET_LIMIT_USD` | Unset; amount at/above which no new run, continuation, or review starts; cancels nothing |
-| `PI_FUSION_PLAN_CONTEXT_PCT` | `35`; plan cap-handoff and continuation-warning percentage; `0` disables those context-based actions |
+| `PI_FUSION_PLAN_CONTEXT_PCT` | Overrides saved `plan.contextPct`, otherwise `35`; plan cap-handoff and continuation-warning percentage; `0` disables those context-based actions |
 | `PI_FUSION_AUTO_REVIEW` | Unset; `1` reviews completed coding runs with changed files, using configured `ask` settings |
 | `PI_FUSION_HISTORY` | Unset; compatibility fallback captured at instance start: `1` turns [history](runs.md#turning-history-on-and-off) on when no preference is saved in [the settings file](#the-fusion-settings-file). History saves prompts/reports/usage to private version-1 JSON files for durable host sessions, and lets the dashboard list [archived runs](dashboard.md#archived-runs) |
 | `PI_FUSION_HISTORY_DIR` | Unset; default `<agent dir>/pi-fusion/history` |
@@ -40,15 +40,20 @@ Role contracts in `contracts/*.md` supply child instructions; see [Child tools a
 
 ## The Fusion settings file
 
-`<agent dir>/pi-fusion/settings.json`, with agent dir resolved by Pi (`PI_CODING_AGENT_DIR`, normally `~/.pi/agent`). It belongs to Fusion and is separate from Pi's own `settings.json` and from [`profiles.json`](profiles.md#the-profiles-file). It holds one user-global preference, used by every project and Pi process of this user:
+`<agent dir>/pi-fusion/settings.json`, with agent dir resolved by Pi (`PI_CODING_AGENT_DIR`, normally `~/.pi/agent`). It belongs to Fusion and is separate from Pi's own `settings.json` and from [`profiles.json`](profiles.md#the-profiles-file). It holds user-global startup settings, used by every project and Pi process of this user:
 
 ```json
-{ "version": 1, "history": { "enabled": true } }
+{ "version": 1, "history": { "enabled": true }, "plan": { "contextPct": 60 } }
 ```
 
-`history.enabled` is `true` or `false`. A missing file, or no `history.enabled`, means nothing is saved. Fusion reads the file once per instance, at startup. Only the `/fusion history on|off` commands write it. See [Turning history on and off](runs.md#turning-history-on-and-off).
+Both sections are optional:
 
-Validation is local. A non-object, a version other than `1`, an unknown field or a non-boolean `enabled` makes the whole file unreadable. At startup that leaves the file untouched, `PI_FUSION_HISTORY` decides, and one warning says so. A save over such a file, or over a file from a newer pi-fusion, is refused so you can fix it by hand.
+- `history.enabled` is `true` or `false`; the saved preference beats `PI_FUSION_HISTORY`. See [Turning history on and off](runs.md#turning-history-on-and-off).
+- `plan.contextPct` is a number from **0 to 100**, fractions included; `0` disables context-based handoffs and continuation warnings. A non-blank `PI_FUSION_PLAN_CONTEXT_PCT` overrides it; with neither, the cap is **35%**. An invalid non-blank variable keeps the 35% default and warns, rather than using the saved value. See [The context cap](runs.md#the-context-cap).
+
+A missing file or field means no value is saved. Fusion reads the file once per instance, at startup; edits take effect after restarting Pi, `/reload`, or replacing the session. Only `/fusion history on|off` writes it, preserving the plan setting; edit `plan.contextPct` by hand.
+
+Validation is local. A non-object, a version other than `1`, an unknown field, a non-boolean `enabled` or an invalid `contextPct` makes the whole file unreadable. At startup that leaves the file untouched, captured variables/defaults decide, and one warning names the resulting history and context-cap behavior. A save over such a file, or over a file from a newer pi-fusion, is refused so you can fix it by hand.
 
 Writes follow the [profiles file](profiles.md#how-the-file-is-written) rules. A missing file creates nothing until a save. A save creates the private directory (`0700`) and file (`0600`) where platform modes apply. It rereads the file, changes only the history preference, and replaces the file through a private temporary sibling and a rename. A failed write leaves the old file. Writes are queued within one process. Separate Pi processes and manual edits have **no lock**: the last rename wins, and nothing watches the file.
 
@@ -118,7 +123,7 @@ A Codex child reports **no cost**, and Fusion estimates none: a Codex run shows 
 
 `PI_FUSION_BUDGET_WARN_USD=5,20` warns once at each amount this process reaches. Warnings change no run. `PI_FUSION_BUDGET_LIMIT_USD=20` refuses new runs, continuations, and manual/automatic reviews at or above the threshold. With either set, the first Codex run admitted in an extension instance (the same scope as the invalid-budget warning) says once that Codex spend is not in the estimate those act on; Codex runs add nothing to the estimate, and no Codex-specific refusal or estimate exists, so neither variable bounds Codex spend. It cancels nothing and sets no child `maxBudgetUsd` or `maxTurns`; a running child can spend beyond it. Raise/unset the limit and restart Pi to admit work again.
 
-Budget variables and the context-cap variable are read at extension load. Invalid budget amounts disable that control and warn once at the first delegation/control/command, for example:
+Budget variables and the context-cap variable are read at extension load; the saved plan cap is read once at startup. Invalid budget amounts disable that control and warn once at the first delegation/control/command, for example:
 
 ```text
 fusion: PI_FUSION_BUDGET_LIMIT_USD=1,000 is not a dollar amount; no limit is set

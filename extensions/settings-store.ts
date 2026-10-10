@@ -5,9 +5,9 @@ import { queued, reason, writePrivate } from "./profile-store.ts";
 
 /**
  * Fusion's own user-global settings: one JSON file, `settings.json` in the Fusion-owned directory under the host agent
- * directory, beside `profiles.json` and never Pi's own `settings.json`. It holds one preference today, whether a new
- * Fusion instance keeps the on-disk run history, and an instance reads it once, when it starts: saving it changes the
- * next instance, never a running one. Reading a missing file is an empty document and creates nothing.
+ * directory, beside `profiles.json` and never Pi's own `settings.json`. An instance reads its history preference and
+ * plan context cap once, when it starts: saving them changes the next instance, never a running one. Reading a missing
+ * file is an empty document and creates nothing.
  *
  * Writes go through the profile store's queue and private atomic write, so the same tradeoff holds: writes of this
  * process to the file are queued and each rereads what the one before it left, and nothing coordinates two Pi
@@ -22,6 +22,7 @@ export const SETTINGS_VERSION = 1;
 export interface FusionSettings {
 	version: typeof SETTINGS_VERSION;
 	history?: { enabled: boolean };
+	plan?: { contextPct: number };
 }
 
 export interface SettingsStore {
@@ -47,20 +48,32 @@ export function parseSettings(value: unknown): FusionSettings {
 		const newer = typeof value.version === "number" && Number.isInteger(value.version) && value.version > SETTINGS_VERSION;
 		throw new Error(`the file has version ${JSON.stringify(value.version) ?? "undefined"}${newer ? ", written by a newer pi-fusion," : ""} and this build reads version ${SETTINGS_VERSION} only`);
 	}
-	for (const key of Object.keys(value)) if (key !== "version" && key !== "history") throw new Error(`the file has unknown field ${JSON.stringify(key)}`);
+	for (const key of Object.keys(value)) if (key !== "version" && key !== "history" && key !== "plan") throw new Error(`the file has unknown field ${JSON.stringify(key)}`);
 	const settings = emptySettings();
-	if (value.history === undefined) return settings;
-	if (!isRecord(value.history)) throw new Error("history must be an object");
-	for (const key of Object.keys(value.history)) if (key !== "enabled") throw new Error(`history has unknown field ${JSON.stringify(key)}`);
-	const enabled = value.history.enabled;
-	if (enabled === undefined) return settings;
-	if (typeof enabled !== "boolean") throw new Error("history.enabled must be true or false");
-	return { ...settings, history: { enabled } };
+	if (value.history !== undefined) {
+		if (!isRecord(value.history)) throw new Error("history must be an object");
+		for (const key of Object.keys(value.history)) if (key !== "enabled") throw new Error(`history has unknown field ${JSON.stringify(key)}`);
+		const enabled = value.history.enabled;
+		if (enabled !== undefined) {
+			if (typeof enabled !== "boolean") throw new Error("history.enabled must be true or false");
+			settings.history = { enabled };
+		}
+	}
+	if (value.plan !== undefined) {
+		if (!isRecord(value.plan)) throw new Error("plan must be an object");
+		for (const key of Object.keys(value.plan)) if (key !== "contextPct") throw new Error(`plan has unknown field ${JSON.stringify(key)}`);
+		const contextPct = value.plan.contextPct;
+		if (contextPct !== undefined) {
+			if (typeof contextPct !== "number" || !Number.isFinite(contextPct) || contextPct < 0 || contextPct > 100) throw new Error("plan.contextPct must be a number between 0 and 100");
+			settings.plan = { contextPct };
+		}
+	}
+	return settings;
 }
 
 /** The document as it is written, with only the preferences it names. */
 export function serializeSettings(settings: FusionSettings): string {
-	return `${JSON.stringify({ version: SETTINGS_VERSION, ...(settings.history === undefined ? {} : { history: { enabled: settings.history.enabled } }) }, null, 2)}\n`;
+	return `${JSON.stringify({ version: SETTINGS_VERSION, ...(settings.history === undefined ? {} : { history: { enabled: settings.history.enabled } }), ...(settings.plan === undefined ? {} : { plan: { contextPct: settings.plan.contextPct } }) }, null, 2)}\n`;
 }
 
 /** The settings a file's text holds, or an error naming the file and what is wrong with it. */

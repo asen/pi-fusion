@@ -46,6 +46,17 @@ test("the document reads an absent preference as unset and both booleans as them
 	assert.equal(serializeSettings(emptySettings()), '{\n  "version": 1\n}\n', "an unset preference is not written as off");
 });
 
+test("the optional plan cap round-trips as a number, including zero, fractions and both bounds", () => {
+	assert.deepEqual(parseSettings({ version: 1, plan: {} }), { version: 1 });
+	for (const contextPct of [0, 35, 60.5, 100]) {
+		const settings = { version: 1 as const, plan: { contextPct } };
+		assert.deepEqual(parseSettings(settings), settings);
+		assert.deepEqual(parseSettings(JSON.parse(serializeSettings(settings))), settings);
+		assert.deepEqual(parseSettings({ ...settings, history: {} }), settings, "an unset history preference does not skip the plan cap");
+		assert.deepEqual(parseSettings({ ...settings, history: { enabled: false } }), { ...settings, history: { enabled: false } });
+	}
+});
+
 test("a malformed document, an unknown version or an unknown field is refused with what is wrong", () => {
 	const refused: Array<[unknown, RegExp]> = [
 		[null, /must hold a JSON object/],
@@ -64,6 +75,11 @@ test("a malformed document, an unknown version or an unknown field is refused wi
 		[{ version: 1, history: { enabled: 1 } }, /history.enabled must be true or false/],
 		[{ version: 1, history: { enabled: null } }, /history.enabled must be true or false/],
 		[{ version: 1, history: { enabled: true, dir: "/tmp" } }, /history has unknown field "dir"/],
+		[{ version: 1, plan: null }, /plan must be an object/],
+		[{ version: 1, plan: true }, /plan must be an object/],
+		[{ version: 1, plan: [] }, /plan must be an object/],
+		[{ version: 1, plan: { contextPct: 60, model: "opus" } }, /plan has unknown field "model"/],
+		...["60", true, null, -1, 101, NaN, Infinity].map((contextPct): [unknown, RegExp] => [{ version: 1, plan: { contextPct } }, /plan.contextPct must be a number between 0 and 100/]),
 	];
 	for (const [value, reason] of refused) assert.throws(() => parseSettings(value), reason, JSON.stringify(value));
 });
@@ -71,7 +87,7 @@ test("a malformed document, an unknown version or an unknown field is refused wi
 test("a file that cannot be read says which file and why, and is never replaced", () =>
 	withDir(async (dir, file) => {
 		const store = fileSettingsStore(() => dir);
-		for (const text of ["{ not json", JSON.stringify({ version: 2, history: { enabled: false } }), JSON.stringify({ version: 1, history: { enabled: "no" } })]) {
+		for (const text of ["{ not json", JSON.stringify({ version: 2, history: { enabled: false } }), JSON.stringify({ version: 1, history: { enabled: "no" } }), JSON.stringify({ version: 1, plan: { contextPct: "60" } })]) {
 			write(file, text);
 			await assert.rejects(store.read(), (error: Error) => error.message.startsWith(`settings file ${file}`) && /fix it by hand$/.test(error.message));
 			await assert.rejects(store.update(() => ({ version: 1, history: { enabled: true } })), /fix it by hand/);
@@ -95,6 +111,15 @@ test("an update writes a private file in a private directory through a temporary
 		assert.deepEqual(JSON.parse(fs.readFileSync(file, "utf8")), { version: 1, history: { enabled: true } });
 		await store.update((current) => ({ ...current, history: { enabled: false } }));
 		assert.deepEqual(await store.read(), { version: 1, history: { enabled: false } });
+	}));
+
+test("a history update preserves the saved plan cap", () =>
+	withDir(async (dir, file) => {
+		write(file, serializeSettings({ version: 1, plan: { contextPct: 0 } }));
+		const store = fileSettingsStore(() => dir);
+		await store.update((current) => ({ ...current, history: { enabled: true } }));
+		assert.deepEqual(await store.read(), { version: 1, history: { enabled: true }, plan: { contextPct: 0 } });
+		assert.deepEqual(JSON.parse(fs.readFileSync(file, "utf8")), { version: 1, history: { enabled: true }, plan: { contextPct: 0 } });
 	}));
 
 test("a write that fails leaves the file as it was and says so", { skip: process.getuid?.() === 0 ? "root writes into a read-only directory" : false }, () =>

@@ -35,7 +35,7 @@ fusion.ts                     host lifecycle and registration
 | `fusion.ts` | Tools/command, mode, configuration application, admission, handles, branch records, questions, controls, reviews, and host lifecycle handlers |
 | `roles.ts` | Supported backends, writer-slot and review eligibility per role |
 | `profiles.ts`, `profile-store.ts` | Captured legacy defaults, settings validation/copies, global profiles file and queued atomic replacement |
-| `settings-store.ts` | Fusion's own `settings.json`: the saved history preference, its validation, and file/memory stores over the profile store's queue and atomic write |
+| `settings-store.ts` | Fusion's own `settings.json`: the saved history preference and plan context cap, validation, and file/memory stores over the profile store's queue and atomic write |
 | `backends/types.ts` | Session references/intents, selection, request/outcome/event/callback shapes; imports nothing |
 | `backends/claude.ts` | Claude SDK options, input/question bridges, stream loop; SDK concerns stay here |
 | `backends/pi-binding.ts` | Pure Pi role/model/effort binding, contracts, and tool/resource lists |

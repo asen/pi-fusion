@@ -1747,7 +1747,7 @@ export default function fusion(pi: ExtensionAPI, options: FusionOptions = {}) {
 	 */
 	const initialize = (): Promise<void> =>
 		(initializing ??= (async () => {
-			const choosing = chooseHistory();
+			const choosing = chooseSettings();
 			try {
 				await loadDefault();
 			} finally {
@@ -1779,16 +1779,18 @@ export default function fusion(pi: ExtensionAPI, options: FusionOptions = {}) {
 	};
 
 	/**
-	 * Settles once per instance whether it keeps run history: a saved preference, else PI_FUSION_HISTORY as it was
-	 * when the instance was created, else off. A file that cannot be read is left alone, the variable decides, and the
-	 * user is told once which it was. Nothing reads or writes history before this has settled.
+	 * Reads global settings once per instance, before routing or history access. A saved history preference beats its
+	 * variable; the plan cap instead uses its captured variable when non-blank, then the saved cap, then the default.
+	 * An unreadable file is left alone: captured variables decide and one warning names the resulting behavior.
 	 */
-	const chooseHistory = (): Promise<void> =>
-		(choosingHistory ??= (async () => {
+	const chooseSettings = (): Promise<void> =>
+		(choosingSettings ??= (async () => {
 			let saved: boolean | undefined;
 			let trouble: string | undefined;
 			try {
-				saved = (await settingsStore.read()).history?.enabled;
+				const settings = await settingsStore.read();
+				saved = settings.history?.enabled;
+				if (!planVariableSet) planPct = settings.plan?.contextPct ?? planPct;
 			} catch (error) {
 				trouble = error instanceof Error ? error.message : String(error);
 			}
@@ -1799,14 +1801,14 @@ export default function fusion(pi: ExtensionAPI, options: FusionOptions = {}) {
 				historyOn = historyVariable;
 				historySource = historyVariable ? "from PI_FUSION_HISTORY=1" : trouble === undefined ? "no preference is saved and PI_FUSION_HISTORY is not 1" : "PI_FUSION_HISTORY is not 1";
 			}
-			if (trouble !== undefined) historyWarning = `${trouble}; run history is ${historyOn ? "on" : "off"} in this instance (${historySource})`;
+			if (trouble !== undefined) settingsWarning = `${trouble}; run history is ${historyOn ? "on" : "off"} in this instance (${historySource}); plan context cap is ${planPct}%`;
 		})());
 
-	/** Says once, where a notice can be shown, that the saved history preference could not be read at startup. */
-	const noteHistory = (ctx: any): void => {
-		if (historyWarning === undefined) return;
-		const warning = historyWarning;
-		historyWarning = undefined;
+	/** Says once, where a notice can be shown, that the global settings could not be read at startup. */
+	const noteSettings = (ctx: any): void => {
+		if (settingsWarning === undefined) return;
+		const warning = settingsWarning;
+		settingsWarning = undefined;
 		record(() => ctx.ui.notify(`fusion: ${warning}`, "warning"));
 	};
 
@@ -1864,8 +1866,10 @@ export default function fusion(pi: ExtensionAPI, options: FusionOptions = {}) {
 	const ledger = new Ledger(budgetConfig());
 	/** The variables that are set and name nothing their control can use, captured when Pi loads this. */
 	const variableTrouble = [...budgetProblems(), ...planProblems(), ...dashboardProblems()];
-	/** The share of its window, as a percentage, past which a plan run is handed off to a fresh one. */
-	const planPct = planContextPct();
+	/** A non-blank variable overrides the saved cap, including an invalid value that keeps the default with a warning. */
+	const planVariableSet = !!process.env.PI_FUSION_PLAN_CONTEXT_PCT?.trim();
+	/** The cap settles with the startup settings read and stays fixed for this instance. */
+	let planPct = planContextPct();
 	let variablesNoted = false;
 	/** Whether an implement, ultracode or security run that changed files gets an independent review without being asked. */
 	const autoReview = process.env.PI_FUSION_AUTO_REVIEW?.trim() === "1";
@@ -1880,9 +1884,9 @@ export default function fusion(pi: ExtensionAPI, options: FusionOptions = {}) {
 	let historyOn: boolean | undefined;
 	/** Where `historyOn` came from, as the history command and status say it. */
 	let historySource = "";
-	/** Why the saved preference was not what this instance started with, said once where a notice can be shown. */
-	let historyWarning: string | undefined;
-	let choosingHistory: Promise<void> | undefined;
+	/** Why global settings could not be read, said once where a notice can be shown. */
+	let settingsWarning: string | undefined;
+	let choosingSettings: Promise<void> | undefined;
 	let history: History | undefined;
 	/** The runs an earlier Pi process left in this host session's file, the newest record per handle. */
 	const historical = new Map<string, HistoryRecord>();
@@ -2989,8 +2993,8 @@ export default function fusion(pi: ExtensionAPI, options: FusionOptions = {}) {
 	 * instances that start after it. A save never changes this instance's history, whatever it was and whatever is saved.
 	 */
 	const historyCommand = async (command: Extract<FusionCommand, { kind: "history" | "history-set" }>, ctx: any, notice: (text: string, level: "info" | "warning" | "error") => void): Promise<void> => {
-		if (historyOn === undefined) await chooseHistory();
-		noteHistory(ctx);
+		if (historyOn === undefined) await chooseSettings();
+		noteSettings(ctx);
 		if (command.kind === "history") {
 			notice([...(await historyLines()), "Change the saved preference with /fusion history on|off; it applies after restarting Pi, /reload or a new session."].join("\n"), "info");
 			return;
@@ -3332,7 +3336,7 @@ export default function fusion(pi: ExtensionAPI, options: FusionOptions = {}) {
 			// profile as a call does; once that has loaded, nothing here yields.
 			if (!initialized) await initialize();
 			noteProfiles(ctx);
-			noteHistory(ctx);
+			noteSettings(ctx);
 			ensureHistory(ctx);
 			if (
 				command.kind === "config" ||
@@ -3566,7 +3570,7 @@ export default function fusion(pi: ExtensionAPI, options: FusionOptions = {}) {
 		mask();
 		await initialize();
 		noteProfiles(ctx);
-		noteHistory(ctx);
+		noteSettings(ctx);
 	});
 
 	pi.on("agent_settled", (_event, ctx) => {
@@ -3620,7 +3624,7 @@ export default function fusion(pi: ExtensionAPI, options: FusionOptions = {}) {
 		// here yields before the run registers, which is what lets a cancel issued right after the call find it.
 		if (!initialized) await initialize();
 		noteProfiles(ctx);
-		noteHistory(ctx);
+		noteSettings(ctx);
 		ensureHistory(ctx);
 		noteVariables(ctx);
 		// A run whose state has just turned terminal records its branch entry when its end path lands; a continue reads it.
@@ -3858,9 +3862,9 @@ export default function fusion(pi: ExtensionAPI, options: FusionOptions = {}) {
 	const control = async (tool: NonNullable<CardDetails["control"]>, params: { action: string; run?: string; message?: string }, signal: AbortSignal | undefined, ctx: any) => {
 		mask();
 		ui = ctx.ui;
-		// A control waits for nothing but the history choice: the runs it names may be ones only the history kept.
-		if (historyOn === undefined) await chooseHistory();
-		noteHistory(ctx);
+		// A control waits for global settings alone: the runs it names may be ones only the history kept.
+		if (historyOn === undefined) await chooseSettings();
+		noteSettings(ctx);
 		ensureHistory(ctx);
 		noteVariables(ctx);
 		const reply = (text: string, details: Record<string, unknown> = {}) => ({ content: [{ type: "text" as const, text }], details: { ...details, ...(details.question === undefined ? {} : { control: tool }) } });
