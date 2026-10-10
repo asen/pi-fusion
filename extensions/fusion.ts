@@ -3294,10 +3294,11 @@ export default function fusion(pi: ExtensionAPI, options: FusionOptions = {}) {
 			/** Every notice /fusion shows: a child's report, activity, question or changed path reaches most of them. */
 			const notice = (text: string, level: "info" | "warning" | "error") => ctx.ui.notify(plainText(text), level);
 			mask();
-			const command = parseFusion(args);
+			let command = parseFusion(args);
 			if (command.kind === "usage") {
 				notice(command.message, "warning");
-				return;
+				if (args.trim()) return;
+				command = { kind: "status" };
 			}
 			// On and off read no configuration, so they switch at once, before the default profile has loaded.
 			if (command.kind === "off") {

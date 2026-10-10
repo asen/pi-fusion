@@ -683,6 +683,29 @@ test("parseFusion reads every /fusion form and answers anything else with the us
 	}
 });
 
+test("bare /fusion keeps the usage warning and shows status without changing mode", async () => {
+	const host = makeHost();
+	for (const mode of ["on", "off"]) {
+		await host.command(mode);
+		const active = [...host.activeTools];
+		for (const args of ["", " \t\n "]) {
+			host.notices.length = 0;
+			await host.command(args);
+			assert.equal(host.notices.length, 2);
+			assert.deepEqual(host.notices[0], [USAGE, "warning"]);
+			const status = host.notices[1]!;
+			assert.equal(status[1], "info");
+			assert.match(status[0], new RegExp(`^fusion: ${mode}\\nprofile: builtin\\n`));
+			assert.deepEqual(host.activeTools, active);
+			host.notices.length = 0;
+			await host.command("status");
+			assert.deepEqual(host.notices, [status]);
+		}
+	}
+	assert.deepEqual(host.branch, []);
+	assert.deepEqual(host.sent, []);
+});
+
 test("/fusion status lists this Pi session's runs and details the one it is given", async () => {
 	const host = makeHost();
 	await host.command("status");

@@ -6,6 +6,7 @@ User commands act on the same runs as either control tool. Run-changing `steer`,
 
 | Command | Effect |
 | --- | --- |
+| `/fusion` | Show the usage warning, then the same status as `/fusion status`; does not change mode or start a child |
 | `/fusion on`, `/fusion off` | Switch delegation mode; neither starts or cancels a child |
 | `/fusion status [run-N]` | Show mode, current profile, this instance's history, role defaults, runs, earlier-process runs, and session usage; with a handle, show only that run's activity, tool count, changed files, and accepted transcript/resume hint |
 | `/fusion cancel run-N` | Stop the run and mark it cancelled by the user; the host still gets its end notice |

@@ -1068,10 +1068,17 @@ test("a later /fusion dashboard gets a fresh url and session_shutdown closes it,
 	await shutdown({ reason: "reload" }, ctx);
 });
 
-test("any other argument warns about the usage and starts nothing", async () => {
+test("bare /fusion also shows status, while invalid arguments only warn about usage", async () => {
 	const usage =
 		"Usage: /fusion dashboard | /fusion dashboard stop | /fusion dashboard limit [N] | /fusion status [run-N] | /fusion cancel run-N | /fusion wait run-N | /fusion steer run-N <text> | /fusion answer [run-N] [text] | /fusion review run-N | /fusion on | /fusion off | /fusion config | /fusion profile [list | use <name> | save <name> | default <name>] | /fusion history [on | off]";
-	for (const args of ["", "   ", "dashboard start", "status foo", "cancel", "steer run-1", "config now"]) {
+	for (const args of ["", "   "]) {
+		const notices = await runCommand(args);
+		assert.equal(notices.length, 2, `for ${JSON.stringify(args)}`);
+		assert.deepEqual(notices[0], { message: usage, type: "warning" });
+		assert.equal(notices[1]!.type, "info");
+		assert.match(notices[1]!.message, /^fusion: on\nprofile: builtin\n/);
+	}
+	for (const args of ["dashboard start", "status foo", "cancel", "steer run-1", "config now"]) {
 		const notices = await runCommand(args);
 		assert.deepEqual(notices, [{ message: usage, type: "warning" }], `for ${JSON.stringify(args)}`);
 	}
