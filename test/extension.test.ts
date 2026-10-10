@@ -511,7 +511,7 @@ test("every prompt guideline names the tool that carries it, and together they n
 		for (const role of ["plan", "implement", "ultracode", "ask"]) {
 			assert.ok(guidelines.some((guideline) => guideline.includes(`role ${role}`)), `no ${tool} guideline names role ${role}`);
 		}
-		for (const pattern of [/do not edit files yourself/, /choice wins/, /^Report to the user/, /Escalation/, /continue set to its handle/, /background true/]) {
+		for (const pattern of [/do not edit files yourself/, /choice wins/, /^Report to the user/, /Escalation/, /continue set to its handle/, /background true/, /tasks and context in normal, readable prose\. Preserve spaces between words; do not concatenate words to shorten prompts/]) {
 			assert.equal(guidelines.filter((guideline) => pattern.test(guideline)).length, 1, `${pattern} must match one ${tool} guideline`);
 		}
 		assert.ok(!guidelines.some((guideline) => /tool list/.test(guideline)), "all roles are always available");

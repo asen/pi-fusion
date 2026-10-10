@@ -1519,6 +1519,7 @@ const guidelines = (tool: string, control: string, roles: RoleSettings, options:
 	}
 	lines.push(
 		`A ${tool} call with continue is never handed off, because you named the run. Past the cap its result says so and names what a fresh run would take instead; act on that when the next step can stand on its own, and keep continuing the run while it cannot.`,
+		`Write ${tool} tasks and context in normal, readable prose. Preserve spaces between words; do not concatenate words to shorten prompts.`,
 		`You orchestrate ${tool} runs and do not implement: delegate implementation in dependency order, pass earlier results on as context, check each report against the task's acceptance criteria before the next task${on("ask") ? `, and review the change with ${askTool} role ask and mode review` : ""}; do not edit files yourself. When a run fails, report its failure message rather than doing the task yourself.`,
 	);
 	if (on("implement") || on("ultracode")) {

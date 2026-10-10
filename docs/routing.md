@@ -45,7 +45,7 @@ Implicit `plan` calls continue the latest plan on the routed backend, or hand of
 
 ## Briefs, escalation, and review
 
-Children do not see the host conversation. Each brief must state the goal, settled decisions, constraints, acceptance criteria, and verification in readable prose. Pass earlier reports as context and check each result before admitting the next task.
+Children do not see the host conversation. Each brief must state the goal, settled decisions, constraints, acceptance criteria, and verification in readable prose. Tasks and context must preserve spaces between words, not concatenate them to shorten prompts. Pass earlier reports as context and check each result before admitting the next task.
 
 An `implement` report's **Escalation** means the task needs broader scope or an unresolved design decision. The run ends; it does not wait or widen the task. Keep verified changes, then take the design question to an enabled `plan` role or give a new `implement` run a wider agreed brief.
 
