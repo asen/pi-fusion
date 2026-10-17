@@ -43,7 +43,8 @@ extension loads -> OFF: fusion_activate available; workflow tools hidden
                      v
                   ON: workflow tools + fusion_deactivate
                      |
-             /fusion off or explicit stop request
+             /fusion off, explicit stop request,
+             or host cleanup of task-scoped use
              only when no run is unfinished
                      v
                   OFF
@@ -55,12 +56,22 @@ To turn it on, type `/fusion on` or explicitly ask for Fusion, such as “use Fu
 
 A role/model/backend request alone (“plan this first,” “do a security audit,” “use ultracode,” “have Claude do it”) does not qualify. Nor do quoted instructions, discussion of Fusion, or earlier use in the conversation. These restrictions guide the host; they cannot prove a model followed them.
 
-Turn it off with `/fusion off` or a plain request such as “turn Fusion off and work directly,” carried out through `fusion_deactivate`. **Finishing a task never turns it off.** Repeating a switch changes nothing and reports the current state.
+The mode tools instruct the host to distinguish task-scoped use from session-wide activation:
 
-After tool/natural-language activation, the host's next `agent_settled` shows one reminder:
+| Request or prior state | Guidance |
+| --- | --- |
+| “Use Fusion to implement this,” when Fusion was off | Call `fusion_deactivate` after the bounded request is complete, including delegated work and required reviews, unless you ask to leave Fusion on |
+| “Turn Fusion on,” “leave Fusion on,” or `/fusion on` | Keep it on until you ask to turn it off |
+| Fusion was already on before a bounded request | Preserve its existing scope; completing that request alone is not a reason to turn it off |
+
+Launching a background run, answering a side question, or waiting for clarification is not task completion. Scope and completion are model judgments: the extension stores no task/session scope and does not switch off automatically when a child or host turn ends. Both mode tools carry the scope rule because activation's guidance leaves when Fusion turns on.
+
+You can also turn it off with `/fusion off` or a plain request such as “turn Fusion off and work directly,” carried out through `fusion_deactivate`. Repeating a switch changes nothing and reports the current state.
+
+After tool/natural-language activation, the host's next `agent_settled` shows one reminder if Fusion is still on:
 
 ```text
-Fusion remains on. Use /fusion off or ask to turn it off when you're done.
+Fusion remains on. Task-scoped use should end after the request is complete; session-wide use ends with /fusion off or a request to turn it off.
 ```
 
 The flag is cleared before notification. Background children may still be active; this is a host notification, not their completion or automatic deactivation. `/fusion on` suppresses the reminder, including when already on; successful off clears it.

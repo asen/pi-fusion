@@ -42,6 +42,7 @@ See [Pi backend](docs/pi-backend.md) and [Codex backend](docs/codex-backend.md) 
 
 - Fusion starts off in each instance; nothing delegates, continues, hands off, or reviews while off. Mode is memory-only.
 - On/off share synchronous implementations. Off refuses every unfinished run (running, waiting, finishing), cancels nothing, respects allow lists/exclusions, and preserves unrelated active tools.
+- Mode-tool guidance makes activation solely for a bounded request task-scoped: instruct the host to deactivate after that request, delegated work and required reviews finish. Preserve pre-existing scope and explicit session-wide on requests, including `/fusion on`. Scope/completion are model judgments, not runtime state or automatic deactivation.
 - Tool activation arms one reminder on the **host's** `agent_settled`: clear before notification, suppress for `/fusion on`, clear on successful off. It is neither child completion nor automatic deactivation.
 - Settings apply only with no unfinished run. Application/admission binding remain synchronous after the last await. Refresh preserves the entire active-tool list; on failure roll settings back and attempt guidance/list restoration, not guaranteed recovery.
 - Builtin disables `security` (Pi-only); enable it through settings/profiles, not a model parameter/variable. Saved profiles keep their enabled settings. Ultracode is Claude-only. Codex supports `plan`/`implement`/`ask` (see [Codex evidence](docs/codex-backend.md#evidence)), and builtin routes nothing there.

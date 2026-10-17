@@ -2,7 +2,7 @@
 
 A [Pi](https://pi.dev) extension for handing work to headless Claude Code, Pi, or Codex sessions. The **host** talks with you; a **child** plans, implements, answers, or reviews a bounded task.
 
-Fusion starts **off**. Type `/fusion on`, or ask “use Fusion to implement this.” It stays on until `/fusion off`, an explicit request to turn it off, or the extension reloads. Turning it on starts no child. After natural-language activation, one reminder tells you that Fusion remains on; finishing a task does not turn it off.
+Fusion starts **off**. Ask “use Fusion to implement this” for task-scoped use: the host is instructed to turn it off after the request and required reviews finish. `/fusion on` or “turn Fusion on” keeps it on until you ask to turn it off or the extension reloads. Turning it on starts no child. Scope is model guidance, not automatic deactivation; see [activation and reminders](docs/fusion-command.md#turning-fusion-on-and-off).
 
 ## Install and quick start
 

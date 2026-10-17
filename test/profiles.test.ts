@@ -437,6 +437,7 @@ test("a cap replacement keeps the planner's model unless the call names another,
 interface Tool {
 	name: string;
 	description: string;
+	promptSnippet?: string;
 	promptGuidelines?: string[];
 	executionMode?: string;
 	parameters?: unknown;
@@ -1354,7 +1355,7 @@ test("tool activation reminds once at the next host settlement, without turning 
 	await host.call("fusion_activate", {});
 	assert.deepEqual(host.notices, [], "activation waits for the host to settle");
 	await host.settled();
-	assert.deepEqual(host.notices, [["Fusion remains on. Use /fusion off or ask to turn it off when you're done.", "info"]]);
+	assert.deepEqual(host.notices, [["Fusion remains on. Task-scoped use should end after the request is complete; session-wide use ends with /fusion off or a request to turn it off.", "info"]]);
 	assert.deepEqual(host.active, ON_TOOLS, "the reminder keeps Fusion available");
 	await host.call("fusion_activate", {});
 	await host.settled();
@@ -1485,8 +1486,31 @@ test("the mode tools carry only their own guidance, and the workflow guidance sa
 	}
 	assert.match(activate.promptGuidelines!.join("\n"), /names a role, a model or a harness without asking for Fusion, such as a plan, a security audit, ultracode, Claude or Pi, does not qualify/);
 	assert.match(activate.promptGuidelines!.join("\n"), /Fusion having been used earlier in this conversation/);
-	assert.match(deactivate.promptGuidelines!.join("\n"), /never because a task ended/);
 	for (const name of ["fusion", "claude"]) {
 		assert.match(host.tools.get(name)!.promptGuidelines![0]!, new RegExp(`^These ${name} guidelines apply while Fusion is on`));
 	}
+});
+
+test("mode guidance cleans up completed task-scoped activation and preserves ongoing, pre-existing or session-wide use", async () => {
+	const host = sdkHost({ ui: false });
+	await host.start();
+	for (const name of ["fusion_activate", "fusion_deactivate"]) {
+		const tool = host.tools.get(name)!;
+		const text = [tool.description, tool.promptSnippet, ...tool.promptGuidelines!].join("\n");
+		assert.match(text, /If you enabled Fusion solely for a bounded user request, call fusion_deactivate once that request is complete, including delegated work and required reviews/);
+		assert.match(text, /unless the user asked to leave Fusion on/);
+		assert.match(text, /Launching a background run, answering a side question or waiting for clarification is not completion/);
+		assert.match(text, /A request to turn Fusion on or leave it on, including \/fusion on, is session-wide: keep it on until the user asks to turn it off/);
+		assert.match(text, /Preserve the existing scope if Fusion was already on before that request/);
+		assert.doesNotMatch(text, /Fusion stays on until|finishing a task does not turn it off|never because a task ended|only when the user explicitly asks to stop using Fusion/);
+	}
+	assert.equal(host.tools.get("fusion_deactivate")!.promptSnippet, "Turn Fusion orchestration off on request or after completing a task-scoped activation");
+	const activated = await host.call("fusion_activate", {});
+	assert.match(activated.text ?? "", /call fusion_deactivate after completing the request, including delegated work and required reviews/);
+	assert.match(activated.text ?? "", /otherwise keep Fusion on until the user asks to turn it off/);
+	assert.equal((await host.call("fusion_activate", {})).text, "Fusion is already on; nothing changed. Preserve its existing scope.");
+	await host.settled();
+	assert.deepEqual(host.active, ON_TOOLS, "settlement cannot infer completion or scope: the host must call deactivation");
+	assert.deepEqual((await host.call("fusion_deactivate", {})).details, { enabled: false, changed: true });
+	await host.shutdown();
 });

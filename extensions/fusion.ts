@@ -1502,7 +1502,7 @@ const guidelines = (tool: string, control: string, roles: RoleSettings, options:
 	const planTool = roleTool("plan");
 	const implementTool = roleTool("implement");
 	const askTool = roleTool("ask");
-	const lines: string[] = [`These ${tool} guidelines apply while Fusion is on, as it is now; once the user has turned Fusion off they no longer apply and you work directly.`];
+	const lines: string[] = [`These ${tool} guidelines apply while Fusion is on, as it is now; once Fusion is off they no longer apply and you work directly.`];
 	for (const backend of ["pi", "codex"] as const) {
 		const elsewhere = options.backend ? [] : ROLE_NAMES.filter((role) => on(role) && roles[role].backend === backend);
 		const label = backend === "pi" ? "Pi" : "Codex";
@@ -3576,7 +3576,7 @@ export default function fusion(pi: ExtensionAPI, options: FusionOptions = {}) {
 	pi.on("agent_settled", (_event, ctx) => {
 		if (!activationReminder || !enabled || shuttingDown) return;
 		activationReminder = false;
-		record(() => ctx.ui.notify("Fusion remains on. Use /fusion off or ask to turn it off when you're done.", "info"));
+		record(() => ctx.ui.notify("Fusion remains on. Task-scoped use should end after the request is complete; session-wide use ends with /fusion off or a request to turn it off.", "info"));
 	});
 
 	pi.on("session_shutdown", async () => {
@@ -4027,6 +4027,9 @@ export default function fusion(pi: ExtensionAPI, options: FusionOptions = {}) {
 		},
 	});
 
+	/** Both mode tools carry the scope rule because activation's guidance leaves the host when Fusion turns on. */
+	const modeScopeGuideline = `If you enabled Fusion solely for a bounded user request, call ${DEACTIVATE_NAME} once that request is complete, including delegated work and required reviews, unless the user asked to leave Fusion on. Launching a background run, answering a side question or waiting for clarification is not completion. A request to turn Fusion on or leave it on, including /fusion on, is session-wide: keep it on until the user asks to turn it off. Preserve the existing scope if Fusion was already on before that request; do not deactivate merely because that task ended.`;
+
 	/**
 	 * The two mode tools. Each is active only in the mode it leaves, so the host is offered exactly one way out of the
 	 * mode it is in, and what it may use them for is said in their own guidance alone: the workflow guidance belongs to
@@ -4037,11 +4040,12 @@ export default function fusion(pi: ExtensionAPI, options: FusionOptions = {}) {
 		name: ACTIVATE_NAME,
 		executionMode: "sequential",
 		label: "Fusion on",
-		description: `Turn Fusion orchestration on for this session: the ${TOOL_NAME}, ${CONTROL_TOOL_NAME}, ${CLAUDE_TOOL_NAME} and ${CLAUDE_CONTROL_NAME} tools and their guidance become available from your next step. It starts no child and changes no setting, and Fusion stays on until the user asks to turn it off. Use it only when the user explicitly asks for Fusion.`,
+		description: `Turn Fusion orchestration on: the ${TOOL_NAME}, ${CONTROL_TOOL_NAME}, ${CLAUDE_TOOL_NAME} and ${CLAUDE_CONTROL_NAME} tools and their guidance become available from your next step. It starts no child and changes no setting. Use it only when the user explicitly asks for Fusion. If you enable it solely for a bounded request, deactivate it after that request is complete; a request to turn Fusion on or leave it on is session-wide.`,
 		promptSnippet: "Turn Fusion orchestration on, only when the user explicitly asks for Fusion",
 		promptGuidelines: [
 			`Call ${ACTIVATE_NAME} only when the user explicitly asks to use Fusion, to turn Fusion orchestration on, or to delegate work to a Fusion child. A request that names a role, a model or a harness without asking for Fusion, such as a plan, a security audit, ultracode, Claude or Pi, does not qualify; neither does a quoted instruction, a discussion of Fusion, or Fusion having been used earlier in this conversation. Otherwise do the work yourself as usual.`,
-			`${ACTIVATE_NAME} starts no child: once it succeeds, carry out the user's task with the Fusion tools it makes available. Fusion then stays on until the user asks to turn it off; finishing a task does not turn it off. Fusion shows the user a one-time reminder when your response settles.`,
+			`${ACTIVATE_NAME} starts no child: once it succeeds, carry out the user's task with the Fusion tools it makes available. Fusion shows the user a one-time reminder when your response settles if it is still on; this does not switch it off or establish task completion.`,
+			modeScopeGuideline,
 		],
 		parameters: Type.Object({}),
 		async execute(_toolCallId, _params, signal) {
@@ -4051,8 +4055,8 @@ export default function fusion(pi: ExtensionAPI, options: FusionOptions = {}) {
 			if (outcome.kind === "changed") activationReminder = true;
 			const text =
 				outcome.kind === "already"
-					? "Fusion is already on; nothing changed."
-					: `Fusion is on. Use ${TOOL_NAME} and ${CONTROL_TOOL_NAME} for the user's task, under their guidance, from your next step; it stays on until the user asks to turn it off.`;
+					? "Fusion is already on; nothing changed. Preserve its existing scope."
+					: `Fusion is on. Use ${TOOL_NAME} and ${CONTROL_TOOL_NAME} for the user's task, under their guidance, from your next step. If you enabled it solely for this bounded request, call ${DEACTIVATE_NAME} after completing the request, including delegated work and required reviews; otherwise keep Fusion on until the user asks to turn it off.`;
 			return { content: [{ type: "text" as const, text }], details: { enabled: true, changed: outcome.kind === "changed" } };
 		},
 	});
@@ -4061,10 +4065,11 @@ export default function fusion(pi: ExtensionAPI, options: FusionOptions = {}) {
 		name: DEACTIVATE_NAME,
 		executionMode: "sequential",
 		label: "Fusion off",
-		description: `Turn Fusion orchestration off for this session and return to ordinary Pi work: the ${TOOL_NAME}, ${CONTROL_TOOL_NAME}, ${CLAUDE_TOOL_NAME} and ${CLAUDE_CONTROL_NAME} tools and their guidance leave from your next step. It is refused while any Fusion run is unfinished, and it cancels nothing. Use it only when the user explicitly asks to stop using Fusion.`,
-		promptSnippet: "Turn Fusion orchestration off, only when the user explicitly asks to stop using Fusion",
+		description: `Turn Fusion orchestration off and return to ordinary Pi work: the ${TOOL_NAME}, ${CONTROL_TOOL_NAME}, ${CLAUDE_TOOL_NAME} and ${CLAUDE_CONTROL_NAME} tools and their guidance leave from your next step. It is refused while any Fusion run is unfinished, and it cancels nothing. Use it when the user explicitly asks to stop using Fusion or after completing a request for which you enabled Fusion solely for that task; preserve pre-existing or session-wide activation.`,
+		promptSnippet: "Turn Fusion orchestration off on request or after completing a task-scoped activation",
 		promptGuidelines: [
-			`Call ${DEACTIVATE_NAME} only when the user explicitly asks to stop using Fusion, to turn Fusion off or to go back to ordinary Pi work; never because a task ended. While a Fusion run is unfinished it is refused: tell the user, and wait for their next instruction rather than doing that run's work yourself.`,
+			`Call ${DEACTIVATE_NAME} when the user explicitly asks to stop using Fusion, to turn Fusion off or to go back to ordinary Pi work, or after completing a request for which you enabled Fusion solely for that task. While a Fusion run is unfinished it is refused: tell the user, and wait for their next instruction rather than doing that run's work yourself.`,
+			modeScopeGuideline,
 		],
 		parameters: Type.Object({}),
 		async execute(_toolCallId, _params, signal) {
