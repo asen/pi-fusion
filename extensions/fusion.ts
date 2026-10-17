@@ -1406,6 +1406,7 @@ const BROWSER_OPENER: Record<string, string> = { darwin: "open", linux: "xdg-ope
 
 /** What a /fusion argument list asks for. */
 export type FusionCommand =
+	| { kind: "summary" }
 	| { kind: "dashboard" }
 	| { kind: "dashboard-stop" }
 	| { kind: "dashboard-limit"; limit?: number }
@@ -1425,11 +1426,12 @@ export type FusionCommand =
 	| { kind: "history-set"; enabled: boolean }
 	| { kind: "usage"; message: string };
 
-/** The command a /fusion argument list names, or the usage when it names none. */
+/** Bare /fusion asks for a summary; invalid arguments ask for usage rather than changing mode. */
 export function parseFusion(args: string): FusionCommand {
 	const usage: FusionCommand = { kind: "usage", message: USAGE };
 	const text = args.trim();
-	const tokens = text ? text.split(/\s+/) : [];
+	if (!text) return { kind: "summary" };
+	const tokens = text.split(/\s+/);
 	const [first, second] = tokens;
 	if (first === "dashboard") {
 		if (tokens.length === 1) return { kind: "dashboard" };
@@ -3273,7 +3275,7 @@ export default function fusion(pi: ExtensionAPI, options: FusionOptions = {}) {
 	};
 
 	pi.registerCommand("fusion", {
-		description: "Open or close the pi-fusion dashboard or set its run limit, check, cancel, steer, answer, review and wait for this session's runs, turn fusion on or off, or configure roles and profiles",
+		description: "Show Fusion's mode and roles, open or close the dashboard or set its run limit, check, cancel, steer, answer, review and wait for this session's runs, turn fusion on or off, or configure roles and profiles",
 		getArgumentCompletions: (prefix: string) => {
 			const profile = PROFILE_ARG.exec(prefix);
 			if (profile) {
@@ -3298,11 +3300,10 @@ export default function fusion(pi: ExtensionAPI, options: FusionOptions = {}) {
 			/** Every notice /fusion shows: a child's report, activity, question or changed path reaches most of them. */
 			const notice = (text: string, level: "info" | "warning" | "error") => ctx.ui.notify(plainText(text), level);
 			mask();
-			let command = parseFusion(args);
+			const command = parseFusion(args);
 			if (command.kind === "usage") {
 				notice(command.message, "warning");
-				if (args.trim()) return;
-				command = { kind: "status" };
+				return;
 			}
 			// On and off read no configuration, so they switch at once, before the default profile has loaded.
 			if (command.kind === "off") {
@@ -3338,6 +3339,10 @@ export default function fusion(pi: ExtensionAPI, options: FusionOptions = {}) {
 			noteProfiles(ctx);
 			noteSettings(ctx);
 			ensureHistory(ctx);
+			if (command.kind === "summary") {
+				notice([`fusion: ${enabled ? "on" : "off"}`, "", ...settingsTable(configuration.roles)].join("\n"), "info");
+				return;
+			}
 			if (
 				command.kind === "config" ||
 				command.kind === "profile" ||

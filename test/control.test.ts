@@ -630,8 +630,8 @@ test("parseFusion reads every /fusion form and answers anything else with the us
 		["wait run-10", { kind: "wait", handle: "run-10" }],
 		["steer run-1 also update the README", { kind: "steer", handle: "run-1", text: "also update the README" }],
 		["steer run-1   keep  going  ", { kind: "steer", handle: "run-1", text: "keep  going" }],
-		["", usage],
-		["   ", usage],
+		["", { kind: "summary" }],
+		["   ", { kind: "summary" }],
 		["dashboard start", usage],
 		["dashboard stop now", usage],
 		["status foo", usage],
@@ -683,7 +683,7 @@ test("parseFusion reads every /fusion form and answers anything else with the us
 	}
 });
 
-test("bare /fusion keeps the usage warning and shows status without changing mode", async () => {
+test("bare /fusion shows only mode and roles without a usage warning or mode change", async () => {
 	const host = makeHost();
 	for (const mode of ["on", "off"]) {
 		await host.command(mode);
@@ -691,15 +691,13 @@ test("bare /fusion keeps the usage warning and shows status without changing mod
 		for (const args of ["", " \t\n "]) {
 			host.notices.length = 0;
 			await host.command(args);
-			assert.equal(host.notices.length, 2);
-			assert.deepEqual(host.notices[0], [USAGE, "warning"]);
-			const status = host.notices[1]!;
-			assert.equal(status[1], "info");
-			assert.match(status[0], new RegExp(`^fusion: ${mode}\\nprofile: builtin\\n`));
+			assert.deepEqual(host.notices, [[[`fusion: ${mode}`, "", ...settingsTable(builtinConfiguration().roles)].join("\n"), "info"]]);
 			assert.deepEqual(host.activeTools, active);
 			host.notices.length = 0;
 			await host.command("status");
-			assert.deepEqual(host.notices, [status]);
+			assert.equal(host.notices.length, 1);
+			assert.match(host.notices[0]![0], new RegExp(`^fusion: ${mode}\\nprofile: builtin\\nhistory: `));
+			assert.match(host.notices[0]![0], /\nno runs in this Pi session yet\nsession usage: /);
 		}
 	}
 	assert.deepEqual(host.branch, []);

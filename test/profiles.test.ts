@@ -613,6 +613,21 @@ test("the default profile loads as the session starts, and the host's guidance a
 	await host.shutdown();
 });
 
+test("bare /fusion loads the default profile and shows its current roles without activating Fusion", async () => {
+	const work = settings({ implement: { enabled: true, backend: "pi", model: "deepseek/deepseek-chat", effort: "low" }, ask: { enabled: false, backend: "codex" } });
+	const host = sdkHost({ profiles: memoryProfileStore(document({ work }, "work")), ui: false });
+	await host.command("");
+	assert.deepEqual(host.notices, [[["fusion: off", "", ...settingsTable(work)].join("\n"), "info"]]);
+	assert.deepEqual(host.active, ["read", "bash", "fusion_activate"]);
+	await host.command("on");
+	host.notices.length = 0;
+	await host.command(" \t\n ");
+	assert.deepEqual(host.notices, [[["fusion: on", "", ...settingsTable(work)].join("\n"), "info"]]);
+	assert.deepEqual(host.active, ON_TOOLS);
+	assert.deepEqual(host.branch, []);
+	await host.shutdown();
+});
+
 test("the claude guidance respects pi-routed profiles and leaves explicit Claude overrides available", async (t) => {
 	const piRoles = settings({
 		plan: { enabled: true, backend: "pi", model: "deepseek/deepseek-chat", effort: "low" },

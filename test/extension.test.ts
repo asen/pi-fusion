@@ -1068,15 +1068,16 @@ test("a later /fusion dashboard gets a fresh url and session_shutdown closes it,
 	await shutdown({ reason: "reload" }, ctx);
 });
 
-test("bare /fusion also shows status, while invalid arguments only warn about usage", async () => {
+test("bare /fusion shows only mode and roles, while invalid arguments only warn about usage", async () => {
 	const usage =
 		"Usage: /fusion dashboard | /fusion dashboard stop | /fusion dashboard limit [N] | /fusion status [run-N] | /fusion cancel run-N | /fusion wait run-N | /fusion steer run-N <text> | /fusion answer [run-N] [text] | /fusion review run-N | /fusion on | /fusion off | /fusion config | /fusion profile [list | use <name> | save <name> | default <name>] | /fusion history [on | off]";
 	for (const args of ["", "   "]) {
 		const notices = await runCommand(args);
-		assert.equal(notices.length, 2, `for ${JSON.stringify(args)}`);
-		assert.deepEqual(notices[0], { message: usage, type: "warning" });
-		assert.equal(notices[1]!.type, "info");
-		assert.match(notices[1]!.message, /^fusion: on\nprofile: builtin\n/);
+		assert.equal(notices.length, 1, `for ${JSON.stringify(args)}`);
+		assert.equal(notices[0]!.type, "info");
+		assert.match(notices[0]!.message, /^fusion: on\n\nrole\s+enabled\s+backend\s+model\s+effort\n/);
+		for (const role of ["plan", "implement", "ultracode", "ask", "security"]) assert.match(notices[0]!.message, new RegExp(`^${role}\\s`, "m"));
+		assert.doesNotMatch(notices[0]!.message, /Usage:|profile:|history:|run-\d+|session usage:|no runs/);
 	}
 	for (const args of ["dashboard start", "status foo", "cancel", "steer run-1", "config now"]) {
 		const notices = await runCommand(args);
