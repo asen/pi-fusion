@@ -56,7 +56,7 @@ import { type Dashboard, dashboardMaxRuns, dashboardProblems, parseRunLimit, Run
 import { ArchiveIndex } from "./dashboard-archive.ts";
 import { contextShare, continueNote, handoffBlocked, handoffNote, handoffPrompt, handoffShare, planContextPct, planProblems, sharePercent, type HandoffReason } from "./handoff.ts";
 import { asEnded, History, type HistoryRecord, historyDir, historyEnabled, sameChild } from "./history.ts";
-import { CLAUDE_PARAMETER_HELP, claudeGuidance, FUSION_PARAMETER_HELP, fusionGuidance, type GuidanceInput } from "./host-guidance.ts";
+import { claudeGuidance, claudeParameterHelp, fusionGuidance, fusionParameterHelp, type GuidanceInput } from "./host-guidance.ts";
 import { hostProfileStore, type ProfileStore } from "./profile-store.ts";
 import { hostSettingsStore, type SettingsStore } from "./settings-store.ts";
 import {
@@ -3639,73 +3639,81 @@ export default function fusion(pi: ExtensionAPI, options: FusionOptions = {}) {
 	});
 
 	/** The fusion tool as this session's configuration describes it; its executor and renderers never change. */
-	const fusionTool = () => ({
-		name: TOOL_NAME,
-		executionMode: "sequential" as const,
-		label: "Fusion",
-		...fusionGuidance(guidanceInput()),
-		parameters: Type.Object({
-			role: Type.Optional(stringEnum(KNOWN_ROLE_NAMES, FUSION_PARAMETER_HELP.role)),
-			task: Type.String({ description: FUSION_PARAMETER_HELP.task }),
-			continue: Type.Optional(Type.String({ description: FUSION_PARAMETER_HELP.continue })),
-			context: Type.Optional(Type.String({ description: FUSION_PARAMETER_HELP.context })),
-			background: Type.Optional(Type.Boolean({ description: FUSION_PARAMETER_HELP.background })),
-			fresh: Type.Optional(Type.Boolean({ description: FUSION_PARAMETER_HELP.fresh })),
-			mode: Type.Optional(stringEnum(ASK_MODES, FUSION_PARAMETER_HELP.mode)),
-			backend: Type.Optional(stringEnum(BACKEND_NAMES, FUSION_PARAMETER_HELP.backend)),
-			model: Type.Optional(Type.String({ description: FUSION_PARAMETER_HELP.model })),
-			// A string and not an enum: each backend has its own grammar, and Codex's levels are the model's own rather than a
-			// list this host could advertise. The binding the call routes to checks the value, before anything starts.
-			effort: Type.Optional(Type.String({ description: FUSION_PARAMETER_HELP.effort })),
-		}),
-		async execute(toolCallId: string, params: FusionParams, signal: AbortSignal | undefined, onUpdate: LiveRun["onUpdate"], ctx: any) {
-			return delegate(TOOL_NAME, toolCallId, params, signal, onUpdate, ctx);
-		},
-		renderCall(args: unknown, theme: any, context: any) {
-			const call = (args ?? {}) as Partial<Record<"continue" | "role" | "task", unknown>>;
-			const continued = argText(call.continue);
-			const target = continued ? `continue ${continued}` : argText(call.role);
-			const label = theme.fg("toolTitle", theme.bold(target ? `${TOOL_NAME} ${target}` : TOOL_NAME));
-			const task = firstLine(argText(call.task));
-			return reuse(context, task ? `${label} ${theme.fg("muted", task)}` : label, [], "truncate");
-		},
-		renderResult(result: any, options: any, theme: any, context: any) {
-			return resultCard(TOOL_NAME, result, options, theme, context);
-		},
-	});
+	const fusionTool = () => {
+		const input = guidanceInput();
+		const help = fusionParameterHelp(input);
+		return {
+			name: TOOL_NAME,
+			executionMode: "sequential" as const,
+			label: "Fusion",
+			...fusionGuidance(input),
+			parameters: Type.Object({
+				role: Type.Optional(stringEnum(KNOWN_ROLE_NAMES, help.role)),
+				task: Type.String({ description: help.task }),
+				continue: Type.Optional(Type.String({ description: help.continue })),
+				context: Type.Optional(Type.String({ description: help.context })),
+				background: Type.Optional(Type.Boolean({ description: help.background })),
+				fresh: Type.Optional(Type.Boolean({ description: help.fresh })),
+				mode: Type.Optional(stringEnum(ASK_MODES, help.mode)),
+				backend: Type.Optional(stringEnum(BACKEND_NAMES, help.backend)),
+				model: Type.Optional(Type.String({ description: help.model })),
+				// A string and not an enum: each backend has its own grammar, and Codex's levels are the model's own rather than a
+				// list this host could advertise. The binding the call routes to checks the value, before anything starts.
+				effort: Type.Optional(Type.String({ description: help.effort })),
+			}),
+			async execute(toolCallId: string, params: FusionParams, signal: AbortSignal | undefined, onUpdate: LiveRun["onUpdate"], ctx: any) {
+				return delegate(TOOL_NAME, toolCallId, params, signal, onUpdate, ctx);
+			},
+			renderCall(args: unknown, theme: any, context: any) {
+				const call = (args ?? {}) as Partial<Record<"continue" | "role" | "task", unknown>>;
+				const continued = argText(call.continue);
+				const target = continued ? `continue ${continued}` : argText(call.role);
+				const label = theme.fg("toolTitle", theme.bold(target ? `${TOOL_NAME} ${target}` : TOOL_NAME));
+				const task = firstLine(argText(call.task));
+				return reuse(context, task ? `${label} ${theme.fg("muted", task)}` : label, [], "truncate");
+			},
+			renderResult(result: any, options: any, theme: any, context: any) {
+				return resultCard(TOOL_NAME, result, options, theme, context);
+			},
+		};
+	};
 
 	/** The claude tool as this session's configuration describes it; its executor and renderers never change. */
-	const claudeTool = () => ({
-		name: CLAUDE_TOOL_NAME,
-		executionMode: "sequential" as const,
-		label: "Claude",
-		...claudeGuidance(guidanceInput()),
-		parameters: Type.Object({
-			role: Type.Optional(stringEnum(ROLE_NAMES, CLAUDE_PARAMETER_HELP.role)),
-			task: Type.String({ description: CLAUDE_PARAMETER_HELP.task }),
-			continue: Type.Optional(Type.String({ description: CLAUDE_PARAMETER_HELP.continue })),
-			context: Type.Optional(Type.String({ description: CLAUDE_PARAMETER_HELP.context })),
-			background: Type.Optional(Type.Boolean({ description: CLAUDE_PARAMETER_HELP.background })),
-			fresh: Type.Optional(Type.Boolean({ description: CLAUDE_PARAMETER_HELP.fresh })),
-			mode: Type.Optional(stringEnum(ASK_MODES, CLAUDE_PARAMETER_HELP.mode)),
-			model: Type.Optional(Type.String({ description: CLAUDE_PARAMETER_HELP.model })),
-			effort: Type.Optional(stringEnum(EFFORTS, CLAUDE_PARAMETER_HELP.effort)),
-		}),
-		async execute(toolCallId: string, params: ClaudeParams, signal: AbortSignal | undefined, onUpdate: LiveRun["onUpdate"], ctx: any) {
-			return delegate(CLAUDE_TOOL_NAME, toolCallId, params, signal, onUpdate, ctx);
-		},
-		renderCall(args: unknown, theme: any, context: any) {
-			const call = (args ?? {}) as Partial<Record<"continue" | "role" | "task", unknown>>;
-			const continued = argText(call.continue);
-			const target = continued ? `continue ${continued}` : argText(call.role);
-			const label = theme.fg("toolTitle", theme.bold(target ? `${CLAUDE_TOOL_NAME} ${target}` : CLAUDE_TOOL_NAME));
-			const task = firstLine(argText(call.task));
-			return reuse(context, task ? `${label} ${theme.fg("muted", task)}` : label, [], "truncate");
-		},
-		renderResult(result: any, options: any, theme: any, context: any) {
-			return resultCard(CLAUDE_TOOL_NAME, result, options, theme, context);
-		},
-	});
+	const claudeTool = () => {
+		const input = guidanceInput();
+		const help = claudeParameterHelp(input);
+		return {
+			name: CLAUDE_TOOL_NAME,
+			executionMode: "sequential" as const,
+			label: "Claude",
+			...claudeGuidance(input),
+			parameters: Type.Object({
+				role: Type.Optional(stringEnum(ROLE_NAMES, help.role)),
+				task: Type.String({ description: help.task }),
+				continue: Type.Optional(Type.String({ description: help.continue })),
+				context: Type.Optional(Type.String({ description: help.context })),
+				background: Type.Optional(Type.Boolean({ description: help.background })),
+				fresh: Type.Optional(Type.Boolean({ description: help.fresh })),
+				mode: Type.Optional(stringEnum(ASK_MODES, help.mode)),
+				model: Type.Optional(Type.String({ description: help.model })),
+				effort: Type.Optional(stringEnum(EFFORTS, help.effort)),
+			}),
+			async execute(toolCallId: string, params: ClaudeParams, signal: AbortSignal | undefined, onUpdate: LiveRun["onUpdate"], ctx: any) {
+				return delegate(CLAUDE_TOOL_NAME, toolCallId, params, signal, onUpdate, ctx);
+			},
+			renderCall(args: unknown, theme: any, context: any) {
+				const call = (args ?? {}) as Partial<Record<"continue" | "role" | "task", unknown>>;
+				const continued = argText(call.continue);
+				const target = continued ? `continue ${continued}` : argText(call.role);
+				const label = theme.fg("toolTitle", theme.bold(target ? `${CLAUDE_TOOL_NAME} ${target}` : CLAUDE_TOOL_NAME));
+				const task = firstLine(argText(call.task));
+				return reuse(context, task ? `${label} ${theme.fg("muted", task)}` : label, [], "truncate");
+			},
+			renderResult(result: any, options: any, theme: any, context: any) {
+				return resultCard(CLAUDE_TOOL_NAME, result, options, theme, context);
+			},
+		};
+	};
 
 	/** What each delegation tool was last registered with, so a refresh re-registers only a tool whose guidance changed. */
 	const registered = new Map<string, string>();
@@ -3718,7 +3726,7 @@ export default function fusion(pi: ExtensionAPI, options: FusionOptions = {}) {
 	 */
 	const registerGuidance = (refresh: boolean): void => {
 		for (const definition of [fusionTool(), claudeTool()]) {
-			const key = JSON.stringify([definition.description, definition.promptGuidelines, definition.parameters]);
+			const key = JSON.stringify([definition.description, definition.promptSnippet, definition.promptGuidelines, definition.parameters]);
 			if (registered.get(definition.name) === key) continue;
 			// The host may install the definition and then throw during its registry refresh; either way rollback must try.
 			registered.delete(definition.name);

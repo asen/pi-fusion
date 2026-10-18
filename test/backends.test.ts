@@ -79,6 +79,12 @@ test("the role capabilities depend on the boundary and on nothing else", () => {
 	}
 });
 
+test("the host guidance is pure text: it depends on the boundary, the settings types and the role capabilities alone", () => {
+	const names = [...dependenciesOf("host-guidance.ts")].sort();
+	assert.deepEqual(names, ["./backends/types.ts", "./profiles.ts", "./roles.ts"], `the guidance must name no host, backend, binding or SDK; it names ${names.join(", ")}`);
+	assert.match(fs.readFileSync(path.join(repoRoot, "extensions", "host-guidance.ts"), "utf8"), /^import type \{[^}]*\} from "\.\/profiles\.ts";$/m, "and only the settings types, never the settings code");
+});
+
 test("the pi binding is a binding, not an adapter: it depends on the boundary alone and names no SDK", () => {
 	const names = dependenciesOf("backends/pi-binding.ts");
 	assert.deepEqual(names, ["./types.ts"], `a role binding must name no host, no process and no SDK; it names ${names.join(", ")}`);

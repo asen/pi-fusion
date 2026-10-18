@@ -48,9 +48,20 @@ continuation
   enabled setting still applies
 ```
 
-Profiles do not fill omitted configured fields from variables. An explicit call to another backend is a one-off override, not a profile change. `claude` uses that override when a role is configured on Pi or Codex; both tools' guidance recommends `fusion` for Pi roles unless you explicitly request Claude Code, and says that only `fusion` runs Codex roles.
+Profiles do not fill omitted configured fields from variables. An explicit call to another backend is a one-off override, not a profile change. `claude` uses that override when a role is configured on Pi or Codex; its description names such a role as configured there, plus the legacy Claude model/effort a `claude` call would force instead. Its guidance recommends `fusion` for Pi and Codex roles unless you explicitly request Claude Code, and says only `fusion` runs Codex roles.
 
 Pi with no model is shown as `unconfigured` and refuses before admission unless the call supplies one. A disabled role also refuses before any handle, child, or file snapshot, for new calls **and continuations**, despite explicit backend/model/effort parameters. Disabling a role unregisters no backend and removes no workflow tool. Enabled security still requires an explicit user security request in host guidance.
+
+## What the host is told
+
+Each delegation tool's description, prompt snippet, guidelines and parameter help come from the session's enabled roles. A tool only covers the roles it runs: `claude` has no `security`.
+
+- A disabled role appears only in factual notices: the configuration sentence (`ask is disabled`), the role parameter help, and one guideline saying calls to it are refused and that enabling it is your choice (`/fusion config` or a profile). Escalation, reporting, security alternatives, backend role lists, task examples and parameter help do not mention it.
+- The schema's `role` enum still lists every role the tool knows, disabled or not, so it is never empty. Runtime refusals are unchanged.
+- A parameter that no enabled role uses says so and asks to leave it unset: for example, `fresh` without `plan`, `mode` without `ask`, or `model`/`effort` when only `ultracode` is enabled. The guideline about honoring your explicit choices offers model/effort overrides only for roles that accept them. It says `ultracode` always runs on its configured model at its fixed effort, so a call that names either for it is refused.
+- With no enabled role, the tool's text says every call is refused, while its control tool can still act on existing runs. With only `security` enabled, `claude` says so and points to `fusion`. If no enabled role implements changes, the guidance says so: the host remains an orchestrator, not a fallback implementer.
+
+A guidance refresh re-registers a tool whenever its description, snippet, guidelines or parameters change.
 
 Recorded settings, plan handoffs, and refusal recovery are described in [Runs](runs.md). Independent review always uses a fresh configured `ask` run; disabled `ask` means no reviewer.
 

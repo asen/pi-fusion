@@ -34,7 +34,7 @@ fusion.ts                     host lifecycle and registration
 | Module under `extensions/` | Responsibility |
 | --- | --- |
 | `fusion.ts` | Tools/command, mode, configuration application, admission, handles, branch records, questions, controls, reviews, and host lifecycle handlers |
-| `host-guidance.ts` | Pure delegation-tool descriptions, snippets, guidelines and parameter help composed from the role settings, captured defaults, tool names and quote markers passed in; no backend binding, routing or registration |
+| `host-guidance.ts` | Pure delegation-tool descriptions, snippets, guidelines and parameter help composed from the enabled roles, role capabilities, captured defaults, tool names and quote markers passed in; no backend binding, routing or registration |
 | `roles.ts` | Supported backends, writer-slot and review eligibility per role |
 | `profiles.ts`, `profile-store.ts` | Captured legacy defaults, settings validation/copies, global profiles file and queued atomic replacement |
 | `settings-store.ts` | Fusion's own `settings.json`: the saved history preference and plan context cap, validation, and file/memory stores over the profile store's queue and atomic write |

@@ -701,7 +701,7 @@ test("roles configured on codex are described as runs that can ask, take one unc
 	assert.match(description, /plan runs on codex with the host's default codex model; implement runs on codex with the host's default codex model; .*ask runs on codex with model gpt-5-codex at effort high/);
 	assert.match(description, /backend codex runs plan and implement in a workspace-write sandbox, and ask read-only, under the same contracts/);
 	assert.doesNotMatch(description, /backend codex is experimental|experimentally/i);
-	assert.match(description, /with no ultracode or security role;/);
+	assert.match(description, /with no ultracode role;/, "the roles codex does not run, of the enabled ones: security is disabled here");
 	assert.match(description, /A codex child also gets ask_orchestrator, through codex's experimental API, and asks you a question as a pi child does\./);
 	assert.doesNotMatch(description, /codex child gets no ask_orchestrator/);
 	assert.match(description, /A message to a running codex run is sent once to its current turn, with no retry, and a turn that took it has queued it, which does not show the child read it\./);

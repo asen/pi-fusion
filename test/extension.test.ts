@@ -353,7 +353,8 @@ test("the fusion tool advertises every role a backend runs and a backend as plai
 	assert.deepEqual(Object.keys(properties), ["role", "task", "continue", "context", "background", "fresh", "mode", "backend", "model", "effort"]);
 	assert.deepEqual(properties.role.enum, ["plan", "implement", "ultracode", "ask", "security"], "the primary tool advertises security, which runs on pi alone");
 	assert.deepEqual(byName("claude").parameters.properties.role.enum, ["plan", "implement", "ultracode", "ask"], "and the compatibility tool advertises the four roles claude runs");
-	assert.match(properties.role.description, /^plan, implement, ultracode, ask or security\. Required unless continue is set\.$/);
+	// The enum keeps every role so it is never empty; the help names the enabled ones and says security is refused.
+	assert.match(properties.role.description, /^plan, implement, ultracode or ask\. Required unless continue is set\. Role security is disabled in this session's configuration and refused\.$/);
 	assert.deepEqual(properties.backend.enum, ["claude", "pi", "codex"]);
 	assert.equal(properties.backend.type, "string");
 	// No enum: a codex level is the model's own, so the schema cannot list it, and each backend's binding checks its own grammar.
@@ -402,22 +403,20 @@ test("the fusion tool says which harness runs what, and the pi backend it regist
 	// pi selection comes from and that a call with none is refused. The compatibility tool stays Claude's own.
 	assert.doesNotMatch(fusionTool.description, /claude backend only/);
 	assert.doesNotMatch(fusionTool.description, /no configuration makes one available here/);
-	assert.match(fusionTool.description, /backend pi runs plan, implement, ask and security on the user's own Pi provider configuration/);
+	assert.match(fusionTool.description, /backend pi runs plan, implement and ask on the user's own Pi provider configuration/);
 	assert.match(fusionTool.description, /PI_FUSION_PI_<ROLE>_MODEL/);
 	assert.match(fusionTool.description, /a provider and a model id, such as deepseek\/deepseek-chat/);
 	assert.match(fusionTool.description, /refused before anything starts/);
 	assert.match(fusionTool.description, /role ultracode runs on the claude backend alone/);
-	assert.match(fusionTool.description, /role security on the pi backend alone/);
-	assert.match(fusionTool.description, /naming claude for it is refused before anything starts/);
+	// Security is disabled in the built-in configuration, so nothing but the configuration sentence names it.
+	assert.doesNotMatch(fusionTool.description, /role security|security: /);
 	assert.match(fusionTool.description, /leave backend unset unless the user names one, and a fresh run goes to the backend the configuration above names for its role/);
 	// What the configuration is, said in the description rather than as fixed model names a profile would make false.
 	assert.match(fusionTool.description, /In this session's configuration plan runs on claude with model fable at effort xhigh; implement runs on claude with model opus at effort high; ultracode runs on claude with model fable; ask runs on claude with model opus at effort high; security is disabled\./);
 	assert.doesNotMatch(fusionTool.description, /Claude Fable|Claude Opus with/);
-	// The one role whose work the user has to have asked for, said in the description as well as in the guideline.
-	assert.match(fusionTool.description, /only when the user asks for a security investigation, audit or fix/);
+	// The role whose work the user has to have asked for is described only once enabled; host-guidance.test.ts covers that.
+	assert.doesNotMatch(fusionTool.description, /security investigation, audit or fix/);
 	assert.doesNotMatch(fusionTool.promptGuidelines?.join("\n") ?? "", /security investigation, audit or fix/, "a disabled role is not recommended in routing guidance");
-	assert.match(fusionTool.description, /never puts a secret in its report by value/);
-	assert.match(fusionTool.description, /with none it reports findings and changes no application code/);
 	assert.doesNotMatch(byName("claude").description, /\bsecurity\b/, "the compatibility tool advertises a role it cannot run nowhere");
 	// Pi's tools are Pi's own, so the generic tool says what each pi role actually has rather than letting the claude
 	// lists above stand for them. What the sentence promises is read back out of it and compared with the lists the
@@ -429,11 +428,11 @@ test("the fusion tool says which harness runs what, and the pi backend it regist
 			.split(/,\s*|\s+and\s+/)
 			.map((tool) => tool.trim())
 			.filter((tool) => tool !== "");
-	const promised = /roles plan, implement and security run with (.+?), role ask runs with (.+?) and has no web search or web fetch tool at all/.exec(fusionTool.description);
+	const promised = /roles plan and implement run with (.+?), role ask runs with (.+?) and has no web search or web fetch tool at all/.exec(fusionTool.description);
 	assert.ok(promised, `the fusion description no longer says what the pi roles run with: ${fusionTool.description}`);
-	assert.deepEqual(named(promised[1]), piTools("plan"), "the plan, implement and security sentence promises another tool list than the pi binding builds");
+	assert.deepEqual(named(promised[1]), piTools("plan"), "the plan and implement sentence promises another tool list than the pi binding builds");
 	assert.deepEqual(piTools("implement"), piTools("plan"), "and that sentence says one list for all three of them");
-	assert.deepEqual(piTools("security"), piTools("implement"), "a security child investigates and, when its task authorizes one, writes the fix");
+	assert.deepEqual(piTools("security"), piTools("implement"), "a security child, once enabled, is said to run with the same list: it investigates and, when its task authorizes one, writes the fix");
 	assert.deepEqual(named(promised[2]), piTools("ask"), "the ask sentence promises another tool list than the pi binding builds");
 	// Said directly beside the parse, because it is the limitation a caller gets wrong: whatever the prose calls them,
 	// no web tool of any name is in what a pi ask child runs with.
@@ -442,10 +441,10 @@ test("the fusion tool says which harness runs what, and the pi backend it regist
 	assert.match(fusionTool.description, /every pi role also gets ask_orchestrator/);
 	assert.doesNotMatch(byName("claude").description, /find and ls/, "the compatibility tool advertises claude's own tools and no pi list");
 	const backendParameter = fusionTool.parameters.properties.backend.description as string;
-	assert.match(backendParameter, /claude, which runs every role but security/);
+	assert.match(backendParameter, /claude, which runs plan, implement, ultracode and ask/);
 	assert.match(backendParameter, /Leave it unset to run the role on the backend this session's configuration names for it/);
-	assert.match(backendParameter, /pi, which runs plan, implement, ask and security/);
-	assert.match(backendParameter, /role security goes to pi whether or not this names it/);
+	assert.match(backendParameter, /pi, which runs plan, implement and ask/);
+	assert.doesNotMatch(backendParameter, /security/, "a disabled role is in no backend list");
 	assert.ok(
 		(fusionTool.promptGuidelines ?? []).some((guideline) => /backend parameter/.test(guideline) && /leave backend unset otherwise/.test(guideline)),
 		"no fusion guideline says where the harness the user named goes",

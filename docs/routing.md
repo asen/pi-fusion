@@ -39,7 +39,7 @@ Security needs separate activation and a Pi model; once enabled, its calls need 
 
 An explicit other-backend override uses that backend's captured legacy defaults, not the configured backend's model/effort. Pi requires an exact `provider/model-id` and guesses none. Unsupported role/backend combinations refuse before admission, once the enabled-role check permits routing.
 
-`claude` is a forced-Claude compatibility tool. Guidance recommends `fusion` for Pi-configured roles unless you explicitly request Claude Code. A continuation stays on its recorded backend/selection; a Pi or Codex run always needs `fusion`. Switching profiles does not move recorded threads.
+`claude` is a forced-Claude compatibility tool. Guidance recommends `fusion` for Pi- and Codex-configured roles unless you explicitly request Claude Code. A continuation stays on its recorded backend/selection; a Pi or Codex run always needs `fusion`. Switching profiles does not move recorded threads.
 
 Implicit `plan` calls continue the latest plan on the routed backend, or hand off for its context cap or an explicitly changed model. An unreadable latest record refuses instead of falling back to another plan. See [Runs](runs.md) and [Profiles](profiles.md) for parameters and precedence.
 
