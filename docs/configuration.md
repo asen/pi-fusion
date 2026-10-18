@@ -75,6 +75,27 @@ startup (session_start, or the first call/command needing configuration)
 - Until it loads, the guidance says the policy is not loaded yet, and delegation calls and every `/fusion` command except `on`, `off`, `history [on|off]` and `dashboard limit` wait for it. The mode tools and `fusion_control`/`claude_control` do not wait.
 - A missing shipped file stops the extension loading, with the other contracts, so no command or tool is registered. A shipped file that is unusable at startup, or a loader failure, fails startup with one error once the extension has registered. Every delegation call and each of those waiting commands (including config, profile, review, status and dashboard) then refuses with it before anything starts, and the instance does not retry. `/fusion on|off`, `/fusion history [on|off]`, `/fusion dashboard limit` and the control tools still work: a history preference is still saved for new instances, and this instance's history stays as it started. A valid override never hides a broken shipped policy.
 
+### Seeing and replacing the policy
+
+`/fusion config` shows what this instance selected at startup, never the policy text, and rereads nothing; the editor shows the same lines above the role table:
+
+```text
+host policy: shipped · <install>/contracts/host.md · selected when this instance started; an edit applies after restarting Pi, /reload or a new session
+host policy: user override · <agent dir>/pi-fusion/host.md · selected when ...
+host policy: shipped (override set aside) · <install>/contracts/host.md · selected when ...
+host policy diagnostic: the host policy override <agent dir>/pi-fusion/host.md is blank; using the shipped host policy instead
+```
+
+The diagnostic line stays for inspection after the one startup warning. A missing override shows only the shipped line. To replace the policy, copy the shipped path the line names and edit the copy:
+
+```bash
+mkdir -p ~/.pi/agent/pi-fusion          # or "$PI_CODING_AGENT_DIR/pi-fusion"
+cp <shipped path from /fusion config> ~/.pi/agent/pi-fusion/host.md
+$EDITOR ~/.pi/agent/pi-fusion/host.md
+```
+
+Then `/reload`, restart Pi, or start a new session, and check `/fusion config`. Delete the copy to return to the shipped policy. Fusion never creates or copies this file itself.
+
 ## The pi backend's variables
 
 For example:

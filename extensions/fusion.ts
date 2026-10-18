@@ -2911,7 +2911,21 @@ export default function fusion(pi: ExtensionAPI, options: FusionOptions = {}) {
 		});
 	};
 
-	/** The configuration as /fusion config shows it: where it came from, what future sessions start with, and every role. */
+	/**
+	 * The host policy as /fusion config shows it: the source and path this instance selected at startup, and why an
+	 * override was set aside when one was, never the policy's text. It is what startup captured, not a read: an edit to
+	 * either file reaches only an instance that starts after it, so the line says so.
+	 */
+	const policyLines = (): string[] => {
+		if (!policy) return ["host policy: not loaded in this instance"];
+		const source = policy.source === "override" ? "user override" : policy.diagnostic === undefined ? "shipped" : "shipped (override set aside)";
+		return [
+			`host policy: ${source} · ${policy.path} · selected when this instance started; an edit applies after restarting Pi, /reload or a new session`,
+			...(policy.diagnostic === undefined ? [] : [`host policy diagnostic: ${policy.diagnostic}`]),
+		];
+	};
+
+	/** The configuration as /fusion config shows it: where it came from, what future sessions start with, every role, and the host policy in use. */
 	const configurationLines = async (): Promise<string[]> => {
 		let startup: string;
 		try {
@@ -2920,7 +2934,7 @@ export default function fusion(pi: ExtensionAPI, options: FusionOptions = {}) {
 			startup = `unknown (${error instanceof Error ? error.message : String(error)})`;
 		}
 		const where = await profileStore.where().catch(() => "unknown");
-		return [`fusion configuration: ${configurationLabel(configuration)} · new sessions start with ${startup}`, ...settingsTable(configuration.roles), `profiles file: ${where}`, ...(await historyLines())];
+		return [`fusion configuration: ${configurationLabel(configuration)} · new sessions start with ${startup}`, ...settingsTable(configuration.roles), `profiles file: ${where}`, ...policyLines(), ...(await historyLines())];
 	};
 
 	/** The saved history preference as a line says it, read again now, or why it could not be read. */
@@ -3117,7 +3131,7 @@ export default function fusion(pi: ExtensionAPI, options: FusionOptions = {}) {
 			const rows = settingsTable(draft);
 			const APPLY = "Apply";
 			const CANCEL = "Cancel";
-			const choice = await ctx.ui.select(`fusion config · ${configurationLabel(configuration)}\n${rows[0]}`, [...rows.slice(1), APPLY, CANCEL]);
+			const choice = await ctx.ui.select(`fusion config · ${configurationLabel(configuration)}\n${[...policyLines(), rows[0]].join("\n")}`, [...rows.slice(1), APPLY, CANCEL]);
 			if (choice === undefined || choice === CANCEL) {
 				notice("fusion config cancelled; nothing changed", "info");
 				return;

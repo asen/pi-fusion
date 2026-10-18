@@ -10,7 +10,7 @@ import type { PiRole } from "../extensions/backends/pi-binding.ts";
 import type { BackendName, HostBackend } from "../extensions/backends/types.ts";
 import fusion, { builtinConfiguration, type Configuration, claudeRoute, fusionCall, fusionRoute, roleFor, type RunRecords, runRecords } from "../extensions/fusion.ts";
 import { policyGuideline } from "../extensions/host-guidance.ts";
-import { type HostPolicyLoader, memoryHostPolicyLoader, SHIPPED_HOST_POLICY_PATH } from "../extensions/host-policy.ts";
+import { fileHostPolicyLoader, HOST_POLICY_FILE, type HostPolicyLoader, memoryHostPolicyLoader, SHIPPED_HOST_POLICY_PATH } from "../extensions/host-policy.ts";
 import { fileProfileStore, memoryProfileStore, PROFILES_FILE, type ProfileStore } from "../extensions/profile-store.ts";
 import { memorySettingsStore, type SettingsStore } from "../extensions/settings-store.ts";
 import {
@@ -29,7 +29,7 @@ import {
 } from "../extensions/profiles.ts";
 import { type FakeBackend, fakeBackend } from "./fake-pi-backend.ts";
 import { turnOn } from "./host-tools.ts";
-import { tripwires } from "./tripwire.ts";
+import { claudeTripwire, tripwires } from "./tripwire.ts";
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 
@@ -513,7 +513,8 @@ function sdkHost(options: SdkHostOptions = {}) {
 		sendMessage: () => {},
 		registerMessageRenderer: () => {},
 	} as unknown as ExtensionAPI;
-	fusion(api, { backends: { ...tripwires(), ...options.backends }, profiles: options.profiles ?? memoryProfileStore(), settings: options.settings ?? memorySettingsStore(), hostPolicy: options.hostPolicy ?? memoryHostPolicyLoader() });
+	// Nothing in this file means to run this build's claude backend, so it is fenced too; a case's own double goes over it.
+	fusion(api, { backends: { ...tripwires(), ...claudeTripwire(), ...options.backends }, profiles: options.profiles ?? memoryProfileStore(), settings: options.settings ?? memorySettingsStore(), hostPolicy: options.hostPolicy ?? memoryHostPolicyLoader() });
 	const answer = (options: string[]) => {
 		const next = dialogs.shift();
 		return typeof next === "function" ? next(options) : next;
@@ -776,7 +777,8 @@ test("profile save, list, use and default each do one thing, and only use change
 	assert.match(host.last() ?? "", /^builtin \(current; default for new sessions\)\nwork\nUsage: \/fusion profile/);
 	await host.command("config");
 	const shown = host.last()?.split("\n") ?? [];
-	assert.deepEqual(shown.slice(0, -3), ["fusion configuration: builtin · new sessions start with builtin", ...settingsTable(LEGACY), "profiles file: (in memory)"]);
+	assert.deepEqual(shown.slice(0, -4), ["fusion configuration: builtin · new sessions start with builtin", ...settingsTable(LEGACY), "profiles file: (in memory)"]);
+	assert.equal(shown.at(-4), policyLine("shipped", SHIPPED_HOST_POLICY_PATH));
 	// The run history is this instance's own and says where the saved preference lives, apart from the profiles.
 	assert.match(shown.slice(-3).join("\n"), /^run history: (on|off) in this instance \([^)]*\)\nsaved history preference for new instances: unset \([^)]*\)\nsettings file: \(in memory\)$/);
 	// Completion offers what the last read found.
@@ -1570,6 +1572,12 @@ const gatedPolicy = (override?: string) => {
 	return { loader, release: () => release(), loads: () => loads };
 };
 
+/** The line /fusion config shows for the policy this instance selected at startup. */
+const policyLine = (source: string, where: string): string => `host policy: ${source} · ${where} · selected when this instance started; an edit applies after restarting Pi, /reload or a new session`;
+
+/** The host policy lines /fusion config printed last. */
+const shownPolicy = (host: ReturnType<typeof sdkHost>): string[] => (host.last() ?? "").split("\n").filter((line) => line.startsWith("host policy"));
+
 /** Everything a delegation tool says to the host: description, snippet, guidelines and every parameter's help. */
 const toolText = (tool: Tool): string[] => [
 	tool.description,
@@ -1725,14 +1733,17 @@ test("a guidance refresh that cannot take the policy at startup fails it rather 
 });
 
 test("an override set aside for the shipped policy is said once, as a warning, and the shipped policy is carried", async () => {
-	const host = sdkHost({ hostPolicy: memoryHostPolicyLoader({ override: "  \n" }), ui: false });
+	const claude = fakeBackend({ name: "claude" });
+	const host = sdkHost({ backends: { claude: claude.backend }, hostPolicy: memoryHostPolicyLoader({ override: "  \n" }), ui: false });
 	await host.start();
 	const warning = "fusion: the host policy override (override, in memory) is blank; using the shipped host policy instead";
 	assert.deepEqual(host.notices, [[warning, "warning"]]);
 	await host.on();
 	await host.command("config");
 	await host.command("profile list");
-	await host.fusion({ role: "ask", task: "x" }).catch(() => {});
+	assert.equal((await host.fusion({ role: "ask", task: "x" })).error, undefined);
+	await host.call("fusion_control", { action: "wait", run: "run-1" });
+	assert.equal(claude.starts.length, 1, "the ask ran on the injected double");
 	assert.equal(host.notices.filter(([text]) => text === warning).length, 1, "said once for the instance");
 	for (const name of ["fusion", "claude"]) assert.equal(host.tools.get(name)!.promptGuidelines![1], policyGuideline(SHIPPED), name);
 	await host.shutdown();
@@ -1798,4 +1809,91 @@ test("history commands stay independent of the host policy: they save while it l
 	assert.equal(claude.starts.length, 0, "no backend entry point was reached");
 	assert.deepEqual(host.branch, [], "and no run was recorded");
 	await host.shutdown();
+});
+
+test("/fusion config shows the source and path startup selected, in memory, and never the policy's text", async () => {
+	const cases: Array<[string, HostPolicyLoader, string[]]> = [
+		["the default shipped file", memoryHostPolicyLoader(), [policyLine("shipped", SHIPPED_HOST_POLICY_PATH)]],
+		["shipped text in memory", memoryHostPolicyLoader({ shipped: "# Shipped here\n" }), [policyLine("shipped", "(shipped, in memory)")]],
+		["an override in memory", memoryHostPolicyLoader({ override: OVERRIDE }), [policyLine("user override", "(override, in memory)")]],
+		[
+			"an override set aside",
+			memoryHostPolicyLoader({ override: "  \n" }),
+			[policyLine("shipped (override set aside)", SHIPPED_HOST_POLICY_PATH), "host policy diagnostic: the host policy override (override, in memory) is blank; using the shipped host policy instead"],
+		],
+	];
+	for (const [what, loader, expected] of cases) {
+		let loads = 0;
+		const host = sdkHost({ hostPolicy: { load: () => ((loads += 1), loader.load()) }, ui: false });
+		await host.start();
+		const warned = host.notices.length;
+		for (let shown = 0; shown < 2; shown += 1) {
+			await host.command("config");
+			assert.deepEqual(shownPolicy(host), expected, `${what}: shown ${shown + 1}`);
+			for (const text of [SHIPPED, OVERRIDE, "# Shipped here"]) for (const line of text.split("\n").filter((line) => line.trim())) assert.ok(!host.last()!.includes(line), `${what}: shows the policy's ${JSON.stringify(line)}`);
+		}
+		// The diagnostic stays for inspection after the one startup warning, which is not said again.
+		assert.equal(host.notices.length, warned + 2, `${what}: only the two configurations were shown`);
+		assert.equal(loads, 1, `${what}: shown from what startup captured, never read again`);
+		await host.shutdown();
+	}
+});
+
+test("/fusion config shows the policy from temporary files as startup selected it; an edit, role change or profile switch reads nothing until a new instance", async () => {
+	const dir = tempDir("policy");
+	const shipped = path.join(dir, "shipped.md");
+	fs.writeFileSync(shipped, "# Shipped\n");
+	const fusionDir = path.join(dir, "agent", "pi-fusion");
+	const override = path.join(fusionDir, HOST_POLICY_FILE);
+	const row = (role: string) => (options: string[]) => options.find((option) => option.startsWith(`${role} `));
+	let loads = 0;
+	const loader = (): HostPolicyLoader => {
+		const files = fileHostPolicyLoader({ shipped, override: () => override });
+		return { load: () => ((loads += 1), files.load()) };
+	};
+
+	// No override: the shipped file, and showing it creates neither the directory nor the file.
+	const plain = sdkHost({ hostPolicy: loader(), ui: false });
+	await plain.start();
+	await plain.command("config");
+	assert.deepEqual(shownPolicy(plain), [policyLine("shipped", shipped)]);
+	assert.equal(fs.existsSync(path.join(dir, "agent")), false, "nothing was created for the override");
+	await plain.shutdown();
+
+	// An override the user wrote, shown with the path it was read from; editing it changes nothing in this instance.
+	fs.mkdirSync(fusionDir, { recursive: true });
+	fs.writeFileSync(override, OVERRIDE);
+	loads = 0;
+	const claude = fakeBackend({ name: "claude" });
+	const host = sdkHost({
+		profiles: memoryProfileStore(document({ work: WORK })),
+		backends: { claude: claude.backend },
+		hostPolicy: loader(),
+		dialogs: [row("ultracode"), "enabled: yes", "Back", "Apply", row("ultracode"), "enabled: no", "Back", "Cancel"],
+	});
+	await host.start();
+	fs.writeFileSync(override, "\n");
+	await host.command("config");
+	const expected = [policyLine("user override", override)];
+	assert.equal(host.titles[0], `fusion config · builtin\n${expected.join("\n")}\n${settingsTable(LEGACY)[0]}`, "the editor shows it above the table");
+	assert.match(host.last() ?? "", /^fusion settings applied to this session/);
+	await host.command("config");
+	assert.ok(host.titles.at(-4)!.includes(`\n${expected[0]}\n`), "and again after a role change");
+	await host.command("profile use work");
+	assert.match(host.last() ?? "", /^fusion uses profile work in this session/);
+	assert.equal(loads, 1, "the edit, the role change and the switch read no policy");
+	for (const name of ["fusion", "claude"]) assert.equal(host.tools.get(name)!.promptGuidelines![1], policyGuideline(OVERRIDE), `${name} keeps what startup selected`);
+	await host.shutdown();
+
+	// A new instance reads the edit: the blank override is set aside, with the reason kept beside the warning.
+	loads = 0;
+	const reloaded = sdkHost({ hostPolicy: loader(), ui: false });
+	await reloaded.start();
+	const why = `the host policy override ${override} is blank; using the shipped host policy instead`;
+	assert.deepEqual(reloaded.notices, [[`fusion: ${why}`, "warning"]]);
+	await reloaded.command("config");
+	assert.deepEqual(shownPolicy(reloaded), [policyLine("shipped (override set aside)", shipped), `host policy diagnostic: ${why}`]);
+	assert.equal(loads, 1);
+	assert.equal(fs.readFileSync(override, "utf8"), "\n", "nothing rewrote the override");
+	await reloaded.shutdown();
 });

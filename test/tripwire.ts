@@ -33,8 +33,11 @@ export const PI_TRIPWIRE = "the suite reached the pi backend tripwire";
 /** The same for codex, named apart so a reach says which harness it would have started. */
 export const CODEX_TRIPWIRE = "the suite reached the codex backend tripwire";
 
+/** The same for claude, which only a host that opts into `claudeTripwire()` registers. */
+export const CLAUDE_TRIPWIRE = "the suite reached the claude backend tripwire";
+
 /** Each entry point a case reached, per backend and in order. Empty lists are the only acceptable value, and the hook below says so. */
-const reaches = { pi: [] as string[], codex: [] as string[] };
+const reaches = { pi: [] as string[], codex: [] as string[], claude: [] as string[] };
 
 /** A backend under `name` every entry point of which records its reach before it throws `message`. */
 function tripwire(name: keyof typeof reaches, message: string): HostBackend {
@@ -63,6 +66,16 @@ export function piTripwire(): { pi: HostBackend } {
 /** The codex tripwire alone: what `productionDefaults()` registers, and what `tripwires()` adds to the pi one. */
 export function codexTripwire(): { codex: HostBackend } {
 	return { codex: tripwire("codex", CODEX_TRIPWIRE) };
+}
+
+/**
+ * The claude tripwire alone. It is not part of `tripwires()`, because the suite's SDK-around-fake-protocol cases run
+ * this build's own claude backend against `fake-claude.mjs` on purpose. A test host whose cases never mean to reach
+ * this build's claude backend registers it under its own doubles, `{ ...tripwires(), ...claudeTripwire(), ...own }`,
+ * so a case that forgot its claude double refuses here instead of launching the production claude executable.
+ */
+export function claudeTripwire(): { claude: HostBackend } {
+	return { claude: tripwire("claude", CLAUDE_TRIPWIRE) };
 }
 
 /** The backends an ordinary host registers to keep every production child harness out of it, ready to spread over its own. */
@@ -120,4 +133,5 @@ export function productionDefaults(): FusionOptions {
 after(() => {
 	assert.deepEqual(reaches.pi, [], "a case reached the pi backend tripwire, which in production is a real pi child");
 	assert.deepEqual(reaches.codex, [], "a case reached the codex backend tripwire, which in production is a real codex app-server");
+	assert.deepEqual(reaches.claude, [], "a case reached the claude backend tripwire, which in production is a real claude child");
 });

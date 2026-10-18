@@ -13,7 +13,7 @@ import { hostBackend, isPiModel, keptRef, keptSelection, piModelParts, resolvedS
 import { ASK_MODES, type AskMode, type ChildRun as ExportedChildRun, codexResumeCommand, failed, ROLE_NAMES } from "../extensions/fusion.ts";
 import { ChildTree } from "../extensions/process-tree.ts";
 import { canChangeFiles, isReviewable, KNOWN_ROLE_NAMES, ROLE_SPECS, runsOn } from "../extensions/roles.ts";
-import { CODEX_VARIABLES, PRODUCTION_DEFAULT_VARIABLES, productionDefaults, tripwires } from "./tripwire.ts";
+import { CODEX_VARIABLES, claudeTripwire, PRODUCTION_DEFAULT_VARIABLES, productionDefaults, tripwires } from "./tripwire.ts";
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
@@ -463,7 +463,22 @@ test("the combined tripwires fence pi and codex, each under its own name", () =>
 	assert.deepEqual([fenced.pi.name, fenced.codex.name], ["pi", "codex"], "a backend registered under another name than its own is refused at registration");
 });
 
-test("a reach of either tripwire that a case swallowed still fails its file, and a file that reached neither passes", () => {
+test("the claude tripwire stands apart from the combined ones, under its own name", () => {
+	const fenced = claudeTripwire();
+	assert.deepEqual(Object.keys(fenced), ["claude"]);
+	assert.equal(fenced.claude.name, "claude");
+	assert.ok(!("claude" in tripwires()), "the combined tripwires leave claude to the cases that run this build's backend over fake-claude.mjs");
+});
+
+test("the profiles test host fences claude by default, and only a case's own claude double goes over it", () => {
+	// The profiles host never means to run this build's claude backend, so a case that forgot its double must meet the
+	// tripwire rather than the production claude executable. The order is the fence: anything spread after it wins.
+	const calls = fusionRegistrations(fs.readFileSync(path.join(repoRoot, "test", "profiles.test.ts"), "utf8"));
+	assert.equal(calls.length, 1, "the profiles file registers the extension in its one host helper");
+	assert.match(calls[0]!, /backends: \{ \.\.\.tripwires\(\), \.\.\.claudeTripwire\(\), \.\.\.options\.backends \}/);
+});
+
+test("a reach of any tripwire that a case swallowed still fails its file, and a file that reached none passes", () => {
 	// Each probe is a test file of its own, run by a node process of its own, so the reach it makes on purpose fails
 	// that process's hook and not this suite's. The probes import the tripwires and call one entry point: nothing in
 	// them registers the extension or starts a child of any harness.
@@ -475,15 +490,15 @@ test("a reach of either tripwire that a case swallowed still fails its file, and
 	delete env.PI_FUSION_CHILD;
 	const probe = (name: string, body: string): { status: number | null; output: string } => {
 		const file = path.join(dir, `${name}.test.ts`);
-		fs.writeFileSync(file, `import test from "node:test";\nimport { tripwires } from ${JSON.stringify(module)};\ntest(${JSON.stringify(name)}, async () => {\n${body}\n});\n`);
+		fs.writeFileSync(file, `import test from "node:test";\nimport { claudeTripwire, tripwires } from ${JSON.stringify(module)};\ntest(${JSON.stringify(name)}, async () => {\n${body}\n});\n`);
 		const ran = spawnSync(process.execPath, ["--test", file], { cwd: dir, env, encoding: "utf8", timeout: 30_000 });
 		return { status: ran.status, output: `${ran.stdout}${ran.stderr}` };
 	};
 	try {
 		const clean = probe("clean", "\ttripwires();");
 		assert.equal(clean.status, 0, `a file that reached no tripwire failed:\n${clean.output}`);
-		for (const backend of ["pi", "codex"]) {
-			const reached = probe(`${backend}-reach`, `\tawait tripwires().${backend}.run({} as never).catch(() => {});`);
+		for (const [backend, fence] of [["pi", "tripwires()"], ["codex", "tripwires()"], ["claude", "claudeTripwire()"]]) {
+			const reached = probe(`${backend}-reach`, `\tawait ${fence}.${backend}.run({} as never).catch(() => {});`);
 			assert.equal(reached.status, 1, `a swallowed ${backend} reach did not fail its file:\n${reached.output}`);
 			assert.match(reached.output, new RegExp(`a case reached the ${backend} backend tripwire`), `the ${backend} probe failed for another reason:\n${reached.output}`);
 		}

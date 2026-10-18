@@ -14,7 +14,7 @@ User commands act on the same runs as either control tool. Run-changing `steer`,
 | `/fusion wait run-N` | Show activity/elapsed time until the run ends or asks a question; Esc leaves it going and never takes the report away from the host |
 | `/fusion answer [run-N] [text]` | Answer a waiting question; no text opens an editor; no handle selects the sole waiting run |
 | `/fusion review run-N` | Start an independent background review of eligible ended work |
-| `/fusion config` | Show/edit the session's role settings; printed output also shows the profiles file, this instance's history, the saved history preference and the settings file |
+| `/fusion config` | Show/edit the session's role settings; printed output also shows the profiles file, this instance's [host policy](configuration.md#seeing-and-replacing-the-policy) source and path (plus any set-aside reason), this instance's history, the saved history preference and the settings file. The editor shows the host policy lines above the role table |
 | `/fusion profile [list \| use <name> \| save <name> \| default <name>]` | Choose/manage global named profiles |
 | `/fusion history [on \| off]` | Show this instance's history, the saved preference and the settings file; `on`/`off` save the preference for new instances only. Works with Fusion off and runs unfinished. See [Turning history on and off](runs.md#turning-history-on-and-off) |
 | `/fusion dashboard`, `/fusion dashboard stop` | Open/reuse or close the read-only monitoring page |
