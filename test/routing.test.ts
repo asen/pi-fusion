@@ -766,8 +766,9 @@ test("a backend a host left out is refused without asking the user to configure 
 	// Whole, so the list of harnesses that are left is pinned as well: the backend the host left out is not in it.
 	assert.equal(
 		refused.error,
-		"the pi backend is not available in this build: run-1 would run role implement on it, and this pi-fusion runs claude only. Nothing was started and nothing was recorded. Take the work to claude with a role it runs, or do it yourself; no configuration makes pi available here.",
+		"the pi backend is not available in this build: run-1 would run role implement on it, and this pi-fusion runs claude only. Nothing was started and nothing was recorded, and no configuration makes pi available here.",
 	);
+	assert.doesNotMatch(refused.error ?? "", /yourself|Take the work to/, "where the work goes instead is the host policy's and the user's");
 	assert.deepEqual(ext.appended, [], "a refused call records nothing");
 });
 

@@ -19,7 +19,7 @@ Editing conventions and invariants live in [AGENTS.md](../AGENTS.md); vocabulary
 ```text
 fusion.ts                     host lifecycle and registration
   +-- host-guidance.ts        delegation tool text over the configuration
-  +-- host-policy.ts          host policy loader (not yet composed)
+  +-- host-policy.ts          host policy loaders
   +-- roles/profiles/store    capabilities and session configuration
   +-- backends/types.ts       SDK-neutral boundary
   |     +-- claude.ts         Claude SDK and stream/questions
@@ -35,8 +35,8 @@ fusion.ts                     host lifecycle and registration
 | Module under `extensions/` | Responsibility |
 | --- | --- |
 | `fusion.ts` | Tools/command, mode, configuration application, admission, handles, branch records, questions, controls, reviews, and host lifecycle handlers |
-| `host-guidance.ts` | Pure delegation-tool descriptions, snippets, guidelines and parameter help composed from the enabled roles, role capabilities, captured defaults, tool names and quote markers passed in; no backend binding, routing or registration |
-| `host-policy.ts` | Host policy loaders: shipped `contracts/host.md`, optionally replaced whole by `pi-fusion/host.md` under the host agent directory (resolved through the lazy `hostAgentDir` seam); strict UTF-8, nonblank, at most 64 KiB; reads only. Returns the selected text, source/path and a diagnostic for a set-aside override; a broken shipped policy fails the load. `FusionOptions.hostPolicy` injects one; nothing loads or composes it yet |
+| `host-guidance.ts` | Pure delegation-tool descriptions, snippets, guidelines and parameter help composed from the enabled roles, role capabilities, captured defaults, tool names, quote markers and selected host policy text passed in, the policy as one shared guideline; no backend binding, routing or registration |
+| `host-policy.ts` | Host policy loaders: shipped `contracts/host.md`, optionally replaced whole by `pi-fusion/host.md` under the host agent directory (resolved through the lazy `hostAgentDir` seam); strict UTF-8, nonblank, at most 64 KiB; reads only. Returns the selected text, source/path and a diagnostic for a set-aside override; a broken shipped policy fails the load. `FusionOptions.hostPolicy` injects one; `fusion.ts` loads it once at startup and `host-guidance.ts` carries its text |
 | `roles.ts` | Supported backends, writer-slot and review eligibility per role |
 | `profiles.ts`, `profile-store.ts` | Captured legacy defaults, settings validation/copies, global profiles file and queued atomic replacement |
 | `settings-store.ts` | Fusion's own `settings.json`: the saved history preference and plan context cap, validation, and file/memory stores over the profile store's queue and atomic write |

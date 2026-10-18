@@ -1965,7 +1965,7 @@ test("an ask reviewer configured on a backend this host did not register is refu
 		const host = makeSecurityHost({ backends: { pi: undefined, codex: undefined, claude: claude.backend }, sessionFile, profiles: profileWith({ ask: { enabled: true, backend: "pi", model: PI_MODEL } }) });
 		await host.command("review run-1");
 		assert.deepEqual(host.notices, [
-			"the pi backend is not available in this build: run-2 would review run-1, and this pi-fusion runs claude only. Nothing was started and nothing was recorded. Take the work to claude with a role it runs, or do it yourself; no configuration makes pi available here.",
+			"the pi backend is not available in this build: run-2 would review run-1, and this pi-fusion runs claude only. Nothing was started and nothing was recorded, and no configuration makes pi available here.",
 		]);
 		assert.deepEqual(claude.starts, [], "no claude child stands in for the backend the ask role is configured on");
 		assert.equal(host.branch.length, 0, "nothing was recorded for a handle nothing took");

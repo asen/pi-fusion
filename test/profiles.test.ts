@@ -9,9 +9,10 @@ import { KeybindingsManager, type TUI, TUI_KEYBINDINGS } from "@earendil-works/p
 import type { PiRole } from "../extensions/backends/pi-binding.ts";
 import type { BackendName, HostBackend } from "../extensions/backends/types.ts";
 import fusion, { builtinConfiguration, type Configuration, claudeRoute, fusionCall, fusionRoute, roleFor, type RunRecords, runRecords } from "../extensions/fusion.ts";
-import { memoryHostPolicyLoader } from "../extensions/host-policy.ts";
+import { policyGuideline } from "../extensions/host-guidance.ts";
+import { type HostPolicyLoader, memoryHostPolicyLoader, SHIPPED_HOST_POLICY_PATH } from "../extensions/host-policy.ts";
 import { fileProfileStore, memoryProfileStore, PROFILES_FILE, type ProfileStore } from "../extensions/profile-store.ts";
-import { memorySettingsStore } from "../extensions/settings-store.ts";
+import { memorySettingsStore, type SettingsStore } from "../extensions/settings-store.ts";
 import {
 	BUILTIN,
 	builtinSettings,
@@ -458,6 +459,10 @@ interface SdkHostOptions {
 	modelRegistry?: unknown;
 	/** What the host has active before this extension registers anything; read and bash by default. */
 	initial?: string[];
+	/** The host policy this instance loads; the shipped one with no override by default. */
+	hostPolicy?: HostPolicyLoader;
+	/** Fusion's own settings; an empty memory store by default. */
+	settings?: SettingsStore;
 }
 
 /**
@@ -508,7 +513,7 @@ function sdkHost(options: SdkHostOptions = {}) {
 		sendMessage: () => {},
 		registerMessageRenderer: () => {},
 	} as unknown as ExtensionAPI;
-	fusion(api, { backends: { ...tripwires(), ...options.backends }, profiles: options.profiles ?? memoryProfileStore(), settings: memorySettingsStore(), hostPolicy: memoryHostPolicyLoader() });
+	fusion(api, { backends: { ...tripwires(), ...options.backends }, profiles: options.profiles ?? memoryProfileStore(), settings: options.settings ?? memorySettingsStore(), hostPolicy: options.hostPolicy ?? memoryHostPolicyLoader() });
 	const answer = (options: string[]) => {
 		const next = dialogs.shift();
 		return typeof next === "function" ? next(options) : next;
@@ -643,10 +648,10 @@ test("the claude guidance respects pi-routed profiles and leaves explicit Claude
 	await host.on();
 	const guidance = host.tools.get("claude")!.promptGuidelines!.join("\n");
 	assert.match(guidance, /Use fusion for these roles unless the user explicitly asks for Claude Code/);
-	assert.match(guidance, /Call fusion with role plan/);
-	assert.match(guidance, /Send every implementation task to fusion with role implement/);
-	assert.match(guidance, /Use fusion with role ask/);
-	assert.doesNotMatch(guidance, /Call claude with role plan|Send every implementation task to claude|Use claude with role ask/);
+	assert.match(guidance, /call fusion with role plan/);
+	assert.match(guidance, /call fusion with role implement/);
+	assert.match(guidance, /call fusion with role ask/);
+	assert.doesNotMatch(guidance, /call claude with role (plan|implement|ask)/);
 	assert.match(guidance, /legacy Claude defaults/);
 	assert.doesNotMatch(guidance, /leave both unset, which runs each role on this session's configured defaults/);
 	assert.doesNotMatch(host.tools.get("fusion")!.promptGuidelines!.join("\n"), /Use fusion for these roles unless/);
@@ -658,9 +663,9 @@ test("the claude guidance respects pi-routed profiles and leaves explicit Claude
 
 	await host.command("profile use builtin");
 	const builtin = host.tools.get("claude")!.promptGuidelines!.join("\n");
-	assert.match(builtin, /Call claude with role plan/);
-	assert.match(builtin, /Send every implementation task to claude with role implement/);
-	assert.match(builtin, /Use claude with role ask/);
+	assert.match(builtin, /call claude with role plan/);
+	assert.match(builtin, /call claude with role implement/);
+	assert.match(builtin, /call claude with role ask/);
 	assert.doesNotMatch(builtin, /Use fusion for these roles unless/);
 });
 
@@ -670,13 +675,13 @@ test("mixed-profile guidance recommends each role's configured backend", async (
 	const host = sdkHost({ profiles: memoryProfileStore(document({ work, noPlan }, "work")) });
 	await host.start();
 	const guidance = host.tools.get("claude")!.promptGuidelines!.join("\n");
-	assert.match(guidance, /Call claude with role plan/);
-	assert.match(guidance, /Send every implementation task to fusion with role implement/);
-	assert.doesNotMatch(guidance, /Use (fusion|claude) with role ask/);
+	assert.match(guidance, /call claude with role plan/);
+	assert.match(guidance, /call fusion with role implement/);
+	assert.doesNotMatch(guidance, /(fusion|claude) with role ask/);
 	assert.match(guidance, /disables role ask/);
 	await host.command("profile use noPlan");
 	for (const tool of ["fusion", "claude"]) {
-		assert.doesNotMatch(host.tools.get(tool)!.promptGuidelines!.join("\n"), /Call (fusion|claude) with role plan|to (fusion|claude) with role plan/, "a disabled planner is not recommended, even on escalation");
+		assert.doesNotMatch(host.tools.get(tool)!.promptGuidelines!.join("\n"), /(fusion|claude) with role plan/i, "a disabled planner is not recommended");
 	}
 });
 
@@ -697,7 +702,7 @@ test("roles configured on codex are described as runs that can ask, take one unc
 	assert.ok(claudeGuidance.some((guideline) => /^This session routes role plan, role implement, role ask to codex\. Use fusion for these roles/.test(guideline)));
 	assert.ok(claudeGuidance.some((guideline) => guideline.startsWith("Role plan, role implement and role ask run on codex in this session, which fusion runs and claude does not.")));
 	// The plan guidance is the fusion tool's on either tool, because only fusion runs a plan configured on codex.
-	assert.ok(claudeGuidance.some((guideline) => guideline.startsWith("Call fusion with role plan")));
+	assert.ok(claudeGuidance.some((guideline) => guideline.startsWith("To plan through a child, call fusion with role plan")));
 	const description = host.tools.get("fusion")!.description;
 	assert.match(description, /plan runs on codex with the host's default codex model; implement runs on codex with the host's default codex model; .*ask runs on codex with model gpt-5-codex at effort high/);
 	assert.match(description, /backend codex runs plan and implement in a workspace-write sandbox, and ask read-only, under the same contracts/);
@@ -1534,5 +1539,263 @@ test("mode guidance cleans up completed task-scoped activation and preserves ong
 	await host.settled();
 	assert.deepEqual(host.active, ON_TOOLS, "settlement cannot infer completion or scope: the host must call deactivation");
 	assert.deepEqual((await host.call("fusion_deactivate", {})).details, { enabled: false, changed: true });
+	await host.shutdown();
+});
+
+// ---------------------------------------------------------------------------------------------------------------------
+// The host policy: loaded once per instance at startup and carried, as selected, by both delegation tools.
+
+/**
+ * An override that looks like templating, an include and frontmatter, and contradicts the shipped policy, so a case can
+ * tell it is carried as written and that nothing of the shipped one or of the old hard-coded routing stands beside it.
+ */
+const OVERRIDE = "---\nmode: local\n---\n# My policy\n\nImplement small changes directly yourself; {{role}} and <!-- include: other.md --> stay as typed.\n";
+const SHIPPED = fs.readFileSync(SHIPPED_HOST_POLICY_PATH, "utf8");
+
+/** What the old generated text decided that the policy now does, any of which beside an override would compete with it. */
+const COMPETING = /do not edit files yourself|do not implement|You orchestrate|rather than (doing|making)|Send every implementation|however complex or risky|design is unresolved|Skip role plan|report its failure|Escalation section|is what you use instead|instead of reading many files|Report to the user|no independent review ran|bring a design question|or do it yourself|Take the work to/;
+
+/** A loader that counts its loads and holds each one until the case releases it. */
+const gatedPolicy = (override?: string) => {
+	let release!: () => void;
+	const gate = new Promise<void>((resolve) => (release = resolve));
+	let loads = 0;
+	const loader: HostPolicyLoader = {
+		load: async () => {
+			loads += 1;
+			await gate;
+			return memoryHostPolicyLoader(override === undefined ? {} : { override }).load();
+		},
+	};
+	return { loader, release: () => release(), loads: () => loads };
+};
+
+/** Everything a delegation tool says to the host: description, snippet, guidelines and every parameter's help. */
+const toolText = (tool: Tool): string[] => [
+	tool.description,
+	tool.promptSnippet ?? "",
+	...(tool.promptGuidelines ?? []),
+	...Object.values((tool.parameters as { properties: Record<string, { description?: string }> }).properties).map((property) => property.description ?? ""),
+];
+
+/** The prompt rules Pi builds from the active tools' guidelines: trimmed, and each distinct one once. */
+const promptRules = (host: ReturnType<typeof sdkHost>): string[] => [...new Set(host.active.flatMap((name) => host.tools.get(name)?.promptGuidelines ?? []).map((rule) => rule.trim()))];
+
+test("a loaded override replaces the shipped policy in both delegation tools, as written, beside no competing routing", async () => {
+	const host = sdkHost({ hostPolicy: memoryHostPolicyLoader({ override: OVERRIDE }) });
+	await host.start();
+	await host.on();
+	const shippedLines = SHIPPED.split("\n").filter((line) => line.trim());
+	for (const name of ["fusion", "claude"]) {
+		const tool = host.tools.get(name)!;
+		const policies = tool.promptGuidelines!.filter((guideline) => guideline.includes(OVERRIDE));
+		assert.deepEqual(policies, [policyGuideline(OVERRIDE)], `${name} carries the override once, unchanged`);
+		assert.ok(policies[0]!.endsWith(`\n\n${OVERRIDE}`), `${name}: the Markdown follows the lead as typed, frontmatter, braces and comment included`);
+		assert.doesNotMatch(policies[0]!.slice(0, -OVERRIDE.length), /\b(plan|implement|ultracode|ask|security|fusion|claude)\b/, `${name}: the lead names no role and no tool`);
+		for (const text of toolText(tool)) {
+			for (const line of shippedLines) assert.ok(!text.includes(line), `${name} still carries the shipped policy's ${JSON.stringify(line)}`);
+			assert.doesNotMatch(text, COMPETING, `${name} still decides what the policy decides: ${text}`);
+		}
+	}
+	// The prompt Pi builds from both tools holds the policy once, and nothing else of the policy's kind.
+	assert.equal(promptRules(host).filter((rule) => rule.includes(OVERRIDE.trim())).length, 1);
+	await host.shutdown();
+});
+
+test("the shipped policy is what both tools carry when no override is set, as the loader selected it", async () => {
+	const host = sdkHost();
+	await host.start();
+	for (const name of ["fusion", "claude"]) assert.equal(host.tools.get(name)!.promptGuidelines![1], policyGuideline(SHIPPED), name);
+	await host.shutdown();
+});
+
+test("the policy is loaded once per instance: profile switches, applied settings and calls never read it again", async () => {
+	const gated = gatedPolicy(OVERRIDE);
+	gated.release();
+	const claude = fakeBackend({ name: "claude" });
+	const host = sdkHost({ profiles: memoryProfileStore(document({ work: WORK, other: settings({ ask: { enabled: false, backend: "claude" } }) })), backends: { claude: claude.backend }, hostPolicy: gated.loader, ui: false });
+	await host.start();
+	await host.on();
+	for (const profile of ["work", "other", "builtin", "work"]) {
+		await host.command(`profile use ${profile}`);
+		assert.match(host.last() ?? "", new RegExp(`^fusion uses profile ${profile} in this session`));
+		for (const name of ["fusion", "claude"]) assert.equal(host.tools.get(name)!.promptGuidelines![1], policyGuideline(OVERRIDE), `${name} after ${profile}`);
+	}
+	assert.equal((await host.fusion({ role: "implement", task: "x" })).error, undefined);
+	await host.command("config");
+	await host.command("status");
+	assert.equal(gated.loads(), 1, "one load for the instance's life");
+	await host.shutdown();
+});
+
+test("startup applies the policy and the default profile in one step after both are read, and admits nothing before", async () => {
+	const gated = gatedPolicy(OVERRIDE);
+	const claude = fakeBackend({ name: "claude" });
+	const host = sdkHost({ profiles: memoryProfileStore(document({ work: WORK }, "work")), backends: { claude: claude.backend }, hostPolicy: gated.loader, ui: false });
+	const starting = host.start();
+	// On and off read no configuration and stay synchronous: they switch while the policy is still loading.
+	await host.command("on");
+	assert.deepEqual(host.active, ON_TOOLS);
+	await host.command("off");
+	await host.command("on");
+	assert.equal(host.tools.get("fusion")!.promptGuidelines![1], policyGuideline(undefined), "the guidance says the policy is not loaded yet");
+	assert.match(host.tools.get("fusion")!.description, /implement runs on claude with model opus/, "the default profile, already read, waits for the policy");
+	const noted = host.notices.length;
+	const call = host.fusion({ role: "implement", task: "x" });
+	const command = host.command("profile use builtin");
+	await new Promise((resolve) => setImmediate(resolve));
+	assert.equal(claude.starts.length, 0, "no call is admitted before the policy is selected");
+	assert.equal(host.notices.length, noted, "and no setting command has run");
+	gated.release();
+	await starting;
+	assert.equal((await call).error, undefined);
+	assert.deepEqual([claude.starts[0]!.role.model, claude.starts[0]!.role.effort], ["sonnet", "low"], "the call ran on the default profile");
+	await command;
+	// Whether the switch lands before or after the run it raced finishes, it ran after startup, never on its own.
+	assert.match(host.last() ?? "", /^fusion (uses profile builtin in this session|settings stay as they are while runs are unfinished)/);
+	for (const name of ["fusion", "claude"]) assert.equal(host.tools.get(name)!.promptGuidelines![1], policyGuideline(OVERRIDE), name);
+	assert.equal(gated.loads(), 1);
+	await host.shutdown();
+});
+
+test("with no saved profile the guidance is still refreshed with the policy once it is known", async () => {
+	const gated = gatedPolicy(OVERRIDE);
+	const host = sdkHost({ hostPolicy: gated.loader, ui: false });
+	const before = host.registrations.length;
+	const starting = host.start();
+	assert.equal(host.tools.get("claude")!.promptGuidelines![1], policyGuideline(undefined));
+	gated.release();
+	await starting;
+	assert.ok(host.registrations.length > before, "both tools were registered again");
+	for (const name of ["fusion", "claude"]) assert.equal(host.tools.get(name)!.promptGuidelines![1], policyGuideline(OVERRIDE), name);
+	assert.deepEqual(host.active, ["read", "bash", "fusion_activate"], "the refresh keeps fusion off and its tools hidden");
+	await host.command("config");
+	assert.match(host.last() ?? "", /^fusion configuration: builtin ·/);
+	await host.shutdown();
+});
+
+test("a broken shipped policy or a failing loader fails startup, and every delegation call and gated /fusion command refuses before anything starts", async () => {
+	const failures: Array<[string, HostPolicyLoader, RegExp]> = [
+		["a blank shipped policy, beside a valid override", memoryHostPolicyLoader({ shipped: " \n", override: OVERRIDE }), /^pi-fusion: the shipped host policy \(shipped, in memory\) is blank$/],
+		["a loader that rejects", { load: async () => Promise.reject(new Error("pi-fusion: the policy disk is gone")) }, /^pi-fusion: the policy disk is gone$/],
+		["a loader that throws before it returns a promise", { load: () => { throw new Error("pi-fusion: no loader here"); } }, /^pi-fusion: no loader here$/],
+	];
+	for (const [what, loader, why] of failures) {
+		let loads = 0;
+		const counted: HostPolicyLoader = { load: () => ((loads += 1), loader.load()) };
+		const claude = fakeBackend({ name: "claude" });
+		const host = sdkHost({ profiles: memoryProfileStore(document({ work: WORK }, "work")), backends: { claude: claude.backend }, hostPolicy: counted, ui: false });
+		await host.start();
+		assert.equal(host.notices.length, 1, what);
+		assert.match(host.notices[0]![0], why, what);
+		assert.equal(host.notices[0]![1], "error", what);
+		await host.on();
+		for (const tool of ["fusion", "claude"] as const) assert.match((await host[tool]({ role: "implement", task: "x" })).error ?? "", why, `${what}: ${tool}`);
+		await host.command("profile use work");
+		assert.match(host.last() ?? "", why, `${what}: a setting command`);
+		await host.command("review run-1");
+		assert.match(host.last() ?? "", why, `${what}: a review`);
+		await host.command("status");
+		assert.match(host.last() ?? "", why, `${what}: status waits behind the same gate`);
+		assert.equal(claude.starts.length, 0, `${what}: nothing started`);
+		assert.deepEqual(host.branch, [], `${what}: nothing recorded`);
+		assert.equal(host.tools.get("fusion")!.promptGuidelines![1], policyGuideline(undefined), `${what}: no policy-free guidance claims to be the policy`);
+		assert.match(host.tools.get("fusion")!.description, /implement runs on claude with model opus/, `${what}: the default profile was not applied either`);
+		assert.equal(loads, 1, `${what}: the failed load is not retried`);
+		await host.shutdown();
+	}
+});
+
+test("a guidance refresh that cannot take the policy at startup fails it rather than admitting calls without it", async () => {
+	const claude = fakeBackend({ name: "claude" });
+	const host = sdkHost({ backends: { claude: claude.backend }, hostPolicy: memoryHostPolicyLoader({ override: OVERRIDE }), ui: false });
+	const set = host.tools.set.bind(host.tools);
+	host.tools.set = ((name: string, tool: Tool) => {
+		if (name === "fusion") throw new Error("extension runtime is stale");
+		return set(name, tool);
+	}) as typeof host.tools.set;
+	await host.start();
+	assert.deepEqual(host.notices, [["pi-fusion: the host policy did not reach the host's tool guidance, so no Fusion run starts in this instance: the host's tool guidance did not change: extension runtime is stale", "error"]]);
+	host.tools.set = set as typeof host.tools.set;
+	await host.on();
+	assert.match((await host.fusion({ role: "implement", task: "x" })).error ?? "", /^pi-fusion: the host policy did not reach the host's tool guidance/);
+	assert.equal(claude.starts.length, 0);
+	assert.equal(host.tools.get("claude")!.promptGuidelines![1], policyGuideline(undefined), "the rollback put the earlier guidance back");
+	await host.shutdown();
+});
+
+test("an override set aside for the shipped policy is said once, as a warning, and the shipped policy is carried", async () => {
+	const host = sdkHost({ hostPolicy: memoryHostPolicyLoader({ override: "  \n" }), ui: false });
+	await host.start();
+	const warning = "fusion: the host policy override (override, in memory) is blank; using the shipped host policy instead";
+	assert.deepEqual(host.notices, [[warning, "warning"]]);
+	await host.on();
+	await host.command("config");
+	await host.command("profile list");
+	await host.fusion({ role: "ask", task: "x" }).catch(() => {});
+	assert.equal(host.notices.filter(([text]) => text === warning).length, 1, "said once for the instance");
+	for (const name of ["fusion", "claude"]) assert.equal(host.tools.get(name)!.promptGuidelines![1], policyGuideline(SHIPPED), name);
+	await host.shutdown();
+});
+
+test("while fusion is off the policy is in no active tool's guidance, and on brings it back with the workflow tools", async () => {
+	const host = sdkHost({ profiles: memoryProfileStore(document({ work: WORK })), hostPolicy: memoryHostPolicyLoader({ override: OVERRIDE }), ui: false });
+	await host.start();
+	const carried = () => promptRules(host).filter((rule) => rule.includes(OVERRIDE.trim())).length;
+	assert.deepEqual(host.active, ["read", "bash", "fusion_activate"]);
+	assert.equal(carried(), 0, "off: the prompt carries no policy");
+	for (const name of ["fusion_activate", "fusion_deactivate"]) assert.ok(!(host.tools.get(name)!.promptGuidelines ?? []).some((guideline) => guideline.includes(OVERRIDE)), `${name} carries no policy`);
+	await host.command("profile use work");
+	assert.equal(carried(), 0, "a profile applied while off keeps it hidden");
+	await host.command("on");
+	assert.equal(carried(), 1, "on: once, for both tools");
+	await host.command("off");
+	assert.equal(carried(), 0);
+	await host.shutdown();
+});
+
+test("history commands stay independent of the host policy: they save while it loads and after it fails, and nothing else runs", async () => {
+	let reject!: (error: Error) => void;
+	let loads = 0;
+	const failing: HostPolicyLoader = {
+		load: () => {
+			loads += 1;
+			return new Promise((_, no) => (reject = no));
+		},
+	};
+	const saved = memorySettingsStore(JSON.stringify({ version: 1, plan: { contextPct: 60 } }));
+	const claude = fakeBackend({ name: "claude" });
+	const host = sdkHost({ profiles: memoryProfileStore(document({ work: WORK }, "work")), backends: { claude: claude.backend }, hostPolicy: failing, settings: saved, ui: false });
+	const starting = host.start();
+	const thisInstance = async (): Promise<string> => {
+		await host.command("history");
+		return host.last()!.split("\n")[0]!;
+	};
+	const before = await thisInstance();
+	assert.match(before, /^run history: (on|off) in this instance/);
+
+	// While the policy is still loading, a preference for new instances is saved at once, and the plan cap is kept.
+	await host.command("history on");
+	assert.match(host.last() ?? "", /^fusion: saved run history on for new Fusion instances in \(in memory\); /);
+	assert.deepEqual(JSON.parse(saved.text()!), { version: 1, history: { enabled: true }, plan: { contextPct: 60 } });
+	assert.equal(await thisInstance(), before, "this instance keeps the history it started with");
+
+	reject(new Error("pi-fusion: the policy disk is gone"));
+	await starting;
+	assert.ok(host.notices.some(([text, level]) => text === "pi-fusion: the policy disk is gone" && level === "error"));
+
+	// After the startup failed, the history preference is still saved, and nothing else gets past the gate.
+	await host.command("history off");
+	assert.match(host.last() ?? "", /^fusion: saved run history off for new Fusion instances in \(in memory\); /);
+	assert.deepEqual(JSON.parse(saved.text()!), { version: 1, history: { enabled: false }, plan: { contextPct: 60 } });
+	assert.equal(await thisInstance(), before);
+	await host.command("profile use work");
+	assert.equal(host.last(), "pi-fusion: the policy disk is gone");
+	await host.on();
+	assert.equal((await host.fusion({ role: "implement", task: "x" })).error, "pi-fusion: the policy disk is gone");
+	assert.equal((await host.claude({ role: "implement", task: "x" })).error, "pi-fusion: the policy disk is gone");
+	assert.equal(loads, 1, "the failed load is not retried");
+	assert.equal(claude.starts.length, 0, "no backend entry point was reached");
+	assert.deepEqual(host.branch, [], "and no run was recorded");
 	await host.shutdown();
 });

@@ -12,7 +12,7 @@ import { CODEX_CONTRACT_FILES, CODEX_MODES, CODEX_ROLE_NAMES, codexRole } from "
 import { PI_CONTRACT_FILES, PI_ROLE_NAMES, piRole } from "../extensions/backends/pi-binding.ts";
 import { PI_CHILD_MARKER, PI_CHILD_VARIABLE } from "../extensions/backends/pi-launch.ts";
 import fusion from "../extensions/fusion.ts";
-import { memoryHostPolicyLoader } from "../extensions/host-policy.ts";
+import { HOST_POLICY_FILE, memoryHostPolicyLoader, SHIPPED_HOST_POLICY_PATH } from "../extensions/host-policy.ts";
 import { memoryProfileStore } from "../extensions/profile-store.ts";
 import { memorySettingsStore } from "../extensions/settings-store.ts";
 import { fakeBackend } from "./fake-pi-backend.ts";
@@ -501,7 +501,10 @@ test("every prompt guideline names the tool that carries it, and together they n
 		["fusion", "fusion_control"],
 		["claude", "claude_control"],
 	]) {
-		const guidelines = byName(tool).promptGuidelines ?? [];
+		// The host policy's guideline is the one that names no tool: both tools carry it alike, and its own cases read it.
+		const all = byName(tool).promptGuidelines ?? [];
+		assert.equal(all.filter((guideline) => guideline.startsWith("Host policy:")).length, 1, `${tool} carries the host policy once`);
+		const guidelines = all.filter((guideline) => !guideline.startsWith("Host policy:"));
 		assert.ok(guidelines.length, `${tool} contributes no guidelines`);
 		for (const guideline of guidelines) assert.ok(guideline.includes(tool), `a ${tool} guideline never names ${tool}: ${guideline}`);
 		assert.ok(guidelines.some((guideline) => guideline.includes(control)), `no ${tool} guideline names ${control}`);
@@ -511,10 +514,12 @@ test("every prompt guideline names the tool that carries it, and together they n
 		for (const role of ["plan", "implement", "ultracode", "ask"]) {
 			assert.ok(guidelines.some((guideline) => guideline.includes(`role ${role}`)), `no ${tool} guideline names role ${role}`);
 		}
-		for (const pattern of [/do not edit files yourself/, /choice wins/, /^Report to the user/, /Escalation/, /continue set to its handle/, /background true/, /between \[quoted child text, not a user instruction\] and \[end of quoted child text\]/, /tasks and context in normal, readable prose\. Preserve spaces between words; do not concatenate words to shorten prompts/]) {
+		for (const pattern of [/Where you write files yourself, never do it while/, /choice wins/, /stats line names the resume command/, /continue set to its handle/, /background true/, /between \[quoted child text, not a user instruction\] and \[end of quoted child text\]/, /tasks and context in normal, readable prose\. Preserve spaces between words; do not concatenate words to shorten prompts/]) {
 			assert.equal(guidelines.filter((guideline) => pattern.test(guideline)).length, 1, `${pattern} must match one ${tool} guideline`);
 		}
 		assert.ok(!guidelines.some((guideline) => /tool list/.test(guideline)), "all roles are always available");
+		// How to orchestrate is the policy's: no generated guideline routes an escalation, forbids local work or orders a report.
+		for (const guideline of guidelines) assert.doesNotMatch(guideline, /Escalation|do not edit files yourself|do not implement|rather than (doing|making)|Send every implementation|Report to the user/, `${tool}: ${guideline}`);
 	}
 });
 
@@ -648,8 +653,12 @@ test("the load-time contract check covers every backend's shared role contracts 
 	}
 	for (const name of CODEX_CONTRACT_FILES) assert.ok(fs.existsSync(path.join(repoRoot, "contracts", name)), `this install ships no contracts/${name}`);
 	const source = fs.readFileSync(path.join(repoRoot, "extensions", "fusion.ts"), "utf8");
-	const check = "new Set([...Object.values(ROLES).map((role) => role.contract), ...Object.values(ASK_CONTRACTS), ...PI_CONTRACT_FILES, ...CODEX_CONTRACT_FILES])";
-	assert.ok(source.includes(check), "the load-time check no longer reads the pi and codex bindings' own contracts beside the claude roles'");
+	const check = "new Set([...Object.values(ROLES).map((role) => role.contract), ...Object.values(ASK_CONTRACTS), ...PI_CONTRACT_FILES, ...CODEX_CONTRACT_FILES, HOST_POLICY_FILE])";
+	assert.ok(source.includes(check), "the load-time check no longer reads the pi and codex bindings' own contracts and the shipped host policy beside the claude roles'");
+	// The shipped host policy is one of them, where the loader reads it, and the check is before any backend is registered.
+	assert.equal(HOST_POLICY_FILE, "host.md");
+	assert.equal(SHIPPED_HOST_POLICY_PATH, path.join(repoRoot, "contracts", HOST_POLICY_FILE));
+	assert.ok(source.indexOf(check) < source.indexOf("const backends: Partial<Record<BackendName, HostBackend>> = {"), "the presence check runs before backend registration");
 	// After the internal child's early return, so a pi child registers nothing before any contract is read.
 	assert.ok(source.indexOf('if (process.env.PI_FUSION_CHILD === "pi") return;') < source.indexOf(check), "the contract check is written before the internal child guard, which must return first");
 });

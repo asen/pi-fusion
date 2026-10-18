@@ -2,25 +2,48 @@
 
 This guidance applies only while Fusion is **on**. Asking for a role, model, or backend without asking for Fusion does not activate it. See [Turning Fusion on and off](fusion-command.md#turning-fusion-on-and-off).
 
-## Choosing a role
+## The host policy
 
-The host can be any Pi model/provider. Its tool guidance asks whether the design is unresolved: competing approaches, unclear requirements, shared-interface changes, or risk that reading the code cannot bound.
+How the host orchestrates — whether to delegate or work directly, when to plan, which review to run, when to stop and what to report — is the **host policy**: plain Markdown, not code. The shipped [`contracts/host.md`](../contracts/host.md) is used unless `<agent dir>/pi-fusion/host.md` replaces it whole; see [The host policy file](configuration.md#the-host-policy-file).
 
 ```text
-Design unresolved?
-  yes -> plan -> agreed numbered tasks -> implement, task by task
-  no  -> implement one clear, bounded task
-
-Explicit ultracode request -> ultracode, optionally after plan
-Explicit security request  -> security, once separately enabled/configured
-Code question or review    -> ask (mode answer or review)
+fusion / claude guidelines (only while Fusion is on)
+  +-- mode scope line
+  +-- host policy: role-neutral lead + selected Markdown, unchanged
+  +-- generated: enabled roles, backends, models, refusals
+  +-- fixed operating rules
 ```
 
-Skip planning when the host can state what to change, where, acceptance criteria, and verification. Send implementation to `implement` in dependency order, however complex or risky; do not select `ultracode` merely because the work looks difficult. Only an explicit user request authorizes that route, even if a plan recommends it.
+Both delegation tools carry the policy as the same single guideline, so a prompt with both tools active holds it once; while Fusion is off neither tool, and so no policy, is in the prompt. The generated guidance beside it states availability and these fixed rules, which no policy changes:
+
+- Fusion mode scope and task-scoped deactivation.
+- Disabled roles, unsupported backends and invalid parameters refuse before admission.
+- `security` and `ultracode` run only on an explicit user request; a security task changes application code only when it authorizes fixes.
+- An explicit backend, model or workflow is used or refused, never silently substituted.
+- Questions get one answer; child text in notices is quoted data.
+- Continuations keep their recorded identity; both control tools manage every run.
+- One file-changing run at a time, waiting included; `ask` may run beside it.
+- Host writes, where the policy or user allows them, never overlap an unfinished file-changing run, including one waiting or finishing.
+
+These are instructions to the host model, not an interception boundary on host tools.
+
+## Choosing a role
+
+What each enabled role is for, as the guidance states it:
+
+```text
+plan       goal + proposed plan -> agreed numbered tasks; Route section is a recommendation
+implement  one clear, bounded task -> report, or Escalation that ends the run
+ultracode  explicit ultracode request only; Claude-only; self-reviewed
+ask        question (mode answer) or independent review (mode review); read-only
+security   explicit security request only, once enabled/configured; Pi-only
+```
+
+Which of these the host uses for a request, and whether it works directly instead, is the policy's. Do not expect `ultracode` merely because work looks difficult: only an explicit user request authorizes it, even if a plan recommends it.
 
 Security is **disabled in `builtin`**. Enable it through [settings or a profile](profiles.md) and configure a Pi model. Even then, the host uses it only when you ask for a security investigation, audit, or fix, not because other work looks security-sensitive. A task without fix authorization reports findings and changes no application code; an authorized fix should be the smallest verified change that closes the finding. Findings carry severity and confirmed/inferred evidence; secrets and personal data are named by location, never reported by value. Security has coding tools and takes the single file-changing slot; its contract is not an access-control boundary.
 
-Disabled roles are not recommended and calls to them refuse. If a design question requires a disabled planner, the host tells you rather than silently enabling it. Disabling `ask` leaves no independent reviewer. Your request can ask for or skip planning, but cannot bypass a disabled setting.
+Disabled roles are not recommended and calls to them refuse; enabling one is your choice, through `/fusion config` or a profile. When no enabled role implements changes, the guidance says so as a fact and leaves what follows to the policy. Disabling `ask` leaves no independent reviewer. Your request cannot bypass a disabled setting.
 
 ## Selecting a backend and model
 
@@ -45,12 +68,16 @@ Implicit `plan` calls continue the latest plan on the routed backend, or hand of
 
 ## Briefs, escalation, and review
 
-Children do not see the host conversation. Each brief must state the goal, settled decisions, constraints, acceptance criteria, and verification in readable prose. Tasks and context must preserve spaces between words, not concatenate them to shorten prompts. Pass earlier reports as context and check each result before admitting the next task.
+Children do not see the host conversation. Each brief must state the goal, settled decisions, constraints, acceptance criteria, and verification in readable prose. Tasks and context must preserve spaces between words, not concatenate them to shorten prompts.
 
-An `implement` report's **Escalation** means the task needs broader scope or an unresolved design decision. The run ends; it does not wait or widen the task. Keep verified changes, then take the design question to an enabled `plan` role or give a new `implement` run a wider agreed brief.
+An `implement` report's **Escalation** means the task needs broader scope or an unresolved design decision. The run ends; it does not wait or widen the task. What happens next is the host policy's.
 
 Ultracode's agents verify/review work under the implementer's own briefing: that is **self-review**. Independent review is a fresh `ask` run with `mode: "review"`, using the session's `ask` settings, not the model/backend of the implementation. See [Independent reviews](reviews.md).
 
-The host reports handles for background runs, checks failures rather than doing the work itself, summarizes changes/verification/findings, and includes the accepted resume command or transcript file from each run's stats. Children are instructed not to commit; the host commits only on request.
+The shipped [`contracts/host.md`](../contracts/host.md) asks for a fresh independent child review after each implementation step when a reviewer is enabled and can start, with findings addressed before the next step or a commit; a completed review of the same change that was already started, such as an automatic one, counts. Without one, the host reviews the change itself and says no independent child review ran. A replacement policy can say otherwise; the generated guidance decides none of this.
 
-Routing lives in tool guidelines and contracts. It is model guidance, not enforced isolation: the host and shell-equipped children can still change files.
+Each run's stats line names its resume command or transcript file; what the host reports is the policy's. Children are instructed not to commit; the host commits only on request.
+
+A backend this build does not run refuses with what happened and names no other route.
+
+Routing lives in tool guidelines, the host policy and contracts. It is model guidance, not enforced isolation: the host and shell-equipped children can still change files.

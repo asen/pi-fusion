@@ -235,3 +235,15 @@ test("every descriptor a load opens is closed, whether the override is read, ref
 	}
 	assert.equal(openDescriptors(), before);
 });
+
+test("the shipped policy asks for an independent child review after each implementation step, and keeps the kinds of review apart", () => {
+	const text = shipped.replace(/\s+/g, " ");
+	assert.match(text, /After each implementation step, get a fresh independent child review of that change when an enabled reviewer is available, and address its findings before the next step or any commit\./);
+	assert.match(text, /An independent review of the same change that was already started, such as an automatic one, satisfies this once it has completed\./);
+	assert.match(text, /A reviewer is available only when it is enabled and its configuration and admission let the review start; enabled alone is not enough\./);
+	assert.match(text, /When no independent child review is available, review the change yourself and tell the user that no independent child review ran, and why\./);
+	assert.match(text, /Reading a child's report or diff yourself is host review\. A child reviewing its own work, as ultracode's agents do, is self-review\. An independent review is a fresh child run that did not write the change and inherits nothing from it\./);
+	assert.match(text, /never present a host review or a self-review as independent/);
+	// An explicit workflow is still never substituted silently, review included.
+	assert.match(text, /Never substitute silently\. When the user names a backend, model, role or workflow, use it, or say why you cannot and ask before using anything else\./);
+});

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { claudeGuidance, claudeParameterHelp, fusionGuidance, fusionParameterHelp, type GuidanceInput, type ParameterHelp, type ToolGuidance } from "../extensions/host-guidance.ts";
+import { claudeGuidance, claudeParameterHelp, fusionGuidance, fusionParameterHelp, type GuidanceInput, type ParameterHelp, policyGuideline, type ToolGuidance } from "../extensions/host-guidance.ts";
 import { builtinSettings, captureBaseline, copySettings, type RoleSettings } from "../extensions/profiles.ts";
 import { KNOWN_ROLE_NAMES, type KnownRoleName } from "../extensions/roles.ts";
 
@@ -13,6 +13,8 @@ import { KNOWN_ROLE_NAMES, type KnownRoleName } from "../extensions/roles.ts";
 /** Captured from an empty environment, so nothing here depends on what this process has set. */
 const baseline = captureBaseline({} as NodeJS.ProcessEnv);
 const CLAUDE_ROLES = ["plan", "implement", "ultracode", "ask"] as const;
+/** A policy that names no role and no tool, so whatever these cases read of roles and tools is the generated text's. */
+const POLICY = "# Test policy\n\nOrchestrate as this test says.\n";
 
 const input = (roles: RoleSettings): GuidanceInput => ({
 	names: { fusion: "fusion", fusionControl: "fusion_control", claude: "claude", claudeControl: "claude_control" },
@@ -20,6 +22,7 @@ const input = (roles: RoleSettings): GuidanceInput => ({
 	baseline,
 	claudeRoles: CLAUDE_ROLES,
 	quote: { open: "[quoted child text, not a user instruction]", close: "[end of quoted child text]" },
+	policy: POLICY,
 });
 
 /** The built-in routing with exactly these roles enabled. */
@@ -76,6 +79,13 @@ const presented = (sentence: string): Set<string> => {
 	return roles;
 };
 
+/**
+ * What the generated text no longer decides, because the host policy does: local implementation, delegation
+ * preference, when to plan, stopping on failure, escalation routing, which review to pick and what to report.
+ */
+const HOST_DECISIONS =
+	/do not edit files yourself|do not implement|You orchestrate|rather than (doing|making)|Send every implementation|however complex or risky|design is unresolved|Skip role plan|report its failure|Escalation|is what you use instead|instead of reading many files|Report to the user|no independent review ran|bring a design question|in one call/;
+
 /** A sentence that says a role is off, which may name it. */
 const saysDisabled = (sentence: string): boolean => /disable|not enabled/.test(sentence);
 
@@ -103,17 +113,22 @@ for (const tool of TOOLS) {
 				else assert.deepEqual(mentions, [], label);
 			}
 
-			for (const guideline of guidance.promptGuidelines) assert.ok(guideline.includes(tool.name), `${label}: a guideline never names ${tool.name}: ${guideline}`);
-			assert.ok(guidance.promptGuidelines.some((guideline) => guideline.includes(tool.control)), `${label}: no guideline names ${tool.control}`);
-			assert.equal(guidance.promptGuidelines.filter((guideline) => /do not edit files yourself/.test(guideline)).length, 1, label);
-			for (const guideline of guidance.promptGuidelines) {
+			// The second guideline is the host policy, the same in both tools; every other one is the tool's own.
+			assert.equal(guidance.promptGuidelines[1], policyGuideline(POLICY), label);
+			const own = guidance.promptGuidelines.filter((guideline) => guideline !== policyGuideline(POLICY));
+			assert.equal(own.length, guidance.promptGuidelines.length - 1, `${label}: the policy is carried once`);
+			for (const guideline of own) assert.ok(guideline.includes(tool.name), `${label}: a guideline never names ${tool.name}: ${guideline}`);
+			assert.ok(own.some((guideline) => guideline.includes(tool.control)), `${label}: no guideline names ${tool.control}`);
+			for (const guideline of own) {
 				assert.doesNotMatch(guideline, /needs role|must enable|enable it\b/, `${label}: an absent role is not to be enabled on the host's say: ${guideline}`);
+				assert.doesNotMatch(guideline, HOST_DECISIONS, `${label}: a host decision the policy owns: ${guideline}`);
 			}
 
 			if (!usable.length) {
 				assert.match(guidance.description, /is enabled in this session's configuration, so every call is refused, whether it starts a run or continues one\./, label);
 				assert.match(guidance.promptSnippet, /every call is refused$/, label);
 				assert.ok(guidance.promptGuidelines.some((guideline) => guideline.startsWith(`No ${tool.name} role is enabled in this session's configuration, so every ${tool.name} call is refused`)), label);
+				assert.equal(guidance.promptGuidelines.filter((guideline) => /^Where you write files yourself/.test(guideline)).length, 0, `${label}: with no role enabled there is no run to overlap`);
 				assert.match(help.role, /^Required unless continue is set, but no role this tool runs is enabled/, label);
 				for (const parameter of ["model", "effort"] as const) assert.match(help[parameter], /leave it unset\.$/, `${label}: ${parameter}`);
 				continue;
@@ -124,7 +139,8 @@ for (const tool of TOOLS) {
 				assert.ok(guidance.promptGuidelines.some((guideline) => guideline.includes(`role ${role}`)), `${label}: no guideline names role ${role}`);
 			}
 			assert.deepEqual([...presented(help.role.split(". ")[0]! + ".")].sort(), [...usable].sort(), `${label}: the role help lists the enabled roles`);
-			for (const pattern of [/choice wins/, /^Report to the user/, /continue set to its handle/, /background true/, /between \[quoted child text, not a user instruction\] and \[end of quoted child text\]/]) {
+			assert.equal(own.filter((guideline) => /^Where you write files yourself, never do it while a \w+ run that can change files is unfinished, including one waiting for an answer or still finishing/.test(guideline)).length, 1, `${label}: the overlap rule`);
+			for (const pattern of [/choice wins/, /stats line names the resume command/, /continue set to its handle/, /background true/, /between \[quoted child text, not a user instruction\] and \[end of quoted child text\]/]) {
 				assert.equal(guidance.promptGuidelines.filter((guideline) => pattern.test(guideline)).length, 1, `${label}: ${pattern}`);
 			}
 			const choice = guidance.promptGuidelines.find((guideline) => /choice wins/.test(guideline))!;
@@ -136,12 +152,10 @@ for (const tool of TOOLS) {
 			} else {
 				assert.doesNotMatch(choice, /ultracode/, label);
 			}
-			assert.equal(guidance.promptGuidelines.some((guideline) => /Escalation/.test(guideline)), usable.includes("implement"), `${label}: escalation is guidance for role implement alone`);
+			assert.equal(guidance.promptGuidelines.some((guideline) => /Escalation/.test(guideline)), false, `${label}: what to do with an escalation is the policy's`);
+			assert.equal(own.some((guideline) => /^No enabled \w+ role implements a change in this session/.test(guideline)), !usable.includes("implement") && !usable.includes("ultracode"), `${label}: no implementing role is said as a fact`);
 			assert.equal(/^plan only, not with continue/.test(help.fresh), usable.includes("plan"), `${label}: fresh`);
 			assert.equal(/^ask only: answer/.test(help.mode), usable.includes("ask"), `${label}: mode`);
-			if (!usable.includes("ask") && (usable.includes("implement") || usable.includes("ultracode"))) {
-				assert.ok(guidance.promptGuidelines.some((guideline) => /that no independent review ran, because role ask is disabled/.test(guideline)), label);
-			}
 		}
 	});
 }
@@ -156,7 +170,7 @@ test("the built-in configuration with every role enabled says what each backend 
 	assert.match(fusion.promptSnippet, /^Delegate planning \(plan\), bounded implementation \(implement\), implementation the user asks ultracode for \(ultracode\), read-only questions and reviews \(ask\) or a scoped security investigation or fix the user asked for \(security\) to a coding child$/);
 	const security = fusion.promptGuidelines.find((guideline) => guideline.startsWith("Use fusion with role security only when the user asks"));
 	assert.ok(security);
-	assert.match(security, /where role implement, role ultracode or role ask with mode review is what you use instead/);
+	assert.match(security, /never on your own judgement that some work looks security-sensitive\. Say in the task/, "and names no role to use instead, which is the policy's");
 	const help = fusionParameterHelp(all);
 	assert.equal(help.role, "plan, implement, ultracode, ask or security. Required unless continue is set.");
 	assert.match(help.backend, /^The harness the child runs in: claude, which runs plan, implement, ultracode and ask, or pi, which runs plan, implement, ask and security on the user's own Pi provider configuration/);
@@ -215,9 +229,9 @@ test("mixed backends: claude guidance names the configured pi and codex routes a
 	assert.match(guidelines, /^This session routes role implement to pi\. Use fusion for these roles unless the user explicitly asks for Claude Code/m);
 	assert.match(guidelines, /^This session routes role ask to codex\. Use fusion for these roles/m);
 	assert.match(guidelines, /^Role ask runs on codex in this session, which fusion runs and claude does not\./m);
-	assert.match(guidelines, /Send every implementation task to fusion with role implement/);
-	assert.match(guidelines, /Use fusion with role ask to answer/);
-	assert.match(guidelines, /Call claude with role plan/);
+	assert.match(guidelines, /call fusion with role implement, one clear, bounded task per call/);
+	assert.match(guidelines, /call fusion with role ask;/);
+	assert.match(guidelines, /call claude with role plan/);
 	assert.match(guidelines, /or this instance's legacy Claude defaults for role implement and role ask, configured on another backend\./);
 	assert.match(guidelines, /^Role security is enabled in this session but runs only through fusion/m);
 	const claudeHelp = claudeParameterHelp(mixed);
@@ -252,7 +266,7 @@ test("a disabled role's notice is factual: it is refused, and enabling it is the
 		const notice = guidance.promptGuidelines.find((guideline) => /disables role plan, role ultracode/.test(guideline));
 		assert.ok(notice);
 		assert.match(notice, /a (fusion|claude) call to a disabled role is refused, whether it starts a run or continues one, so do not call one\. Whether to enable one is the user's choice, through \/fusion config or another profile\.$/);
-		assert.ok(guidance.promptGuidelines.some((guideline) => /Role plan is disabled in this session, so bring a design question to the user\./.test(guideline)));
+		assert.ok(!guidance.promptGuidelines.some((guideline) => /design question/.test(guideline)), "where a design question goes is the policy's");
 	}
 });
 
@@ -286,4 +300,39 @@ test("the user-choice guideline offers model and effort overrides only for roles
 	const noUltracode = input(enabling(["plan", "implement", "ask"]));
 	assert.match(choiceOf(fusionGuidance(noUltracode)), /A backend, model or effort the user names goes in fusion's backend, model or effort parameter; otherwise leave all three unset/);
 	assert.match(choiceOf(claudeGuidance(noUltracode)), /For an explicit claude call, put a model or effort the user names in its model or effort parameter;/);
+});
+
+test("the host policy is one guideline, the same in both tools, with its Markdown unchanged after a lead that names no role or tool", () => {
+	const typed = "---\ntitle: x\n---\n# Mine\n\n{{role}} ${tool} <!-- include: a.md --> stays as typed.\n\n";
+	const configuration = { ...input(enabling(KNOWN_ROLE_NAMES)), policy: typed };
+	const carried = [fusionGuidance(configuration), claudeGuidance(configuration)].map((guidance) => guidance.promptGuidelines.filter((guideline) => guideline.includes(typed)));
+	assert.deepEqual(carried, [[policyGuideline(typed)], [policyGuideline(typed)]]);
+	const lead = policyGuideline(typed).slice(0, -typed.length);
+	assert.ok(lead.endsWith("\n\n") && lead.startsWith("Host policy: "));
+	assert.doesNotMatch(lead, /\b(plan|implement|ultracode|ask|security|fusion|claude|delegate)\b/, "the lead is role- and tool-neutral; Fusion is the product, fusion the tool");
+	// Before the instance has loaded it, both tools say so in its place, and say no call runs without it.
+	const pending = { ...configuration, policy: undefined };
+	for (const guidance of [fusionGuidance(pending), claudeGuidance(pending)]) {
+		assert.equal(guidance.promptGuidelines[1], policyGuideline(undefined));
+		assert.match(guidance.promptGuidelines[1]!, /^Host policy: not loaded yet in this Fusion instance\. A Fusion call waits for it and is refused, before anything starts, when it cannot be loaded\.$/);
+	}
+});
+
+test("a policy that stages ultracode work is carried by both tools beside no generated whole-plan mandate, and ultracode's facts stay", () => {
+	const staged = "# Staged\n\nWhen the user asks for ultracode, give it one stage of the agreed plan per call and check each stage before the next.\n";
+	for (const enabled of [["plan", "implement", "ultracode", "ask"], ["plan", "ultracode"], ["ultracode"]] as KnownRoleName[][]) {
+		const configuration = { ...input(enabling(enabled)), policy: staged };
+		for (const [name, guidance] of [["fusion", fusionGuidance(configuration)], ["claude", claudeGuidance(configuration)]] as const) {
+			const label = `${name} with ${enabled.join(", ")}`;
+			assert.deepEqual(guidance.promptGuidelines.filter((guideline) => guideline.includes(staged)), [policyGuideline(staged)], `${label}: the staging policy, once and unchanged`);
+			const own = guidance.promptGuidelines.filter((guideline) => guideline !== policyGuideline(staged));
+			for (const guideline of own) assert.doesNotMatch(guideline, /in one call|whole (agreed plan|task)|one stage/, `${label}: the generated text decides how ultracode work is split: ${guideline}`);
+			const ultracode = own.find((guideline) => guideline.includes(`Use ${name} with role ultracode only when the user explicitly asks for ultracode`));
+			assert.ok(ultracode, `${label}: ultracode stays explicit-only`);
+			assert.match(ultracode, /Review section is a self-review by agents it briefed, not an independent review/, label);
+			assert.match(ultracode, /runs its agents one at a time so builds and tests do not overlap/, label);
+			assert.equal(/even when a Route section recommends it/.test(ultracode), enabled.includes("plan"), `${label}: a Route section does not authorize it`);
+			assert.ok(own.some((guideline) => /call for role ultracode takes no model or effort, and one that names either is refused/.test(guideline)), `${label}: its parameter restriction`);
+		}
+	}
 });

@@ -90,7 +90,7 @@ const command = async (held, text) => {
 	return held.notices.at(-1)?.[0];
 };
 
-const ORCHESTRATE = /You orchestrate fusion runs and do not implement/;
+const ORCHESTRATE = /These fusion guidelines apply while Fusion is on/;
 const ACTIVATE = /Call fusion_activate only when the user explicitly asks to use Fusion/;
 const DEACTIVATE = /Call fusion_deactivate only when the user explicitly asks to stop using Fusion/;
 

@@ -57,7 +57,7 @@ import { ArchiveIndex } from "./dashboard-archive.ts";
 import { contextShare, continueNote, handoffBlocked, handoffNote, handoffPrompt, handoffShare, planContextPct, planProblems, sharePercent, type HandoffReason } from "./handoff.ts";
 import { asEnded, History, type HistoryRecord, historyDir, historyEnabled, sameChild } from "./history.ts";
 import { claudeGuidance, claudeParameterHelp, fusionGuidance, fusionParameterHelp, type GuidanceInput } from "./host-guidance.ts";
-import type { HostPolicyLoader } from "./host-policy.ts";
+import { HOST_POLICY_FILE, type HostPolicy, type HostPolicyLoader, hostPolicyLoader } from "./host-policy.ts";
 import { hostProfileStore, type ProfileStore } from "./profile-store.ts";
 import { hostSettingsStore, type SettingsStore } from "./settings-store.ts";
 import {
@@ -1543,8 +1543,9 @@ export interface FusionOptions {
 	settings?: SettingsStore;
 	/**
 	 * Where the host policy is loaded from: in production, this build's `contracts/host.md`, replaced whole by
-	 * `pi-fusion/host.md` under the host agent directory. This build does not load or compose it yet; every test host
-	 * passes a memory or temporary-directory loader of its own so no case ever reads the user's override.
+	 * `pi-fusion/host.md` under the host agent directory. It is loaded once per instance, at startup, and both delegation
+	 * tools carry what it selected; every test host passes a memory or temporary-directory loader of its own so no case
+	 * ever reads the user's override.
 	 */
 	hostPolicy?: HostPolicyLoader;
 	/** How the dashboard server starts. Left out, it is this build's own; a test host passes one that sees what it is given. */
@@ -1559,9 +1560,10 @@ export default function fusion(pi: ExtensionAPI, options: FusionOptions = {}) {
 	// registers the ordinary surface, because a marker this build does not know is not a child of this build.
 	if (process.env.PI_FUSION_CHILD === "pi") return;
 	// Every contract any role of any backend can run under, in one check: the Claude roles' own, the ask modes', the Pi
-	// bindings' and the Codex bindings'. An install missing one is broken whichever backend would have run it, so none
-	// waits for a call to find out.
-	for (const name of new Set([...Object.values(ROLES).map((role) => role.contract), ...Object.values(ASK_CONTRACTS), ...PI_CONTRACT_FILES, ...CODEX_CONTRACT_FILES])) {
+	// bindings' and the Codex bindings', and the shipped host policy the host itself is told. An install missing one is
+	// broken whichever backend would have run it, so none waits for a call to find out. Whether the policy's content is
+	// usable is the startup load's to say, and its failure refuses every call before a child starts.
+	for (const name of new Set([...Object.values(ROLES).map((role) => role.contract), ...Object.values(ASK_CONTRACTS), ...PI_CONTRACT_FILES, ...CODEX_CONTRACT_FILES, HOST_POLICY_FILE])) {
 		const contract = path.join(CONTRACTS_DIR, name);
 		if (!fs.existsSync(contract)) throw new Error(`pi-fusion: missing contract ${contract}`);
 	}
@@ -1609,12 +1611,12 @@ export default function fusion(pi: ExtensionAPI, options: FusionOptions = {}) {
 		const names = Object.entries(backends).filter(([, registered]) => registered).map(([name]) => name);
 		const why = `the ${backend} backend is not available in this build: ${what}, `;
 		// A host that registered nothing at all has nowhere to send the work. Composing the ordinary sentence around an
-		// empty list would say "runs  only" and "Take the work to  with a role it runs", so it is replaced rather than
-		// filled in: the whole of what can be said is that nothing here runs this.
+		// empty list would say "runs  only", so it is replaced rather than filled in: the whole of what can be said is
+		// that nothing here runs this.
 		if (names.length === 0) return `${why}and this pi-fusion runs no backend at all. Nothing was started and nothing was recorded. Nothing can run this here; no configuration makes ${backend} available here.`;
-		const available = names.join(", ");
-		const instead = continued ? `Read what that run reported and start a new run on ${available}` : `Take the work to ${available} with a role it runs, or do it yourself`;
-		return `${why}and this pi-fusion runs ${available} only. Nothing was started and nothing was recorded. ${instead}; no configuration makes ${backend} available here.`;
+		// What happens to the work instead is the host policy's and the user's to say, so this names no other route.
+		const after = continued ? ". That run cannot be continued here, and" : ", and";
+		return `${why}and this pi-fusion runs ${names.join(", ")} only. Nothing was started and nothing was recorded${after} no configuration makes ${backend} available here.`;
 	};
 
 	/**
@@ -1632,8 +1634,21 @@ export default function fusion(pi: ExtensionAPI, options: FusionOptions = {}) {
 	let knownProfiles: ProfileDocument | undefined;
 	/** Why the default profile was not loaded at startup, said once where a notice can be shown. */
 	let profileWarning: string | undefined;
+	const policyLoader = options.hostPolicy ?? hostPolicyLoader(hostAgentDir);
+	/**
+	 * The host policy this instance selected at startup, with its source, path and any diagnostic, kept for as long as
+	 * the instance lives: no profile switch or settings change reads it again. Undefined until the startup load settles.
+	 */
+	let policy: HostPolicy | undefined;
+	/** Why the host policy override was set aside, said once where a notice can be shown. */
+	let policyWarning: string | undefined;
 	let initializing: Promise<void> | undefined;
-	/** True once the startup load has settled, so a call after it registers its run without yielding to anything first. */
+	/**
+	 * True once the startup load has succeeded, so a call after it registers its run without yielding to anything first.
+	 * A load that failed leaves it false, and every later delegation call and every /fusion command behind this gate meets
+	 * the same rejection: the policy is loaded once per instance, never retried, and nothing is admitted without it. On,
+	 * off, history and the dashboard limit come before the gate, and the control tools wait for the settings read alone.
+	 */
 	let initialized = false;
 	/** True once this session chose its settings itself, which a late startup load must not overwrite. */
 	let chosen = false;
@@ -1646,40 +1661,59 @@ export default function fusion(pi: ExtensionAPI, options: FusionOptions = {}) {
 	};
 
 	/**
-	 * Loads the default profile once per instance, before any run starts or any setting is applied: a call or a command
-	 * that arrives first waits for it. A file that cannot be read, or a default it does not hold, leaves the built-in
-	 * configuration and a warning; nothing is rewritten and nothing claims the broken profile was applied.
+	 * Loads the host policy and the default profile once per instance, before any run starts or any setting is applied: a
+	 * call or a command that arrives first waits for it. Both are read before either is applied, and both reach the
+	 * guidance in one synchronous step after the last read, whether or not a profile is applied, so no call is admitted
+	 * on one while the host is told the other. A policy that cannot be loaded, or a guidance that cannot take it, fails
+	 * the startup and refuses every delegation call and gated command; a profile file that cannot be read, or a default it does not hold, leaves the
+	 * built-in configuration and a warning, and nothing is rewritten.
 	 */
 	const initialize = (): Promise<void> =>
 		(initializing ??= (async () => {
 			const choosing = chooseSettings();
 			try {
-				await loadDefault();
+				const [selected, profile] = await Promise.all([(async () => policyLoader.load())(), defaultProfile()]);
+				startWith(selected, profile);
 			} finally {
 				await choosing;
-				initialized = true;
 			}
+			initialized = true;
 		})());
 
-	const loadDefault = async (): Promise<void> => {
+	/** The default profile as a configuration to apply, or undefined with a warning when there is none to apply. */
+	const defaultProfile = async (): Promise<Configuration | undefined> => {
 		let document: ProfileDocument;
 		try {
 			document = await readProfiles();
 		} catch (error) {
 			profileWarning = `${error instanceof Error ? error.message : String(error)}; this session uses the ${BUILTIN} configuration`;
-			return;
+			return undefined;
 		}
 		const name = document.defaultProfile;
-		if (name === null || chosen) return;
+		if (name === null) return undefined;
 		const settings = Object.hasOwn(document.profiles, name) ? document.profiles[name] : undefined;
 		if (!settings) {
 			profileWarning = `the default profile ${name} is not in ${await profileStore.where().catch(() => "the profiles file")}; this session uses the ${BUILTIN} configuration`;
-			return;
+			return undefined;
+		}
+		return { profile: name, modified: false, roles: copySettings(settings), baseline };
+	};
+
+	/** Applies what the startup selected, in one synchronous step: the default profile if it applies, the policy always. */
+	const startWith = (selected: HostPolicy, profile: Configuration | undefined): void => {
+		policyWarning = selected.diagnostic;
+		if (profile && !chosen) {
+			try {
+				applyConfiguration(profile, selected);
+				return;
+			} catch (error) {
+				profileWarning = `the default profile ${profile.profile} was not applied: ${error instanceof Error ? error.message : String(error)}; this session uses the ${BUILTIN} configuration`;
+			}
 		}
 		try {
-			applyConfiguration({ profile: name, modified: false, roles: copySettings(settings), baseline });
+			applyConfiguration(configuration, selected);
 		} catch (error) {
-			profileWarning = `the default profile ${name} was not applied: ${error instanceof Error ? error.message : String(error)}; this session uses the ${BUILTIN} configuration`;
+			throw new Error(`pi-fusion: the host policy did not reach the host's tool guidance, so no Fusion run starts in this instance: ${error instanceof Error ? error.message : String(error)}`);
 		}
 	};
 
@@ -1720,26 +1754,32 @@ export default function fusion(pi: ExtensionAPI, options: FusionOptions = {}) {
 	/** This instance's run history as a line says it: the choice it started with, and where that came from. */
 	const historyActive = (): string => `${historyOn ? "on" : "off"} in this instance (${historySource})`;
 
-	/** Says once, where a notice can be shown, that the default profile was not what this session started with. */
+	/**
+	 * Says once, where a notice can be shown, that the default profile was not what this session started with, and that
+	 * the host policy override was set aside for the shipped one.
+	 */
 	const noteProfiles = (ctx: any): void => {
-		if (profileWarning === undefined) return;
-		const warning = profileWarning;
+		for (const warning of [profileWarning, policyWarning]) if (warning !== undefined) record(() => ctx.ui.notify(`fusion: ${warning}`, "warning"));
 		profileWarning = undefined;
-		record(() => ctx.ui.notify(`fusion: ${warning}`, "warning"));
+		policyWarning = undefined;
 	};
 
 	/**
 	 * Makes a configuration this session's, with the host's tool guidance in the same synchronous step, so the host is
-	 * never told one configuration while calls run on another. A guidance refresh that throws puts both back.
+	 * never told one configuration while calls run on another. The policy is the one already selected unless startup
+	 * passes the one it loaded. A guidance refresh that throws puts both back.
 	 */
-	const applyConfiguration = (next: Configuration): void => {
+	const applyConfiguration = (next: Configuration, selected: HostPolicy | undefined = policy): void => {
 		const previous = configuration;
+		const previousPolicy = policy;
 		const activeTools = pi.getActiveTools();
 		configuration = next;
+		policy = selected;
 		try {
 			registerGuidance(true);
 		} catch (error) {
 			configuration = previous;
+			policy = previousPolicy;
 			try {
 				registerGuidance(true);
 			} catch {}
@@ -3243,9 +3283,18 @@ export default function fusion(pi: ExtensionAPI, options: FusionOptions = {}) {
 				notice(`fusion: dashboard run limit is ${store.maxRuns}; active runs are never evicted`, "info");
 				return;
 			}
-			// A command that starts a review or applies settings reads the configuration, so it waits for the default
-			// profile as a call does; once that has loaded, nothing here yields.
-			if (!initialized) await initialize();
+			// Every command from here on waits for the default profile and the host policy as a call does: a review or a
+			// setting reads the configuration, and the others have always waited with them. Once both have loaded, nothing
+			// here yields. A startup that failed refuses each of them with its reason, as it refuses every delegation call;
+			// on, off, history and the dashboard limit above never depend on it.
+			if (!initialized) {
+				try {
+					await initialize();
+				} catch (error) {
+					notice(error instanceof Error ? error.message : String(error), "error");
+					return;
+				}
+			}
 			noteProfiles(ctx);
 			noteSettings(ctx);
 			ensureHistory(ctx);
@@ -3480,10 +3529,16 @@ export default function fusion(pi: ExtensionAPI, options: FusionOptions = {}) {
 	});
 
 	// Fusion starts off: the workflow tools are hidden before anything here awaits, so the first prompt carries none of
-	// their guidance, and the default profile loads as the session starts, so on already finds its guidance in place.
+	// their guidance, and the default profile and host policy load as the session starts, so on already finds its
+	// guidance in place. A startup that failed is said here once; every delegation call and gated /fusion command then
+	// refuses with it, while on, off, history, the dashboard limit and the control tools still work.
 	pi.on("session_start", async (_event, ctx) => {
 		mask();
-		await initialize();
+		try {
+			await initialize();
+		} catch (error) {
+			record(() => ctx.ui.notify(error instanceof Error ? error.message : String(error), "error"));
+		}
 		noteProfiles(ctx);
 		noteSettings(ctx);
 	});
@@ -3535,8 +3590,9 @@ export default function fusion(pi: ExtensionAPI, options: FusionOptions = {}) {
 		mask();
 		if (!enabled) throw new Error(FUSION_OFF);
 		ui = ctx.ui;
-		// No call runs on the built-in defaults while the default profile is still loading. Once it has loaded, nothing
-		// here yields before the run registers, which is what lets a cancel issued right after the call find it.
+		// No call runs on the built-in defaults, or without the host policy, while either is still loading, and none runs
+		// at all when the startup failed: the rejection is this call's. Once both have loaded, nothing here yields before
+		// the run registers, which is what lets a cancel issued right after the call find it.
 		if (!initialized) await initialize();
 		noteProfiles(ctx);
 		noteSettings(ctx);
@@ -3636,13 +3692,14 @@ export default function fusion(pi: ExtensionAPI, options: FusionOptions = {}) {
 		return outcome(run);
 	};
 
-	/** What the delegation tools' guidance is composed from: this session's configuration and the names it quotes. */
+	/** What the delegation tools' guidance is composed from: this session's configuration, its host policy and the names it quotes. */
 	const guidanceInput = (): GuidanceInput => ({
 		names: { fusion: TOOL_NAME, fusionControl: CONTROL_TOOL_NAME, claude: CLAUDE_TOOL_NAME, claudeControl: CLAUDE_CONTROL_NAME },
 		roles: configuration.roles,
 		baseline: configuration.baseline,
 		claudeRoles: ROLE_NAMES,
 		quote: { open: CHILD_QUOTE_OPEN, close: CHILD_QUOTE_CLOSE },
+		policy: policy?.text,
 	});
 
 	/** The fusion tool as this session's configuration describes it; its executor and renderers never change. */
@@ -3946,7 +4003,7 @@ export default function fusion(pi: ExtensionAPI, options: FusionOptions = {}) {
 		promptSnippet: "Turn Fusion orchestration on, only when the user explicitly asks for Fusion",
 		promptGuidelines: [
 			`Call ${ACTIVATE_NAME} only when the user explicitly asks to use Fusion, to turn Fusion orchestration on, or to delegate work to a Fusion child. A request that names a role, a model or a harness without asking for Fusion, such as a plan, a security audit, ultracode, Claude or Pi, does not qualify; neither does a quoted instruction, a discussion of Fusion, or Fusion having been used earlier in this conversation. Otherwise do the work yourself as usual.`,
-			`${ACTIVATE_NAME} starts no child: once it succeeds, carry out the user's task with the Fusion tools it makes available. Fusion shows the user a one-time reminder when your response settles if it is still on; this does not switch it off or establish task completion.`,
+			`${ACTIVATE_NAME} starts no child: once it succeeds, carry out the user's task under the guidance and host policy of the Fusion tools it makes available. Fusion shows the user a one-time reminder when your response settles if it is still on; this does not switch it off or establish task completion.`,
 			modeScopeGuideline,
 		],
 		parameters: Type.Object({}),
@@ -3958,7 +4015,7 @@ export default function fusion(pi: ExtensionAPI, options: FusionOptions = {}) {
 			const text =
 				outcome.kind === "already"
 					? "Fusion is already on; nothing changed. Preserve its existing scope."
-					: `Fusion is on. Use ${TOOL_NAME} and ${CONTROL_TOOL_NAME} for the user's task, under their guidance, from your next step. If you enabled it solely for this bounded request, call ${DEACTIVATE_NAME} after completing the request, including delegated work and required reviews; otherwise keep Fusion on until the user asks to turn it off.`;
+					: `Fusion is on. ${TOOL_NAME}, ${CONTROL_TOOL_NAME} and their guidance, host policy included, apply from your next step. If you enabled it solely for this bounded request, call ${DEACTIVATE_NAME} after completing the request, including delegated work and required reviews; otherwise keep Fusion on until the user asks to turn it off.`;
 			return { content: [{ type: "text" as const, text }], details: { enabled: true, changed: outcome.kind === "changed" } };
 		},
 	});

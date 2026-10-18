@@ -36,7 +36,7 @@ The built-in configuration enables every role except **security**, whose backend
 
 Claude plan effort defaults to `xhigh`; there is no plan-effort environment variable, but a profile or call can set it. Ultracode effort is fixed to `ultracode`, not plain `xhigh`, because the latter drops the workflow opt-in. Its workflow agents' model/effort live in `contracts/ultracode.md`, not a variable.
 
-Role contracts in `contracts/*.md` supply child instructions; see [Child tools and settings](runs.md#child-tools-and-settings) for how each backend applies them. Their no-commit and file-change rules are guidance, not enforced permissions.
+Role contracts in `contracts/*.md` supply child instructions; see [Child tools and settings](runs.md#child-tools-and-settings) for how each backend applies them. Their no-commit and file-change rules are guidance, not enforced permissions. `contracts/host.md` is the exception: the shipped [host policy](#the-host-policy-file), told to the host, never to a child.
 
 ## The Fusion settings file
 
@@ -56,6 +56,24 @@ A missing file or field means no value is saved. Fusion reads the file once per 
 Validation is local. A non-object, a version other than `1`, an unknown field, a non-boolean `enabled` or an invalid `contextPct` makes the whole file unreadable. At startup that leaves the file untouched, captured variables/defaults decide, and one warning names the resulting history and context-cap behavior. A save over such a file, or over a file from a newer pi-fusion, is refused so you can fix it by hand.
 
 Writes follow the [profiles file](profiles.md#how-the-file-is-written) rules. A missing file creates nothing until a save. A save creates the private directory (`0700`) and file (`0600`) where platform modes apply. It rereads the file, changes only the history preference, and replaces the file through a private temporary sibling and a rename. A failed write leaves the old file. Writes are queued within one process. Separate Pi processes and manual edits have **no lock**: the last rename wins, and nothing watches the file.
+
+## The host policy file
+
+`<agent dir>/pi-fusion/host.md`, beside the settings file, optionally replaces the shipped `contracts/host.md` **whole**: nothing is merged or appended. Both delegation tools carry the selected text unchanged; see [The host policy](routing.md#the-host-policy) for what it decides and what it cannot change. Either source must be a regular file of strict UTF-8, nonblank, at most 64 KiB. It is read as written: no templating, includes or frontmatter.
+
+```text
+startup (session_start, or the first call/command needing configuration)
+  read shipped host.md --unusable--> startup fails
+  read override --missing--> shipped, no notice
+               --unusable--> shipped, one warning naming the file and why
+               --valid-----> override
+  read default profile
+  -> policy + profile applied to guidance in one step (also with no saved profile)
+```
+
+- Loaded **once per extension instance**. Profile switches and `/fusion config` never reread it; edits take effect after restarting Pi, `/reload`, or a new session. Loading creates no directory or file.
+- Until it loads, the guidance says the policy is not loaded yet, and delegation calls and every `/fusion` command except `on`, `off`, `history [on|off]` and `dashboard limit` wait for it. The mode tools and `fusion_control`/`claude_control` do not wait.
+- A missing shipped file stops the extension loading, with the other contracts, so no command or tool is registered. A shipped file that is unusable at startup, or a loader failure, fails startup with one error once the extension has registered. Every delegation call and each of those waiting commands (including config, profile, review, status and dashboard) then refuses with it before anything starts, and the instance does not retry. `/fusion on|off`, `/fusion history [on|off]`, `/fusion dashboard limit` and the control tools still work: a history preference is still saved for new instances, and this instance's history stays as it started. A valid override never hides a broken shipped policy.
 
 ## The pi backend's variables
 
