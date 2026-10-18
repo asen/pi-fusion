@@ -478,6 +478,122 @@ test("the profiles test host fences claude by default, and only a case's own cla
 	assert.match(calls[0]!, /backends: \{ \.\.\.tripwires\(\), \.\.\.claudeTripwire\(\), \.\.\.options\.backends \}/);
 });
 
+/** The variable this build's claude backend launches its executable from, which a fenced file points at the fake. */
+const CLAUDE_BIN = "PI_FUSION_CLAUDE_BIN";
+
+/** The repository root as the suite's files compute it: `path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..")`. */
+const REPO_ROOT_TEXT = 'path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..")';
+
+/** Whether a node is `process.env.PI_FUSION_CLAUDE_BIN`, the one spelling the suite assigns it with. */
+const isClaudeBin = (node: ts.Node): boolean =>
+	ts.isPropertyAccessExpression(node) && node.name.text === CLAUDE_BIN && ts.isPropertyAccessExpression(node.expression) && node.expression.name.text === "env" && ts.isIdentifier(node.expression.expression) && node.expression.expression.text === "process";
+
+/** Whether a top-level statement writes the variable at all: an assignment of any kind or a delete, which a later one would undo the fake with. */
+const writesClaudeBin = (statement: ts.Statement): boolean => {
+	let writes = false;
+	const visit = (node: ts.Node): void => {
+		if (ts.isBinaryExpression(node) && node.operatorToken.kind >= ts.SyntaxKind.FirstAssignment && node.operatorToken.kind <= ts.SyntaxKind.LastAssignment && isClaudeBin(node.left)) writes = true;
+		else if (ts.isDeleteExpression(node) && isClaudeBin(node.expression)) writes = true;
+		if (!ts.isFunctionLike(node)) ts.forEachChild(node, visit);
+	};
+	visit(statement);
+	return writes;
+};
+
+/**
+ * Whether a test file points this build's claude backend at `test/fake-claude.mjs` before any case runs, read from its
+ * syntax tree rather than its text, so a comment or a string that spells the assignment is not one. The assignment
+ * must be a top-level expression statement of its own: one inside a function, a block, an `if`, a `&&` or a ternary
+ * runs only when something calls or chooses it, so it counts for nothing. Its value must be
+ * `path.join(repoRoot, "test", "fake-claude.mjs")`, written there or held by a top-level `const` declared before it,
+ * with `repoRoot` the top-level `const` every suite file computes from its own URL and `path` imported from
+ * `node:path`. No later top-level statement may write the variable again, nor delete it; a case that changes it
+ * inside a test and puts it back is that case's own business, as child.test.ts does.
+ */
+function pointsClaudeAtFake(source: string): boolean {
+	const file = ts.createSourceFile("fenced.ts", source, ts.ScriptTarget.Latest, true);
+	const consts = new Map<string, ts.Expression>();
+	let pathImported = false;
+	let fenced = false;
+	const fakePath = (value: ts.Expression): boolean =>
+		ts.isCallExpression(value) &&
+		value.expression.getText(file) === "path.join" &&
+		value.arguments.length === 3 &&
+		ts.isIdentifier(value.arguments[0]!) &&
+		value.arguments[0].text === "repoRoot" &&
+		consts.get("repoRoot")?.getText(file) === REPO_ROOT_TEXT &&
+		ts.isStringLiteral(value.arguments[1]!) &&
+		value.arguments[1].text === "test" &&
+		ts.isStringLiteral(value.arguments[2]!) &&
+		value.arguments[2].text === "fake-claude.mjs";
+	for (const statement of file.statements) {
+		if (ts.isImportDeclaration(statement) && ts.isStringLiteral(statement.moduleSpecifier) && statement.moduleSpecifier.text === "node:path") {
+			const bindings = statement.importClause?.namedBindings;
+			if (bindings && ts.isNamespaceImport(bindings) && bindings.name.text === "path") pathImported = true;
+		}
+		if (ts.isVariableStatement(statement) && statement.declarationList.flags & ts.NodeFlags.Const) {
+			for (const declaration of statement.declarationList.declarations) if (ts.isIdentifier(declaration.name) && declaration.initializer) consts.set(declaration.name.text, declaration.initializer);
+		}
+		if (!writesClaudeBin(statement)) continue;
+		const expression = ts.isExpressionStatement(statement) ? statement.expression : undefined;
+		const direct = expression && ts.isBinaryExpression(expression) && expression.operatorToken.kind === ts.SyntaxKind.EqualsToken && isClaudeBin(expression.left) ? expression.right : undefined;
+		const value = direct && ts.isIdentifier(direct) ? consts.get(direct.text) : direct;
+		// The last write decides: a fake one fences the file, and anything else written after it unfences it again.
+		fenced = pathImported && value !== undefined && fakePath(value);
+	}
+	return fenced;
+}
+
+test("every file that registers the extension keeps this build's claude backend off the production executable", () => {
+	// A registration that leaves this build's claude backend in place launches whatever PI_FUSION_CLAUDE_BIN names, or
+	// the SDK's own claude when nothing does, which is a real, paid child. So each registering file either fences claude
+	// with its tripwire in every registration, or points the variable at fake-claude.mjs at module level, before any case.
+	const fencedByVariable: string[] = [];
+	for (const file of testFiles()) {
+		const source = fs.readFileSync(file, "utf8");
+		const calls = fusionRegistrations(source);
+		if (!calls.length) continue;
+		const where = relative(file);
+		if (calls.every((call) => /\.\.\.claudeTripwire\(\)/.test(call))) continue;
+		assert.ok(pointsClaudeAtFake(source), `${where} registers this build's claude backend without the claude tripwire and without pointing PI_FUSION_CLAUDE_BIN at test/fake-claude.mjs at module level`);
+		fencedByVariable.push(where);
+	}
+	assert.deepEqual(fencedByVariable, ["test/control.test.ts", "test/extension.test.ts", "test/lifecycle.test.ts", "test/routing.test.ts", "test/session.test.ts"], "every registering file but the profiles one is fenced by the variable");
+});
+
+test("the fake claude audit reads the syntax tree: only an unconditional top-level assignment of this repository's fake counts", () => {
+	const header = `import * as path from "node:path";\nimport { fileURLToPath } from "node:url";\nconst repoRoot = ${REPO_ROOT_TEXT};\n`;
+	const fake = 'path.join(repoRoot, "test", "fake-claude.mjs")';
+	const fenced: Array<[string, string]> = [
+		["the direct form", `${header}process.env.${CLAUDE_BIN} = ${fake};\n`],
+		["through a const", `${header}const fakeClaude = ${fake};\nprocess.env.${CLAUDE_BIN} = fakeClaude;\n`],
+		["a case that changes it and puts it back", `${header}process.env.${CLAUDE_BIN} = ${fake};\ntest("x", () => { process.env.${CLAUDE_BIN} = "/x"; delete process.env.${CLAUDE_BIN}; });\n`],
+	];
+	const unfenced: Array<[string, string]> = [
+		["no assignment", header],
+		["inside an uncalled function", `${header}function fence() {\n\tprocess.env.${CLAUDE_BIN} = ${fake};\n}\n`],
+		["inside an arrow function", `${header}const fence = () => { process.env.${CLAUDE_BIN} = ${fake}; };\n`],
+		["in a line comment", `${header}// process.env.${CLAUDE_BIN} = ${fake};\n`],
+		["in a block comment", `${header}/*\nprocess.env.${CLAUDE_BIN} = ${fake};\n*/\n`],
+		["in a string", `${header}const text = "process.env.${CLAUDE_BIN} = path.join(repoRoot, 'test', 'fake-claude.mjs');";\n`],
+		["in a template", `${header}const text = \`\nprocess.env.${CLAUDE_BIN} = ${fake};\n\`;\n`],
+		["under an if", `${header}if (process.env.CI) process.env.${CLAUDE_BIN} = ${fake};\n`],
+		["in a block", `${header}{\n\tprocess.env.${CLAUDE_BIN} = ${fake};\n}\n`],
+		["behind &&", `${header}process.env.CI && (process.env.${CLAUDE_BIN} = ${fake});\n`],
+		["in a ternary", `${header}process.env.CI ? (process.env.${CLAUDE_BIN} = ${fake}) : undefined;\n`],
+		["another file", `${header}process.env.${CLAUDE_BIN} = path.join(repoRoot, "test", "fake-codex.mjs");\n`],
+		["another root", `import * as path from "node:path";\nconst repoRoot = "/usr/local";\nprocess.env.${CLAUDE_BIN} = ${fake};\n`],
+		["no path import", `import { fileURLToPath } from "node:url";\nconst repoRoot = ${REPO_ROOT_TEXT};\nprocess.env.${CLAUDE_BIN} = ${fake};\n`],
+		["a let the file can change", `${header}let fakeClaude = ${fake};\nprocess.env.${CLAUDE_BIN} = fakeClaude;\n`],
+		["a const declared after", `${header}process.env.${CLAUDE_BIN} = fakeClaude;\nconst fakeClaude = ${fake};\n`],
+		["deleted later", `${header}process.env.${CLAUDE_BIN} = ${fake};\ndelete process.env.${CLAUDE_BIN};\n`],
+		["overwritten later", `${header}process.env.${CLAUDE_BIN} = ${fake};\nprocess.env.${CLAUDE_BIN} = "/usr/local/bin/claude";\n`],
+		["added to", `${header}process.env.${CLAUDE_BIN} = ${fake};\nprocess.env.${CLAUDE_BIN} += "x";\n`],
+	];
+	for (const [what, source] of fenced) assert.equal(pointsClaudeAtFake(source), true, what);
+	for (const [what, source] of unfenced) assert.equal(pointsClaudeAtFake(source), false, what);
+});
+
 test("a reach of any tripwire that a case swallowed still fails its file, and a file that reached none passes", () => {
 	// Each probe is a test file of its own, run by a node process of its own, so the reach it makes on purpose fails
 	// that process's hook and not this suite's. The probes import the tripwires and call one entry point: nothing in

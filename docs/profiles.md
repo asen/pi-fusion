@@ -64,7 +64,7 @@ Each delegation tool's description, prompt snippet, guidelines and parameter hel
 
 A guidance refresh re-registers a tool whenever its description, snippet, guidelines or parameters change.
 
-Recorded settings, plan handoffs, and refusal recovery are described in [Runs](runs.md). Independent review always uses a fresh configured `ask` run; disabled `ask` means no reviewer.
+Recorded settings, plan handoffs, and refusal recovery are described in [Runs](runs.md). Independent review always uses a fresh configured `ask` run; disabled `ask` means no reviewer, and what the host does then is the host policy's ([kinds of review](reviews.md#kinds-of-review)).
 
 ## The editor
 

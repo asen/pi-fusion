@@ -60,7 +60,7 @@ Alternatively, configure that role through `/fusion config` or `PI_FUSION_PI_IMP
 
 Codex is opt-in: name `backend: "codex"` or configure a role there; builtin routes nothing to it. Model and effort may be omitted to use your own Codex defaults. Children inherit your Codex home, configuration, and login, and delegated connections opt into its experimental question API. Cost is unknown and excluded from the dollar estimate. See [Codex behavior and qualification limits](docs/codex-backend.md).
 
-The host's routing guidance is: plan when the design is unresolved, implement bounded tasks in dependency order, and use `ultracode` only when you ask. [Role settings](docs/profiles.md) can disable any role. The [contracts](contracts/) define each child's behavior; these instructions are not a sandbox or permission boundary.
+How the host orchestrates (delegate or work directly, plan, review, report) is the editable [host policy](docs/routing.md#the-host-policy): the shipped [`contracts/host.md`](contracts/host.md), or your own `pi-fusion/host.md` replacing it whole ([how](docs/configuration.md#the-host-policy-file)). Generated guidance adds only what this session enables and fixed operating rules; `ultracode` and `security` run only when you ask. [Role settings](docs/profiles.md) can disable any role. The [contracts](contracts/) define each child's behavior; these instructions are not a sandbox or permission boundary.
 
 ## Tools and controls
 
@@ -89,16 +89,16 @@ pi --tools read,grep,find,ls,bash,fusion,fusion_control,fusion_activate,fusion_d
 
 Fusion never bypasses that list. Omitting the mode tools leaves `/fusion on` and `/fusion off` available, but prevents switching by natural-language tool calls. Add `claude,claude_control` if you want the compatibility pair too.
 
-While on, the host is instructed to delegate implementation and not edit files itself. That is guidance: its shell tool can still write files. Removing that tool also removes the host's ability to run Git. Cancellation does not undo changes, and descendant cleanup is bounded best effort, not process isolation.
+While on, the shipped host policy asks the host to delegate implementation and implement directly only when you explicitly ask, and the generated guidance tells it never to write while a file-changing run is unfinished. Both are instructions to the host model, not permissions or enforced concurrency: its shell tool can still write files. Removing that tool also removes the host's ability to run Git. Cancellation does not undo changes, and descendant cleanup is bounded best effort, not process isolation.
 
 ## Documentation
 
-- [Routing](docs/routing.md): planning, implementation, escalation, and explicit opt-ins.
+- [Routing](docs/routing.md): the host policy, planning, implementation, escalation, and explicit opt-ins.
 - [Runs and tool parameters](docs/runs.md): handles, continuation, forks, background controls, cancellation, and history.
 - [Questions](docs/questions.md): the child's waiting state and exactly-one-answer flow.
 - [User commands and terminal UI](docs/fusion-command.md): activation, reminders, cards, and the widget.
 - [Profiles and role settings](docs/profiles.md): configure roles and save named profiles.
-- [Configuration](docs/configuration.md): environment variables and the session budget.
+- [Configuration](docs/configuration.md): environment variables, the settings and host policy files, and the session budget.
 - [Independent reviews](docs/reviews.md): manual and automatic `ask` review runs.
 - [Ultracode](docs/ultracode.md): Claude workflows, permission modes, and cost.
 - [Dashboard](docs/dashboard.md): local, read-only monitoring and sensitive-output limits.
@@ -106,4 +106,4 @@ While on, the host is instructed to delegate implementation and not edit files i
 - [Codex backend](docs/codex-backend.md): inherited install, lifecycle, continuation, steers, and recorded qualification limits.
 - [Development](docs/development.md): module map, deterministic tests, and manual harness commands.
 
-Change role behavior in `contracts/*.md`. Children are instructed not to commit; the host commits only when you ask.
+Change role behavior in `contracts/*.md`, and host orchestration in `contracts/host.md` or [your override](docs/configuration.md#the-host-policy-file). Children are instructed not to commit; the host commits only when you ask.

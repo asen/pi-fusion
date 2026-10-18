@@ -4,7 +4,7 @@ This guidance applies only while Fusion is **on**. Asking for a role, model, or 
 
 ## The host policy
 
-How the host orchestrates — whether to delegate or work directly, when to plan, which review to run, when to stop and what to report — is the **host policy**: plain Markdown, not code. The shipped [`contracts/host.md`](../contracts/host.md) is used unless `<agent dir>/pi-fusion/host.md` replaces it whole; see [The host policy file](configuration.md#the-host-policy-file).
+How the host orchestrates — whether to delegate or work directly, when to plan, which review to run, when to stop and what to report — is the **host policy**: plain Markdown, not code. The shipped [`contracts/host.md`](../contracts/host.md) is used unless `<agent dir>/pi-fusion/host.md` replaces it whole; see [The host policy file](configuration.md#the-host-policy-file) for loading once per instance, the invalid-override warning and fallback, and what `/fusion config` shows. It is instruction to the host model, not a permission: Fusion neither enforces it nor checks compliance.
 
 ```text
 fusion / claude guidelines (only while Fusion is on)
@@ -72,7 +72,7 @@ Children do not see the host conversation. Each brief must state the goal, settl
 
 An `implement` report's **Escalation** means the task needs broader scope or an unresolved design decision. The run ends; it does not wait or widen the task. What happens next is the host policy's.
 
-Ultracode's agents verify/review work under the implementer's own briefing: that is **self-review**. Independent review is a fresh `ask` run with `mode: "review"`, using the session's `ask` settings, not the model/backend of the implementation. See [Independent reviews](reviews.md).
+Host review, **self-review** (such as ultracode's agents under its own briefing) and independent review are distinct; see [Kinds of review](reviews.md#kinds-of-review). Independent review is a fresh `ask` run with `mode: "review"`, using the session's `ask` settings, not the model/backend of the implementation.
 
 The shipped [`contracts/host.md`](../contracts/host.md) asks for a fresh independent child review after each implementation step when a reviewer is enabled and can start, with findings addressed before the next step or a commit; a completed review of the same change that was already started, such as an automatic one, counts. Without one, the host reviews the change itself and says no independent child review ran. A replacement policy can say otherwise; the generated guidance decides none of this.
 

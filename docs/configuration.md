@@ -71,6 +71,7 @@ startup (session_start, or the first call/command needing configuration)
   -> policy + profile applied to guidance in one step (also with no saved profile)
 ```
 
+- Told to the host only, and only while Fusion is on. It is instruction, not an OS permission or concurrency control: disabled-role refusals and one-file-changing-run admission are code and hold whatever it says.
 - Loaded **once per extension instance**. Profile switches and `/fusion config` never reread it; edits take effect after restarting Pi, `/reload`, or a new session. Loading creates no directory or file.
 - Until it loads, the guidance says the policy is not loaded yet, and delegation calls and every `/fusion` command except `on`, `off`, `history [on|off]` and `dashboard limit` wait for it. The mode tools and `fusion_control`/`claude_control` do not wait.
 - A missing shipped file stops the extension loading, with the other contracts, so no command or tool is registered. A shipped file that is unusable at startup, or a loader failure, fails startup with one error once the extension has registered. Every delegation call and each of those waiting commands (including config, profile, review, status and dashboard) then refuses with it before anything starts, and the instance does not retry. `/fusion on|off`, `/fusion history [on|off]`, `/fusion dashboard limit` and the control tools still work: a history preference is still saved for new instances, and this instance's history stays as it started. A valid override never hides a broken shipped policy.

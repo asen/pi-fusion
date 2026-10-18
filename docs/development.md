@@ -94,7 +94,7 @@ extension test host
 ```
 
 - Tripwires record every reach. File-level assertions catch accidental routing even if the host turns the throw into a report.
-- `claudeTripwire()` is separate from `tripwires()`, because SDK-around-fake-protocol cases run this build's Claude backend over `fake-claude.mjs`. A host none of whose cases means to run that backend spreads it between the combined tripwires and its own doubles: `{ ...tripwires(), ...claudeTripwire(), ...own }`. The `profiles.test.ts` host does, and `test/backends.test.ts` audits that order.
+- `claudeTripwire()` is separate from `tripwires()`, because SDK-around-fake-protocol cases run this build's Claude backend over `fake-claude.mjs`. A host none of whose cases means to run that backend spreads it between the combined tripwires and its own doubles: `{ ...tripwires(), ...claudeTripwire(), ...own }`. The `profiles.test.ts` host does, and `test/backends.test.ts` audits that order. Every other registering file points `PI_FUSION_CLAUDE_BIN` at `fake-claude.mjs` at module level, before any case; the same file audits that each registering file has one fence or the other.
 - Registry overlays spread injected entries last; explicit `undefined` removes a default without fallback. A routed Codex case needs an own double/fake, never `codex: undefined` alone.
 - The two `productionDefaults()` hosts never run a backend. They refuse with Pi/Codex selection variables or `PI_FUSION_CODEX_BIN` set; Codex needs a tripwire because an omitted model uses its host default.
 - `test/backends.test.ts` audits registrations, overlays and import boundaries, and constructs the default Codex backend without calling `run`. Every registration uses `tripwires()` or `productionDefaults()`, never both.

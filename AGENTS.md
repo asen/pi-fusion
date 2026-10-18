@@ -18,7 +18,7 @@ Tests past 60 seconds are cancelled and named. Browser tests use `PI_FUSION_CHRO
 
 - Relative TypeScript imports carry `.ts` (`allowImportingTsExtensions`). Child/preload programs use `.mjs`, with `.d.mts` where needed.
 - Tabs, semicolons, long lines. Put `/** ... */` comments above declarations and explain why, not merely what.
-- Change role behavior in `contracts/*.md`. Shared plan/implement/ask contracts stay vendor-neutral; backend-specific contracts may name their requirements.
+- Change role behavior in `contracts/*.md`, and host orchestration (delegate vs direct, planning, review expectations, reporting) in `contracts/host.md` only: generated tool text states availability and fixed operating rules, never a competing orchestration mandate. Shared plan/implement/ask contracts stay vendor-neutral; backend-specific contracts may name their requirements.
 - Keep runtime fixes and documentation consolidation separate. User-facing behavior changes belong in the owning topic page in the same commit.
 - Document current behavior from code, not completed implementation plans. Keep TODOs, open issues, future proposals, and scoped qualification evidence. Prefer ASCII diagrams and short tables/bullets to walls of prose; link to the owning page rather than repeating detail.
 - Commit only when asked: concise imperative subject (up to about 150 characters), no AI or `Co-Authored-By` trailers.
@@ -27,7 +27,7 @@ Tests past 60 seconds are cancelled and named. Browser tests use `PI_FUSION_CHRO
 
 `extensions/fusion.ts` exports `fusion(pi, options?)`: delegation/control pairs `fusion`/`fusion_control` and compatibility `claude`/`claude_control`, two mode tools, `/fusion`, the run-message renderer, and `session_start`, `agent_settled`, `session_shutdown`, `session_before_tree` handlers.
 
-Load order: internal child marker, required contracts for every backend/ask mode, Pi bootstrap existence, then backend registration. A Pi child with `PI_FUSION_CHILD=pi` registers nothing before any contract check; this is not a user setting.
+Load order: internal child marker, required contracts for every backend/ask mode plus `contracts/host.md`, Pi bootstrap existence, then backend registration. A Pi child with `PI_FUSION_CHILD=pi` registers nothing before any contract check; this is not a user setting.
 
 - Host: mode, configuration, routing, handles, scheduling, questions, branch records; no direct backend-SDK import.
 - `backends/types.ts`: import-free, SDK-neutral requests/outcomes. Each backend owns its binding, session/role shapes, protocol, and SDK options; registration key must match backend name.
@@ -45,6 +45,7 @@ See [Pi backend](docs/pi-backend.md) and [Codex backend](docs/codex-backend.md) 
 - Mode-tool guidance makes activation solely for a bounded request task-scoped: instruct the host to deactivate after that request, delegated work and required reviews finish. Preserve pre-existing scope and explicit session-wide on requests, including `/fusion on`. Scope/completion are model judgments, not runtime state or automatic deactivation.
 - Tool activation arms one reminder on the **host's** `agent_settled`: clear before notification, suppress for `/fusion on`, clear on successful off. It is neither child completion nor automatic deactivation.
 - Settings apply only with no unfinished run. Application/admission binding remain synchronous after the last await. Refresh preserves the entire active-tool list; on failure roll settings back and attempt guidance/list restoration, not guaranteed recovery.
+- The host policy is shipped `contracts/host.md`, replaced whole by `<agent dir>/pi-fusion/host.md`; it is loaded once per instance at startup, before any run or setting, and carried unchanged as one guideline of both delegation tools, so only while on. Profile/settings refreshes never reread it. An unusable override warns once and falls back to shipped; an unusable shipped policy or loader fails startup, refusing delegation and gated `/fusion` commands, while on/off, history, dashboard limit and control tools still work. It is host-model guidance, not permission or concurrency enforcement.
 - Builtin disables `security` (Pi-only); enable it through settings/profiles, not a model parameter/variable. Saved profiles keep their enabled settings. Ultracode is Claude-only. Codex supports `plan`/`implement`/`ask` (see [Codex evidence](docs/codex-backend.md#evidence)), and builtin routes nothing there.
 - Disabled roles refuse fresh calls and continuations before a handle. Role/profile lookups use own properties, never inherited keys.
 - Fresh calls use configured routing unless overridden; another backend uses its captured legacy defaults, not the configured backend's selection. Continuations retain recorded backend/settings unless permitted fields are explicitly overridden.
@@ -81,7 +82,7 @@ See [Pi backend](docs/pi-backend.md) and [Codex backend](docs/codex-backend.md) 
 
 The default suite starts no real Claude/Pi/Codex child or paid model request, and no test host call locates a native `codex`. Preserve that boundary:
 
-- Extension hosts inject `tripwires()` (Pi and Codex) and `memoryProfileStore()`. The two `productionDefaults()` registrations test Pi missing-model refusals before any backend entry point and still inject the Codex tripwire, since Codex's host-default model leaves no such refusal. Own doubles spread over the tripwires: `{ ...tripwires(), pi: own }`.
+- Extension hosts inject `tripwires()` (Pi and Codex), `memoryProfileStore()`, `memorySettingsStore()` and `memoryHostPolicyLoader()` (never the user's `host.md`). A host none of whose cases means to run this build's Claude backend spreads `claudeTripwire()` before its own doubles (`profiles.test.ts`); every other registering file sets `PI_FUSION_CLAUDE_BIN` to `fake-claude.mjs` at module level. `backends.test.ts` audits both. The two `productionDefaults()` registrations test Pi missing-model refusals before any backend entry point and still inject the Codex tripwire, since Codex's host-default model leaves no such refusal. Own doubles spread over the tripwires: `{ ...tripwires(), pi: own }`.
 - Activate through the registered tool, never a default-on option; explicitly enable security in its cases.
 - `fake-claude.mjs` uses real SDK objects around fake protocol; `fake-pi.mjs` speaks native RPC without SDK; `fake-pi-backend.ts` is an in-memory lifecycle backend; `fake-codex.mjs` speaks literal app-server JSON-RPC from builtins only, never an SDK, and is launched by path through injected seams. These test different layers.
 - A case that routes to Codex overrides `codex` with an own double or this build's backend over explicit fake seams, never relying on `codex: undefined` alone. `backends.test.ts` audits the registry overlay, tripwire/`productionDefaults()` use, and Codex import boundaries from source.

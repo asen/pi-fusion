@@ -1260,7 +1260,8 @@ test("a failed guidance refresh rolls back settings, both tool definitions and t
 	for (const enabled of [false, true]) {
 		for (const tool of ["fusion", "claude"]) {
 			for (const failDuringRegistration of [false, true]) {
-				const host = sdkHost({ profiles: memoryProfileStore(document({ work: WORK })), allowed, ui: false });
+				// An override, so the policy the rollback must keep is not also what a guidance without one would carry.
+				const host = sdkHost({ profiles: memoryProfileStore(document({ work: WORK })), allowed, hostPolicy: memoryHostPolicyLoader({ override: OVERRIDE }), ui: false });
 				await host.start();
 				if (enabled) await host.on();
 				const originalTools = ["fusion", "claude"].map((name) => {
@@ -1287,6 +1288,7 @@ test("a failed guidance refresh rolls back settings, both tool definitions and t
 					const definition = host.tools.get(name)!;
 					return [definition.description, definition.promptGuidelines, definition.parameters];
 				}), originalTools);
+				for (const name of ["fusion", "claude"]) assert.equal(host.tools.get(name)!.promptGuidelines![1], policyGuideline(OVERRIDE), `${tool}: ${name} keeps the selected policy`);
 				await host.command("config");
 				assert.match(host.last() ?? "", /^fusion configuration: builtin ·/);
 				await host.command("profile use work");
@@ -1705,6 +1707,13 @@ test("a broken shipped policy or a failing loader fails startup, and every deleg
 		assert.match(host.last() ?? "", why, `${what}: a review`);
 		await host.command("status");
 		assert.match(host.last() ?? "", why, `${what}: status waits behind the same gate`);
+		// The control tools and the dashboard limit stand outside the gate: they still answer after the startup failed.
+		for (const control of ["fusion_control", "claude_control"]) assert.equal((await host.call(control, { action: "status" })).text, "no runs in this Pi session yet", `${what}: ${control}`);
+		await host.command("dashboard limit 7");
+		assert.equal(host.last(), "fusion: dashboard run limit is 7; active runs are never evicted", `${what}: the dashboard limit`);
+		await host.command("off");
+		assert.equal(host.last(), "fusion is off; no run can start until /fusion on", `${what}: off`);
+		assert.deepEqual(host.active, ["read", "bash", "fusion_activate"], `${what}: off hides the workflow tools`);
 		assert.equal(claude.starts.length, 0, `${what}: nothing started`);
 		assert.deepEqual(host.branch, [], `${what}: nothing recorded`);
 		assert.equal(host.tools.get("fusion")!.promptGuidelines![1], policyGuideline(undefined), `${what}: no policy-free guidance claims to be the policy`);
@@ -1808,6 +1817,117 @@ test("history commands stay independent of the host policy: they save while it l
 	assert.equal(loads, 1, "the failed load is not retried");
 	assert.equal(claude.starts.length, 0, "no backend entry point was reached");
 	assert.deepEqual(host.branch, [], "and no run was recorded");
+	await host.shutdown();
+});
+
+test("a call waiting for the startup load is refused once fusion is turned off meanwhile, and the control tools answer while it loads", async () => {
+	const gated = gatedPolicy(OVERRIDE);
+	const claude = fakeBackend({ name: "claude" });
+	const host = sdkHost({ profiles: memoryProfileStore(document({ work: WORK }, "work")), backends: { claude: claude.backend }, hostPolicy: gated.loader, ui: false });
+	const starting = host.start();
+	await host.on();
+	const calls = [host.fusion({ role: "implement", task: "x" }), host.claude({ role: "ask", task: "x" })];
+	// The control tools wait for the settings read alone, never for the policy.
+	assert.equal((await host.call("fusion_control", { action: "status" })).text, "no runs in this Pi session yet");
+	await host.command("dashboard limit 3");
+	assert.equal(host.last(), "fusion: dashboard run limit is 3; active runs are never evicted");
+	await host.command("off");
+	assert.equal(host.last(), "fusion is off; no run can start until /fusion on", "nothing was unfinished, so off was accepted while the calls waited");
+	gated.release();
+	await starting;
+	for (const call of calls) assert.equal((await call).error, "fusion is off; turn it on with /fusion on, or ask for Fusion by name");
+	assert.equal(claude.starts.length, 0, "neither waiting call started a run");
+	assert.deepEqual(host.branch, [], "and neither recorded one");
+	for (const name of ["fusion", "claude"]) assert.equal(host.tools.get(name)!.promptGuidelines![1], policyGuideline(OVERRIDE), `${name} carries the policy, hidden`);
+	assert.deepEqual(host.active, ["read", "bash", "fusion_activate"], "the startup refresh kept fusion off");
+	await host.on();
+	assert.deepEqual(host.active, ON_TOOLS, "and on brings back exactly the workflow tools");
+	assert.equal(gated.loads(), 1);
+	await host.shutdown();
+});
+
+test("the startup refresh keeps the host's active list as it stood when the policy arrived, under an allow list", async () => {
+	const gated = gatedPolicy(OVERRIDE);
+	const allowed = ["read", "bash", "write", "fusion", "fusion_control", "claude", "claude_control", "fusion_activate", "fusion_deactivate"];
+	const host = sdkHost({ allowed, hostPolicy: gated.loader, ui: false });
+	const starting = host.start();
+	await host.command("on");
+	// The user turns bash off and leaves write off while the policy loads; the registry refresh would bring both back.
+	host.active.splice(host.active.indexOf("bash"), 1);
+	const before = [...host.active];
+	assert.ok(!before.includes("write"));
+	gated.release();
+	await starting;
+	assert.deepEqual(host.active, before, "the refresh put back exactly the list it found");
+	for (const name of ["fusion", "claude"]) assert.equal(host.tools.get(name)!.promptGuidelines![1], policyGuideline(OVERRIDE), name);
+	await host.shutdown();
+});
+
+/** Every role off: what a profile that disables the whole workflow looks like. */
+const NONE = settings({
+	plan: { enabled: false, backend: "claude" },
+	implement: { enabled: false, backend: "claude" },
+	ultracode: { enabled: false, backend: "claude" },
+	ask: { enabled: false, backend: "claude" },
+});
+
+test("the selected policy stays the one orchestration text across profiles that disable every role or the reviewer, which refuse what they disable", async () => {
+	let loads = 0;
+	const loader = memoryHostPolicyLoader({ override: OVERRIDE });
+	const claude = fakeBackend({ name: "claude" });
+	const noReview = settings({ ask: { enabled: false, backend: "claude" } });
+	const host = sdkHost({
+		profiles: memoryProfileStore(document({ work: WORK, none: NONE, noreview: noReview })),
+		backends: { claude: claude.backend },
+		hostPolicy: { load: () => ((loads += 1), loader.load()) },
+		ui: false,
+	});
+	await host.start();
+	await host.on();
+	/** The policy as both tools carry it, once in the prompt Pi builds, beside no generated text that competes with it. */
+	const carriesPolicyAlone = (what: string): void => {
+		for (const name of ["fusion", "claude"]) {
+			const tool = host.tools.get(name)!;
+			assert.equal(tool.promptGuidelines![1], policyGuideline(OVERRIDE), `${what}: ${name}`);
+			for (const text of toolText(tool)) assert.doesNotMatch(text, COMPETING, `${what}: ${name} decides what the policy decides: ${text}`);
+		}
+		assert.equal(promptRules(host).filter((rule) => rule.includes(OVERRIDE.trim())).length, 1, `${what}: the prompt holds the policy once`);
+		assert.deepEqual(host.active, ON_TOOLS, `${what}: the refresh kept the active list`);
+	};
+
+	// A run to continue later, admitted under a profile that enables it.
+	await host.command("profile use work");
+	assert.equal((await host.fusion({ role: "implement", task: "x" })).error, undefined);
+	await host.call("fusion_control", { action: "wait", run: "run-1" });
+	assert.equal(claude.starts.length, 1);
+	carriesPolicyAlone("work");
+
+	// Every role off: the guidance says every call is refused, and every call, fresh or continued, is.
+	await host.command("profile use none");
+	assert.match(host.last() ?? "", /^fusion uses profile none in this session; disabled: plan, implement, ultracode, ask, security/);
+	carriesPolicyAlone("none");
+	assert.match(host.tools.get("fusion")!.promptSnippet ?? "", /no role enabled in this session's configuration: every call is refused/);
+	assert.ok(host.tools.get("claude")!.promptGuidelines!.some((line) => line.startsWith("No claude role is enabled in this session's configuration, so every claude call is refused")));
+	for (const tool of ["fusion", "claude"] as const) {
+		assert.equal((await host[tool]({ role: "implement", task: "x" })).error, "role implement is disabled in profile none; change /fusion config or select another profile", `${tool}: fresh`);
+		assert.equal((await host[tool]({ continue: "run-1", task: "more" })).error, "role implement is disabled in profile none; change /fusion config or select another profile", `${tool}: continued`);
+	}
+	assert.equal((await host.call("fusion_control", { action: "status", run: "run-1" })).error, undefined, "the control tools still read the run");
+
+	// The reviewer off: nothing recommends role ask, an ask call is refused, and the policy is what it was.
+	await host.command("profile use noreview");
+	carriesPolicyAlone("noreview");
+	for (const name of ["fusion", "claude"]) {
+		const guidance = host.tools.get(name)!.promptGuidelines!.join("\n");
+		assert.doesNotMatch(guidance, /call (fusion|claude) with role ask/, `${name} recommends no disabled reviewer`);
+		assert.match(guidance, /configuration disables role ask\b/, `${name} says the reviewer is disabled`);
+	}
+	assert.equal((await host.fusion({ role: "ask", task: "x", mode: "review" })).error, "role ask is disabled in profile noreview; change /fusion config or select another profile");
+	// A continuation of a role still enabled goes on as before.
+	assert.equal((await host.fusion({ continue: "run-1", task: "more" })).error, undefined);
+	await host.call("fusion_control", { action: "wait", run: "run-1" });
+	assert.equal(claude.starts.length, 2, "only the enabled continuation started anything");
+	assert.equal(loads, 1, "no profile switch read the policy again");
 	await host.shutdown();
 });
 

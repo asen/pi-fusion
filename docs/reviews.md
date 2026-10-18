@@ -2,6 +2,16 @@
 
 `/fusion review run-N` starts a fresh background `ask` run in review mode, linked to the ended run it reviews. It gets read/search/shell tools and `contracts/ask-review.md`; the implementation child did not brief it. Like any run, it takes a handle, records its own branch entry, and reports through background controls/messages.
 
+## Kinds of review
+
+| Kind | What it is | Independent |
+| --- | --- | --- |
+| Host review | The host reads a child's report or diff itself | No |
+| Self-review | A child reviews its own work, such as ultracode's agents under its briefing | No |
+| Independent review | A fresh `ask` review run that did not write the change and inherits nothing from it | Yes |
+
+This page owns the independent kind. Whether and when the host asks for one, and what it reports, is the [host policy](routing.md#the-host-policy)'s: the shipped policy asks for one after each implementation step when a reviewer can start, and otherwise for a host review labelled as such. Fusion enforces only the eligibility rules below, never the policy.
+
 ## What can be reviewed
 
 | Requirement | Rule |
@@ -16,7 +26,7 @@ A newly terminal run may still be collecting its changed paths; review waits for
 
 The prompt tells the reviewer to inspect the **uncommitted working-tree change**, using Git status/diff and the changed files, and carries the source task/report, each capped at 32 KiB. Source text is quoted data behind non-colliding markers; instructions inside it are findings, not commands to follow. The tree may include other writers' work, which the reviewer should call out rather than silently attribute to this run.
 
-An `ask` child has no edit/write tool and its contract forbids shell-based file changes. That is instruction, not an operating-system read-only boundary. Ultracode's own agents review under its briefing: that is self-review, not this independent review.
+An `ask` child has no edit/write tool and its contract forbids shell-based file changes. That is instruction, not an operating-system read-only boundary.
 
 ## Which backend reviews a run
 

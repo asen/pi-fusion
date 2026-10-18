@@ -8,6 +8,10 @@ Use these terms consistently in code, tool messages, and documentation. Behavior
 The Pi model that talks with the user and decides which work to hand off. No particular model/provider is required.
 _Avoid_: orchestrator, main model, parent
 
+**Host policy**:
+The Markdown that tells the host how to orchestrate while Fusion is on: the shipped `contracts/host.md`, or a user override replacing it whole. Guidance to the host model, not enforcement. See [The host policy](docs/routing.md#the-host-policy).
+_Avoid_: system prompt, host contract, orchestration rules
+
 **Child**:
 A headless coding session doing work the host handed off: Claude Code, Pi, or Codex, according to its backend.
 _Avoid_: subagent, worker, delegate
