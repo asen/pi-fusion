@@ -14,6 +14,7 @@ import { hostBackend } from "../extensions/backends/types.ts";
 import fusion, { builtinConfiguration, claudeCall, claudeRoute, type FusionParams, fusionCall, fusionRoute, modelText, ROLE_NAMES, roleFor, type RunRecords, runRecords } from "../extensions/fusion.ts";
 import { KNOWN_ROLE_NAMES, roleSpec } from "../extensions/roles.ts";
 import { History } from "../extensions/history.ts";
+import { memoryHostPolicyLoader } from "../extensions/host-policy.ts";
 import { memoryProfileStore, type ProfileStore } from "../extensions/profile-store.ts";
 import { memorySettingsStore } from "../extensions/settings-store.ts";
 import { builtinSettings, captureBaseline, serializeDocument } from "../extensions/profiles.ts";
@@ -470,7 +471,7 @@ function recorder(): { ext: Extension; api: ExtensionAPI } {
  */
 const makeExtension = (backends: Partial<Record<BackendName, HostBackend>> = {}, profiles: ProfileStore = memoryProfileStore()): Extension => {
 	const { ext, api } = recorder();
-	fusion(api, { backends: { ...tripwires(), ...backends }, profiles, settings: memorySettingsStore() });
+	fusion(api, { backends: { ...tripwires(), ...backends }, profiles, settings: memorySettingsStore(), hostPolicy: memoryHostPolicyLoader() });
 	void turnOn(ext.tools.get("fusion_activate"));
 	return ext;
 };

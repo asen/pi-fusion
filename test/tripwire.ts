@@ -3,6 +3,7 @@ import { after } from "node:test";
 import { PI_ROLE_NAMES, piEffortVariable, piModelVariable } from "../extensions/backends/pi-binding.ts";
 import type { HostBackend, SessionIntent } from "../extensions/backends/types.ts";
 import type { FusionOptions } from "../extensions/fusion.ts";
+import { memoryHostPolicyLoader } from "../extensions/host-policy.ts";
 import { memoryProfileStore } from "../extensions/profile-store.ts";
 import { memorySettingsStore } from "../extensions/settings-store.ts";
 import { KNOWN_ROLE_NAMES, runsOn } from "../extensions/roles.ts";
@@ -105,9 +106,9 @@ export const PRODUCTION_DEFAULT_VARIABLES = [...PI_SELECTION_VARIABLES, ...CODEX
 export function productionDefaults(): FusionOptions {
 	const set = PRODUCTION_DEFAULT_VARIABLES.filter((name) => process.env[name] !== undefined);
 	if (set.length) throw new Error(`a production-default registration must leave a pi role no model to resolve and codex nothing to launch with, and ${set.join(", ")} is still set`);
-	// This build's own claude and pi backends, the codex tripwire, and never the user's own profiles or settings
-	// file: no registration of the suite reads or writes either.
-	return { backends: { ...codexTripwire() }, profiles: memoryProfileStore(), settings: memorySettingsStore() };
+	// This build's own claude and pi backends, the codex tripwire, and never the user's own profiles, settings or host
+	// policy file: no registration of the suite reads or writes any of them.
+	return { backends: { ...codexTripwire() }, profiles: memoryProfileStore(), settings: memorySettingsStore(), hostPolicy: memoryHostPolicyLoader() };
 }
 
 /**

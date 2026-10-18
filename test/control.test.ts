@@ -11,6 +11,7 @@ import { type ArchiveProvider, startDashboard } from "../extensions/dashboard.ts
 import { ArchiveIndex } from "../extensions/dashboard-archive.ts";
 import fusion, { builtinConfiguration, type FusionOptions, parseFusion, runRecords } from "../extensions/fusion.ts";
 import { settingsTable } from "../extensions/profiles.ts";
+import { memoryHostPolicyLoader } from "../extensions/host-policy.ts";
 import { memoryProfileStore } from "../extensions/profile-store.ts";
 import { memorySettingsStore, type SettingsStore, serializeSettings } from "../extensions/settings-store.ts";
 import { History, HISTORY_ABORTED, HISTORY_VERSION, type HistoryRecord } from "../extensions/history.ts";
@@ -117,7 +118,7 @@ function makeHost(cwd = repoRoot, mode: "tui" | "print" = "print", session: { id
 		registerMessageRenderer: (customType: string, renderer: Renderer) => renderers.set(customType, renderer),
 	} as unknown as ExtensionAPI;
 	// These cases run only claude, through its fake protocol or an in-memory backend; accidental pi and codex routing stays fenced.
-	fusion(api, { ...extra, backends: { ...tripwires(), ...backends }, profiles: memoryProfileStore(), settings: extra.settings ?? memorySettingsStore() });
+	fusion(api, { ...extra, backends: { ...tripwires(), ...backends }, profiles: memoryProfileStore(), settings: extra.settings ?? memorySettingsStore(), hostPolicy: memoryHostPolicyLoader() });
 	const theme = { fg: (_color: string, text: string) => text, bold: (text: string) => text, dim: (text: string) => text };
 	const ui = {
 		setStatus(_key: string, _text: string | undefined) {},

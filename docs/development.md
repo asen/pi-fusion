@@ -19,6 +19,7 @@ Editing conventions and invariants live in [AGENTS.md](../AGENTS.md); vocabulary
 ```text
 fusion.ts                     host lifecycle and registration
   +-- host-guidance.ts        delegation tool text over the configuration
+  +-- host-policy.ts          host policy loader (not yet composed)
   +-- roles/profiles/store    capabilities and session configuration
   +-- backends/types.ts       SDK-neutral boundary
   |     +-- claude.ts         Claude SDK and stream/questions
@@ -35,6 +36,7 @@ fusion.ts                     host lifecycle and registration
 | --- | --- |
 | `fusion.ts` | Tools/command, mode, configuration application, admission, handles, branch records, questions, controls, reviews, and host lifecycle handlers |
 | `host-guidance.ts` | Pure delegation-tool descriptions, snippets, guidelines and parameter help composed from the enabled roles, role capabilities, captured defaults, tool names and quote markers passed in; no backend binding, routing or registration |
+| `host-policy.ts` | Host policy loaders: shipped `contracts/host.md`, optionally replaced whole by `pi-fusion/host.md` under the host agent directory (resolved through the lazy `hostAgentDir` seam); strict UTF-8, nonblank, at most 64 KiB; reads only. Returns the selected text, source/path and a diagnostic for a set-aside override; a broken shipped policy fails the load. `FusionOptions.hostPolicy` injects one; nothing loads or composes it yet |
 | `roles.ts` | Supported backends, writer-slot and review eligibility per role |
 | `profiles.ts`, `profile-store.ts` | Captured legacy defaults, settings validation/copies, global profiles file and queued atomic replacement |
 | `settings-store.ts` | Fusion's own `settings.json`: the saved history preference and plan context cap, validation, and file/memory stores over the profile store's queue and atomic write |
@@ -93,7 +95,7 @@ extension test host
 - Registry overlays spread injected entries last; explicit `undefined` removes a default without fallback. A routed Codex case needs an own double/fake, never `codex: undefined` alone.
 - The two `productionDefaults()` hosts never run a backend. They refuse with Pi/Codex selection variables or `PI_FUSION_CODEX_BIN` set; Codex needs a tripwire because an omitted model uses its host default.
 - `test/backends.test.ts` audits registrations, overlays and import boundaries, and constructs the default Codex backend without calling `run`. Every registration uses `tripwires()` or `productionDefaults()`, never both.
-- Every host injects a memory profile store and a memory settings store: no user `profiles.json` or `settings.json` reads/writes. `test/backends.test.ts` audits that each registration names a settings store. `control.test.ts` and `extension.test.ts`, whose cases assert history behavior, clear `PI_FUSION_HISTORY` at load so the shell's value cannot change them; cases that need it set it themselves. Codex tests use no native binary, home, auth or `PATH` lookup.
+- Every host injects a memory profile store, a memory settings store and a memory host policy loader: no user `profiles.json`, `settings.json` or `host.md` reads/writes. `test/backends.test.ts` audits that each registration names a settings store and a host policy loader, and that `productionDefaults()` uses `memoryHostPolicyLoader()`. `host-policy.test.ts` uses memory loaders or explicit temporary agent directories only. `control.test.ts` and `extension.test.ts`, whose cases assert history behavior, clear `PI_FUSION_HISTORY` at load so the shell's value cannot change them; cases that need it set it themselves. Codex tests use no native binary, home, auth or `PATH` lookup.
 
 [`test/fake-codex.mjs`](../test/fake-codex.mjs) is the literal app-server layer, separate from in-memory binding doubles. `FAKE_CODEX_SCENARIO` selects behavior; `FAKE_CODEX_LOG` records each input line in a per-case temporary file. Its other variables script replies, persisted-thread history, usage, steers and questions; the fixture source owns that catalogue. None is a production request field.
 

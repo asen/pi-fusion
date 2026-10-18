@@ -376,6 +376,8 @@ test("every Fusion registration in the suite names the backends it takes, and th
 			// Left out, the settings store is the user's own pi-fusion/settings.json, so a registration that names none
 			// would read the user's saved history preference; productionDefaults() names one of its own, checked below.
 			assert.ok(production || /\bsettings:/.test(call), `${where} registers the extension without a settings store of its own, so it would read the user's settings file: ${call}`);
+			// The same for the host policy: left out, it is the shipped policy replaced by the user's own pi-fusion/host.md.
+			assert.ok(production || /\bhostPolicy:/.test(call), `${where} registers the extension without a host policy loader of its own, so it would read the user's host policy: ${call}`);
 			if (production) defaults.push(where);
 		}
 	}
@@ -423,6 +425,11 @@ test("the production-default registration keeps the codex tripwire, because no m
 	assert.ok(
 		settings && ts.isPropertyAssignment(settings) && settings.initializer.getText() === "memorySettingsStore()",
 		"productionDefaults reads and writes settings in memory, never the user's own settings file",
+	);
+	const hostPolicy = returned.properties.find((property) => ts.isPropertyAssignment(property) && property.name.getText() === "hostPolicy");
+	assert.ok(
+		hostPolicy && ts.isPropertyAssignment(hostPolicy) && hostPolicy.initializer.getText() === "memoryHostPolicyLoader()",
+		"productionDefaults loads the host policy in memory with no override, never the user's own host policy file",
 	);
 
 	// And what it returns, with every variable it refuses cleared for the call: this build's own claude and pi, which

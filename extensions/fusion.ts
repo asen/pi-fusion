@@ -57,6 +57,7 @@ import { ArchiveIndex } from "./dashboard-archive.ts";
 import { contextShare, continueNote, handoffBlocked, handoffNote, handoffPrompt, handoffShare, planContextPct, planProblems, sharePercent, type HandoffReason } from "./handoff.ts";
 import { asEnded, History, type HistoryRecord, historyDir, historyEnabled, sameChild } from "./history.ts";
 import { claudeGuidance, claudeParameterHelp, fusionGuidance, fusionParameterHelp, type GuidanceInput } from "./host-guidance.ts";
+import type { HostPolicyLoader } from "./host-policy.ts";
 import { hostProfileStore, type ProfileStore } from "./profile-store.ts";
 import { hostSettingsStore, type SettingsStore } from "./settings-store.ts";
 import {
@@ -1540,6 +1541,12 @@ export interface FusionOptions {
 	 * host agent directory, resolved on first use; every test host passes a store of its own so no case reads or writes it.
 	 */
 	settings?: SettingsStore;
+	/**
+	 * Where the host policy is loaded from: in production, this build's `contracts/host.md`, replaced whole by
+	 * `pi-fusion/host.md` under the host agent directory. This build does not load or compose it yet; every test host
+	 * passes a memory or temporary-directory loader of its own so no case ever reads the user's override.
+	 */
+	hostPolicy?: HostPolicyLoader;
 	/** How the dashboard server starts. Left out, it is this build's own; a test host passes one that sees what it is given. */
 	dashboard?: typeof startDashboard;
 }

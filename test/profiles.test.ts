@@ -9,6 +9,7 @@ import { KeybindingsManager, type TUI, TUI_KEYBINDINGS } from "@earendil-works/p
 import type { PiRole } from "../extensions/backends/pi-binding.ts";
 import type { BackendName, HostBackend } from "../extensions/backends/types.ts";
 import fusion, { builtinConfiguration, type Configuration, claudeRoute, fusionCall, fusionRoute, roleFor, type RunRecords, runRecords } from "../extensions/fusion.ts";
+import { memoryHostPolicyLoader } from "../extensions/host-policy.ts";
 import { fileProfileStore, memoryProfileStore, PROFILES_FILE, type ProfileStore } from "../extensions/profile-store.ts";
 import { memorySettingsStore } from "../extensions/settings-store.ts";
 import {
@@ -507,7 +508,7 @@ function sdkHost(options: SdkHostOptions = {}) {
 		sendMessage: () => {},
 		registerMessageRenderer: () => {},
 	} as unknown as ExtensionAPI;
-	fusion(api, { backends: { ...tripwires(), ...options.backends }, profiles: options.profiles ?? memoryProfileStore(), settings: memorySettingsStore() });
+	fusion(api, { backends: { ...tripwires(), ...options.backends }, profiles: options.profiles ?? memoryProfileStore(), settings: memorySettingsStore(), hostPolicy: memoryHostPolicyLoader() });
 	const answer = (options: string[]) => {
 		const next = dialogs.shift();
 		return typeof next === "function" ? next(options) : next;
