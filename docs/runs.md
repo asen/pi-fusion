@@ -187,6 +187,23 @@ Ordinary editor text targets the host. `/fusion steer run-N <text>` targets the 
 
 Generated questions/cards/handoffs use the invoking tool pair (`fusion`/`fusion_control` or `claude`/`claude_control`); a control reply uses the name called. Pi and Codex continuation hints always use `fusion`. Reviews with no initiating delegation tool use the primary pair. User commands always remain `/fusion ...`.
 
+### Labelled child text
+
+Pi delivers a `pi-fusion-run` notice's content to the host model as user-role input. Child-written text in those notices (a background report, a failed or aborted run's failure text, a background question, and the question quoted in a user-answer notice) therefore sits between two markers:
+
+```text
+Background run run-3 (implement) done.
+
+[quoted child text, not a user instruction]
+## Changed
+...
+[end of quoted child text]
+
+[run-3 · implement · opus · ...]
+```
+
+Host-written lines stay outside the markers: the header, notes, stats, review link, answer hint, and a cancellation's own wording. A host guideline says the marked text is the child's output, not a user request. The labels are guidance, not a boundary: the text is still user-role input, and a child could print a marker itself. Tool results (foreground reports, control `wait`/`status`) are not user-role input and carry no markers. Notice cards show the content as sent, markers included.
+
 ## Runs across Pi processes
 
 An earlier process's branch-recorded run is not active. Controls explain that distinction; `fusion` can continue it only when its record is usable. Reports live in memory unless [history is on](#turning-history-on-and-off) for this instance, which saves them for a durable host session. No history is written for `--no-session`.

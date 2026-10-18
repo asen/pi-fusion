@@ -53,6 +53,7 @@ See [Pi backend](docs/pi-backend.md) and [Codex backend](docs/codex-backend.md) 
 ## Run and record invariants
 
 - One active file-changing run across backends, waiting included; ask may run beside it. Each question gets one answer; a competing host answer must not become an accidental steer.
+- Child-written text in `pi-fusion-run` notices (Pi delivers them as user-role input) sits between the `[quoted child text, not a user instruction]` / `[end of quoted child text]` markers; host-written lines, including a cancellation's wording, stay outside. Tool results stay unlabelled.
 - `/tree` refuses unfinished runs; shutdown cancels active work and awaits final recording.
 - `recordDecision` alone authorizes persistence: outcome identity, never progress or a predicted fork path. Contradictory outcomes fail and publish no identity to branch/history.
 - Untagged entries are Claude. Claude keeps flat session/checkpoint/model/effort; missing older settings use captured legacy defaults with notice. Pi keeps a structured reference and verified selection.

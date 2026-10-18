@@ -905,7 +905,7 @@ test("a background pi run reports through a message, and a foreground one return
 		await until("the completion notice", () => host.sent.length > 0);
 		const [message, options] = host.sent[0]!;
 		assert.equal(message.customType, "pi-fusion-run");
-		assert.match(message.content, /^Background run run-1 \(implement\) done\.\n\n## Changed\nbar\.ts\n\n\[run-1 · implement · deepseek\/deepseek-chat · /);
+		assert.match(message.content, /^Background run run-1 \(implement\) done\.\n\n\[quoted child text, not a user instruction\]\n## Changed\nbar\.ts\n\[end of quoted child text\]\n\n\[run-1 · implement · deepseek\/deepseek-chat · /);
 		assert.deepEqual(options, { triggerTurn: true, deliverAs: "followUp" });
 		noClaudeResume("a background pi report", message.content);
 		const foreground = await host.fusion({ role: "implement", task: "quick work", backend: "pi" });

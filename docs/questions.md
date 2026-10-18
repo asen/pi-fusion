@@ -12,7 +12,7 @@ cancellation / fatal Pi dialog failure -> child stopped, run ends
 
 ## Waiting and answering
 
-A foreground delegation returns early with the handle/question and becomes background work. A background run announces its question unless a host control `wait` is collecting it; that wait returns the question instead. Waiting still occupies the file-changing slot when the role has one, so another coding run cannot start beside it.
+A foreground delegation returns early with the handle/question and becomes background work. A background run announces its question, labelled as [quoted child text](runs.md#labelled-child-text), unless a host control `wait` is collecting it; that wait returns the question instead. Waiting still occupies the file-changing slot when the role has one, so another coding run cannot start beside it.
 
 The host uses a control `message` action, asking you first when the decision is yours. Generated hints use `fusion_control` for a `fusion` delegation or `claude_control` for `claude`; either control can answer every run. Further queued questions are answered in order, and an answer reply can carry the next question.
 
@@ -26,7 +26,7 @@ You can answer directly:
 
 No text opens an editor titled with the question. An empty user-editor answer sends nothing and leaves the run waiting. No handle chooses the sole waiting run; when several wait, supply one.
 
-A user answer notifies the host as a follow-up **without starting a turn**. The host reads it with its next response. A newly exposed queued question is still announced separately so that the answer notification cannot hide it.
+A user answer notifies the host as a follow-up **without starting a turn**. The host reads it with its next response; the question's first line is quoted there, labelled as [child text](runs.md#labelled-child-text). A newly exposed queued question is still announced separately so that the answer notification cannot hide it.
 
 ## Exactly one answer wins
 
