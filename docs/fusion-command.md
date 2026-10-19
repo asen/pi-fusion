@@ -82,7 +82,7 @@ The mode exists only in this instance's memory. Status/dashboard/settings/histor
 
 #### Active tools and allow lists
 
-A switch changes only Fusion's active tools. On restores the saved workflow subset, including an empty subset, while preserving unrelated tools' state. One that was inactive stays inactive. Off leaves only activation; on leaves only deactivation among the mode tools.
+A switch changes only Fusion's active tools. On restores the saved workflow subset while preserving unrelated tools' state. One that was inactive stays inactive. The first subset is what was active when the instance first masked; if none was, as when a resumed or reloaded session restores an earlier instance's masked loadout from its transcript, it is every workflow tool the registry offers. An empty subset saved by off stays empty. Off leaves only activation; on leaves only deactivation among the mode tools.
 
 Pi's allow list/exclusions decide what can be activated; Fusion never bypasses them. Include both mode tools for natural-language switching, and a delegation/control pair for usable workflows. Without mode tools, the commands still work. Reload does not preserve a pre-reload saved subset, and a model request already in flight keeps the tools/guidance it was sent. A host prompt override or another extension's tool changes are not overwritten into a guaranteed Fusion setup.
 

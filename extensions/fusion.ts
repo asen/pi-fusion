@@ -2187,7 +2187,9 @@ export default function fusion(pi: ExtensionAPI, options: FusionOptions = {}) {
 	let activationReminder = false;
 	/**
 	 * The workflow tools on gives back and no other. The first is what the host had active before this instance first
-	 * hid them, and each off takes the subset active at that moment; an empty subset is one, not a request for all four.
+	 * hid them or, when it had none, every one the registry offers: a resumed or reloaded session restores the loadout
+	 * its transcript last declared, before session_start, and that is the masked one an earlier instance left. Each off
+	 * takes the subset active at that moment; an empty subset saved by off is one, not a request for all four.
 	 */
 	let hidden: string[] = [];
 	/** Whether the starting mask has been applied: once per instance, by whichever entry point binds the host first. */
@@ -2215,6 +2217,9 @@ export default function fusion(pi: ExtensionAPI, options: FusionOptions = {}) {
 		return [...new Set([...kept, ...(on ? workflow : []), ...(offered.has(own) ? [own] : [])])];
 	};
 
+	/** The workflow tools the host's registry offers, which its allow list and exclusions have already narrowed. */
+	const offeredWorkflow = (): string[] => pi.getAllTools().map((tool) => tool.name).filter((name) => FUSION_TOOLS.includes(name));
+
 	/** Sets the host's active list, and puts back the one it had when the host threw part way through the change. */
 	const setTools = (next: string[], previous: string[]): void => {
 		try {
@@ -2235,14 +2240,16 @@ export default function fusion(pi: ExtensionAPI, options: FusionOptions = {}) {
 	 */
 	const mask = (): void => {
 		if (masked) return;
-		let current: string[];
+		let workflow: string[];
 		try {
-			current = pi.getActiveTools();
+			const current = pi.getActiveTools();
+			workflow = current.filter((name) => FUSION_TOOLS.includes(name));
+			if (!workflow.length) workflow = offeredWorkflow();
 			setTools(modeTools(current, false, []), current);
 		} catch {
 			return;
 		}
-		hidden = current.filter((name) => FUSION_TOOLS.includes(name));
+		hidden = workflow;
 		masked = true;
 	};
 

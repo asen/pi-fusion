@@ -1434,14 +1434,20 @@ test("deactivation is refused while a run is running, waiting or finishing, by t
 	await host.shutdown();
 });
 
-test("an empty saved subset stays empty, and a host that excludes a mode tool keeps it out while the command still switches", async () => {
-	// The user had none of the workflow tools active when fusion started: on gives back none of them.
+test("a start with no workflow tools active gives back every offered one, an empty subset saved by off stays empty, and a host that excludes a mode tool keeps it out while the command still switches", async () => {
+	// A resumed session restores the masked loadout an earlier instance left: no workflow tool is active at the start.
 	const bare = sdkHost({ initial: ["read"], ui: false });
 	for (const name of ["fusion", "claude", "fusion_control", "claude_control"]) bare.active.splice(0, bare.active.length, ...bare.active.filter((tool) => tool !== name));
 	await bare.start();
 	assert.deepEqual(bare.active, ["read", "fusion_activate"]);
+	await bare.call("fusion_activate", {});
+	assert.deepEqual(bare.active, ["read", "fusion", "claude", "fusion_control", "claude_control", "fusion_deactivate"], "on gives back every workflow tool the registry offers");
+
+	// The user turned every workflow tool off while on: the empty subset off saves is one, not a request for all four.
+	bare.active.splice(0, bare.active.length, ...bare.active.filter((tool) => !["fusion", "claude", "fusion_control", "claude_control"].includes(tool)));
+	await bare.command("off");
 	await bare.command("on");
-	assert.deepEqual(bare.active, ["read", "fusion_deactivate"], "an empty subset is not a request for all four");
+	assert.deepEqual(bare.active, ["read", "fusion_deactivate"], "an empty subset saved by off stays empty");
 
 	// An allow list that names the workflow tools but no mode tool: nothing forces a mode tool in.
 	const allowed = ["read", "bash", "fusion", "fusion_control", "claude", "claude_control"];
