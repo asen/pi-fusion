@@ -81,7 +81,8 @@ test("the role capabilities depend on the boundary and on nothing else", () => {
 
 test("the host guidance is pure text: it depends on the boundary, the settings types and the role capabilities alone", () => {
 	const names = [...dependenciesOf("host-guidance.ts")].sort();
-	assert.deepEqual(names, ["./backends/types.ts", "./profiles.ts", "./roles.ts"], `the guidance must name no host, backend, binding or SDK; it names ${names.join(", ")}`);
+	assert.deepEqual(names, ["./backends/types.ts", "./profiles.ts", "./role-contracts.ts", "./roles.ts"], `the guidance must name no host, backend, binding or SDK; it names ${names.join(", ")}`);
+	assert.match(fs.readFileSync(path.join(repoRoot, "extensions", "host-guidance.ts"), "utf8"), /^import type \{[^}]*\} from "\.\/role-contracts\.ts";$/m, "role contracts supply only the metadata type; composing guidance reads no file");
 	assert.match(fs.readFileSync(path.join(repoRoot, "extensions", "host-guidance.ts"), "utf8"), /^import type \{[^}]*\} from "\.\/profiles\.ts";$/m, "and only the settings types, never the settings code");
 });
 
@@ -211,7 +212,7 @@ test("the codex transport is a transport over its own protocol readers: it takes
 });
 
 test("the codex backend composes its own modules, and the host reaches it only through its factory: no other backend or package does", () => {
-	assert.deepEqual(dependenciesOf("backends/codex.ts").sort(), ["../process-tree.ts", "./codex-binding.ts", "./codex-launch.ts", "./codex-outcome.ts", "./codex-protocol.ts", "./codex-transport.ts", "./types.ts", "node:fs", "node:path", "node:url"]);
+	assert.deepEqual(dependenciesOf("backends/codex.ts").sort(), ["../process-tree.ts", "../role-contracts.ts", "./codex-binding.ts", "./codex-launch.ts", "./codex-outcome.ts", "./codex-protocol.ts", "./codex-transport.ts", "./types.ts", "node:fs", "node:path", "node:url"]);
 	// The mapping is pure: the boundary, the binding's role shape and the protocol and transport types, no process or file.
 	assert.deepEqual(dependenciesOf("backends/codex-outcome.ts").sort(), ["./codex-binding.ts", "./codex-protocol.ts", "./codex-transport.ts", "./types.ts"]);
 	const importers = productionModules()

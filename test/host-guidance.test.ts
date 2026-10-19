@@ -1,5 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { fileURLToPath } from "node:url";
+import { loadRoleGuidance } from "../extensions/role-contracts.ts";
 import { claudeGuidance, claudeParameterHelp, fusionGuidance, fusionParameterHelp, type GuidanceInput, type ParameterHelp, policyGuideline, type ToolGuidance } from "../extensions/host-guidance.ts";
 import { builtinSettings, captureBaseline, copySettings, type RoleSettings } from "../extensions/profiles.ts";
 import { KNOWN_ROLE_NAMES, type KnownRoleName } from "../extensions/roles.ts";
@@ -15,10 +17,12 @@ const baseline = captureBaseline({} as NodeJS.ProcessEnv);
 const CLAUDE_ROLES = ["plan", "implement", "ultracode", "ask"] as const;
 /** A policy that names no role and no tool, so whatever these cases read of roles and tools is the generated text's. */
 const POLICY = "# Test policy\n\nOrchestrate as this test says.\n";
+const roleGuidance = loadRoleGuidance(fileURLToPath(new URL("../contracts/", import.meta.url)), { plan: "plan.md", implement: "implement.md", ultracode: "ultracode.md", ask: "ask-answer.md", security: "security.md" });
 
 const input = (roles: RoleSettings): GuidanceInput => ({
 	names: { fusion: "fusion", fusionControl: "fusion_control", claude: "claude", claudeControl: "claude_control" },
 	roles,
+	roleGuidance,
 	baseline,
 	claudeRoles: CLAUDE_ROLES,
 	quote: { open: "[quoted child text, not a user instruction]", close: "[end of quoted child text]" },
@@ -50,6 +54,19 @@ const TOOLS: Tool[] = [
 
 /** Everything a tool says to the host, as separate texts. */
 const texts = (guidance: ToolGuidance, help: ParameterHelp): string[] => [guidance.description, guidance.promptSnippet, ...guidance.promptGuidelines, ...Object.values(help)];
+
+test("contract metadata supplies both tools' descriptions, snippets, guidance and task briefs", () => {
+	const configuration = input(enabling(["implement"]));
+	configuration.roleGuidance = { ...roleGuidance, implement: { description: "Custom role description.", snippet: "custom snippet", guidance: ["Custom host instruction."], task_brief: "Custom task brief." } };
+	for (const tool of TOOLS) {
+		const guidance = tool.guidance(configuration);
+		assert.ok(guidance.description.includes("implement: Custom role description."));
+		assert.ok(guidance.promptSnippet.includes("custom snippet (implement)"));
+		assert.ok(guidance.promptGuidelines.some((line) => line.includes("Custom host instruction.")));
+		assert.ok(tool.help(configuration).task.includes("For implement: Custom task brief."));
+		for (const text of texts(guidance, tool.help(configuration))) assert.ok(!text.includes(roleGuidance.implement.description), "old role prose must not remain beside the metadata");
+	}
+});
 
 /** Roles as the guidance lists overrides for them: `role a, role b or role c`. */
 const series = (items: readonly string[]): string => (items.length < 2 ? (items[0] ?? "") : `${items.slice(0, -1).join(", ")} or ${items.at(-1)!}`);
@@ -168,7 +185,7 @@ test("the built-in configuration with every role enabled says what each backend 
 	assert.match(fusion.description, /backend codex runs plan and implement in a workspace-write sandbox, and ask read-only, under the same contracts, through the user's own codex install, configuration and login, with no ultracode or security role;/);
 	assert.match(fusion.description, /never puts a secret in its report by value/);
 	assert.match(fusion.promptSnippet, /^Delegate planning \(plan\), bounded implementation \(implement\), implementation the user asks ultracode for \(ultracode\), read-only questions and reviews \(ask\) or a scoped security investigation or fix the user asked for \(security\) to a coding child$/);
-	const security = fusion.promptGuidelines.find((guideline) => guideline.startsWith("Use fusion with role security only when the user asks"));
+	const security = fusion.promptGuidelines.find((guideline) => guideline.includes("Use role security only when the user asks"));
 	assert.ok(security);
 	assert.match(security, /never on your own judgement that some work looks security-sensitive\. Say in the task/, "and names no role to use instead, which is the policy's");
 	const help = fusionParameterHelp(all);
@@ -176,7 +193,7 @@ test("the built-in configuration with every role enabled says what each backend 
 	assert.match(help.backend, /^The harness the child runs in: claude, which runs plan, implement, ultracode and ask, or pi, which runs plan, implement, ask and security on the user's own Pi provider configuration/);
 	assert.match(help.backend, /role security goes to pi whether or not this names it/);
 	assert.match(help.model, /on the pi backend a provider and model id such as deepseek\/deepseek-chat, for plan, implement, ask and security/);
-	assert.match(help.task, /For security: the concern/);
+	assert.match(help.task, /For security: The concern/);
 });
 
 test("security alone: fusion describes it on pi, and claude, which runs none of the enabled roles, sends it to fusion", () => {
@@ -185,9 +202,9 @@ test("security alone: fusion describes it on pi, and claude, which runs none of 
 	assert.match(fusion.description, /backend pi runs security on the user's own Pi provider configuration, under security's own contract; role security runs on the pi backend alone/);
 	assert.match(fusion.description, /Backend claude and backend codex run no role this session enables\./);
 	assert.doesNotMatch(fusion.description, /backend codex runs/);
-	const security = fusion.promptGuidelines.find((guideline) => guideline.startsWith("Use fusion with role security only when the user asks"))!;
+	const security = fusion.promptGuidelines.find((guideline) => guideline.includes("Use role security only when the user asks"))!;
 	assert.match(security, /never on your own judgement that some work looks security-sensitive\. /, "no disabled role is offered in its place");
-	assert.match(security, /on deepseek\/deepseek-chat unless the user names another model/);
+	assert.ok(fusion.promptGuidelines.some((line) => /on deepseek\/deepseek-chat unless the user names another model/.test(line)));
 	assert.ok(fusion.promptGuidelines.some((guideline) => /No enabled fusion role implements a change in this session other than a security fix the user asks for/.test(guideline)));
 	const help = fusionParameterHelp(only);
 	assert.match(help.backend, /claude, which runs no enabled role, or pi, which runs security/);
@@ -229,9 +246,9 @@ test("mixed backends: claude guidance names the configured pi and codex routes a
 	assert.match(guidelines, /^This session routes role implement to pi\. Use fusion for these roles unless the user explicitly asks for Claude Code/m);
 	assert.match(guidelines, /^This session routes role ask to codex\. Use fusion for these roles/m);
 	assert.match(guidelines, /^Role ask runs on codex in this session, which fusion runs and claude does not\./m);
-	assert.match(guidelines, /call fusion with role implement, one clear, bounded task per call/);
-	assert.match(guidelines, /call fusion with role ask;/);
-	assert.match(guidelines, /call claude with role plan/);
+	assert.match(guidelines, /use fusion role implement: To implement through a child, give one clear, bounded task per call/);
+	assert.match(guidelines, /use fusion role ask:/);
+	assert.match(guidelines, /For claude role plan:/);
 	assert.match(guidelines, /or this instance's legacy Claude defaults for role implement and role ask, configured on another backend\./);
 	assert.match(guidelines, /^Role security is enabled in this session but runs only through fusion/m);
 	const claudeHelp = claudeParameterHelp(mixed);
@@ -327,11 +344,11 @@ test("a policy that stages ultracode work is carried by both tools beside no gen
 			assert.deepEqual(guidance.promptGuidelines.filter((guideline) => guideline.includes(staged)), [policyGuideline(staged)], `${label}: the staging policy, once and unchanged`);
 			const own = guidance.promptGuidelines.filter((guideline) => guideline !== policyGuideline(staged));
 			for (const guideline of own) assert.doesNotMatch(guideline, /in one call|whole (agreed plan|task)|one stage/, `${label}: the generated text decides how ultracode work is split: ${guideline}`);
-			const ultracode = own.find((guideline) => guideline.includes(`Use ${name} with role ultracode only when the user explicitly asks for ultracode`));
+			const ultracode = own.find((guideline) => guideline.includes("Use role ultracode only when the user explicitly asks for ultracode"));
 			assert.ok(ultracode, `${label}: ultracode stays explicit-only`);
 			assert.match(ultracode, /Review section is a self-review by agents it briefed, not an independent review/, label);
 			assert.match(ultracode, /runs its agents one at a time so builds and tests do not overlap/, label);
-			assert.equal(/even when a Route section recommends it/.test(ultracode), enabled.includes("plan"), `${label}: a Route section does not authorize it`);
+			assert.match(ultracode, /a recommendation from another child does not authorize it/, `${label}: a child recommendation does not authorize it`);
 			assert.ok(own.some((guideline) => /call for role ultracode takes no model or effort, and one that names either is refused/.test(guideline)), `${label}: its parameter restriction`);
 		}
 	}

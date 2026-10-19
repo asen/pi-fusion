@@ -83,6 +83,7 @@ import {
 	ULTRACODE_EFFORT,
 } from "./profiles.ts";
 import { reviewable, reviewPrompt } from "./review.ts";
+import { loadRoleGuidance } from "./role-contracts.ts";
 import { canChangeFiles, isKnownRole, KNOWN_ROLE_NAMES, type KnownRoleName, ROLE_SPECS, type RoleSpec, roleSpec } from "./roles.ts";
 
 /** A run as the shared lifecycle reads it, whichever backend produced it: the record over the part of a role the host uses. */
@@ -1580,6 +1581,7 @@ export default function fusion(pi: ExtensionAPI, options: FusionOptions = {}) {
 	// missing either fails as a module error of this host's own before `fusion()` runs at all. `pi-helper-retry.mjs`
 	// is the one that is the child's alone: an install missing it passes this check and fails when the child starts.
 	if (!fs.existsSync(PI_BOOTSTRAP_PATH)) throw new Error(`pi-fusion: missing pi bootstrap ${PI_BOOTSTRAP_PATH}`);
+	const roleGuidance = loadRoleGuidance(CONTRACTS_DIR, { plan: ROLES.plan.contract, implement: ROLES.implement.contract, ultracode: ROLES.ultracode.contract, ask: ROLES.ask.contract, security: "security.md" });
 
 	/**
 	 * The harnesses this runtime can run a child in: the Claude, Pi and Codex backends, all this build's own, with a
@@ -3710,6 +3712,7 @@ export default function fusion(pi: ExtensionAPI, options: FusionOptions = {}) {
 	const guidanceInput = (): GuidanceInput => ({
 		names: { fusion: TOOL_NAME, fusionControl: CONTROL_TOOL_NAME, claude: CLAUDE_TOOL_NAME, claudeControl: CLAUDE_CONTROL_NAME },
 		roles: configuration.roles,
+		roleGuidance,
 		baseline: configuration.baseline,
 		claudeRoles: ROLE_NAMES,
 		quote: { open: CHILD_QUOTE_OPEN, close: CHILD_QUOTE_CLOSE },

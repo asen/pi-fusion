@@ -63,7 +63,7 @@ fusion.ts                     host lifecycle and registration
 | `changes.ts`, `history.ts`, `budget.ts` | Git snapshots; opt-in host run history; running-total cost ledger |
 | `handoff.ts`, `review.ts` | Plan cap/model-change handoff; independent review eligibility and quoted prompt data |
 
-Role behavior belongs in `contracts/*.md`. Review **selection** belongs in `fusion.ts`: every review uses the session's configured `ask` backend/model/effort, not the reviewed role's backend or model. Backend architecture, storage, and runtime limitations are in [Pi backend](pi-backend.md) and [Codex backend](codex-backend.md).
+Role behavior and static host-facing role prose belong in `contracts/*.md`. `role-contracts.ts` parses their host-only YAML frontmatter and child body; `host-guidance.ts` composes that metadata with runtime facts. See [Configuration](configuration.md) for the fields. Review **selection** belongs in `fusion.ts`: every review uses the session's configured `ask` backend/model/effort, not the reviewed role's backend or model. Backend architecture, storage, and runtime limitations are in [Pi backend](pi-backend.md) and [Codex backend](codex-backend.md).
 
 ## Test strategy
 

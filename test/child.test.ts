@@ -5,6 +5,7 @@ import * as path from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 import { type ChildEvent, type ChildRun, type Role, childOptions, claudeExecutable, failed, failureMessage, questionAnswers, questionText, runChild } from "../extensions/fusion.ts";
+import { parseRoleContract } from "../extensions/role-contracts.ts";
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const fakeClaude = path.join(repoRoot, "test", "fake-claude.mjs");
@@ -433,7 +434,7 @@ test("childOptions maps a role to SDK options", () => {
 		const systemPrompt = ultracode.systemPrompt as { type: string; preset: string; append: string };
 		assert.equal(systemPrompt.type, "preset");
 		assert.equal(systemPrompt.preset, "claude_code");
-		assert.equal(systemPrompt.append, fs.readFileSync(path.join(repoRoot, "contracts", "ultracode.md"), "utf8"));
+		assert.equal(systemPrompt.append, parseRoleContract(fs.readFileSync(path.join(repoRoot, "contracts", "ultracode.md"), "utf8"), "ultracode.md").body);
 
 		process.env.PI_FUSION_ULTRACODE_WORKFLOW_SIZE = "large";
 		assert.deepEqual(childOptions(ultracodeRole, undefined, "t").settings, { workflowSizeGuideline: "large" });

@@ -649,9 +649,9 @@ test("the claude guidance respects pi-routed profiles and leaves explicit Claude
 	await host.on();
 	const guidance = host.tools.get("claude")!.promptGuidelines!.join("\n");
 	assert.match(guidance, /Use fusion for these roles unless the user explicitly asks for Claude Code/);
-	assert.match(guidance, /call fusion with role plan/);
-	assert.match(guidance, /call fusion with role implement/);
-	assert.match(guidance, /call fusion with role ask/);
+	assert.match(guidance, /use fusion role plan:/);
+	assert.match(guidance, /use fusion role implement:/);
+	assert.match(guidance, /use fusion role ask:/);
 	assert.doesNotMatch(guidance, /call claude with role (plan|implement|ask)/);
 	assert.match(guidance, /legacy Claude defaults/);
 	assert.doesNotMatch(guidance, /leave both unset, which runs each role on this session's configured defaults/);
@@ -664,9 +664,9 @@ test("the claude guidance respects pi-routed profiles and leaves explicit Claude
 
 	await host.command("profile use builtin");
 	const builtin = host.tools.get("claude")!.promptGuidelines!.join("\n");
-	assert.match(builtin, /call claude with role plan/);
-	assert.match(builtin, /call claude with role implement/);
-	assert.match(builtin, /call claude with role ask/);
+	assert.match(builtin, /For claude role plan:/);
+	assert.match(builtin, /For claude role implement:/);
+	assert.match(builtin, /For claude role ask:/);
 	assert.doesNotMatch(builtin, /Use fusion for these roles unless/);
 });
 
@@ -676,8 +676,8 @@ test("mixed-profile guidance recommends each role's configured backend", async (
 	const host = sdkHost({ profiles: memoryProfileStore(document({ work, noPlan }, "work")) });
 	await host.start();
 	const guidance = host.tools.get("claude")!.promptGuidelines!.join("\n");
-	assert.match(guidance, /call claude with role plan/);
-	assert.match(guidance, /call fusion with role implement/);
+	assert.match(guidance, /For claude role plan:/);
+	assert.match(guidance, /use fusion role implement:/);
 	assert.doesNotMatch(guidance, /(fusion|claude) with role ask/);
 	assert.match(guidance, /disables role ask/);
 	await host.command("profile use noPlan");
@@ -703,7 +703,7 @@ test("roles configured on codex are described as runs that can ask, take one unc
 	assert.ok(claudeGuidance.some((guideline) => /^This session routes role plan, role implement, role ask to codex\. Use fusion for these roles/.test(guideline)));
 	assert.ok(claudeGuidance.some((guideline) => guideline.startsWith("Role plan, role implement and role ask run on codex in this session, which fusion runs and claude does not.")));
 	// The plan guidance is the fusion tool's on either tool, because only fusion runs a plan configured on codex.
-	assert.ok(claudeGuidance.some((guideline) => guideline.startsWith("To plan through a child, call fusion with role plan")));
+	assert.ok(claudeGuidance.some((guideline) => guideline.startsWith("For claude, use fusion role plan: To plan through a child")));
 	const description = host.tools.get("fusion")!.description;
 	assert.match(description, /plan runs on codex with the host's default codex model; implement runs on codex with the host's default codex model; .*ask runs on codex with model gpt-5-codex at effort high/);
 	assert.match(description, /backend codex runs plan and implement in a workspace-write sandbox, and ask read-only, under the same contracts/);

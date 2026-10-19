@@ -1,4 +1,5 @@
 import { readFileSync, realpathSync } from "node:fs";
+import { parseRoleContract } from "../role-contracts.ts";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import type { OwnedCleanup } from "../process-tree.ts";
@@ -314,7 +315,7 @@ async function runCodexCall(request: RunRequest<CodexRole, CodexSession, ChildCo
 		let instructions: string;
 		try {
 			const read = deps.readContract ?? readRoleContract;
-			instructions = `${read(role.contract).trimEnd()}\n`;
+			instructions = `${parseRoleContract(read(role.contract), role.contract).body.trimEnd()}\n`;
 		} catch (error) {
 			report.stage = "contract";
 			report.thrown = { error };

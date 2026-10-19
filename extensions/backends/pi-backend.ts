@@ -1,4 +1,5 @@
 import { readFileSync } from "node:fs";
+import { parseRoleContract } from "../role-contracts.ts";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import type { OwnedCleanup } from "../process-tree.ts";
@@ -219,7 +220,7 @@ async function runPiCall(request: RunRequest<PiRole, PiSession, PiSteerQueue>, d
 
 		let contract: string;
 		try {
-			contract = (deps.readContract ?? readRoleContract)(role.contract);
+			contract = parseRoleContract((deps.readContract ?? readRoleContract)(role.contract), role.contract).body;
 		} catch (error) {
 			report.stage = "contract";
 			report.thrown = { error };

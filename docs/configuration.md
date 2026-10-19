@@ -38,6 +38,21 @@ Claude plan effort defaults to `xhigh`; there is no plan-effort environment vari
 
 Role contracts in `contracts/*.md` supply child instructions; see [Child tools and settings](runs.md#child-tools-and-settings) for how each backend applies them. Their no-commit and file-change rules are guidance, not enforced permissions. `contracts/host.md` is the exception: the shipped [host policy](#the-host-policy-file), told to the host, never to a child.
 
+The five roles' host descriptions live in YAML frontmatter in `plan.md`, `implement.md`, `ultracode.md`, `ask-answer.md` and `security.md`:
+
+```yaml
+---
+host:
+  description: Implements one bounded task.
+  guidance:
+    - Supply acceptance criteria and verification commands.
+  task_brief: What to change, where, and how to verify it.
+  snippet: bounded implementation
+---
+```
+
+Fusion reads and validates this metadata when the extension loads, and uses it for both delegation tools. Only enabled roles are advertised. Each backend strips the header before sending the Markdown body to a child; contracts without a header, including `ask-review.md`, pass through unchanged. Ask's host metadata describes both answer and review modes. Restart or `/reload` after editing the metadata. Runtime capabilities, parameters and settings remain generated from code; cross-role orchestration remains the host policy's. This parsing applies to role contracts only: `host.md` is still carried as written.
+
 ## The Fusion settings file
 
 `<agent dir>/pi-fusion/settings.json`, with agent dir resolved by Pi (`PI_CODING_AGENT_DIR`, normally `~/.pi/agent`). It belongs to Fusion and is separate from Pi's own `settings.json` and from [`profiles.json`](profiles.md#the-profiles-file). It holds user-global startup settings, used by every project and Pi process of this user:

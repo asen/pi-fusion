@@ -265,9 +265,10 @@ async function runResolve(spec) {
 		const storageModule = await import(pathToFileURL(path.join(spec.repoRoot, "extensions", "backends", "pi-storage.ts")).href);
 		const launchModule = await import(pathToFileURL(path.join(spec.repoRoot, "extensions", "backends", "pi-launch.ts")).href);
 		const bindingModule = await import(pathToFileURL(path.join(spec.repoRoot, "extensions", "backends", "pi-binding.ts")).href);
+		const { parseRoleContract } = await import(pathToFileURL(path.join(spec.repoRoot, "extensions", "role-contracts.ts")).href);
 		const role = bindingModule.piRole({ role: spec.role.name, model: spec.role.model }, undefined, {});
 		storage = storageModule.prepareCallStorage({ hostAgentDir: spec.hostAgentDir, cwd: spec.cwd, handle: spec.handle });
-		const input = launchModule.bootstrapInput({ role, storage, session: { kind: "new" }, contract: fs.readFileSync(spec.contractFile, "utf8") });
+		const input = launchModule.bootstrapInput({ role, storage, session: { kind: "new" }, contract: parseRoleContract(fs.readFileSync(spec.contractFile, "utf8"), spec.contractFile).body });
 		observations.selected = {
 			sharedAuth: storage.sharedAuth,
 			authPath: storage.authPath,

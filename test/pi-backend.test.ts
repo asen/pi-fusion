@@ -393,8 +393,9 @@ const outcomeOf = (run: PiRun) => ({
 });
 
 test("one new-session call runs the whole composition, stops its child once, and removes the storage it ran on", async (t) => {
-	const harness = harnessOf(t, { script: happyScript() });
+	const harness = harnessOf(t, { script: happyScript(), deps: { readContract: () => "---\nhost:\n  description: Host only.\n  guidance: []\n  task_brief: Task.\n  snippet: Role.\n---\n\nChild instructions.\n" } });
 	const run = await harness.call();
+	assert.equal(harness.inputs[0]?.contract, "Child instructions.", "the bootstrap receives only the contract body, without host metadata");
 
 	assert.deepEqual(harness.seen.steps, HAPPY_STEPS, "the preparation's readbacks, then the turn's own, in one order");
 	assert.deepEqual(harness.seen.shutdowns, ["host"], "one stop, and it is the task's own: this composition never stops a child itself");
@@ -871,7 +872,7 @@ test("the host's own callbacks cannot change what a call reports, and the host e
 	const specifiers = importSpecifiers(source);
 	assert.deepEqual(
 		[...new Set(specifiers)].sort(),
-		["../process-tree.ts", "./pi-binding.ts", "./pi-launch.ts", "./pi-outcome.ts", "./pi-prepare.ts", "./pi-storage.ts", "./pi-task.ts", "./pi-transport.ts", "./types.ts", "node:fs", "node:path", "node:url"].sort(),
+		["../process-tree.ts", "../role-contracts.ts", "./pi-binding.ts", "./pi-launch.ts", "./pi-outcome.ts", "./pi-prepare.ts", "./pi-storage.ts", "./pi-task.ts", "./pi-transport.ts", "./types.ts", "node:fs", "node:path", "node:url"].sort(),
 	);
 	for (const forbidden of ["claude.ts", "fusion.ts", "cards.ts"]) {
 		assert.equal(

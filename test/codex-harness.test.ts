@@ -8,6 +8,7 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import { type CodexCall, codexRole } from "../extensions/backends/codex-binding.ts";
 import { CODEX_APP_SERVER_ARGS } from "../extensions/backends/codex-launch.ts";
 import { CODEX_CONTRACTS_DIR, createCodexBackend } from "../extensions/backends/codex.ts";
+import { parseRoleContract } from "../extensions/role-contracts.ts";
 import { CODEX_QUESTION_DESCRIPTION, CODEX_QUESTION_TOOL_SPEC } from "../extensions/backends/codex-transport.ts";
 import {
 	additivity,
@@ -478,7 +479,7 @@ test("model-free thread fields and shared contracts match createCodexBackend; it
 			const sent = fs.readFileSync(log, "utf8").split("\n").filter(Boolean).map((line) => JSON.parse(line)).filter((entry) => entry.in?.method).map((entry) => entry.in);
 			const thread = sent.find((message) => message.method === "thread/start");
 			const turn = sent.find((message) => message.method === "turn/start");
-			const harnessBody = threadParams(role, composeInstructions(role, (name) => fs.readFileSync(path.join(CODEX_CONTRACTS_DIR, name), "utf8")));
+			const harnessBody = threadParams(role, composeInstructions(role, (name) => parseRoleContract(fs.readFileSync(path.join(CODEX_CONTRACTS_DIR, name), "utf8"), name).body));
 			assert.deepEqual(thread.params, { ...harnessBody, dynamicTools: [{ ...CODEX_QUESTION_TOOL_SPEC }] }, `${JSON.stringify(call)}: shared thread fields match, with question registration added by the transport`);
 			assert.ok(!("cwd" in thread.params) && !("config" in thread.params));
 			assert.deepEqual(Object.keys(turn.params).sort(), call.effort === undefined ? ["input", "threadId"] : ["effort", "input", "threadId"], "turn/start names only the thread, the input and a named effort");

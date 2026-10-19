@@ -304,7 +304,7 @@ function ended(outcome: Outcome, stopReason: string): void {
 
 test("a host-default implement run: one thread, one turn, the readback barrier, the parent thread's usage and one clean stop", async () => {
 	await withBackend("ok", async (fixture) => {
-		const outcome = await fixture.call({ role: "implement" });
+		const outcome = await fixture.call({ role: "implement" }, { deps: { readContract: (name) => `---\nhost:\n  description: Host only.\n  guidance: []\n  task_brief: Task.\n  snippet: Role.\n---\n\n${readContract(name)}` } });
 		const { run } = outcome;
 		ended(outcome, "stop");
 		assert.equal(failed(run), false);

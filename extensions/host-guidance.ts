@@ -1,5 +1,6 @@
 import { BACKEND_NAMES } from "./backends/types.ts";
 import type { Baseline, RoleSetting, RoleSettings } from "./profiles.ts";
+import type { RoleGuidanceMap } from "./role-contracts.ts";
 import { KNOWN_ROLE_NAMES, type KnownRoleName, runsOn } from "./roles.ts";
 
 /**
@@ -36,6 +37,7 @@ export interface QuoteMarkers {
 export interface GuidanceInput {
 	names: DelegationNames;
 	roles: RoleSettings;
+	roleGuidance: RoleGuidanceMap;
 	/** The legacy defaults the instance captured: what the claude tool runs a role configured on another backend as. */
 	baseline: Baseline;
 	/** The roles the claude tool advertises, in its own order. */
@@ -135,10 +137,9 @@ const guidelines = (view: View): string[] => {
 	const { roles, names, quote } = input;
 	const roleTool = (role: KnownRoleName): string => !view.backend && roles[role].backend !== "claude" ? names.fusion : tool;
 	const planTool = roleTool("plan");
-	const implementTool = roleTool("implement");
-	const askTool = roleTool("ask");
 	const lines: string[] = [`These ${tool} guidelines apply while Fusion is on, as it is now; once Fusion is off they no longer apply and you work directly.`, policyGuideline(input.policy)];
-	const security = !view.backend && roles.security.enabled ? [securityPointer(tool, names.fusion)] : [];
+	const roleGuidelines = (role: KnownRoleName): string[] => input.roleGuidance[role].guidance.map((line) => `For ${tool}${roleTool(role) === tool ? "" : `, use ${roleTool(role)}`} role ${role}: ${line}`);
+	const security = !view.backend && roles.security.enabled ? [`${securityPointer(tool, names.fusion)} ${roleGuidelines("security").join(" ")}`] : [];
 	const commit = `A ${tool} child does not commit, whatever it changed. Commit only when the user asks you to.`;
 	if (!view.enabled.length) {
 		lines.push(
@@ -155,9 +156,9 @@ const guidelines = (view: View): string[] => {
 	}
 	const onCodex = view.enabled.filter((role) => roles[role].backend === "codex");
 	if (onCodex.length) lines.push(codexGuideline(tool, names.fusion, onCodex));
+	for (const role of view.enabled) lines.push(...roleGuidelines(role));
 	if (on("plan")) {
 		lines.push(
-			`To plan through a child, call ${planTool} with role plan, giving the goal, a short proposed plan, constraints and what is already decided. It returns an agreed, numbered task list with acceptance criteria, and its Route section is a recommendation.`,
 			`Leave ${planTool}'s model unset for role plan, which runs it on its configured model. Later plan calls keep the plan run's model; name another model only when the user asks for one, which starts a fresh plan run that carries the plan so far.`,
 			`A ${planTool} call with role plan continues the last plan run while that run's context stays under its cap, 35% of the window by default, and while the call names the model that run is on. Past the cap, or when the call names another model, it starts a fresh plan run that carries the last report, the plan agreed so far, instead of the transcript behind it, and the result says which run replaced which. A fresh run past the cap keeps the plan run's model. Keep working with the fresh run: state anything the earlier run knew and its report does not say, and call ${planTool} with continue and the older handle only when you need what it dropped.`,
 		);
@@ -168,14 +169,6 @@ const guidelines = (view: View): string[] => {
 	);
 	if (!implementing(view)) {
 		lines.push(`No enabled ${tool} role implements a change in this session${view.backend && on("security") ? " other than a security fix the user asks for" : ""}.`);
-	} else {
-		const implement = on("implement")
-			? `To implement through a child, call ${implementTool} with role implement, one clear, bounded task per call: what to change, where, its acceptance criteria and how to verify it.`
-			: `Role implement is disabled in this session, and role ultracode implements only when the user explicitly asks for ultracode.`;
-		const ultracode = on("ultracode")
-			? ` Use ${tool} with role ultracode only when the user explicitly asks for ultracode${on("plan") ? ", even when a Route section recommends it" : ""}. It is slow, and its report's Review section is a self-review by agents it briefed, not an independent review. Role ultracode runs its agents one at a time so builds and tests do not overlap, so do not ask it for parallel work.`
-			: "";
-		lines.push(`${implement}${ultracode}`);
 	}
 	const choice = `The user's explicit choice wins over these ${tool} guidelines${on("ultracode") ? ", including asking for role ultracode" : ""}.`;
 	// A model or effort override goes only to a role whose binding accepts one: ultracode's are its own, never a call's.
@@ -195,11 +188,6 @@ const guidelines = (view: View): string[] => {
 			? ` For an explicit ${tool} call${only}, put a model or effort the user names in its model or effort parameter; otherwise leave both unset to use the role's configured Claude settings${elsewhere.length ? `, or this instance's legacy Claude defaults for ${roleSeries(elsewhere)}, configured on another backend` : ""}.`
 			: "";
 	lines.push(`${choice}${overrides}${ultracode}`);
-	if (on("ask")) {
-		lines.push(
-			`To ask a child about the code or its dependencies without changing files, call ${askTool} with role ask; for an independent review of a change, call it with role ask and mode review, naming the diff or files and what the change must do. Role ask runs read-only tools and returns an answer or ranked findings with file and line references; it never implements.`,
-		);
-	}
 	lines.push(
 		`To follow up on an earlier ${tool} run${implementing(view) ? ", such as a test that still fails after an implementation" : ""}, call ${tool} with continue set to its handle and the follow-up as task instead of starting a new run; the child keeps its context. Start a new run when the work is unrelated.`,
 		`Call ${tool} with background true when the run will take long and you have other work or the user wants to keep talking${implementing(view) ? ", such as a long implementation" : ""}; the call returns the handle at once and the report arrives later as a message. Tell the user the handle, so they can follow the run with /fusion. Only one run that can change files is active at a time${on("ask") ? ", but role ask runs can go next to it" : ""}. Use ${control} status to check a run, wait to block on its report, message to steer it, and cancel to stop it. A message to a run that has ended is not sent; decide from the returned report whether to continue the run with ${tool} continue or leave it.`,
@@ -236,20 +224,15 @@ const codexGuideline = (tool: string, primary: string, roles: readonly KnownRole
 const backendGuideline = (tool: string, pi: boolean): string =>
 	`When the user names the harness a task is to run on, pass that name in ${tool}'s backend parameter; leave backend unset otherwise, which runs the role on the backend this session's configuration names for it. A harness the role does not run on is refused before anything starts.${pi ? ` A run on the pi backend is the other reason to set ${tool}'s model parameter: a pi role with no model configured needs a provider and model id there.` : ""}`;
 
-/**
- * The other guideline only the primary tool carries, because it is the only one that advertises the role: `security`
- * is the user's to ask for, enabled or not. Nothing here lets the host decide that work looks security-sensitive and
- * route it there on its own, and the task is where the authorization to change application code comes from. What the
- * host does with other work is the host policy's, so nothing here names a role to use instead.
- */
+/** Security's configured selection and scheduling are runtime facts; its instructions come from the contract. */
 const securityGuideline = (view: View, setting: RoleSetting): string => {
 	const { tool } = view;
-	return `Use ${tool} with role security only when the user asks for a security investigation, audit or fix: never on your own judgement that some work looks security-sensitive. Say in the task whether fixes are authorized, and what is in scope; a security task that does not say reports findings and changes no application code. Role security runs on the pi backend alone, ${setting.model ? `on ${setting.model} unless the user names another model` : `and this session configures no model for it, so it needs a provider and model id in ${tool}'s model parameter or one chosen with /fusion config`}, and it takes the single active file-changing slot.`;
+	return `For ${tool}, role security runs on the pi backend alone, ${setting.model ? `on ${setting.model} unless the user names another model` : `and this session configures no model for it, so it needs a provider and model id in ${tool}'s model parameter or one chosen with /fusion config`}, and it takes the single active file-changing slot.`;
 };
 
 /** What the claude tool says of an enabled security role it cannot run: where it does run, and on whose request. */
 const securityPointer = (tool: string, primary: string): string =>
-	`Role security is enabled in this session but runs only through ${primary}, on the pi backend; ${tool} does not run it. Use ${primary} with role security only when the user asks for a security investigation, audit or fix.`;
+	`Role security is enabled in this session but runs only through ${primary}, on the pi backend; ${tool} does not run it.`;
 
 /** A role's model and effort as a description says them. */
 const selectionText = (role: KnownRoleName, setting: RoleSetting): string => {
@@ -278,52 +261,14 @@ const claudeConfigurationText = (input: GuidanceInput): string =>
 		return `${role} is configured on ${setting.backend} with ${selectionText(role, setting)}, and ${input.names.claude} runs it on claude with this instance's legacy Claude defaults, ${selectionText(role, legacy)}`;
 	}).join("; ")}.`;
 
-const IMPLEMENT_TEXT =
-	"implement: implements one clear, bounded task with full tools and reports what changed and how it was verified. If the task needs a broader scope or a design decision, it stops and reports under Escalation instead of widening the task.";
-
-/** Ultracode's description, which compares it with role implement only while that role is there to compare with. */
-const ultracodeText = (implement: boolean): string =>
-	`ultracode: Claude Code with ultracode on orchestrates Claude Opus 5 agents at xhigh effort, one agent at a time, to implement, verify and review a task, several tasks in dependency order, or a whole agreed plan. It is ${implement ? "slower and costlier than implement" : "slow and costly"}; use it only when the user asks for it.`;
-
-/** What each role does, as the fusion tool's description says it, for the enabled roles in role order. */
-const fusionRoleText = (role: KnownRoleName, view: View): string => {
-	switch (role) {
-		case "plan":
-			return "plan: a planner on the configured model, or the model you name, which can read the code, run commands and write scratch files, challenges a goal and your proposed plan and consolidates it into an agreed, numbered task list with acceptance criteria. A plan call continues the last plan run of the backend it routes to, so follow-ups can refer to the earlier agreement, until that run's context passes its cap or the call names another model, when the call starts a fresh plan run carrying the agreed plan and says so; fresh starts a new plan run.";
-		case "implement":
-			return IMPLEMENT_TEXT;
-		case "ultracode":
-			return ultracodeText(view.on("implement"));
-		case "ask":
-			return "ask: read-only tools (on claude: Read, Bash, Grep, Glob, WebSearch, WebFetch) answer a question about the code with file and line references, or with mode review give an independent review of a change, findings ranked by severity. It has no edit or write tool, and its contract forbids changing files through a shell.";
-		case "security":
-			return "security: investigates one scoped security concern, area or change on the user's own Pi provider configuration, with full coding tools. It confirms a finding where it can, reports each with a severity and with whether it is confirmed or inferred, and never puts a secret in its report by value. Its task says whether fixes are authorized: with none it reports findings and changes no application code, and with one it writes the smallest fix that closes a finding and verifies it. Ask for it only when the user asks for a security investigation, audit or fix.";
-	}
-};
-
-/** What each role does, as the claude tool's description says it, with Claude Code's own tool names. */
-const claudeRoleText = (role: KnownRoleName, view: View): string => {
-	switch (role) {
-		case "plan":
-			return "plan: a planner on its configured model, or the model you name, which can read the code, run commands and write scratch files, challenges a goal and your proposed plan and consolidates it into an agreed, numbered task list with acceptance criteria. A plan call continues the last plan run, so follow-ups can refer to the earlier agreement, until that run's context passes its cap or the call names another model, when the call starts a fresh plan run carrying the agreed plan and says so; fresh starts a new plan run.";
-		case "ask":
-			return "ask: read-only tools (Read, Bash, Grep, Glob, WebSearch, WebFetch) answer a question about the code with file and line references, or with mode review give an independent review of a change, findings ranked by severity. It has no Edit or Write, and its contract forbids changing files through Bash.";
-		default:
-			return fusionRoleText(role, view);
-	}
-};
-
-/** Each role's part of a prompt snippet. */
-const SNIPPET_TEXT: Record<KnownRoleName, string> = {
-	plan: "planning (plan)",
-	implement: "bounded implementation (implement)",
-	ultracode: "implementation the user asks ultracode for (ultracode)",
-	ask: "read-only questions and reviews (ask)",
-	security: "a scoped security investigation or fix the user asked for (security)",
-};
+/** Static role prose comes from the contract; the prefix names the role in this tool's inventory. */
+const roleText = (role: KnownRoleName, view: View): string => `${role}: ${view.input.roleGuidance[role].description}`;
 
 const snippet = (view: View, child: string, none: string): string =>
-	view.enabled.length ? `Delegate ${series(view.enabled.map((role) => SNIPPET_TEXT[role]), "or")} to ${child}` : none;
+	view.enabled.length ? `Delegate ${series(view.enabled.map((role) => `${view.input.roleGuidance[role].snippet} (${role})`), "or")} to ${child}` : none;
+
+/** Tool availability is a backend fact, separate from ask's contract prose. */
+const CLAUDE_ASK_TOOLS = "On claude, role ask runs with Read, Bash, Grep, Glob, WebSearch and WebFetch, and has no Edit or Write tool.";
 
 /** The pi part of the fusion description: what it runs, which roles are pinned to one harness, its tools and its models. */
 const piText = (view: View): string[] => {
@@ -369,6 +314,7 @@ const backendText = (view: View): string[] => {
 	const idle = BACKEND_NAMES.filter((backend) => !runOn(view.enabled, backend).length);
 	return [
 		"backend picks the harness a child runs in: leave backend unset unless the user names one, and a fresh run goes to the backend the configuration above names for its role, on that role's configured model and effort. A call that names the other backend runs there on that backend's own defaults, never on the settings configured for the role's other backend.",
+		...(view.on("ask") ? [CLAUDE_ASK_TOOLS] : []),
 		...piText(view),
 		...codexText(view),
 		...(idle.length ? [`${capital(series(idle.map((backend) => `backend ${backend}`)))} ${idle.length === 1 ? "runs" : "run"} no role this session enables.`] : []),
@@ -384,7 +330,7 @@ export function fusionGuidance(input: GuidanceInput): ToolGuidance {
 	const ask = fusion.on("ask") ? "; ask runs can go next to it" : "";
 	const description = [
 		"Delegate work to a child: a headless coding session in this working directory, run through one of this build's backends. The role picks the job.",
-		fusion.enabled.length ? fusion.enabled.map((role) => fusionRoleText(role, fusion)).join(" ") : NO_ROLE,
+		fusion.enabled.length ? fusion.enabled.map((role) => roleText(role, fusion)).join(" ") : NO_ROLE,
 		configurationText(roles),
 		...(fusion.disabled.length && fusion.enabled.length ? ["A disabled role is refused whether a call starts or continues it."] : []),
 		...(fusion.enabled.length ? backendText(fusion) : []),
@@ -409,8 +355,9 @@ export function claudeGuidance(input: GuidanceInput): ToolGuidance {
 	const ask = claude.on("ask") ? "; ask runs can go next to it" : "";
 	const description = [
 		"Delegate work to a child: a headless Claude Code session in this working directory. The role picks the job.",
-		claude.enabled.length ? claude.enabled.map((role) => claudeRoleText(role, claude)).join(" ") : "No role this tool runs is enabled in this session's configuration, so every call is refused, whether it starts a run or continues one.",
+		claude.enabled.length ? claude.enabled.map((role) => roleText(role, claude)).join(" ") : "No role this tool runs is enabled in this session's configuration, so every call is refused, whether it starts a run or continues one.",
 		claudeConfigurationText(input),
+		...(claude.on("ask") ? [CLAUDE_ASK_TOOLS] : []),
 		...(claude.disabled.length && claude.enabled.length ? ["A disabled role is refused whether a call starts or continues it."] : []),
 		"Every run gets a handle such as run-3, shown in the stats line. continue with a handle sends the task as a follow-up to that run: the child keeps its context from the run's last successful call, across a resume of this session, /tree and forks, and keeps the model and effort that run was started with unless the call names others. Calls run one at a time: Pi serializes any turn that contains one.",
 		`Returns the child's report, or with background true the handle at once and the report later as a message; manage a background run with ${names.claudeControl}. If the child asks a question, the call returns the question at once and the run waits in the background until you answer it with ${names.claudeControl} message. Only one run that can change files is active at a time, waiting included${ask}.`,
@@ -431,13 +378,9 @@ const roleHelp = (view: View): string => {
 
 /** The task parameter's help, with the example for each enabled role. */
 const taskHelp = (view: View): string => {
-	const writers = view.enabled.filter((role) => role === "implement" || role === "ultracode");
 	return [
 		"Plain, readable prose, with the spaces between words kept. A new run has not seen this conversation, so make the task self-contained, and name files instead of pasting their contents.",
-		...(view.on("plan") ? ["For plan: the goal, your proposed plan, constraints and decisions already made; the child reads the code itself."] : []),
-		...(writers.length ? [`For ${series(writers)}: the task or tasks, agreed or direct: what to change, where, acceptance criteria, and how to verify each one.`] : []),
-		...(view.on("ask") ? ["For ask: the question, or for mode review the change to review (a diff, a commit range or files) and what it must do."] : []),
-		...(view.on("security") ? ["For security: the concern, area or change to investigate, what the code is meant to guarantee, and whether fixes are authorized; without that it reports findings and changes no application code."] : []),
+		...view.enabled.map((role) => `For ${role}: ${view.input.roleGuidance[role].task_brief}`),
 		"With continue: the follow-up message.",
 	].join(" ");
 };

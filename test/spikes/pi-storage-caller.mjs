@@ -106,6 +106,7 @@ async function runCall(spec) {
 	const storageModule = await import(path.join(spec.repoRoot, "extensions", "backends", "pi-storage.ts"));
 	const launchModule = await import(path.join(spec.repoRoot, "extensions", "backends", "pi-launch.ts"));
 	const bindingModule = await import(path.join(spec.repoRoot, "extensions", "backends", "pi-binding.ts"));
+	const { parseRoleContract } = await import(path.join(spec.repoRoot, "extensions", "role-contracts.ts"));
 	const { prepareCallStorage, writeCallInput, piPaths } = storageModule;
 	const { bootstrapInput, piLaunch, openSession, hostBinPlacement } = launchModule;
 	const { piRole } = bindingModule;
@@ -172,7 +173,7 @@ async function runCall(spec) {
 			role,
 			storage,
 			session,
-			contract: fs.readFileSync(spec.contractFile, "utf8"),
+			contract: parseRoleContract(fs.readFileSync(spec.contractFile, "utf8"), spec.contractFile).body,
 			// A call's own resource additions, which is the internal parameter the production composer already takes:
 			// the spec names local paths, the composer checks and resolves them, and nothing here writes a list of its own.
 			...(spec.resources?.extensions === undefined ? {} : { extensions: spec.resources.extensions }),

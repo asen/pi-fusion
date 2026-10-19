@@ -151,7 +151,7 @@ async function main(cli) {
 
 /** The production modules, imported only once a run is asked for, so a guard path loads none of them. */
 async function loadProduction() {
-	const [binding, launch, backend, outcome, transport, protocol, types] = await Promise.all([
+	const [binding, launch, backend, outcome, transport, protocol, types, contracts] = await Promise.all([
 		import("../../extensions/backends/codex-binding.ts"),
 		import("../../extensions/backends/codex-launch.ts"),
 		import("../../extensions/backends/codex.ts"),
@@ -159,8 +159,9 @@ async function loadProduction() {
 		import("../../extensions/backends/codex-transport.ts"),
 		import("../../extensions/backends/codex-protocol.ts"),
 		import("../../extensions/backends/types.ts"),
+		import("../../extensions/role-contracts.ts"),
 	]);
-	return { ...binding, ...launch, ...backend, ...outcome, ...transport, ...protocol, failed: types.failed };
+	return { ...binding, ...launch, ...backend, ...outcome, ...transport, ...protocol, failed: types.failed, parseRoleContract: contracts.parseRoleContract };
 }
 
 async function runSelected(cli, cases) {
@@ -436,7 +437,7 @@ function describeRead(read) {
 
 /** A shipped contract file, read the way the backend's default reader does. */
 function productionContract(mod, name) {
-	return fs.readFileSync(path.join(mod.CODEX_CONTRACTS_DIR, name), "utf8");
+	return mod.parseRoleContract(fs.readFileSync(path.join(mod.CODEX_CONTRACTS_DIR, name), "utf8"), name).body;
 }
 
 /** The thread/start body the backend sends for a role, with the shipped contracts (pinned to the backend by a test). */

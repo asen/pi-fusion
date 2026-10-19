@@ -15,6 +15,7 @@ import fusion from "../extensions/fusion.ts";
 import { HOST_POLICY_FILE, memoryHostPolicyLoader, SHIPPED_HOST_POLICY_PATH } from "../extensions/host-policy.ts";
 import { memoryProfileStore } from "../extensions/profile-store.ts";
 import { memorySettingsStore } from "../extensions/settings-store.ts";
+import { parseRoleContract } from "../extensions/role-contracts.ts";
 import { fakeBackend } from "./fake-pi-backend.ts";
 import { PRODUCTION_DEFAULT_VARIABLES, productionDefaults, tripwires } from "./tripwire.ts";
 import { toolList, turnOn } from "./host-tools.ts";
@@ -150,7 +151,7 @@ function assertCommon(run: Invocation, contract: string) {
 	assert.ok(run.argv.includes("--allow-dangerously-skip-permissions"));
 	assert.equal(valueOf(run.argv, "--permission-prompts"), "none");
 	assert.equal(count(run.argv, "--effort"), 1);
-	assert.equal(run.appendSystemPrompt, fs.readFileSync(path.join(repoRoot, "contracts", contract), "utf8"));
+	assert.equal(run.appendSystemPrompt, parseRoleContract(fs.readFileSync(path.join(repoRoot, "contracts", contract), "utf8"), contract).body);
 	assert.ok(!run.argv.includes("--append-system-prompt"), "the contract goes through the SDK handshake, not argv");
 	assert.ok(!run.argv.includes("--setting-sources"), "children load Claude Code's default setting sources");
 	assert.equal(run.env.CLAUDE_AGENT_SDK_CLIENT_APP, "pi-fusion");
