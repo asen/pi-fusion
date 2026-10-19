@@ -141,6 +141,7 @@ const guidelines = (view: View): string[] => {
 	const roleGuidelines = (role: KnownRoleName): string[] => input.roleGuidance[role].guidance.map((line) => `For ${tool}${roleTool(role) === tool ? "" : `, use ${roleTool(role)}`} role ${role}: ${line}`);
 	const security = !view.backend && roles.security.enabled ? [`${securityPointer(tool, names.fusion)} ${roleGuidelines("security").join(" ")}`] : [];
 	const commit = `A ${tool} child does not commit, whatever it changed. Commit only when the user asks you to.`;
+	if (view.disabled.length) lines.push(`This session's configuration disables ${view.disabled.map((role) => `role ${role}`).join(", ")}: ${tool} refuses fresh calls and continuations.`);
 	if (!view.enabled.length) {
 		lines.push(
 			`No ${tool} role is enabled in this session's configuration, so every ${tool} call is refused, whether it starts a run or continues one; do not call ${tool}. ${control} still reports on, waits for, messages and cancels any run there is.`,
@@ -197,11 +198,6 @@ const guidelines = (view: View): string[] => {
 		commit,
 		`Each ${tool} run's stats line names the resume command or session file that reaches its child again.`,
 	);
-	if (view.disabled.length) {
-		lines.push(
-			`This session's configuration disables ${view.disabled.map((role) => `role ${role}`).join(", ")}: a ${tool} call to a disabled role is refused, whether it starts a run or continues one, so do not call one. Whether to enable one is the user's choice, through /fusion config or another profile.`,
-		);
-	}
 	lines.push(...security);
 	return lines;
 };
@@ -243,10 +239,10 @@ const selectionText = (role: KnownRoleName, setting: RoleSetting): string => {
 
 /** How a role's setting reads in a description: where a fresh run of it goes and what it runs as there. */
 const settingText = (role: KnownRoleName, setting: RoleSetting): string =>
-	setting.enabled ? `${role} runs on ${setting.backend} with ${selectionText(role, setting)}` : `${role} is disabled`;
+	`${role} runs on ${setting.backend} with ${selectionText(role, setting)}`;
 
-/** The configuration as the fusion tool says it: every role, its backend, model and effort, or that it is disabled. */
-const configurationText = (roles: RoleSettings): string => `In this session's configuration ${KNOWN_ROLE_NAMES.map((role) => settingText(role, roles[role])).join("; ")}.`;
+/** Only enabled settings belong in the inventory; one guideline names disabled roles and their refusal. */
+const configurationText = (roles: RoleSettings): string => `In this session's configuration ${KNOWN_ROLE_NAMES.filter((role) => roles[role].enabled).map((role) => settingText(role, roles[role])).join("; ")}.`;
 
 /**
  * What the claude tool runs each of its roles as: the configured setting for a role this session runs on Claude. A
@@ -254,9 +250,9 @@ const configurationText = (roles: RoleSettings): string => `In this session's co
  * forces it onto, so the forced run never reads as the configured route.
  */
 const claudeConfigurationText = (input: GuidanceInput): string =>
-	`In this session's configuration ${input.claudeRoles.map((role) => {
+	`In this session's configuration ${input.claudeRoles.filter((role) => input.roles[role].enabled).map((role) => {
 		const setting = input.roles[role];
-		if (!setting.enabled || setting.backend === "claude") return settingText(role, setting);
+		if (setting.backend === "claude") return settingText(role, setting);
 		const legacy: RoleSetting = { enabled: true, backend: "claude", ...input.baseline[role].claude };
 		return `${role} is configured on ${setting.backend} with ${selectionText(role, setting)}, and ${input.names.claude} runs it on claude with this instance's legacy Claude defaults, ${selectionText(role, legacy)}`;
 	}).join("; ")}.`;
@@ -331,9 +327,7 @@ export function fusionGuidance(input: GuidanceInput): ToolGuidance {
 	const description = [
 		"Delegate work to a child: a headless coding session in this working directory, run through one of this build's backends. The role picks the job.",
 		fusion.enabled.length ? fusion.enabled.map((role) => roleText(role, fusion)).join(" ") : NO_ROLE,
-		configurationText(roles),
-		...(fusion.disabled.length && fusion.enabled.length ? ["A disabled role is refused whether a call starts or continues it."] : []),
-		...(fusion.enabled.length ? backendText(fusion) : []),
+		...(fusion.enabled.length ? [configurationText(roles), ...backendText(fusion)] : []),
 		"Every run gets a handle such as run-3, shown in the stats line. continue with a handle sends the task as a follow-up to that run: the child keeps its context from the run's last successful call, across a resume of this session, /tree and forks, stays on the backend it ran on, and keeps the model and effort that run was started with unless the call names others, whatever profile is selected since. Calls run one at a time: Pi serializes any turn that contains one.",
 		`Returns the child's report, or with background true the handle at once and the report later as a message; manage a background run with ${names.fusionControl}. If the child asks a question, the call returns the question at once and the run waits in the background until you answer it with ${names.fusionControl} message. Only one run that can change files is active at a time, waiting included${ask}. The ${names.claude} tool is this same delegation forced to the claude backend, kept for compatibility, and ${names.fusionControl} and ${names.claudeControl} both act on every run.`,
 	];
@@ -356,9 +350,8 @@ export function claudeGuidance(input: GuidanceInput): ToolGuidance {
 	const description = [
 		"Delegate work to a child: a headless Claude Code session in this working directory. The role picks the job.",
 		claude.enabled.length ? claude.enabled.map((role) => roleText(role, claude)).join(" ") : "No role this tool runs is enabled in this session's configuration, so every call is refused, whether it starts a run or continues one.",
-		claudeConfigurationText(input),
+		...(claude.enabled.length ? [claudeConfigurationText(input)] : []),
 		...(claude.on("ask") ? [CLAUDE_ASK_TOOLS] : []),
-		...(claude.disabled.length && claude.enabled.length ? ["A disabled role is refused whether a call starts or continues it."] : []),
 		"Every run gets a handle such as run-3, shown in the stats line. continue with a handle sends the task as a follow-up to that run: the child keeps its context from the run's last successful call, across a resume of this session, /tree and forks, and keeps the model and effort that run was started with unless the call names others. Calls run one at a time: Pi serializes any turn that contains one.",
 		`Returns the child's report, or with background true the handle at once and the report later as a message; manage a background run with ${names.claudeControl}. If the child asks a question, the call returns the question at once and the run waits in the background until you answer it with ${names.claudeControl} message. Only one run that can change files is active at a time, waiting included${ask}.`,
 	];
@@ -369,11 +362,10 @@ export function claudeGuidance(input: GuidanceInput): ToolGuidance {
 	};
 }
 
-/** The role parameter's help: the enabled roles a call may name, and the disabled ones it is refused for. */
+/** Parameter help lists usable roles; the disabled-role refusal is stated once in the guidelines. */
 const roleHelp = (view: View): string => {
 	if (!view.enabled.length) return "Required unless continue is set, but no role this tool runs is enabled in this session's configuration, so every call is refused.";
-	const off = view.disabled.length ? ` ${capital(roleSeries(view.disabled))} ${view.disabled.length === 1 ? "is" : "are"} disabled in this session's configuration and refused.` : "";
-	return `${series(view.enabled, "or")}. Required unless continue is set.${off}`;
+	return `${series(view.enabled, "or")}. Required unless continue is set.`;
 };
 
 /** The task parameter's help, with the example for each enabled role. */
@@ -387,13 +379,13 @@ const taskHelp = (view: View): string => {
 
 /** The help both tools share: parameters whose meaning no backend changes, with the role a parameter is for named. */
 const sharedHelp = (view: View, continued: string): Omit<ParameterHelp, "role" | "task" | "model" | "effort"> => ({
-	continue: `${continued}${view.disabled.length ? " A run whose role is disabled in this session's configuration is refused." : ""}`,
+	continue: continued,
 	context: "Extra context the child needs, in plain, readable prose: decisions, related files, results of earlier tasks.",
 	background: "Return at once with the run's handle and let the run go on; you get its report as a message when it ends. Default false.",
-	fresh: view.on("plan") ? "plan only, not with continue: start a new plan run instead of continuing the last one." : "plan only, and role plan is not enabled in this session's configuration, so leave it unset.",
+	fresh: view.on("plan") ? "plan only, not with continue: start a new plan run instead of continuing the last one." : "Not available to enabled roles; leave unset.",
 	mode: view.on("ask")
 		? "ask only: answer (default) for a question, review for an independent review of a change. A continued ask run keeps its mode unless this names another."
-		: "ask only, and role ask is not enabled in this session's configuration, so leave it unset.",
+		: "Not available to enabled roles; leave unset.",
 });
 
 /** What a model or effort parameter says when no enabled role takes it. */

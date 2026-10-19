@@ -602,11 +602,11 @@ test("the default profile loads as the session starts, and the host's guidance a
 	await host.start();
 	assert.deepEqual(host.notices, [], "a default that loaded is no warning");
 	const description = host.tools.get("fusion")!.description;
-	assert.match(description, /In this session's configuration plan runs on claude with model fable at effort xhigh; implement runs on claude with model sonnet at effort low; ultracode is disabled; ask runs on claude with model haiku at effort medium;/);
+	assert.match(description, /In this session's configuration plan runs on claude with model fable at effort xhigh; implement runs on claude with model sonnet at effort low; ask runs on claude with model haiku at effort medium\./);
 	const guidelines = host.tools.get("fusion")!.promptGuidelines ?? [];
-	assert.ok(guidelines.some((line) => /disables role ultracode, role security: a fusion call to a disabled role is refused/.test(line)), guidelines.join("\n"));
+	assert.ok(guidelines.includes("This session's configuration disables role ultracode, role security: fusion refuses fresh calls and continuations."));
 	assert.ok(!guidelines.some((line) => /Use fusion with role ultracode/.test(line)), "a disabled role is recommended nowhere");
-	assert.match(host.tools.get("claude")!.description, /ultracode is disabled/);
+	assert.doesNotMatch(host.tools.get("claude")!.description, /ultracode/);
 	assert.deepEqual(host.active, ["read", "bash", "fusion_activate"], "and fusion starts off, with only its way in offered");
 	await host.command("status");
 	// The history line is the instance's own, whatever profile it runs, and is checked where history is the subject.
@@ -907,7 +907,8 @@ test("the editor stages every change and applies them together, and a run that s
 	await host.start();
 	await host.command("config");
 	assert.equal(host.last(), "fusion settings applied to this session; disabled: ultracode, security; save them with /fusion profile save <name>");
-	assert.match(host.tools.get("fusion")!.description, /implement runs on pi with model openrouter\/deepseek\/deepseek-r1 at effort high; ultracode is disabled/);
+	assert.match(host.tools.get("fusion")!.description, /implement runs on pi with model openrouter\/deepseek\/deepseek-r1 at effort high/);
+	assert.doesNotMatch(host.tools.get("fusion")!.description, /ultracode/);
 	await host.command("profile list");
 	assert.match(host.last() ?? "", /^builtin \(current, modified; default for new sessions\)$/m);
 	await host.command("status");
@@ -984,7 +985,7 @@ const CLAUDE_PICKER = ["opus", "opus[1m]", "fable", "claude-opus-5-5", "claude-o
 const claudeRole = (role: "plan" | "implement" | "ultracode" | "ask") => settings({ [role]: { enabled: true, backend: "claude", model: "custom-alias", effort: role === "ultracode" ? "ultracode" : "low" } });
 
 /** How the fusion tool describes a Claude role on a model, ending where the role's text does so a longer id cannot match. */
-const claudeText = (role: string, model: string) => `${role} runs on claude with model ${model}${role === "ultracode" ? ";" : " at effort low;"}`;
+const claudeText = (role: string, model: string) => `${role} runs on claude with model ${model}${role === "ultracode" ? "" : " at effort low"}${role === "ask" ? "." : ";"}`;
 
 test("the claude shortcuts are exactly the static models the picker lists, in its order", () => {
 	assert.deepEqual([...CLAUDE_MODEL_SUGGESTIONS], CLAUDE_PICKER.slice(0, -1));
@@ -1170,7 +1171,7 @@ test("the editor takes a codex role back to the host's defaults, and the table a
 	await host.start();
 	await host.command("config");
 	assert.equal(host.last(), "fusion settings applied to this session; disabled: security; save them with /fusion profile save <name>");
-	assert.match(host.tools.get("fusion")!.description, /ask runs on codex with the host's default codex model;/);
+	assert.match(host.tools.get("fusion")!.description, /ask runs on codex with the host's default codex model\./);
 });
 
 test("an empty answer changes nothing, and a backend changed and changed back starts from that backend's own defaults", async () => {

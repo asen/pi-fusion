@@ -355,8 +355,8 @@ test("the fusion tool advertises every role a backend runs and a backend as plai
 	assert.deepEqual(Object.keys(properties), ["role", "task", "continue", "context", "background", "fresh", "mode", "backend", "model", "effort"]);
 	assert.deepEqual(properties.role.enum, ["plan", "implement", "ultracode", "ask", "security"], "the primary tool advertises security, which runs on pi alone");
 	assert.deepEqual(byName("claude").parameters.properties.role.enum, ["plan", "implement", "ultracode", "ask"], "and the compatibility tool advertises the four roles claude runs");
-	// The enum keeps every role so it is never empty; the help names the enabled ones and says security is refused.
-	assert.match(properties.role.description, /^plan, implement, ultracode or ask\. Required unless continue is set\. Role security is disabled in this session's configuration and refused\.$/);
+	// The enum keeps every role so it is never empty; the help names only enabled roles, with one refusal guideline.
+	assert.match(properties.role.description, /^plan, implement, ultracode or ask\. Required unless continue is set\.$/);
 	assert.deepEqual(properties.backend.enum, ["claude", "pi", "codex"]);
 	assert.equal(properties.backend.type, "string");
 	// No enum: a codex level is the model's own, so the schema cannot list it, and each backend's binding checks its own grammar.
@@ -410,11 +410,11 @@ test("the fusion tool says which harness runs what, and the pi backend it regist
 	assert.match(fusionTool.description, /a provider and a model id, such as deepseek\/deepseek-chat/);
 	assert.match(fusionTool.description, /refused before anything starts/);
 	assert.match(fusionTool.description, /role ultracode runs on the claude backend alone/);
-	// Security is disabled in the built-in configuration, so nothing but the configuration sentence names it.
+	// Security is disabled in the built-in configuration, so only the refusal guideline names it.
 	assert.doesNotMatch(fusionTool.description, /role security|security: /);
 	assert.match(fusionTool.description, /leave backend unset unless the user names one, and a fresh run goes to the backend the configuration above names for its role/);
 	// What the configuration is, said in the description rather than as fixed model names a profile would make false.
-	assert.match(fusionTool.description, /In this session's configuration plan runs on claude with model fable at effort xhigh; implement runs on claude with model opus at effort high; ultracode runs on claude with model fable; ask runs on claude with model opus at effort high; security is disabled\./);
+	assert.match(fusionTool.description, /In this session's configuration plan runs on claude with model fable at effort xhigh; implement runs on claude with model opus at effort high; ultracode runs on claude with model fable; ask runs on claude with model opus at effort high\./);
 	assert.doesNotMatch(fusionTool.description, /Claude Fable|Claude Opus with/);
 	// The role whose work the user has to have asked for is described only once enabled; host-guidance.test.ts covers that.
 	assert.doesNotMatch(fusionTool.description, /security investigation, audit or fix/);

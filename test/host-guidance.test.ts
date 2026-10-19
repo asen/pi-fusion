@@ -68,6 +68,28 @@ test("contract metadata supplies both tools' descriptions, snippets, guidance an
 	}
 });
 
+test("disabled roles contribute no metadata and have one refusal notice per tool, across every enabled-role combination", () => {
+	for (const enabled of SUBSETS) {
+		const configuration = input(enabling(enabled));
+		configuration.roleGuidance = { ...roleGuidance };
+		const disabled = KNOWN_ROLE_NAMES.filter((role) => !enabled.includes(role));
+		for (const role of disabled) configuration.roleGuidance[role] = { description: `hidden-${role}-description`, guidance: [`hidden-${role}-guidance`], task_brief: `hidden-${role}-brief`, snippet: `hidden-${role}-snippet` };
+		for (const tool of TOOLS) {
+			const guidance = tool.guidance(configuration);
+			const help = tool.help(configuration);
+			const all = texts(guidance, help);
+			assert.ok(all.every((text) => !text.includes("hidden-")), `${tool.name}: disabled metadata reached the host`);
+			const notices = guidance.promptGuidelines.filter((line) => line.startsWith("This session's configuration disables "));
+			const off = tool.advertised.filter((role) => disabled.includes(role));
+			assert.equal(notices.length, off.length ? 1 : 0);
+			if (off.length) {
+				assert.equal(notices[0], `This session's configuration disables ${off.map((role) => `role ${role}`).join(", ")}: ${tool.name} refuses fresh calls and continuations.`);
+				for (const text of all.filter((text) => text !== notices[0])) assert.doesNotMatch(text, /disabled|disables/, "no repeated disabled-role explanation");
+			}
+		}
+	}
+});
+
 /** Roles as the guidance lists overrides for them: `role a, role b or role c`. */
 const series = (items: readonly string[]): string => (items.length < 2 ? (items[0] ?? "") : `${items.slice(0, -1).join(", ")} or ${items.at(-1)!}`);
 
@@ -273,16 +295,16 @@ test("all roles on codex but ultracode and security, both disabled: codex is des
 	const claude = claudeGuidance(codex);
 	assert.match(claude.description, /plan is configured on codex with the host's default codex model, and claude runs it on claude with this instance's legacy Claude defaults, model fable at effort xhigh/);
 	assert.ok(claude.promptGuidelines.some((guideline) => guideline.startsWith("This session routes role plan, role implement, role ask to codex.")));
-	assert.ok(claude.promptGuidelines.some((guideline) => guideline.startsWith("This session's configuration disables role ultracode: a claude call to a disabled role is refused")));
+	assert.ok(claude.promptGuidelines.includes("This session's configuration disables role ultracode: claude refuses fresh calls and continuations."));
 	assert.ok(!claude.promptGuidelines.some((guideline) => /security/.test(guideline)));
 });
 
-test("a disabled role's notice is factual: it is refused, and enabling it is the user's choice", () => {
+test("a disabled role's notice states only the fresh-call and continuation refusal", () => {
 	const roles = input(enabling(["implement", "ask"]));
 	for (const guidance of [fusionGuidance(roles), claudeGuidance(roles)]) {
 		const notice = guidance.promptGuidelines.find((guideline) => /disables role plan, role ultracode/.test(guideline));
 		assert.ok(notice);
-		assert.match(notice, /a (fusion|claude) call to a disabled role is refused, whether it starts a run or continues one, so do not call one\. Whether to enable one is the user's choice, through \/fusion config or another profile\.$/);
+		assert.match(notice, /: (fusion|claude) refuses fresh calls and continuations\.$/);
 		assert.ok(!guidance.promptGuidelines.some((guideline) => /design question/.test(guideline)), "where a design question goes is the policy's");
 	}
 });

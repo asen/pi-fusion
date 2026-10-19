@@ -43,7 +43,7 @@ Which of these the host uses for a request, and whether it works directly instea
 
 Security is **disabled in `builtin`**. Enable it through [settings or a profile](profiles.md) and configure a Pi model. Even then, the host uses it only when you ask for a security investigation, audit, or fix, not because other work looks security-sensitive. A task without fix authorization reports findings and changes no application code; an authorized fix should be the smallest verified change that closes the finding. Findings carry severity and confirmed/inferred evidence; secrets and personal data are named by location, never reported by value. Security has coding tools and takes the single file-changing slot; its contract is not an access-control boundary.
 
-Disabled roles are not recommended and calls to them refuse; enabling one is your choice, through `/fusion config` or a profile. When no enabled role implements changes, the guidance says so as a fact and leaves what follows to the policy. Disabling `ask` leaves no independent reviewer. Your request cannot bypass a disabled setting.
+Disabled roles contribute no descriptions, guidance, snippets or task briefs. One short guideline per tool names its disabled roles and says fresh calls and continuations refuse; parameter help lists only enabled roles. The role schema keeps every supported role so its enum is never empty. Enabling one is your choice, through `/fusion config` or a profile. When no enabled role implements changes, the guidance says so as a fact and leaves what follows to the policy. Disabling `ask` leaves no independent reviewer. Your request cannot bypass a disabled setting.
 
 ## Selecting a backend and model
 
