@@ -7,7 +7,6 @@ import { fileURLToPath } from "node:url";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { CODEX_HOST_DEFAULT, codexRole } from "../extensions/backends/codex-binding.ts";
 import { createCodexBackend } from "../extensions/backends/codex.ts";
-import { CONTRACT_UNREADABLE } from "../extensions/backends/codex.ts";
 import { type PiRole, piModelVariable, piRole } from "../extensions/backends/pi-binding.ts";
 import type { Backend, BackendName, ChildControl, ChildRun, HostBackend, PiSessionRef, ResolvedSelection, SessionIntent } from "../extensions/backends/types.ts";
 import { hostBackend } from "../extensions/backends/types.ts";
@@ -15,6 +14,7 @@ import fusion, { builtinConfiguration, claudeCall, claudeRoute, type FusionParam
 import { KNOWN_ROLE_NAMES, roleSpec } from "../extensions/roles.ts";
 import { History } from "../extensions/history.ts";
 import { memoryHostPolicyLoader } from "../extensions/host-policy.ts";
+import { memoryRoleContractLoader } from "../extensions/role-contract-loader.ts";
 import { memoryProfileStore, type ProfileStore } from "../extensions/profile-store.ts";
 import { memorySettingsStore } from "../extensions/settings-store.ts";
 import { builtinSettings, captureBaseline, serializeDocument } from "../extensions/profiles.ts";
@@ -471,7 +471,7 @@ function recorder(): { ext: Extension; api: ExtensionAPI } {
  */
 const makeExtension = (backends: Partial<Record<BackendName, HostBackend>> = {}, profiles: ProfileStore = memoryProfileStore()): Extension => {
 	const { ext, api } = recorder();
-	fusion(api, { backends: { ...tripwires(), ...backends }, profiles, settings: memorySettingsStore(), hostPolicy: memoryHostPolicyLoader() });
+	fusion(api, { backends: { ...tripwires(), ...backends }, profiles, settings: memorySettingsStore(), hostPolicy: memoryHostPolicyLoader(), roleContracts: memoryRoleContractLoader() });
 	void turnOn(ext.tools.get("fusion_activate"));
 	return ext;
 };
@@ -1004,11 +1004,11 @@ test("a codex record is refused for reading before this build's codex backend ru
 	const { baseline, ...unmeasured } = CODEX_REF;
 	assert.match((await call(ext, "fusion", { continue: "run-1", task: "x" }, makeCtx([entry(codexEntry({ session: unmeasured }))]))).error ?? "", /^run-1 ran on codex and recorded its checkpoint with no usage baseline, so it is kept for reading/, "a checkpoint with no baseline is refused for reading too");
 	assert.deepEqual(codex.reached, [], "no contract was read, no binary located and nothing started for a record kept for reading");
-	// A checkpoint with its baseline is mapped to a resume, and in another host session to a fork, and the run reaches
-	// the fenced contract read first: no binary is located and nothing starts.
-	assert.equal((await call(ext, "fusion", { continue: "run-1", task: "x" }, makeCtx([entry(codexEntry())]))).error, CONTRACT_UNREADABLE);
-	assert.equal((await call(ext, "fusion", { continue: "run-1", task: "x" }, makeCtx([entry(codexEntry())], "host-2"))).error, CONTRACT_UNREADABLE, "and a fork, which another host session's continuation is");
-	assert.deepEqual(codex.reached, ["contract", "contract"], "the contract read is the first and only seam reached");
+	// The host supplies its startup body to a resume and a fork alike, so no backend contract read occurs. The fenced
+	// launch is the first seam reached: it refuses before any binary lookup or child start.
+	assert.equal((await call(ext, "fusion", { continue: "run-1", task: "x" }, makeCtx([entry(codexEntry())]))).error, "the case reached the codex launch seam");
+	assert.equal((await call(ext, "fusion", { continue: "run-1", task: "x" }, makeCtx([entry(codexEntry())], "host-2"))).error, "the case reached the codex launch seam", "and a fork, which another host session's continuation is");
+	assert.deepEqual(codex.reached, ["launch", "launch"], "the startup contract bypasses the backend reader");
 	assert.deepEqual(ext.appended, [], "a run that threw records nothing");
 });
 
@@ -1091,13 +1091,13 @@ test("a codex record routes through fusion alone, on the selection and provider 
 	assert.deepEqual(fusionCall({ continue: "run-1", task: "x" }, withEffort).bound, { ...codexAsk("review"), model: "gpt-5-codex", provider: "azure", effort: "minimal" });
 	assert.throws(() => fusionCall({ continue: "run-1", task: "x", fresh: true }, records), /^Error: fresh is not allowed with continue$/);
 	assert.throws(() => claudeRoute({ continue: "run-1", task: "x" }, records), /^Error: run-1 ran on the codex backend, which the claude tool does not run; continue it with fusion and continue run-1$/);
-	// This build's codex backend over refusing seams: the binding and the session mapping succeed, so the fenced contract
-	// read is what stops the call, before any binary lookup or start.
+	// The binding and session mapping succeed; the startup contract bypasses the backend reader, and the fenced launch
+	// stops the call before any binary lookup or start.
 	const codex = fencedCodex();
 	const ext = makeExtension({ codex: codex.backend });
 	const branch = [entry(codexEntry())];
-	assert.equal((await call(ext, "fusion", { continue: "run-1", task: "x" }, makeCtx(branch))).error, CONTRACT_UNREADABLE);
-	assert.deepEqual(codex.reached, ["contract"]);
+	assert.equal((await call(ext, "fusion", { continue: "run-1", task: "x" }, makeCtx(branch))).error, "the case reached the codex launch seam");
+	assert.deepEqual(codex.reached, ["launch"]);
 	assert.equal((await call(ext, "claude", { continue: "run-1", task: "x" }, makeCtx(branch))).error, "run-1 ran on the codex backend, which the claude tool does not run; continue it with fusion and continue run-1");
 	// Controls of either pair name fusion for a codex run, and a thread kept only for reading says how to reopen it. An
 	// extension that ran nothing knows run-1 from its record alone, as a later Pi process would.

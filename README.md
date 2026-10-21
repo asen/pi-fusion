@@ -60,7 +60,7 @@ Alternatively, configure that role through `/fusion config` or `PI_FUSION_PI_IMP
 
 Codex is opt-in: name `backend: "codex"` or configure a role there; builtin routes nothing to it. Model and effort may be omitted to use your own Codex defaults. Children inherit your Codex home, configuration, and login, and delegated connections opt into its experimental question API. Cost is unknown and excluded from the dollar estimate. See [Codex behavior and qualification limits](docs/codex-backend.md).
 
-How the host orchestrates (delegate or work directly, plan, review, report) is the editable [host policy](docs/routing.md#the-host-policy): the shipped [`contracts/host.md`](contracts/host.md), or your own `pi-fusion/host.md` replacing it whole ([how](docs/configuration.md#the-host-policy-file)). Generated guidance adds only what this session enables and fixed operating rules; `ultracode` and `security` run only when you ask. [Role settings](docs/profiles.md) can disable any role. The [contracts](contracts/) define each child's behavior; these instructions are not a sandbox or permission boundary.
+How the host orchestrates (delegate or work directly, plan, review, report) is the editable [host policy](docs/routing.md#the-host-policy): the shipped [`contracts/host.md`](contracts/host.md), or your own `pi-fusion/host.md` replacing it whole ([how](docs/configuration.md#the-host-policy-file)). Generated guidance adds only what this session enables and fixed operating rules; `ultracode` and `security` run only when you ask. [Role settings](docs/profiles.md) can disable any role. The [contracts](contracts/) define each child's behavior and host-facing role descriptions; [user-directory overrides](docs/configuration.md#role-contract-overrides) replace individual files at startup. These instructions are not a sandbox or permission boundary.
 
 ## Tools and controls
 
@@ -106,4 +106,4 @@ While on, the shipped host policy asks the host to delegate implementation and i
 - [Codex backend](docs/codex-backend.md): inherited install, lifecycle, continuation, steers, and recorded qualification limits.
 - [Development](docs/development.md): module map, deterministic tests, and manual harness commands.
 
-Change role behavior in `contracts/*.md`, and host orchestration in `contracts/host.md` or [your override](docs/configuration.md#the-host-policy-file). Children are instructed not to commit; the host commits only when you ask.
+Change role behavior in `contracts/*.md` or [your role overrides](docs/configuration.md#role-contract-overrides), and host orchestration in `contracts/host.md` or [your host policy override](docs/configuration.md#the-host-policy-file). Children are instructed not to commit; the host commits only when you ask.

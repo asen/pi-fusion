@@ -66,7 +66,7 @@ Fusion does not isolate or re-audit the inherited configuration
 
 ## One call
 
-Source: [`runCodexCall` / `drive`](../extensions/backends/codex.ts).
+Source: [`runCodexCall` / `drive`](../extensions/backends/codex.ts). The host supplies the child body from its [startup contract snapshot](configuration.md#role-contract-overrides); no backend file read occurs. Standalone callers omitting `RunRequest.contract` retain the lazy shipped-file reader or their injected `readContract` seam.
 
 ```text
 map new/resume/fork intent
@@ -74,7 +74,7 @@ map new/resume/fork intent
   | already cancelled    -> finish without starting a child
   | no callable question callback -> refuse before contract read, lookup or spawn
   v
-read shared role contract only
+take shared role body (fallback file read only for standalone callers)
   -> locate binary / compose launch / read client version
   -> spawn -> initialize -> initialized -> verify reported home
   v

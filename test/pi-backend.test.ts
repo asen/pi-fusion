@@ -392,6 +392,14 @@ const outcomeOf = (run: PiRun) => ({
 	...(run.contextWindow === undefined ? {} : { contextWindow: run.contextWindow }),
 });
 
+test("a startup-resolved body reaches the Pi bootstrap without rereading a file or reparsing frontmatter", async (t) => {
+	const harness = harnessOf(t, { script: happyScript(), deps: { readContract: () => { throw new Error("must not reread a startup contract"); } } });
+	const body = "---\nAlready parsed child instructions.\n";
+	const run = await harness.call({ contract: body });
+	assert.equal(failed(run), false);
+	assert.equal(harness.inputs[0]?.contract, body.trim(), "the existing bootstrap-input whitespace normalization is unchanged");
+});
+
 test("one new-session call runs the whole composition, stops its child once, and removes the storage it ran on", async (t) => {
 	const harness = harnessOf(t, { script: happyScript(), deps: { readContract: () => "---\nhost:\n  description: Host only.\n  guidance: []\n  task_brief: Task.\n  snippet: Role.\n---\n\nChild instructions.\n" } });
 	const run = await harness.call();

@@ -156,6 +156,7 @@ interface CaseOptions {
 	onRead?: (when: "sent" | "answered") => void;
 	onEvent?: (event: ChildEvent) => void;
 	prompt?: string;
+	contract?: string;
 	/** What the host asks of the session, mapped by the backend's own `session`. A new thread when unset. */
 	intent?: SessionIntent;
 	/** The selection the run it continues recorded, which the binding repeats. */
@@ -245,6 +246,7 @@ async function withBackend(scenario: string, body: (fixture: Fixture) => Promise
 				backend.run({
 					role: codexRole(call, options.recorded, {}),
 					prompt: options.prompt ?? "do the task",
+					contract: options.contract,
 					cwd: work,
 					session: backend.session(options.intent ?? { kind: "new" }),
 					signal: options.signal,
@@ -301,6 +303,15 @@ function ended(outcome: Outcome, stopReason: string): void {
 /* ------------------------------------------------------------------------------------------------------------------
  * Success
  * ---------------------------------------------------------------------------------------------------------------- */
+
+test("a startup-resolved body reaches Codex developer instructions without a file read or another frontmatter parse", async () => {
+	await withBackend("ok", async (fixture) => {
+		const body = "---\nAlready parsed child instructions.\n";
+		const outcome = await fixture.call({ role: "implement" }, { contract: body, deps: { readContract: () => { throw new Error("must not reread a startup contract"); } } });
+		ended(outcome, "stop");
+		assert.equal(sent(fixture, "thread/start")[0].params?.developerInstructions, body);
+	});
+});
 
 test("a host-default implement run: one thread, one turn, the readback barrier, the parent thread's usage and one clean stop", async () => {
 	await withBackend("ok", async (fixture) => {

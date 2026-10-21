@@ -100,7 +100,7 @@ function effortOptions(effort: string): Pick<Options, "effort" | "extraArgs"> {
 	return effort === "ultracode" ? { extraArgs: { effort } } : { effort: effort as EffortLevel };
 }
 
-export function childOptions(role: Role, session: ChildSession | undefined, title: string): Options {
+export function childOptions(role: Role, session: ChildSession | undefined, title: string, contract?: string): Options {
 	const options: Options = {
 		model: role.model,
 		...effortOptions(role.effort),
@@ -110,7 +110,7 @@ export function childOptions(role: Role, session: ChildSession | undefined, titl
 		systemPrompt: {
 			type: "preset",
 			preset: "claude_code",
-			append: parseRoleContract(fs.readFileSync(path.join(CONTRACTS_DIR, role.contract), "utf8"), role.contract).body,
+			append: contract ?? parseRoleContract(fs.readFileSync(path.join(CONTRACTS_DIR, role.contract), "utf8"), role.contract).body,
 		},
 		includePartialMessages: true,
 		title,
@@ -615,7 +615,7 @@ export async function runChild(opts: RunRequest<Role, ChildSession, ChildInput>)
 		const messages = query({
 			prompt: input,
 			options: {
-				...childOptions(role, opts.session, opts.title ?? `pi-fusion ${role.name}`),
+				...childOptions(role, opts.session, opts.title ?? `pi-fusion ${role.name}`, opts.contract),
 				...(opts.onQuestion ? questionOptions(opts.onQuestion, controller.signal) : {}),
 				...claudeExecutable(),
 				cwd: opts.cwd,

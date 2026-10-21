@@ -1,5 +1,3 @@
-import { readFileSync } from "node:fs";
-import * as path from "node:path";
 import { parse } from "yaml";
 import type { KnownRoleName } from "./roles.ts";
 
@@ -21,9 +19,10 @@ export function parseRoleContract(text: string, source: string): { body: string;
 	if (!header) return fail("unterminated frontmatter");
 	let metadata: unknown;
 	try {
-		metadata = parse(header[1]!);
-	} catch (error) {
-		return fail(`invalid YAML (${error instanceof Error ? error.message : String(error)})`);
+		metadata = parse(header[1]!, { logLevel: "error" });
+	} catch {
+		// YAML diagnostics quote source lines; config and startup warnings must not print contract contents.
+		return fail("invalid YAML");
 	}
 	const host = metadata && typeof metadata === "object" && "host" in metadata ? metadata.host : undefined;
 	if (!host || typeof host !== "object" || Array.isArray(host)) return fail("host must be an object");
@@ -35,16 +34,4 @@ export function parseRoleContract(text: string, source: string): { body: string;
 	const body = text.slice(header[0].length).replace(/^\r?\n/, "");
 	if (!body.trim()) return fail("child instructions are blank");
 	return { body, host: fields as unknown as RoleGuidance };
-}
-
-/** Read the shipped host metadata once per instance, before tools are registered; no user paths or cache. */
-export function loadRoleGuidance(directory: string, contracts: Record<KnownRoleName, string>): RoleGuidanceMap {
-	const result = {} as RoleGuidanceMap;
-	for (const role of Object.keys(contracts) as KnownRoleName[]) {
-		const file = path.join(directory, contracts[role]);
-		const { host } = parseRoleContract(readFileSync(file, "utf8"), file);
-		if (!host) throw new Error(`pi-fusion: role contract ${file} has no host frontmatter`);
-		result[role] = host;
-	}
-	return result;
 }

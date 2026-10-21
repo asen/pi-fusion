@@ -51,7 +51,7 @@ host:
 ---
 ```
 
-Fusion reads and validates this metadata when the extension loads, and uses it for both delegation tools. Only enabled roles are advertised. Each backend strips the header before sending the Markdown body to a child; contracts without a header, including `ask-review.md`, pass through unchanged. Ask's host metadata describes both answer and review modes. Restart or `/reload` after editing the metadata. Runtime capabilities, parameters and settings remain generated from code; cross-role orchestration remains the host policy's. This parsing applies to role contracts only: `host.md` is still carried as written.
+At startup, Fusion resolves and validates [role contracts](#role-contract-overrides) once, using the same selection for both delegation tools' host metadata and every backend's child instructions. Only enabled roles are advertised. The host strips frontmatter before passing the Markdown body to a child; `ask-review.md` may remain headerless. Ask's host metadata describes both answer and review modes. Runtime capabilities, parameters and settings remain generated from code; cross-role orchestration remains the host policy's. This parsing applies to role contracts only: `host.md` is still carried as written.
 
 ## The Fusion settings file
 
@@ -82,8 +82,8 @@ startup (session_start, or the first call/command needing configuration)
   read override --missing--> shipped, no notice
                --unusable--> shipped, one warning naming the file and why
                --valid-----> override
-  read default profile
-  -> policy + profile applied to guidance in one step (also with no saved profile)
+  resolve role contracts (see below) and read default profile
+  -> policy + contract metadata + profile applied to guidance in one step (also with no saved profile)
 ```
 
 - Told to the host only, and only while Fusion is on. It is instruction, not an OS permission or concurrency control: disabled-role refusals and one-file-changing-run admission are code and hold whatever it says.
@@ -111,6 +111,35 @@ $EDITOR ~/.pi/agent/pi-fusion/host.md
 ```
 
 Then `/reload`, restart Pi, or start a new session, and check `/fusion config`. Delete the copy to return to the shipped policy. Fusion never creates or copies this file itself.
+
+## Role-contract overrides
+
+`<agent dir>/pi-fusion/contracts/`, normally `~/.pi/agent/pi-fusion/contracts/`, holds optional user-global replacements outside the installation. Pi resolves agent dir (`PI_CODING_AGENT_DIR` relocates it), as for `host.md`.
+
+| File | Host metadata | Child instructions |
+| --- | --- | --- |
+| `plan.md` | Plan | Plan |
+| `implement.md` | Implement | Implement |
+| `ultracode.md` | Ultracode | Ultracode (Claude only) |
+| `ask-answer.md` | Ask, including review mode | Ask answer mode |
+| `ask-review.md` | Not used; frontmatter is optional | Ask review mode |
+| `security.md` | Security | Security (Pi only) |
+
+Each named file replaces its shipped counterpart **whole**, not just its body or frontmatter. The five files supplying host metadata must retain the complete `host` header shown above and a nonblank child body. `ask-review.md` needs only nonblank child instructions; if it has frontmatter, that header must also be valid. Unknown filenames are ignored. The host policy override remains `pi-fusion/host.md`, not `pi-fusion/contracts/host.md`.
+
+Loading uses the same file machinery as the host policy: regular files, strict UTF-8, nonblank, at most **64 KiB per file**, no templates or includes. Every shipped contract is validated before any role override is consulted, including disabled roles. A broken shipped contract fails startup; an override never hides a broken install. A missing override quietly selects that shipped file. An unreadable or invalid override selects that shipped file with one startup warning naming the file and reason; other valid overrides still apply. Loading creates and writes nothing.
+
+The host loads one snapshot at `session_start`, or the first call/command needing configuration. Delegation and configuration wait for it. Both host metadata and child bodies come from that snapshot, including continuations, plan handoffs and reviews, on Claude, Pi and Codex. No run rereads contract files, and profile/settings changes do not reload them. Before startup finishes, role descriptions say their contracts are not loaded yet. A failed load is not retried in that instance and refuses the same gated operations as a failed host-policy load; mode and control tools remain usable.
+
+`/fusion config` and its editor list each selected source and path, plus diagnostics for overrides set aside, never contract contents. These are startup observations, not new reads. To customize one file, copy the shipped path shown there:
+
+```bash
+mkdir -p ~/.pi/agent/pi-fusion/contracts
+cp <shipped implement.md path from /fusion config> ~/.pi/agent/pi-fusion/contracts/implement.md
+$EDITOR ~/.pi/agent/pi-fusion/contracts/implement.md
+```
+
+Then `/reload`, restart Pi, or start a new session. Remove the override and reload to return to the shipped version. An existing instance keeps its snapshot even if a file is edited or deleted. Contract text is guidance, not a way to alter runtime tool lists, enabled roles, backend support or admission restrictions.
 
 ## The pi backend's variables
 

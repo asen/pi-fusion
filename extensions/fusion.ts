@@ -83,7 +83,8 @@ import {
 	ULTRACODE_EFFORT,
 } from "./profiles.ts";
 import { reviewable, reviewPrompt } from "./review.ts";
-import { loadRoleGuidance } from "./role-contracts.ts";
+import type { RoleGuidanceMap } from "./role-contracts.ts";
+import { ROLE_CONTRACT_FILES, roleContractBody, type RoleContractLoader, roleContractLoader, type RoleContractSnapshot } from "./role-contract-loader.ts";
 import { canChangeFiles, isKnownRole, KNOWN_ROLE_NAMES, type KnownRoleName, ROLE_SPECS, type RoleSpec, roleSpec } from "./roles.ts";
 
 /** A run as the shared lifecycle reads it, whichever backend produced it: the record over the part of a role the host uses. */
@@ -1549,6 +1550,8 @@ export interface FusionOptions {
 	 * ever reads the user's override.
 	 */
 	hostPolicy?: HostPolicyLoader;
+	/** Startup contract selection; tests inject a memory or temporary-directory loader, never user overrides. */
+	roleContracts?: RoleContractLoader;
 	/** How the dashboard server starts. Left out, it is this build's own; a test host passes one that sees what it is given. */
 	dashboard?: typeof startDashboard;
 }
@@ -1581,7 +1584,10 @@ export default function fusion(pi: ExtensionAPI, options: FusionOptions = {}) {
 	// missing either fails as a module error of this host's own before `fusion()` runs at all. `pi-helper-retry.mjs`
 	// is the one that is the child's alone: an install missing it passes this check and fails when the child starts.
 	if (!fs.existsSync(PI_BOOTSTRAP_PATH)) throw new Error(`pi-fusion: missing pi bootstrap ${PI_BOOTSTRAP_PATH}`);
-	const roleGuidance = loadRoleGuidance(CONTRACTS_DIR, { plan: ROLES.plan.contract, implement: ROLES.implement.contract, ultracode: ROLES.ultracode.contract, ask: ROLES.ask.contract, security: "security.md" });
+	let contracts: RoleContractSnapshot | undefined;
+	// No role prose is advertised before startup selects its source. Admission waits for that same selection.
+	const unloadedRoleGuidance = {} as RoleGuidanceMap;
+	for (const role of KNOWN_ROLE_NAMES) unloadedRoleGuidance[role] = { description: `${role} (contract not loaded yet)`, guidance: [], task_brief: "The task; role contracts load before any run starts.", snippet: role };
 
 	/**
 	 * The harnesses this runtime can run a child in: the Claude, Pi and Codex backends, all this build's own, with a
@@ -1637,6 +1643,8 @@ export default function fusion(pi: ExtensionAPI, options: FusionOptions = {}) {
 	/** Why the default profile was not loaded at startup, said once where a notice can be shown. */
 	let profileWarning: string | undefined;
 	const policyLoader = options.hostPolicy ?? hostPolicyLoader(hostAgentDir);
+	const contractLoader = options.roleContracts ?? roleContractLoader(hostAgentDir);
+	let contractWarnings: string[] = [];
 	/**
 	 * The host policy this instance selected at startup, with its source, path and any diagnostic, kept for as long as
 	 * the instance lives: no profile switch or settings change reads it again. Undefined until the startup load settles.
@@ -1663,10 +1671,10 @@ export default function fusion(pi: ExtensionAPI, options: FusionOptions = {}) {
 	};
 
 	/**
-	 * Loads the host policy and the default profile once per instance, before any run starts or any setting is applied: a
-	 * call or a command that arrives first waits for it. Both are read before either is applied, and both reach the
-	 * guidance in one synchronous step after the last read, whether or not a profile is applied, so no call is admitted
-	 * on one while the host is told the other. A policy that cannot be loaded, or a guidance that cannot take it, fails
+	 * Loads the host policy, role contracts and default profile once per instance, before any run or settings change: a
+	 * call or command arriving first waits. All instruction sources reach guidance in one synchronous step after the
+	 * last read, whether or not a profile is applied, so no call runs on instructions different from the host's guidance.
+	 * An instruction load failure, or guidance that cannot take the selection, fails
 	 * the startup and refuses every delegation call and gated command; a profile file that cannot be read, or a default it does not hold, leaves the
 	 * built-in configuration and a warning, and nothing is rewritten.
 	 */
@@ -1674,7 +1682,9 @@ export default function fusion(pi: ExtensionAPI, options: FusionOptions = {}) {
 		(initializing ??= (async () => {
 			const choosing = chooseSettings();
 			try {
-				const [selected, profile] = await Promise.all([(async () => policyLoader.load())(), defaultProfile()]);
+				const [selected, profile, loaded] = await Promise.all([(async () => policyLoader.load())(), defaultProfile(), (async () => contractLoader.load())()]);
+				contracts = loaded;
+				contractWarnings = Object.values(loaded.files).flatMap((file) => file.diagnostic === undefined ? [] : [file.diagnostic]);
 				startWith(selected, profile);
 			} finally {
 				await choosing;
@@ -1758,12 +1768,13 @@ export default function fusion(pi: ExtensionAPI, options: FusionOptions = {}) {
 
 	/**
 	 * Says once, where a notice can be shown, that the default profile was not what this session started with, and that
-	 * the host policy override was set aside for the shipped one.
+	 * instruction overrides were set aside for shipped files.
 	 */
 	const noteProfiles = (ctx: any): void => {
-		for (const warning of [profileWarning, policyWarning]) if (warning !== undefined) record(() => ctx.ui.notify(`fusion: ${warning}`, "warning"));
+		for (const warning of [profileWarning, policyWarning, ...contractWarnings]) if (warning !== undefined) record(() => ctx.ui.notify(`fusion: ${warning}`, "warning"));
 		profileWarning = undefined;
 		policyWarning = undefined;
+		contractWarnings = [];
 	};
 
 	/**
@@ -2545,6 +2556,7 @@ export default function fusion(pi: ExtensionAPI, options: FusionOptions = {}) {
 					child = await call.backend.run({
 						role,
 						prompt,
+						contract: roleContractBody(contracts!, role.contract),
 						cwd: ctx.cwd,
 						session,
 						title,
@@ -2927,7 +2939,20 @@ export default function fusion(pi: ExtensionAPI, options: FusionOptions = {}) {
 		];
 	};
 
-	/** The configuration as /fusion config shows it: where it came from, what future sessions start with, every role, and the host policy in use. */
+	/** Report selected sources, never contract contents or fresh reads. */
+	const contractLines = (): string[] => {
+		if (!contracts) return ["role contracts: not loaded in this instance"];
+		return [
+			"role contracts: selected when this instance started; edits apply after restarting Pi, /reload or a new session",
+			...ROLE_CONTRACT_FILES.flatMap((name) => {
+				const file = contracts!.files[name];
+				const source = file.source === "override" ? "user override" : file.diagnostic === undefined ? "shipped" : "shipped (override set aside)";
+				return [`role contract ${name}: ${source} · ${file.path}`, ...(file.diagnostic === undefined ? [] : [`role contract diagnostic: ${file.diagnostic}`])];
+			}),
+		];
+	};
+
+	/** The configuration's settings and the startup instruction sources in use. */
 	const configurationLines = async (): Promise<string[]> => {
 		let startup: string;
 		try {
@@ -2936,7 +2961,7 @@ export default function fusion(pi: ExtensionAPI, options: FusionOptions = {}) {
 			startup = `unknown (${error instanceof Error ? error.message : String(error)})`;
 		}
 		const where = await profileStore.where().catch(() => "unknown");
-		return [`fusion configuration: ${configurationLabel(configuration)} · new sessions start with ${startup}`, ...settingsTable(configuration.roles), `profiles file: ${where}`, ...policyLines(), ...(await historyLines())];
+		return [`fusion configuration: ${configurationLabel(configuration)} · new sessions start with ${startup}`, ...settingsTable(configuration.roles), `profiles file: ${where}`, ...policyLines(), ...contractLines(), ...(await historyLines())];
 	};
 
 	/** The saved history preference as a line says it, read again now, or why it could not be read. */
@@ -3133,7 +3158,7 @@ export default function fusion(pi: ExtensionAPI, options: FusionOptions = {}) {
 			const rows = settingsTable(draft);
 			const APPLY = "Apply";
 			const CANCEL = "Cancel";
-			const choice = await ctx.ui.select(`fusion config · ${configurationLabel(configuration)}\n${[...policyLines(), rows[0]].join("\n")}`, [...rows.slice(1), APPLY, CANCEL]);
+			const choice = await ctx.ui.select(`fusion config · ${configurationLabel(configuration)}\n${[...policyLines(), ...contractLines(), rows[0]].join("\n")}`, [...rows.slice(1), APPLY, CANCEL]);
 			if (choice === undefined || choice === CANCEL) {
 				notice("fusion config cancelled; nothing changed", "info");
 				return;
@@ -3712,7 +3737,7 @@ export default function fusion(pi: ExtensionAPI, options: FusionOptions = {}) {
 	const guidanceInput = (): GuidanceInput => ({
 		names: { fusion: TOOL_NAME, fusionControl: CONTROL_TOOL_NAME, claude: CLAUDE_TOOL_NAME, claudeControl: CLAUDE_CONTROL_NAME },
 		roles: configuration.roles,
-		roleGuidance,
+		roleGuidance: contracts?.guidance ?? unloadedRoleGuidance,
 		baseline: configuration.baseline,
 		claudeRoles: ROLE_NAMES,
 		quote: { open: CHILD_QUOTE_OPEN, close: CHILD_QUOTE_CLOSE },

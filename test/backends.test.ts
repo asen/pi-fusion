@@ -379,6 +379,7 @@ test("every Fusion registration in the suite names the backends it takes, and th
 			assert.ok(production || /\bsettings:/.test(call), `${where} registers the extension without a settings store of its own, so it would read the user's settings file: ${call}`);
 			// The same for the host policy: left out, it is the shipped policy replaced by the user's own pi-fusion/host.md.
 			assert.ok(production || /\bhostPolicy:/.test(call), `${where} registers the extension without a host policy loader of its own, so it would read the user's host policy: ${call}`);
+			assert.ok(production || /\broleContracts:/.test(call), `${where} registers the extension without a role contract loader of its own, so it would read the user's contracts: ${call}`);
 			if (production) defaults.push(where);
 		}
 	}
@@ -432,6 +433,9 @@ test("the production-default registration keeps the codex tripwire, because no m
 		hostPolicy && ts.isPropertyAssignment(hostPolicy) && hostPolicy.initializer.getText() === "memoryHostPolicyLoader()",
 		"productionDefaults loads the host policy in memory with no override, never the user's own host policy file",
 	);
+
+	const contracts = returned.properties.find((property) => ts.isPropertyAssignment(property) && property.name.getText() === "roleContracts");
+	assert.ok(contracts && ts.isPropertyAssignment(contracts) && contracts.initializer.getText() === "memoryRoleContractLoader()", "productionDefaults never reads the user's role contracts");
 
 	// And what it returns, with every variable it refuses cleared for the call: this build's own claude and pi, which
 	// it leaves alone, and the codex tripwire. No entry point of it is called, so nothing here is a reach.

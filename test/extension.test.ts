@@ -13,6 +13,7 @@ import { PI_CONTRACT_FILES, PI_ROLE_NAMES, piRole } from "../extensions/backends
 import { PI_CHILD_MARKER, PI_CHILD_VARIABLE } from "../extensions/backends/pi-launch.ts";
 import fusion from "../extensions/fusion.ts";
 import { HOST_POLICY_FILE, memoryHostPolicyLoader, SHIPPED_HOST_POLICY_PATH } from "../extensions/host-policy.ts";
+import { memoryRoleContractLoader } from "../extensions/role-contract-loader.ts";
 import { memoryProfileStore } from "../extensions/profile-store.ts";
 import { memorySettingsStore } from "../extensions/settings-store.ts";
 import { parseRoleContract } from "../extensions/role-contracts.ts";
@@ -92,7 +93,7 @@ const api = {
 
 // The tripwires in place of the pi and codex backends: nothing in this file runs a pi or codex child, and the one case
 // that reads the production registration makes its own below.
-fusion(api, { backends: { ...tripwires() }, profiles: memoryProfileStore(), settings: memorySettingsStore(), hostPolicy: memoryHostPolicyLoader() });
+fusion(api, { backends: { ...tripwires() }, profiles: memoryProfileStore(), settings: memorySettingsStore(), hostPolicy: memoryHostPolicyLoader(), roleContracts: memoryRoleContractLoader() });
 // Fusion starts off; the cases here delegate, so the host turns it on as a user's request for Fusion does.
 void turnOn(tools.find((tool) => tool.name === "fusion_activate"));
 
@@ -486,7 +487,7 @@ test("the fusion tool says which harness runs what, and the pi backend it regist
 	// lifecycle. The fake is in-memory and starts nothing: no pi child, process, protocol or provider is behind it.
 	const fake = fakeBackend();
 	const injected = recordedHost();
-	fusion(injected.api, { backends: { ...tripwires(), pi: fake.backend }, profiles: memoryProfileStore(), settings: memorySettingsStore(), hostPolicy: memoryHostPolicyLoader() });
+	fusion(injected.api, { backends: { ...tripwires(), pi: fake.backend }, profiles: memoryProfileStore(), settings: memorySettingsStore(), hostPolicy: memoryHostPolicyLoader(), roleContracts: memoryRoleContractLoader() });
 	void turnOn(injected.into.tools.get("fusion_activate"));
 	const injectedFusion = injected.into.tools.get("fusion");
 	assert.ok(injectedFusion, "the registration that injected a pi backend advertises no fusion tool");
@@ -587,7 +588,7 @@ test("a marked pi child registers nothing at all, and any other value registers 
 		try {
 			// What is registered is what this case reads, so the tripwires stand in for pi and codex here too: nothing
 			// below runs a call, and a registration that took the production one would still be one more of them.
-			fusion(recorder, { backends: { ...tripwires() }, profiles: memoryProfileStore(), settings: memorySettingsStore(), hostPolicy: memoryHostPolicyLoader() });
+			fusion(recorder, { backends: { ...tripwires() }, profiles: memoryProfileStore(), settings: memorySettingsStore(), hostPolicy: memoryHostPolicyLoader(), roleContracts: memoryRoleContractLoader() });
 		} finally {
 			if (before === undefined) delete process.env[PI_CHILD_VARIABLE];
 			else process.env[PI_CHILD_VARIABLE] = before;

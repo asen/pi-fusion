@@ -1,7 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { fileURLToPath } from "node:url";
-import { loadRoleGuidance } from "../extensions/role-contracts.ts";
+import { memoryRoleContractLoader } from "../extensions/role-contract-loader.ts";
 import { claudeGuidance, claudeParameterHelp, fusionGuidance, fusionParameterHelp, type GuidanceInput, type ParameterHelp, policyGuideline, type ToolGuidance } from "../extensions/host-guidance.ts";
 import { builtinSettings, captureBaseline, copySettings, type RoleSettings } from "../extensions/profiles.ts";
 import { KNOWN_ROLE_NAMES, type KnownRoleName } from "../extensions/roles.ts";
@@ -17,7 +16,7 @@ const baseline = captureBaseline({} as NodeJS.ProcessEnv);
 const CLAUDE_ROLES = ["plan", "implement", "ultracode", "ask"] as const;
 /** A policy that names no role and no tool, so whatever these cases read of roles and tools is the generated text's. */
 const POLICY = "# Test policy\n\nOrchestrate as this test says.\n";
-const roleGuidance = loadRoleGuidance(fileURLToPath(new URL("../contracts/", import.meta.url)), { plan: "plan.md", implement: "implement.md", ultracode: "ultracode.md", ask: "ask-answer.md", security: "security.md" });
+const roleGuidance = (await memoryRoleContractLoader().load()).guidance;
 
 const input = (roles: RoleSettings): GuidanceInput => ({
 	names: { fusion: "fusion", fusionControl: "fusion_control", claude: "claude", claudeControl: "claude_control" },

@@ -78,6 +78,7 @@ export interface FakeScript {
 export interface FakeStart {
 	role: HostRole;
 	prompt: string;
+	contract?: string;
 	title?: string;
 	session?: FakeSession;
 	/** The intent the host mapped into that session, which is what a continuation test reads. */
@@ -238,6 +239,7 @@ export function fakeBackend(options: FakeBackendOptions = {}): FakeBackend {
 			const start: FakeStart = {
 				role: request.role,
 				prompt: request.prompt,
+				contract: request.contract,
 				...(request.title === undefined ? {} : { title: request.title }),
 				...(request.session === undefined ? {} : { session: request.session, intent: request.session.intent }),
 				steers: input.pushed,

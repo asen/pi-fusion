@@ -11,6 +11,7 @@ import type { BackendName, HostBackend } from "../extensions/backends/types.ts";
 import fusion, { builtinConfiguration, type Configuration, claudeRoute, fusionCall, fusionRoute, roleFor, type RunRecords, runRecords } from "../extensions/fusion.ts";
 import { policyGuideline } from "../extensions/host-guidance.ts";
 import { fileHostPolicyLoader, HOST_POLICY_FILE, type HostPolicyLoader, memoryHostPolicyLoader, SHIPPED_HOST_POLICY_PATH } from "../extensions/host-policy.ts";
+import { fileRoleContractLoader, type RoleContractLoader, memoryRoleContractLoader, ROLE_CONTRACT_FILES, SHIPPED_ROLE_CONTRACTS_DIR } from "../extensions/role-contract-loader.ts";
 import { fileProfileStore, memoryProfileStore, PROFILES_FILE, type ProfileStore } from "../extensions/profile-store.ts";
 import { memorySettingsStore, type SettingsStore } from "../extensions/settings-store.ts";
 import {
@@ -461,6 +462,7 @@ interface SdkHostOptions {
 	initial?: string[];
 	/** The host policy this instance loads; the shipped one with no override by default. */
 	hostPolicy?: HostPolicyLoader;
+	roleContracts?: RoleContractLoader;
 	/** Fusion's own settings; an empty memory store by default. */
 	settings?: SettingsStore;
 }
@@ -514,7 +516,7 @@ function sdkHost(options: SdkHostOptions = {}) {
 		registerMessageRenderer: () => {},
 	} as unknown as ExtensionAPI;
 	// Nothing in this file means to run this build's claude backend, so it is fenced too; a case's own double goes over it.
-	fusion(api, { backends: { ...tripwires(), ...claudeTripwire(), ...options.backends }, profiles: options.profiles ?? memoryProfileStore(), settings: options.settings ?? memorySettingsStore(), hostPolicy: options.hostPolicy ?? memoryHostPolicyLoader() });
+	fusion(api, { backends: { ...tripwires(), ...claudeTripwire(), ...options.backends }, profiles: options.profiles ?? memoryProfileStore(), settings: options.settings ?? memorySettingsStore(), hostPolicy: options.hostPolicy ?? memoryHostPolicyLoader(), roleContracts: options.roleContracts ?? memoryRoleContractLoader() });
 	const answer = (options: string[]) => {
 		const next = dialogs.shift();
 		return typeof next === "function" ? next(options) : next;
@@ -777,8 +779,9 @@ test("profile save, list, use and default each do one thing, and only use change
 	assert.match(host.last() ?? "", /^builtin \(current; default for new sessions\)\nwork\nUsage: \/fusion profile/);
 	await host.command("config");
 	const shown = host.last()?.split("\n") ?? [];
-	assert.deepEqual(shown.slice(0, -4), ["fusion configuration: builtin · new sessions start with builtin", ...settingsTable(LEGACY), "profiles file: (in memory)"]);
-	assert.equal(shown.at(-4), policyLine("shipped", SHIPPED_HOST_POLICY_PATH));
+	assert.deepEqual(shown.slice(0, 8), ["fusion configuration: builtin · new sessions start with builtin", ...settingsTable(LEGACY), "profiles file: (in memory)"]);
+	assert.equal(shown[8], policyLine("shipped", SHIPPED_HOST_POLICY_PATH));
+	assert.equal(shown.filter((line) => /^role contract [\w-]+\.md: shipped · /.test(line)).length, ROLE_CONTRACT_FILES.length);
 	// The run history is this instance's own and says where the saved preference lives, apart from the profiles.
 	assert.match(shown.slice(-3).join("\n"), /^run history: (on|off) in this instance \([^)]*\)\nsaved history preference for new instances: unset \([^)]*\)\nsettings file: \(in memory\)$/);
 	// Completion offers what the last read found.
@@ -1996,7 +1999,8 @@ test("/fusion config shows the policy from temporary files as startup selected i
 	fs.writeFileSync(override, "\n");
 	await host.command("config");
 	const expected = [policyLine("user override", override)];
-	assert.equal(host.titles[0], `fusion config · builtin\n${expected.join("\n")}\n${settingsTable(LEGACY)[0]}`, "the editor shows it above the table");
+	assert.ok(host.titles[0]!.startsWith(`fusion config · builtin\n${expected.join("\n")}\nrole contracts:`), "the editor shows instruction sources above the table");
+	assert.ok(host.titles[0]!.endsWith(`\n${settingsTable(LEGACY)[0]}`));
 	assert.match(host.last() ?? "", /^fusion settings applied to this session/);
 	await host.command("config");
 	assert.ok(host.titles.at(-4)!.includes(`\n${expected[0]}\n`), "and again after a role change");
@@ -2017,4 +2021,138 @@ test("/fusion config shows the policy from temporary files as startup selected i
 	assert.equal(loads, 1);
 	assert.equal(fs.readFileSync(override, "utf8"), "\n", "nothing rewrote the override");
 	await reloaded.shutdown();
+});
+
+const roleOverride = (label: string, body: string): string => `---\nhost:\n  description: Host ${label}.\n  guidance:\n    - Guidance ${label}.\n  task_brief: Brief ${label}.\n  snippet: Snippet ${label}.\n---\n\n${body}`;
+
+test("startup contract overrides reach both tools and every backend, fresh calls and continuations, without rereading after edits", async () => {
+	const dir = tempDir("role-contracts");
+	const override = path.join(dir, "agent", "pi-fusion", "contracts");
+	fs.mkdirSync(override, { recursive: true });
+	const body = "---\nBODY_SNAPSHOT: already parsed child instructions.\n";
+	fs.writeFileSync(path.join(override, "implement.md"), roleOverride("IMPLEMENT_SNAPSHOT", body));
+	fs.writeFileSync(path.join(override, "plan.md"), roleOverride("PLAN_SNAPSHOT", "PLAN_BODY\n"));
+	fs.writeFileSync(path.join(override, "ask-answer.md"), roleOverride("ASK_SNAPSHOT", "ANSWER_SNAPSHOT\n"));
+	fs.writeFileSync(path.join(override, "ask-review.md"), "REVIEW_SNAPSHOT\n");
+	let loads = 0;
+	const files = fileRoleContractLoader({ shipped: SHIPPED_ROLE_CONTRACTS_DIR, override: () => override });
+	const loader = { load: () => (++loads, files.load()) };
+	const claude = fakeBackend({ name: "claude", scripts: [{ sessionId: "contract-claude" }] });
+	const pi = fakeBackend({ name: "pi" });
+	const codex = fakeBackend({ name: "codex", scripts: [{ session: { backend: "codex", sessionId: "contract-thread", checkpoint: "turn-1", baseline: { inputTokens: 10, cachedInputTokens: 0, outputTokens: 5, reasoningOutputTokens: 0, totalTokens: 15 } }, selection: { model: "codex-model", provider: "openai" } }] });
+	const host = sdkHost({ roleContracts: loader, backends: { claude: claude.backend, pi: pi.backend, codex: codex.backend }, profiles: memoryProfileStore(document({ work: WORK })), ui: false });
+	await host.start();
+	await host.on();
+	for (const name of ["fusion", "claude"]) {
+		const text = toolText(host.tools.get(name)!).join("\n");
+		assert.match(text, /Host IMPLEMENT_SNAPSHOT\./);
+		assert.match(text, /Guidance IMPLEMENT_SNAPSHOT\./);
+		assert.match(text, /Brief IMPLEMENT_SNAPSHOT\./);
+		assert.match(text, /Host ASK_SNAPSHOT\./);
+		assert.doesNotMatch(text, /BODY_SNAPSHOT|REVIEW_SNAPSHOT|ANSWER_SNAPSHOT/);
+	}
+	fs.writeFileSync(path.join(override, "implement.md"), roleOverride("EDITED", "EDITED_BODY\n"));
+	fs.rmSync(override, { recursive: true });
+	for (const backend of [claude, pi, codex]) {
+		const first = await host.fusion({ role: "implement", backend: backend.name, task: "first", ...(backend.name === "pi" ? { model: "openai/gpt-5" } : {}) });
+		assert.equal(first.error, undefined);
+		assert.equal(backend.starts[0]?.contract, body);
+		const continued = await host.fusion({ continue: first.details!.handle, task: "continue" });
+		assert.equal(continued.error, undefined);
+		assert.equal(backend.starts[1]?.contract, body);
+		assert.equal(backend.starts[1]?.intent?.kind, "resume");
+	}
+	await host.claude({ role: "ask", task: "answer" });
+	assert.equal(claude.starts.at(-1)?.contract, "ANSWER_SNAPSHOT\n");
+	await host.fusion({ role: "ask", mode: "review", task: "review" });
+	assert.equal(claude.starts.at(-1)?.contract, "REVIEW_SNAPSHOT\n");
+	claude.script({ sessionId: "plan-contract", contextTokens: 40, contextWindow: 100 });
+	const plan = await host.fusion({ role: "plan", fresh: true, task: "plan" });
+	const handoff = await host.fusion({ role: "plan", task: "continue past the cap" });
+	assert.equal(plan.error, undefined);
+	assert.equal(handoff.error, undefined);
+	assert.notEqual(plan.details!.handle, handoff.details!.handle);
+	assert.deepEqual(claude.starts.slice(-2).map((start) => [start.intent?.kind, start.contract]), [["new", "PLAN_BODY\n"], ["new", "PLAN_BODY\n"]]);
+	await host.command("profile use work");
+	await host.command("config");
+	assert.ok(host.last()!.includes(`role contract implement.md: user override · ${path.join(override, "implement.md")}`));
+	assert.ok(host.last()!.includes(`role contract ask-review.md: user override · ${path.join(override, "ask-review.md")}`));
+	assert.doesNotMatch(host.last()!, /BODY_SNAPSHOT|IMPLEMENT_SNAPSHOT|REVIEW_SNAPSHOT/);
+	await host.start();
+	assert.equal(loads, 1, "configuration, profiles and repeated session_start all use the startup snapshot");
+	assert.match(host.tools.get("fusion")!.description, /IMPLEMENT_SNAPSHOT/);
+	await host.shutdown();
+	const reloaded = sdkHost({ roleContracts: loader, ui: false });
+	await reloaded.start();
+	assert.equal(loads, 2);
+	assert.doesNotMatch(reloaded.tools.get("fusion")!.description, /IMPLEMENT_SNAPSHOT/);
+	await reloaded.command("config");
+	assert.match(reloaded.last()!, /role contract implement\.md: shipped · /);
+	await reloaded.shutdown();
+});
+
+test("a pending startup contract selection gates calls and configuration and is loaded only once", async () => {
+	let release!: () => void;
+	let loads = 0;
+	const gate = new Promise<void>((resolve) => (release = resolve));
+	const loader: RoleContractLoader = { load: async () => {
+		loads++;
+		await gate;
+		return memoryRoleContractLoader({ overrides: { "implement.md": roleOverride("GATED_CONTRACT", "GATED_BODY\n") } }).load();
+	} };
+	const claude = fakeBackend({ name: "claude" });
+	const host = sdkHost({ roleContracts: loader, backends: { claude: claude.backend }, ui: false });
+	await host.on();
+	const starting = host.start();
+	const calling = host.fusion({ role: "implement", task: "work" });
+	const showing = host.command("config");
+	assert.equal(loads, 1);
+	assert.equal(claude.starts.length, 0);
+	assert.equal(claude.sessions.length, 0, "no session is bound before the contract selection");
+	assert.doesNotMatch(host.tools.get("fusion")!.description, /GATED_CONTRACT/);
+	release();
+	await Promise.all([starting, calling, showing]);
+	assert.equal(claude.starts[0]?.contract, "GATED_BODY\n");
+	assert.match(host.tools.get("fusion")!.description, /GATED_CONTRACT/);
+	assert.equal(loads, 1);
+	await host.shutdown();
+});
+
+test("an invalid contract override warns once and keeps its diagnostic in config without exposing contract text", async () => {
+	const host = sdkHost({ roleContracts: memoryRoleContractLoader({ overrides: { "implement.md": "NO_HOST_METADATA" } }), ui: false });
+	await host.start();
+	const warnings = host.notices.filter(([, level]) => level === "warning");
+	assert.equal(warnings.length, 1);
+	assert.match(warnings[0]![0], /role contract implement\.md override .* has no host frontmatter/);
+	await host.command("config");
+	assert.match(host.last()!, /role contract implement\.md: shipped \(override set aside\)/);
+	assert.match(host.last()!, /role contract diagnostic: .*has no host frontmatter/);
+	assert.doesNotMatch(host.last()!, /NO_HOST_METADATA/);
+	await host.start();
+	assert.equal(host.notices.filter(([, level]) => level === "warning").length, 1);
+	await host.shutdown();
+});
+
+test("broken shipped contracts and failed contract loaders refuse startup and delegation without a retry, leaving controls usable", async () => {
+	for (const loader of [
+		memoryRoleContractLoader({ shipped: { "security.md": "Missing metadata even though this role is disabled." }, overrides: { "security.md": roleOverride("VALID", "Body.") } }),
+		{ load: async () => { throw new Error("contract disk failed"); } },
+		{ load: () => { throw new Error("contract loader threw"); } },
+	]) {
+		let loads = 0;
+		const claude = fakeBackend({ name: "claude" });
+		const host = sdkHost({ roleContracts: { load: () => (++loads, loader.load()) }, backends: { claude: claude.backend }, ui: false });
+		await host.start();
+		assert.equal(host.notices.filter(([, level]) => level === "error").length, 1);
+		await host.on();
+		assert.match((await host.fusion({ role: "implement", task: "must not start" })).error!, /no host frontmatter|contract disk failed|contract loader threw/);
+		await host.command("config");
+		assert.match(host.last()!, /no host frontmatter|contract disk failed|contract loader threw/);
+		assert.deepEqual(claude.sessions, []);
+		assert.deepEqual(claude.starts, []);
+		assert.equal((await host.call("fusion_control", { action: "status" })).text, "no runs in this Pi session yet");
+		await host.command("off");
+		assert.equal(loads, 1);
+		await host.shutdown();
+	}
 });

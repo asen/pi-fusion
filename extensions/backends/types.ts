@@ -346,6 +346,8 @@ export interface ChildControl {
 export interface RunRequest<TRole, TSession, TControl extends ChildControl = ChildControl> {
 	role: TRole;
 	prompt: string;
+	/** Child instructions resolved at host startup. Standalone callers may omit this for the shipped contract. */
+	contract?: string;
 	cwd: string;
 	session?: TSession;
 	title?: string;

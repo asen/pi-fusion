@@ -31,6 +31,7 @@ function run(
 	scenario: string,
 	opts: {
 		role?: Role;
+		contract?: string;
 		signal?: AbortSignal;
 		killGraceMs?: number;
 		onProgress?: (run: ChildRun) => void;
@@ -41,6 +42,7 @@ function run(
 	return runChild({
 		role: opts.role ?? ultracodeRole,
 		prompt: "do the thing",
+		contract: opts.contract,
 		cwd: repoRoot,
 		signal: opts.signal,
 		onProgress: opts.onProgress ?? (() => {}),
@@ -412,6 +414,23 @@ test("a large non-ascii report survives chunk boundaries", async () => {
 	assert.equal(failed(child), false);
 	assert.equal(child.text, `x${"é".repeat(100_000)}`);
 	assert.ok(!child.text.includes("�"), "report contains replacement characters");
+});
+
+test("a startup-resolved body reaches the Claude SDK without rereading a file or parsing the body as frontmatter", async (t) => {
+	const dir = fs.mkdtempSync(path.join(os.tmpdir(), "fusion-claude-contract-"));
+	t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+	const out = path.join(dir, "argv.json");
+	const body = "---\nAlready parsed child instructions.\n";
+	const previous = process.env.FAKE_CLAUDE_ARGV_OUT;
+	process.env.FAKE_CLAUDE_ARGV_OUT = out;
+	try {
+		const result = await run("ok", { role: { ...implementRole, contract: "does-not-exist.md" }, contract: body });
+		assert.equal(failed(result), false);
+		assert.equal(JSON.parse(fs.readFileSync(out, "utf8")).appendSystemPrompt, body);
+	} finally {
+		if (previous === undefined) delete process.env.FAKE_CLAUDE_ARGV_OUT;
+		else process.env.FAKE_CLAUDE_ARGV_OUT = previous;
+	}
 });
 
 test("childOptions maps a role to SDK options", () => {

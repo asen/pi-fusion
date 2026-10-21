@@ -50,6 +50,8 @@ See the [contributor module map](development.md#module-map) for file-level owner
 
 ## One call's lifecycle
 
+The host supplies the child body from its [startup contract snapshot](configuration.md#role-contract-overrides); the Pi backend does not reread that file. Standalone backend callers that omit `RunRequest.contract` retain the lazy shipped-file reader or their injected `readContract` seam.
+
 ```text
 resolve role/model and session intent
   -> prepare storage and write bootstrap input
