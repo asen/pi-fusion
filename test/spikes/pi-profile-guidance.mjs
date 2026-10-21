@@ -134,11 +134,12 @@ await check("a profile applied by command rebuilds the host's system prompt with
 	const held = await session();
 	await command(held, "/fusion on");
 	const before = held.session.systemPrompt;
-	assert.match(before, /Use fusion with role ultracode only when the user explicitly asks/, "the built-in guidance recommends ultracode");
+	const ultracodeGuidance = /For fusion role ultracode: Use role ultracode only when the user explicitly asks/;
+	assert.match(before, ultracodeGuidance, "the built-in guidance recommends ultracode");
 	assert.equal(await command(held, "/fusion profile use work"), "fusion uses profile work in this session; disabled: ultracode");
 	const after = held.session.systemPrompt;
 	assert.notEqual(after, before);
-	assert.doesNotMatch(after, /Use fusion with role ultracode only when the user explicitly asks/, "a disabled role is no longer recommended");
+	assert.doesNotMatch(after, ultracodeGuidance, "a disabled role is no longer recommended");
 	assert.match(after, /This session's configuration disables role ultracode/);
 	const fusionTool = held.session.getAllTools?.().find((tool) => tool.name === "fusion");
 	if (fusionTool) assert.match(fusionTool.description, /implement runs on claude with model sonnet at effort low/);
