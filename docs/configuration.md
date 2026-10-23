@@ -72,16 +72,48 @@ Validation is local. A non-object, a version other than `1`, an unknown field, a
 
 Writes follow the [profiles file](profiles.md#how-the-file-is-written) rules. A missing file creates nothing until a save. A save creates the private directory (`0700`) and file (`0600`) where platform modes apply. It rereads the file, changes only the history preference, and replaces the file through a private temporary sibling and a rename. A failed write leaves the old file. Writes are queued within one process. Separate Pi processes and manual edits have **no lock**: the last rename wins, and nothing watches the file.
 
+## Project-local instruction overrides
+
+Fusion can select instructions from the Pi session's working directory:
+
+```text
+<cwd>/.pi/pi-fusion/
+  host.md
+  contracts/
+    implement.md          # only the files you customize
+```
+
+Selection is **per file**, not per directory:
+
+```text
+valid project override -> valid user override -> shipped file
+<cwd>/.pi/pi-fusion/      <agent dir>/pi-fusion/   <install>/contracts/
+```
+
+You do not need to copy every contract. For example, a project can replace only `implement.md`, while `ask-answer.md` comes from your user directory and `ask-review.md` from the installation. Each selected file replaces the lower-priority version whole; host metadata and child body are never merged from different files. Missing files silently fall through. Invalid or unreadable project files warn and fall through to the user version, then shipped; if both overrides are invalid, the diagnostic retains both reasons. The shipped files must still be valid.
+
+Lookup uses the **session context's cwd**, not the process cwd, and does not search parents or infer a Git root. Start Pi in the directory whose `.pi/pi-fusion` you want. Production loaders consult project files only when Pi's `isProjectTrusted()` reports `true`; a false or unavailable accessor skips them. Fusion adds no separate trust prompt or database. Pi may report trust without prompting when no recognized protected project resources exist; `--approve` and `--no-approve` explicitly control Pi's decision. Trust is not isolation.
+
+Both scopes are read once at startup. Edits, deletion, trust changes and profile switches do not change that instance's instruction snapshot; restart or `/reload` to select again. `/fusion config` shows `project override`, `user override` or `shipped`, their selected paths and any fallback diagnostics. Loading creates no directories or files.
+
+To customize just the implementer, copy its currently selected complete file, including frontmatter:
+
+```bash
+mkdir -p .pi/pi-fusion/contracts
+cp <selected implement.md path from /fusion config> .pi/pi-fusion/contracts/implement.md
+$EDITOR .pi/pi-fusion/contracts/implement.md
+```
+
+The same applies to `.pi/pi-fusion/host.md`. **Profiles and settings remain user-global**: there is no project `profiles.json` or `settings.json` support under `.pi/pi-fusion/`. Role enablement/backend/model settings still come from the current profile or `/fusion config`.
+
 ## The host policy file
 
-`<agent dir>/pi-fusion/host.md`, beside the settings file, optionally replaces the shipped `contracts/host.md` **whole**: nothing is merged or appended. Both delegation tools carry the selected text unchanged; see [The host policy](routing.md#the-host-policy) for what it decides and what it cannot change. Either source must be a regular file of strict UTF-8, nonblank, at most 64 KiB. It is read as written: no templating, includes or frontmatter.
+`<agent dir>/pi-fusion/host.md`, beside the settings file, optionally replaces shipped `contracts/host.md`; trusted-project `.pi/pi-fusion/host.md` takes precedence as [described above](#project-local-instruction-overrides). The selected file replaces the policy **whole**: nothing is merged or appended. Both delegation tools carry its text unchanged; see [The host policy](routing.md#the-host-policy) for what it decides and what it cannot change. Each source must be a regular file of strict UTF-8, nonblank, at most 64 KiB. It is read as written: no templating, includes or frontmatter.
 
 ```text
 startup (session_start, or the first call/command needing configuration)
   read shipped host.md --unusable--> startup fails
-  read override --missing--> shipped, no notice
-               --unusable--> shipped, one warning naming the file and why
-               --valid-----> override
+  select project -> user -> shipped (missing falls through; unusable warns and falls through)
   resolve role contracts (see below) and read default profile
   -> policy + contract metadata + profile applied to guidance in one step (also with no saved profile)
 ```
@@ -98,11 +130,13 @@ startup (session_start, or the first call/command needing configuration)
 ```text
 host policy: shipped · <install>/contracts/host.md · selected when this instance started; an edit applies after restarting Pi, /reload or a new session
 host policy: user override · <agent dir>/pi-fusion/host.md · selected when ...
+host policy: project override · <cwd>/.pi/pi-fusion/host.md · selected when ...
+host policy: user override (project override set aside) · <agent dir>/pi-fusion/host.md · selected when ...
 host policy: shipped (override set aside) · <install>/contracts/host.md · selected when ...
 host policy diagnostic: the host policy override <agent dir>/pi-fusion/host.md is blank; using the shipped host policy instead
 ```
 
-The diagnostic line stays for inspection after the one startup warning. A missing override shows only the shipped line. To replace the policy, copy the shipped path the line names and edit the copy:
+The diagnostic line stays for inspection after the one startup warning. With no override in either scope, only the shipped line appears. To replace the policy user-globally, copy its selected path and edit the copy (a valid project override still takes precedence):
 
 ```bash
 mkdir -p ~/.pi/agent/pi-fusion          # or "$PI_CODING_AGENT_DIR/pi-fusion"
@@ -110,11 +144,11 @@ cp <shipped path from /fusion config> ~/.pi/agent/pi-fusion/host.md
 $EDITOR ~/.pi/agent/pi-fusion/host.md
 ```
 
-Then `/reload`, restart Pi, or start a new session, and check `/fusion config`. Delete the copy to return to the shipped policy. Fusion never creates or copies this file itself.
+Then `/reload`, restart Pi, or start a new session, and check `/fusion config`. Delete the copy to return to the next valid lower-priority policy. Fusion never creates or copies this file itself.
 
 ## Role-contract overrides
 
-`<agent dir>/pi-fusion/contracts/`, normally `~/.pi/agent/pi-fusion/contracts/`, holds optional user-global replacements outside the installation. Pi resolves agent dir (`PI_CODING_AGENT_DIR` relocates it), as for `host.md`.
+`<agent dir>/pi-fusion/contracts/`, normally `~/.pi/agent/pi-fusion/contracts/`, holds optional user-global replacements outside the installation. Trusted-project `.pi/pi-fusion/contracts/` takes priority per file; [missing project files fall through individually](#project-local-instruction-overrides). Pi resolves agent dir (`PI_CODING_AGENT_DIR` relocates it), as for `host.md`.
 
 | File | Host metadata | Child instructions |
 | --- | --- | --- |
@@ -125,9 +159,9 @@ Then `/reload`, restart Pi, or start a new session, and check `/fusion config`. 
 | `ask-review.md` | Not used; frontmatter is optional | Ask review mode |
 | `security.md` | Security | Security (Pi only) |
 
-Each named file replaces its shipped counterpart **whole**, not just its body or frontmatter. The five files supplying host metadata must retain the complete `host` header shown above and a nonblank child body. `ask-review.md` needs only nonblank child instructions; if it has frontmatter, that header must also be valid. Unknown filenames are ignored. The host policy override remains `pi-fusion/host.md`, not `pi-fusion/contracts/host.md`.
+Each named override replaces its lower-priority counterpart **whole**, not just its body or frontmatter. The five files supplying host metadata must retain the complete `host` header shown above and a nonblank child body. `ask-review.md` needs only nonblank child instructions; if it has frontmatter, that header must also be valid. Unknown filenames are ignored. The host policy override remains `pi-fusion/host.md`, not `pi-fusion/contracts/host.md`.
 
-Loading uses the same file machinery as the host policy: regular files, strict UTF-8, nonblank, at most **64 KiB per file**, no templates or includes. Every shipped contract is validated before any role override is consulted, including disabled roles. A broken shipped contract fails startup; an override never hides a broken install. A missing override quietly selects that shipped file. An unreadable or invalid override selects that shipped file with one startup warning naming the file and reason; other valid overrides still apply. Loading creates and writes nothing.
+Loading uses the same file machinery as the host policy: regular files, strict UTF-8, nonblank, at most **64 KiB per file**, no templates or includes. Every shipped contract is validated before any role override is consulted, including disabled roles. A broken shipped contract fails startup; an override never hides a broken install. A missing override quietly falls through to the next scope. An unreadable or invalid override falls through with one startup warning naming the file and reason; other valid overrides still apply. Loading creates and writes nothing.
 
 The host loads one snapshot at `session_start`, or the first call/command needing configuration. Delegation and configuration wait for it. Both host metadata and child bodies come from that snapshot, including continuations, plan handoffs and reviews, on Claude, Pi and Codex. No run rereads contract files, and profile/settings changes do not reload them. Before startup finishes, role descriptions say their contracts are not loaded yet. A failed load is not retried in that instance and refuses the same gated operations as a failed host-policy load; mode and control tools remain usable.
 
@@ -139,7 +173,7 @@ cp <shipped implement.md path from /fusion config> ~/.pi/agent/pi-fusion/contrac
 $EDITOR ~/.pi/agent/pi-fusion/contracts/implement.md
 ```
 
-Then `/reload`, restart Pi, or start a new session. Remove the override and reload to return to the shipped version. An existing instance keeps its snapshot even if a file is edited or deleted. Contract text is guidance, not a way to alter runtime tool lists, enabled roles, backend support or admission restrictions.
+Then `/reload`, restart Pi, or start a new session. Remove the override and reload to return to the next valid lower-priority version. An existing instance keeps its snapshot even if a file is edited or deleted. Contract text is guidance, not a way to alter runtime tool lists, enabled roles, backend support or admission restrictions.
 
 ## The pi backend's variables
 

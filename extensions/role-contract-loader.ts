@@ -1,7 +1,7 @@
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import { FUSION_DIR } from "./backends/pi-storage.ts";
-import { instructionBytes, instructionOverride, type InstructionSource, readInstructionFile, selectInstruction, shippedInstruction } from "./instruction-files.ts";
+import { instructionBytes, instructionOverride, type InstructionContext, type InstructionSource, readInstructionFile, selectInstruction, shippedInstruction } from "./instruction-files.ts";
 import { parseRoleContract, type RoleGuidanceMap } from "./role-contracts.ts";
 
 export const ROLE_CONTRACTS = { plan: "plan.md", implement: "implement.md", ultracode: "ultracode.md", ask: "ask-answer.md", security: "security.md" } as const;
@@ -20,7 +20,7 @@ export interface RoleContractSnapshot {
 
 export interface RoleContractLoader {
 	/** The host calls this once; profile/settings changes never reload contracts. */
-	load(): Promise<RoleContractSnapshot>;
+	load(context?: InstructionContext): Promise<RoleContractSnapshot>;
 }
 
 /** The five advertised roles need host metadata; review may remain a headerless child contract. */
@@ -41,8 +41,8 @@ export function roleContractBody(contracts: RoleContractSnapshot, name: string):
 	return contracts.files[name as RoleContractName].body;
 }
 
-/** Validate every shipped contract before locating user overrides, so replacements cannot hide a broken install. */
-export function fileRoleContractLoader(sources: { shipped: string; override: () => string | Promise<string> }): RoleContractLoader {
+/** Validate every shipped contract before locating either override scope, so replacements cannot hide a broken install. */
+export function fileRoleContractLoader(sources: { shipped: string; override: () => string | Promise<string>; project?: () => string | Promise<string> }): RoleContractLoader {
 	return {
 		load: async () => {
 			const files = {} as RoleContractSnapshot["files"];
@@ -51,17 +51,26 @@ export function fileRoleContractLoader(sources: { shipped: string; override: () 
 				files[name] = shippedInstruction(await readInstructionFile(file), file, `role contract ${name}`, parser(name));
 			}
 			let directory: Promise<string> | undefined;
+			let projectDirectory: Promise<string> | undefined;
+			const resolveProject = sources.project;
 			for (const name of ROLE_CONTRACT_FILES) {
-				files[name] = await instructionOverride(files[name], async () => path.join(await (directory ??= Promise.resolve().then(sources.override)), name), `role contract ${name}`, parser(name));
+				const project = resolveProject === undefined ? undefined : async () => path.join(await (projectDirectory ??= Promise.resolve().then(resolveProject)), name);
+				files[name] = await instructionOverride(files[name], async () => path.join(await (directory ??= Promise.resolve().then(sources.override)), name), `role contract ${name}`, parser(name), project);
 			}
 			return snapshot(files);
 		},
 	};
 }
 
-/** Construction reads and resolves nothing; startup uses the same agent directory as the host policy. */
+/** Startup uses the same trusted cwd and lazy user agent directory as the host policy, without ancestor discovery. */
 export function roleContractLoader(agentDir: () => Promise<string>): RoleContractLoader {
-	return fileRoleContractLoader({ shipped: SHIPPED_ROLE_CONTRACTS_DIR, override: async () => path.join(await agentDir(), FUSION_DIR, "contracts") });
+	return {
+		load: (context) => fileRoleContractLoader({
+			shipped: SHIPPED_ROLE_CONTRACTS_DIR,
+			override: async () => path.join(await agentDir(), FUSION_DIR, "contracts"),
+			...(context?.projectTrusted === true ? { project: () => path.join(context.cwd, ".pi", FUSION_DIR, "contracts") } : {}),
+		}).load(),
+	};
 }
 
 type MemoryContracts = Partial<Record<RoleContractName, string | Uint8Array>>;

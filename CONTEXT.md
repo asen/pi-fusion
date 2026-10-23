@@ -9,7 +9,7 @@ The Pi model that talks with the user and decides which work to hand off. No par
 _Avoid_: orchestrator, main model, parent
 
 **Host policy**:
-The Markdown that tells the host how to orchestrate while Fusion is on: the shipped `contracts/host.md`, or a user override replacing it whole. Guidance to the host model, not enforcement. See [The host policy](docs/routing.md#the-host-policy).
+The Markdown that tells the host how to orchestrate while Fusion is on: the shipped `contracts/host.md`, or a user/project override replacing it whole. Guidance to the host model, not enforcement. See [The host policy](docs/routing.md#the-host-policy).
 _Avoid_: system prompt, host contract, orchestration rules
 
 **Child**:

@@ -4,7 +4,7 @@ This guidance applies only while Fusion is **on**. Asking for a role, model, or 
 
 ## The host policy
 
-How the host orchestrates — whether to delegate or work directly, when to plan, which review to run, when to stop and what to report — is the **host policy**: plain Markdown, not code. The shipped [`contracts/host.md`](../contracts/host.md) is used unless `<agent dir>/pi-fusion/host.md` replaces it whole; see [The host policy file](configuration.md#the-host-policy-file) for loading once per instance, the invalid-override warning and fallback, and what `/fusion config` shows. It is instruction to the host model, not a permission: Fusion neither enforces it nor checks compliance.
+How the host orchestrates — whether to delegate or work directly, when to plan, which review to run, when to stop and what to report — is the **host policy**: plain Markdown, not code. The shipped [`contracts/host.md`](../contracts/host.md) can be replaced whole by user `<agent dir>/pi-fusion/host.md`, with trusted-project `<cwd>/.pi/pi-fusion/host.md` taking priority; see [The host policy file](configuration.md#the-host-policy-file) for loading once per instance, the invalid-override warning and fallback, and what `/fusion config` shows. It is instruction to the host model, not a permission: Fusion neither enforces it nor checks compliance.
 
 ```text
 fusion / claude guidelines (only while Fusion is on)

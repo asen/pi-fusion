@@ -58,6 +58,7 @@ import { contextShare, continueNote, handoffBlocked, handoffNote, handoffPrompt,
 import { asEnded, History, type HistoryRecord, historyDir, historyEnabled, sameChild } from "./history.ts";
 import { claudeGuidance, claudeParameterHelp, fusionGuidance, fusionParameterHelp, type GuidanceInput } from "./host-guidance.ts";
 import { HOST_POLICY_FILE, type HostPolicy, type HostPolicyLoader, hostPolicyLoader } from "./host-policy.ts";
+import { type InstructionContext, instructionSourceLabel } from "./instruction-files.ts";
 import { hostProfileStore, type ProfileStore } from "./profile-store.ts";
 import { hostSettingsStore, type SettingsStore } from "./settings-store.ts";
 import {
@@ -1545,12 +1546,12 @@ export interface FusionOptions {
 	settings?: SettingsStore;
 	/**
 	 * Where the host policy is loaded from: in production, this build's `contracts/host.md`, replaced whole by
-	 * `pi-fusion/host.md` under the host agent directory. It is loaded once per instance, at startup, and both delegation
+	 * user `pi-fusion/host.md` or trusted-project `.pi/pi-fusion/host.md`. It loads once with the startup cwd/trust; both delegation
 	 * tools carry what it selected; every test host passes a memory or temporary-directory loader of its own so no case
 	 * ever reads the user's override.
 	 */
 	hostPolicy?: HostPolicyLoader;
-	/** Startup contract selection; tests inject a memory or temporary-directory loader, never user overrides. */
+	/** Startup contract selection over project/user/shipped files; tests inject memory or temporary roots. */
 	roleContracts?: RoleContractLoader;
 	/** How the dashboard server starts. Left out, it is this build's own; a test host passes one that sees what it is given. */
 	dashboard?: typeof startDashboard;
@@ -1678,11 +1679,12 @@ export default function fusion(pi: ExtensionAPI, options: FusionOptions = {}) {
 	 * the startup and refuses every delegation call and gated command; a profile file that cannot be read, or a default it does not hold, leaves the
 	 * built-in configuration and a warning, and nothing is rewritten.
 	 */
-	const initialize = (): Promise<void> =>
+	const initialize = (ctx: any): Promise<void> =>
 		(initializing ??= (async () => {
 			const choosing = chooseSettings();
 			try {
-				const [selected, profile, loaded] = await Promise.all([(async () => policyLoader.load())(), defaultProfile(), (async () => contractLoader.load())()]);
+				const context: InstructionContext = { cwd: ctx.cwd, projectTrusted: typeof ctx.isProjectTrusted === "function" && ctx.isProjectTrusted() === true };
+				const [selected, profile, loaded] = await Promise.all([(async () => policyLoader.load(context))(), defaultProfile(), (async () => contractLoader.load(context))()]);
 				contracts = loaded;
 				contractWarnings = Object.values(loaded.files).flatMap((file) => file.diagnostic === undefined ? [] : [file.diagnostic]);
 				startWith(selected, profile);
@@ -2932,7 +2934,7 @@ export default function fusion(pi: ExtensionAPI, options: FusionOptions = {}) {
 	 */
 	const policyLines = (): string[] => {
 		if (!policy) return ["host policy: not loaded in this instance"];
-		const source = policy.source === "override" ? "user override" : policy.diagnostic === undefined ? "shipped" : "shipped (override set aside)";
+		const source = instructionSourceLabel(policy);
 		return [
 			`host policy: ${source} · ${policy.path} · selected when this instance started; an edit applies after restarting Pi, /reload or a new session`,
 			...(policy.diagnostic === undefined ? [] : [`host policy diagnostic: ${policy.diagnostic}`]),
@@ -2946,7 +2948,7 @@ export default function fusion(pi: ExtensionAPI, options: FusionOptions = {}) {
 			"role contracts: selected when this instance started; edits apply after restarting Pi, /reload or a new session",
 			...ROLE_CONTRACT_FILES.flatMap((name) => {
 				const file = contracts!.files[name];
-				const source = file.source === "override" ? "user override" : file.diagnostic === undefined ? "shipped" : "shipped (override set aside)";
+				const source = instructionSourceLabel(file);
 				return [`role contract ${name}: ${source} · ${file.path}`, ...(file.diagnostic === undefined ? [] : [`role contract diagnostic: ${file.diagnostic}`])];
 			}),
 		];
@@ -3330,7 +3332,7 @@ export default function fusion(pi: ExtensionAPI, options: FusionOptions = {}) {
 			// on, off, history and the dashboard limit above never depend on it.
 			if (!initialized) {
 				try {
-					await initialize();
+					await initialize(ctx);
 				} catch (error) {
 					notice(error instanceof Error ? error.message : String(error), "error");
 					return;
@@ -3576,7 +3578,7 @@ export default function fusion(pi: ExtensionAPI, options: FusionOptions = {}) {
 	pi.on("session_start", async (_event, ctx) => {
 		mask();
 		try {
-			await initialize();
+			await initialize(ctx);
 		} catch (error) {
 			record(() => ctx.ui.notify(error instanceof Error ? error.message : String(error), "error"));
 		}
@@ -3634,7 +3636,7 @@ export default function fusion(pi: ExtensionAPI, options: FusionOptions = {}) {
 		// No call runs on the built-in defaults, or without the host policy, while either is still loading, and none runs
 		// at all when the startup failed: the rejection is this call's. Once both have loaded, nothing here yields before
 		// the run registers, which is what lets a cancel issued right after the call find it.
-		if (!initialized) await initialize();
+		if (!initialized) await initialize(ctx);
 		noteProfiles(ctx);
 		noteSettings(ctx);
 		ensureHistory(ctx);

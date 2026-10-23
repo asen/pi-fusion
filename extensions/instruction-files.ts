@@ -7,8 +7,14 @@ export const INSTRUCTION_MAX_BYTES = 64 * 1024;
 
 export type InstructionRead = { bytes: Uint8Array } | { missing: true } | { error: string };
 
+/** The first startup context fixes project lookup for this instance; absent trust means user/shipped only. */
+export interface InstructionContext {
+	readonly cwd: string;
+	readonly projectTrusted: boolean;
+}
+
 export interface InstructionSource {
-	source: "shipped" | "override";
+	source: "shipped" | "override" | "project";
 	path: string;
 	diagnostic?: string;
 }
@@ -79,15 +85,41 @@ export function selectInstruction<T extends object>(shipped: T & InstructionSour
 	return { ...result.value, source: "override", path: where };
 }
 
-/** Resolve user paths only during loading; an unavailable agent directory is an override failure, not a broken install. */
-export async function instructionOverride<T extends object>(shipped: T & InstructionSource, override: () => string | Promise<string>, label: string, parse: (text: string, source: string) => T): Promise<T & InstructionSource> {
-	let where: string;
-	try {
-		where = path.resolve(await override());
-	} catch (error) {
-		return { ...shipped, diagnostic: `the ${label} override could not be located (${error instanceof Error ? error.message : String(error)}); using the shipped ${label} instead` };
+/** Consult a project file before the user file; missing or invalid files fall through without merging their contents. */
+export async function instructionOverride<T extends object>(shipped: T & InstructionSource, override: () => string | Promise<string>, label: string, parse: (text: string, source: string) => T, project?: () => string | Promise<string>): Promise<T & InstructionSource> {
+	let projectProblem: string | undefined;
+	if (project) {
+		let where: string | undefined;
+		try {
+			where = path.resolve(await project());
+		} catch (error) {
+			projectProblem = `the project ${label} override could not be located (${error instanceof Error ? error.message : String(error)})`;
+		}
+		if (where !== undefined) {
+			const read = await readInstructionFile(where);
+			if (!("missing" in read)) {
+				const result = checked(read, where, parse);
+				if ("value" in result) return { ...result.value, source: "project", path: where };
+				projectProblem = `the project ${label} override ${where} ${result.error}`;
+			}
+		}
 	}
-	return selectInstruction(shipped, await readInstructionFile(where), where, label, parse);
+	let selected: T & InstructionSource;
+	try {
+		const where = path.resolve(await override());
+		selected = selectInstruction(shipped, await readInstructionFile(where), where, label, parse);
+	} catch (error) {
+		selected = { ...shipped, diagnostic: `the ${label} override could not be located (${error instanceof Error ? error.message : String(error)}); using the shipped ${label} instead` };
+	}
+	if (projectProblem === undefined) return selected;
+	return { ...selected, diagnostic: selected.diagnostic === undefined ? `${projectProblem}; using the ${selected.source === "override" ? "user" : "shipped"} ${label} instead` : `${projectProblem}; ${selected.diagnostic}` };
+}
+
+/** Source reporting distinguishes a bad higher-priority project file from an invalid user override. */
+export function instructionSourceLabel(file: InstructionSource): string {
+	if (file.source === "project") return "project override";
+	if (file.source === "override") return file.diagnostic === undefined ? "user override" : "user override (project override set aside)";
+	return file.diagnostic === undefined ? "shipped" : "shipped (override set aside)";
 }
 
 /** Memory loaders exercise the same validation without ever reaching the user's files. */

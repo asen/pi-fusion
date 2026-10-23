@@ -10,8 +10,8 @@ import type { PiRole } from "../extensions/backends/pi-binding.ts";
 import type { BackendName, HostBackend } from "../extensions/backends/types.ts";
 import fusion, { builtinConfiguration, type Configuration, claudeRoute, fusionCall, fusionRoute, roleFor, type RunRecords, runRecords } from "../extensions/fusion.ts";
 import { policyGuideline } from "../extensions/host-guidance.ts";
-import { fileHostPolicyLoader, HOST_POLICY_FILE, type HostPolicyLoader, memoryHostPolicyLoader, SHIPPED_HOST_POLICY_PATH } from "../extensions/host-policy.ts";
-import { fileRoleContractLoader, type RoleContractLoader, memoryRoleContractLoader, ROLE_CONTRACT_FILES, SHIPPED_ROLE_CONTRACTS_DIR } from "../extensions/role-contract-loader.ts";
+import { fileHostPolicyLoader, HOST_POLICY_FILE, type HostPolicyLoader, hostPolicyLoader, memoryHostPolicyLoader, SHIPPED_HOST_POLICY_PATH } from "../extensions/host-policy.ts";
+import { fileRoleContractLoader, type RoleContractLoader, memoryRoleContractLoader, ROLE_CONTRACT_FILES, roleContractLoader, SHIPPED_ROLE_CONTRACTS_DIR } from "../extensions/role-contract-loader.ts";
 import { fileProfileStore, memoryProfileStore, PROFILES_FILE, type ProfileStore } from "../extensions/profile-store.ts";
 import { memorySettingsStore, type SettingsStore } from "../extensions/settings-store.ts";
 import {
@@ -449,6 +449,9 @@ interface Tool {
 
 interface SdkHostOptions {
 	profiles?: ProfileStore;
+	cwd?: string;
+	/** Undefined models an older host with no trust accessor. */
+	projectTrusted?: boolean;
 	/** The host's `--tools` allow list, which a registry refresh puts back on the active list whole. */
 	allowed?: string[];
 	backends?: Partial<Record<BackendName, HostBackend>>;
@@ -549,7 +552,8 @@ function sdkHost(options: SdkHostOptions = {}) {
 				}),
 	};
 	const ctx = {
-		cwd: repoRoot,
+		cwd: options.cwd ?? repoRoot,
+		...(options.projectTrusted === undefined ? {} : { isProjectTrusted: () => options.projectTrusted === true }),
 		mode: "print",
 		hasUI: options.ui !== false,
 		ui,
@@ -2155,4 +2159,126 @@ test("broken shipped contracts and failed contract loaders refuse startup and de
 		assert.equal(loads, 1);
 		await host.shutdown();
 	}
+});
+
+/** Both directory scopes are temporary: production instruction loaders never see real user paths here. */
+function projectInstructionFixture() {
+	const dir = tempDir("project-instructions");
+	const agent = path.join(dir, "agent");
+	const cwd = path.join(dir, "project");
+	const user = path.join(agent, "pi-fusion");
+	const project = path.join(cwd, ".pi", "pi-fusion");
+	for (const root of [user, project]) fs.mkdirSync(path.join(root, "contracts"), { recursive: true });
+	fs.writeFileSync(path.join(user, "host.md"), "USER_POLICY_SNAPSHOT\n");
+	fs.writeFileSync(path.join(user, "contracts", "implement.md"), roleOverride("USER_IMPLEMENT", "USER_BODY\n"));
+	fs.writeFileSync(path.join(project, "host.md"), "PROJECT_POLICY_SNAPSHOT\n");
+	fs.writeFileSync(path.join(project, "contracts", "implement.md"), roleOverride("PROJECT_IMPLEMENT", "PROJECT_BODY\n"));
+	return { agent, cwd, user, project };
+}
+
+test("trusted project instructions reach host guidance and child bodies once; profiles remain in their user store", async () => {
+	const f = projectInstructionFixture();
+	fs.writeFileSync(path.join(f.user, "profiles.json"), document({ work: WORK }, "work"));
+	const projectProfiles = path.join(f.project, "profiles.json");
+	fs.writeFileSync(projectProfiles, "Invalid project profiles must never be read or overwritten.");
+	const claude = fakeBackend({ name: "claude", scripts: [{ sessionId: "project-child" }] });
+	const options: SdkHostOptions = {
+		cwd: f.cwd, projectTrusted: true, ui: false,
+		profiles: fileProfileStore(() => f.user),
+		hostPolicy: hostPolicyLoader(async () => f.agent),
+		roleContracts: roleContractLoader(async () => f.agent),
+		backends: { claude: claude.backend },
+	};
+	const host = sdkHost(options);
+	await host.start();
+	await host.on();
+	for (const name of ["fusion", "claude"]) {
+		assert.match(host.tools.get(name)!.description, /PROJECT_IMPLEMENT/);
+		assert.ok(host.tools.get(name)!.promptGuidelines!.some((line) => line.includes("PROJECT_POLICY_SNAPSHOT")));
+		assert.doesNotMatch(toolText(host.tools.get(name)!).join("\n"), /USER_POLICY_SNAPSHOT|USER_IMPLEMENT/);
+	}
+	const first = await host.fusion({ role: "implement", task: "first" });
+	assert.equal(first.error, undefined);
+	assert.equal(claude.starts[0]?.contract, "PROJECT_BODY\n");
+	fs.writeFileSync(path.join(f.project, "host.md"), "EDITED_PROJECT_POLICY\n");
+	fs.writeFileSync(path.join(f.project, "contracts", "implement.md"), roleOverride("EDITED_PROJECT", "EDITED_PROJECT_BODY\n"));
+	await host.command("profile use builtin");
+	await host.command("config");
+	assert.ok(host.last()!.includes(policyLine("project override", path.join(f.project, "host.md"))));
+	assert.ok(host.last()!.includes(`role contract implement.md: project override · ${path.join(f.project, "contracts", "implement.md")}`));
+	assert.ok(host.last()!.includes(`profiles file: ${path.join(f.user, "profiles.json")}`));
+	assert.doesNotMatch(host.last()!, /PROJECT_BODY|EDITED_PROJECT/);
+	const continued = await host.fusion({ continue: first.details!.handle, task: "continue" });
+	assert.equal(continued.error, undefined);
+	assert.equal(claude.starts[1]?.contract, "PROJECT_BODY\n");
+	await host.start();
+	assert.match(host.tools.get("fusion")!.description, /PROJECT_IMPLEMENT/);
+	await host.command("profile save saved");
+	assert.ok(parseDocument(JSON.parse(fs.readFileSync(path.join(f.user, "profiles.json"), "utf8"))).profiles.saved);
+	assert.equal(fs.readFileSync(projectProfiles, "utf8"), "Invalid project profiles must never be read or overwritten.");
+	await host.shutdown();
+	const reloaded = sdkHost(options);
+	await reloaded.start();
+	assert.match(reloaded.tools.get("fusion")!.description, /EDITED_PROJECT/);
+	assert.ok(reloaded.tools.get("fusion")!.promptGuidelines!.some((line) => line.includes("EDITED_PROJECT_POLICY")));
+	await reloaded.shutdown();
+});
+
+test("untrusted projects and hosts without a trust accessor use user instructions, without consulting project files", async () => {
+	const f = projectInstructionFixture();
+	fs.writeFileSync(path.join(f.project, "host.md"), " \n");
+	fs.writeFileSync(path.join(f.project, "contracts", "implement.md"), "Invalid project metadata.");
+	for (const projectTrusted of [false, undefined]) {
+		const host = sdkHost({ cwd: f.cwd, projectTrusted, hostPolicy: hostPolicyLoader(async () => f.agent), roleContracts: roleContractLoader(async () => f.agent), ui: false });
+		await host.start();
+		assert.match(host.tools.get("fusion")!.description, /USER_IMPLEMENT/);
+		assert.ok(host.tools.get("fusion")!.promptGuidelines!.some((line) => line.includes("USER_POLICY_SNAPSHOT")));
+		assert.equal(host.notices.length, 0, "invalid project files were not read, so there is no warning");
+		await host.command("config");
+		assert.ok(host.last()!.includes(policyLine("user override", path.join(f.user, "host.md"))));
+		assert.doesNotMatch(host.last()!, /project override|override set aside/);
+		await host.shutdown();
+	}
+});
+
+test("the first session_start, config command or delegation supplies its actual cwd/trust to instruction loading", async () => {
+	const f = projectInstructionFixture();
+	for (const first of ["start", "config", "call"]) {
+		const claude = fakeBackend({ name: "claude" });
+		const policies = hostPolicyLoader(async () => f.agent);
+		const contracts = roleContractLoader(async () => f.agent);
+		const seen: unknown[] = [];
+		const host = sdkHost({ cwd: f.cwd, projectTrusted: true, ui: false, backends: { claude: claude.backend }, hostPolicy: { load: (context) => (seen.push(context), policies.load(context)) }, roleContracts: { load: (context) => (seen.push(context), contracts.load(context)) } });
+		if (first === "start") await host.start();
+		else if (first === "config") await host.command("config");
+		else {
+			await host.on();
+			assert.equal((await host.fusion({ role: "implement", task: "first" })).error, undefined);
+			assert.equal(claude.starts[0]?.contract, "PROJECT_BODY\n");
+		}
+		assert.match(host.tools.get("fusion")!.description, /PROJECT_IMPLEMENT/);
+		assert.deepEqual(seen, [{ cwd: f.cwd, projectTrusted: true }, { cwd: f.cwd, projectTrusted: true }]);
+		await host.start();
+		await host.command("config");
+		assert.equal(seen.length, 2, "later entry points do not select new instructions");
+		await host.shutdown();
+	}
+});
+
+test("config names the user fallback and project diagnostic once when project instructions are invalid", async () => {
+	const f = projectInstructionFixture();
+	fs.writeFileSync(path.join(f.project, "host.md"), " \n");
+	fs.writeFileSync(path.join(f.project, "contracts", "implement.md"), "Invalid project metadata.");
+	const host = sdkHost({ cwd: f.cwd, projectTrusted: true, hostPolicy: hostPolicyLoader(async () => f.agent), roleContracts: roleContractLoader(async () => f.agent), ui: false });
+	await host.start();
+	assert.equal(host.notices.filter(([, level]) => level === "warning").length, 2);
+	await host.command("config");
+	assert.match(host.last()!, /host policy: user override \(project override set aside\)/);
+	assert.match(host.last()!, /role contract implement\.md: user override \(project override set aside\)/);
+	assert.ok(host.last()!.includes(path.join(f.project, "host.md")));
+	assert.ok(host.last()!.includes(path.join(f.project, "contracts", "implement.md")));
+	assert.match(host.tools.get("fusion")!.description, /USER_IMPLEMENT/);
+	await host.start();
+	assert.equal(host.notices.filter(([, level]) => level === "warning").length, 2);
+	await host.shutdown();
 });
