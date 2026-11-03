@@ -26,7 +26,30 @@ const emit = (event) => {
 let appendSystemPrompt;
 let initialize;
 let started = false;
-const KEEP_STDIN = new Set(["steer", "question", "question-escape", "question-then-steer", "question-then-question", "question-then-end", "two-questions", "ask-user"]);
+/**
+ * Lifecycle scenarios keep stdin too and end only once the run closes it, as Claude Code in stream-json mode does: a
+ * scenario that sees EOF before the step it guards ends with a `stdin closed early` result, and one that waits for EOF
+ * and never gets it ends with `stdin stayed open`.
+ */
+const LIFECYCLE = new Set([
+	"state-plain",
+	"state-clear-idle",
+	"state-bash-idle",
+	"state-ambient-flip",
+	"state-stuck",
+	"state-clear-mid-turn",
+	"state-steer-after-idle",
+	"state-question",
+	"state-late-edges",
+	"state-idle-noise",
+	"state-running-stale-result",
+	"nostate-drain",
+	"nostate-mid-turn",
+	"nostate-steer-after-result",
+	"nostate-question",
+	"interim-revisions",
+]);
+const KEEP_STDIN = new Set(["steer", "question", "question-escape", "question-then-steer", "question-then-question", "question-then-end", "two-questions", "ask-user", "tasks-cleared", ...LIFECYCLE]);
 /** What each question scenario asks. question-escape paints its question red and hides a link behind a label, as a child's text can. */
 const ASKED = {
 	question: ["Which name?"],
@@ -56,6 +79,22 @@ const nextInput = (ms) =>
 		onInput = () => {
 			clearTimeout(timer);
 			resolve(inputs.shift());
+		};
+	});
+let eof = false;
+let onEof;
+process.stdin.on("end", () => {
+	eof = true;
+	onEof?.();
+});
+/** Resolves true once stdin has ended, or false after `ms` without it. */
+const eofWithin = (ms) =>
+	new Promise((resolve) => {
+		if (eof) return resolve(true);
+		const timer = setTimeout(() => resolve(false), ms);
+		onEof = () => {
+			clearTimeout(timer);
+			resolve(true);
 		};
 	});
 let buffer = "";
@@ -104,6 +143,7 @@ async function main(prompt) {
 			JSON.stringify({ argv, prompt, appendSystemPrompt, initialize, env: {
 					CLAUDE_AGENT_SDK_CLIENT_APP: process.env.CLAUDE_AGENT_SDK_CLIENT_APP,
 					CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS: process.env.CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS,
+					CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS: process.env.CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS,
 				} }),
 		);
 	}
@@ -145,6 +185,31 @@ async function main(prompt) {
 		emit({ type: "stream_event", event, session_id: sessionId, parent_tool_use_id: parentToolUseId });
 	};
 	const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+	const state = (value) => emit({ type: "system", subtype: "session_state_changed", state: value, session_id: sessionId });
+	const tasks = (list) => emit({ type: "system", subtype: "background_tasks_changed", tasks: list, session_id: sessionId });
+	const taskStarted = (taskId, taskType, extra = {}) => emit({ type: "system", subtype: "task_started", task_id: taskId, task_type: taskType, description: taskId, ...extra });
+	const taskEnded = (taskId) => emit({ type: "system", subtype: "task_notification", task_id: taskId, status: "completed", summary: `${taskId} done` });
+	const text = (value) => assistant([{ type: "text", text: value }]);
+	/** True, after ending the run with a result saying so, when stdin closed before this step; a pause first lets a premature close arrive. */
+	const closedEarly = async (step) => {
+		await sleep(150);
+		if (!eof) return false;
+		result(`stdin closed early: ${step}`);
+		return true;
+	};
+	/** Waits for the run to close stdin; without it, ends the run with a result saying so and stops reading. */
+	const awaitEof = async () => {
+		if (await eofWithin(3000)) return true;
+		result("stdin stayed open");
+		process.stdin.destroy();
+		return false;
+	};
+	/** A follow-up turn the way Claude Code drains a pending notification after EOF: the result carries the final report. */
+	const followUp = (taskId, report) => {
+		taskEnded(taskId);
+		text(report);
+		result(report);
+	};
 
 	switch (scenario) {
 		case "ok":
@@ -166,6 +231,44 @@ async function main(prompt) {
 			});
 			result("Workflow running; waiting for the completion notification.");
 			emit({ type: "system", subtype: "task_notification", task_id: "wf-1", status: "completed", usage: { total_tokens: 250 } });
+			emit({
+				type: "assistant",
+				uuid: `asst-${++assistantCount}`,
+				session_id: sessionId,
+				message: { role: "assistant", usage: { input_tokens: 6, cache_read_input_tokens: 1000, cache_creation_input_tokens: 200 }, content: [{ type: "thinking", thinking: "Run the tests next." }] },
+			});
+			toolUse("tu-2", "Bash", { command: "npm test" });
+			result("## Changed\nfoo.ts", {
+				usage: { input_tokens: 4, output_tokens: 3, cache_read_input_tokens: 7, cache_creation_input_tokens: 2 },
+				total_cost_usd: 0.25,
+				num_turns: 2,
+				duration_api_ms: 1500,
+				modelUsage: {
+					"claude-fable-5-1": { inputTokens: 14, outputTokens: 8, cacheReadInputTokens: 9, cacheCreationInputTokens: 3, costUSD: 0.2, contextWindow: 1000000 },
+					"claude-opus-5": { inputTokens: 100, outputTokens: 50, cacheReadInputTokens: 0, cacheCreationInputTokens: 0, costUSD: 0.05, contextWindow: 1000000 },
+				},
+			});
+			break;
+		case "ok-sync":
+			// "ok" with the workflow ending before the turn's result: the same spend, and no report while a task still runs.
+			init();
+			toolUse("tu-1", "Workflow", { script: "export const meta = {}" });
+			emit({ type: "system", subtype: "task_started", task_id: "wf-1", task_type: "local_workflow", workflow_name: "probe" });
+			emit({
+				type: "system",
+				subtype: "task_progress",
+				task_id: "wf-1",
+				description: "Probe: a",
+				usage: { total_tokens: 100 },
+				workflow_progress: [
+					{ type: "workflow_phase", index: 1, title: "Probe" },
+					{ type: "workflow_agent", label: "a", state: "done" },
+					{ type: "workflow_agent", label: "b", state: "start" },
+					{ type: "workflow_agent", state: "start" },
+				],
+			});
+			emit({ type: "system", subtype: "task_notification", task_id: "wf-1", status: "completed", usage: { total_tokens: 250 } });
+			result("Workflow finished.");
 			emit({
 				type: "assistant",
 				uuid: `asst-${++assistantCount}`,
@@ -394,6 +497,9 @@ async function main(prompt) {
 			void mcp("tools/call", { name: "ask_orchestrator", arguments: { question } });
 			await sleep(300);
 			result("ended while asking");
+			// The child exits by itself with its question unanswered; an open question keeps the run's input open, so EOF
+			// would never come.
+			process.stdin.destroy();
 			break;
 		}
 		case "ask-user": {
@@ -415,6 +521,297 @@ async function main(prompt) {
 			result(JSON.stringify(output.hookSpecificOutput ?? output));
 			break;
 		}
+		case "state-plain":
+			init();
+			state("running");
+			text("done");
+			result("done");
+			if (await closedEarly("before idle")) break;
+			state("idle");
+			await awaitEof();
+			break;
+		case "state-clear-idle":
+			init();
+			state("running");
+			taskStarted("wf-1", "local_workflow");
+			tasks([{ task_id: "wf-1", task_type: "local_workflow", description: "probe" }]);
+			result("report first");
+			if (await closedEarly("after the result, with the workflow live")) break;
+			tasks([]);
+			if (await closedEarly("after the clear, before idle")) break;
+			state("idle");
+			await awaitEof();
+			break;
+		case "state-bash-idle":
+			init();
+			state("running");
+			taskStarted("b-1", "local_bash");
+			tasks([{ task_id: "b-1", task_type: "local_bash", description: "build" }]);
+			text("report while the build runs");
+			result("report while the build runs");
+			// Claude Code reports idle with a background shell still running; the shell still blocks.
+			state("idle");
+			if (await closedEarly("at idle, with the shell live")) break;
+			tasks([]);
+			if (!(await awaitEof())) break;
+			followUp("b-1", "build finished after EOF");
+			break;
+		case "state-ambient-flip":
+			init();
+			state("running");
+			taskStarted("m-1", "monitor_ws");
+			tasks([{ task_id: "m-1", task_type: "monitor_ws", description: "journal" }]);
+			result("watching");
+			if (await closedEarly("with the monitor not yet ambient")) break;
+			tasks([{ task_id: "m-1", task_type: "monitor_ws", description: "journal", ambient: true }]);
+			state("idle");
+			await awaitEof();
+			break;
+		case "state-stuck":
+			init();
+			state("running");
+			taskStarted("b-1", "local_bash");
+			tasks([{ task_id: "b-1", task_type: "local_bash", description: "server" }]);
+			result("report while the server runs");
+			state("idle");
+			setInterval(() => {
+				if (eof) {
+					result("stdin closed early: with the server live");
+					process.exit(0);
+				}
+			}, 50);
+			break;
+		case "state-clear-mid-turn":
+			init();
+			state("running");
+			taskStarted("wf-1", "local_workflow");
+			taskStarted("wf-2", "local_workflow");
+			tasks([
+				{ task_id: "wf-1", task_type: "local_workflow", description: "probe" },
+				{ task_id: "wf-2", task_type: "local_workflow", description: "scan" },
+			]);
+			result("started");
+			// wf-2's notification starts a turn, and wf-1 ends in the middle of it.
+			tasks([{ task_id: "wf-1", task_type: "local_workflow", description: "probe" }]);
+			taskEnded("wf-2");
+			state("running");
+			text("reading wf-2's findings");
+			tasks([]);
+			taskEnded("wf-1");
+			if (await closedEarly("mid-turn")) break;
+			toolUse("tu-2", "Read", { file_path: "a.ts" });
+			emit({ type: "user", session_id: sessionId, message: { role: "user", content: [{ type: "tool_result", tool_use_id: "tu-2", content: "ok" }] } });
+			if (await closedEarly("after a tool result")) break;
+			text("final");
+			result("final");
+			if (await closedEarly("after the final result, before idle")) break;
+			state("idle");
+			await awaitEof();
+			break;
+		case "state-steer-after-idle": {
+			init();
+			state("running");
+			taskStarted("b-1", "local_bash");
+			tasks([{ task_id: "b-1", task_type: "local_bash", description: "build" }]);
+			result("first report");
+			state("idle");
+			const steer = await nextInput(3000);
+			// An idle written before Claude Code read the steer, then the shell ending: neither is the steer's turn.
+			state("idle");
+			tasks([]);
+			if (await closedEarly("before the steer's turn")) break;
+			state("running");
+			text(`steered: ${steer ?? "nothing"}`);
+			result(`steered: ${steer ?? "nothing"}`);
+			state("idle");
+			await awaitEof();
+			break;
+		}
+		case "state-question": {
+			init();
+			state("running");
+			taskStarted("ag-1", "local_agent");
+			tasks([{ task_id: "ag-1", task_type: "local_agent", description: "probe" }]);
+			result("agent started");
+			state("idle");
+			await mcp("initialize", { protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: "fake-claude", version: "1" } });
+			await control({ subtype: "mcp_message", server_name: "pi-fusion", message: { jsonrpc: "2.0", method: "notifications/initialized" } });
+			// The background agent asks while the session is idle and its task then leaves the membership.
+			const asking = mcp("tools/call", { name: "ask_orchestrator", arguments: { question: "Which name?" } });
+			await sleep(100);
+			tasks([]);
+			if (await closedEarly("with the question open")) break;
+			const reply = await asking;
+			if (await closedEarly("after the answer, before idle")) break;
+			state("running");
+			const answered = reply?.result?.content?.[0]?.text ?? "nothing";
+			text(`answered: ${answered}`);
+			result(`answered: ${answered}`);
+			state("idle");
+			await awaitEof();
+			break;
+		}
+		case "state-late-edges":
+			init();
+			state("running");
+			// A start edge before its snapshot, and a snapshot before its start edge.
+			taskStarted("a-1", "local_bash");
+			tasks([{ task_id: "a-1", task_type: "local_bash", description: "a" }]);
+			tasks([
+				{ task_id: "a-1", task_type: "local_bash", description: "a" },
+				{ task_id: "b-1", task_type: "local_bash", description: "b" },
+				{ task_id: "m-1", task_type: "monitor_ws", description: "journal", ambient: true },
+			]);
+			taskStarted("b-1", "local_bash");
+			// A start edge for an id the snapshot lists as ambient adds no blocker.
+			taskStarted("m-1", "monitor_ws");
+			result("report with two shells");
+			state("idle");
+			// a-1 ends level first; its late edges, end and then start, neither invalidate idle nor bring it back.
+			tasks([{ task_id: "b-1", task_type: "local_bash", description: "b" }, { task_id: "m-1", task_type: "monitor_ws", description: "journal", ambient: true }]);
+			taskEnded("a-1");
+			taskStarted("a-1", "local_bash");
+			taskStarted("b-1", "local_bash");
+			if (await closedEarly("with b-1 live")) break;
+			// b-1 ends edge first.
+			taskEnded("b-1");
+			if (!(await awaitEof())) break;
+			tasks([{ task_id: "m-1", task_type: "monitor_ws", description: "journal", ambient: true }]);
+			break;
+		case "state-idle-noise":
+			init();
+			state("running");
+			taskStarted("b-1", "local_bash");
+			tasks([{ task_id: "b-1", task_type: "local_bash", description: "build" }]);
+			result("report");
+			state("idle");
+			// A background agent's progress and frames run beside the idle session.
+			emit({ type: "system", subtype: "task_progress", task_id: "ag-1", description: "probe", usage: { total_tokens: 5 } });
+			emit({ type: "assistant", uuid: "asst-sub-1", session_id: sessionId, parent_tool_use_id: "tu-ag", message: { role: "assistant", content: [{ type: "text", text: "sub" }] } });
+			streamEvent({ type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "sub" } }, "tu-ag");
+			if (await closedEarly("with the shell live")) break;
+			tasks([]);
+			await awaitEof();
+			break;
+		case "state-running-stale-result":
+			init();
+			state("running");
+			taskStarted("b-1", "local_bash");
+			tasks([{ task_id: "b-1", task_type: "local_bash", description: "build" }]);
+			result("old report");
+			state("idle");
+			// A new turn starts with no frame yet, the shell leaves, and an idle arrives before the turn's own result.
+			state("running");
+			tasks([]);
+			state("idle");
+			if (await closedEarly("on the old turn's result")) break;
+			text("new report");
+			result("new report");
+			if (await closedEarly("after the new result, before idle")) break;
+			state("idle");
+			await awaitEof();
+			break;
+		case "nostate-drain":
+			init();
+			taskStarted("wf-1", "local_workflow");
+			tasks([{ task_id: "wf-1", task_type: "local_workflow", description: "probe" }]);
+			result("report first");
+			if (await closedEarly("with the workflow live")) break;
+			// The membership clears before the notification; Claude Code drains the follow-up after EOF.
+			tasks([]);
+			if (!(await awaitEof())) break;
+			followUp("wf-1", "final after the follow-up");
+			break;
+		case "nostate-mid-turn":
+			init();
+			taskStarted("wf-1", "local_workflow");
+			taskStarted("wf-2", "local_workflow");
+			result("report first");
+			// wf-2's notification starts a turn, and wf-1 ends in the middle of it.
+			taskEnded("wf-2");
+			text("reading wf-2's findings");
+			taskEnded("wf-1");
+			if (await closedEarly("mid-turn")) break;
+			text("final");
+			result("final");
+			await awaitEof();
+			break;
+		case "nostate-steer-after-result": {
+			init();
+			taskStarted("wf-1", "local_workflow");
+			result("first report");
+			const steer = await nextInput(3000);
+			taskEnded("wf-1");
+			if (await closedEarly("before the steer's turn")) break;
+			text(`steered: ${steer ?? "nothing"}`);
+			result(`steered: ${steer ?? "nothing"}`);
+			await awaitEof();
+			break;
+		}
+		case "nostate-question": {
+			init();
+			taskStarted("ag-1", "local_agent");
+			text("starting the agent");
+			await mcp("initialize", { protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: "fake-claude", version: "1" } });
+			await control({ subtype: "mcp_message", server_name: "pi-fusion", message: { jsonrpc: "2.0", method: "notifications/initialized" } });
+			// The agent asks, the main turn ends and the agent leaves the membership, all while the question is open; the
+			// answer comes back over stdin, so EOF then would lose it.
+			const asking = mcp("tools/call", { name: "ask_orchestrator", arguments: { question: "Which name?" } });
+			await sleep(100);
+			result("agent started");
+			taskEnded("ag-1");
+			if (await closedEarly("with the question open")) break;
+			const reply = await asking;
+			// A repeated empty membership after the answer is no evidence the turn that reads it has ended.
+			tasks([]);
+			if (await closedEarly("after the answer, before the turn that reads it")) break;
+			const answered = reply?.result?.content?.[0]?.text ?? "nothing";
+			text(`answered: ${answered}`);
+			result(`answered: ${answered}`);
+			await awaitEof();
+			break;
+		}
+		case "interim-revisions":
+			init();
+			state("running");
+			taskStarted("wf-1", "local_workflow", { workflow_name: "probe" });
+			tasks([{ task_id: "wf-1", task_type: "local_workflow", description: "probe" }]);
+			result("first report", { uuid: "r-1" });
+			// The same result seen again is the same report, not a new revision.
+			result("first report", { uuid: "r-1" });
+			state("idle");
+			state("running");
+			text("checking");
+			result("   ", { uuid: "r-2" });
+			tasks([
+				{ task_id: "wf-1", task_type: "local_workflow", description: "probe" },
+				{ task_id: "wf-2", task_type: "local_workflow", description: "scan" },
+			]);
+			state("idle");
+			state("running");
+			text("second report");
+			result("second report", { uuid: "r-3" });
+			state("idle");
+			tasks([{ task_id: "wf-2", task_type: "local_workflow", description: "scan" }]);
+			taskEnded("wf-1");
+			state("running");
+			text("final");
+			tasks([]);
+			taskEnded("wf-2");
+			result("final", { uuid: "r-4" });
+			state("idle");
+			await awaitEof();
+			break;
+		case "many-blockers":
+			init();
+			tasks(Array.from({ length: 25 }, (_, index) => ({ task_id: `t-${index}`, task_type: "local_bash", description: `${index} ${"x".repeat(300)}` })));
+			result("many going");
+			break;
+		case "interim-error":
+			init();
+			taskStarted("wf-1", "local_workflow", { workflow_name: "probe" });
+			result("rate limited", { is_error: true });
+			break;
 		case "slow":
 			init();
 			toolUse("tu-1", "Bash", { command: "npm test" });

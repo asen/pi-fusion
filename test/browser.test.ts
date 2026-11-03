@@ -1825,3 +1825,65 @@ test("a claude id only a failed continuation reported is readable but never offe
 		await served.close();
 	}
 });
+
+test("an interim report is offered on a going run's Report tab without taking the selection, as text only, and as partial text once the run is cancelled", { skip }, async () => {
+	const { page, store, url } = await fixture();
+	store.start({ id: "int-live", role: "int-live-role", model: "fable" });
+	store.event("int-live", { type: "task_started", taskId: "wf-1", name: "probe" });
+	store.event("int-live", { type: "blockers", tasks: [{ id: "wf-1", label: "workflow <b>probe</b>" }], total: 3 });
+	store.event("int-live", { type: "interim", revision: 2, text: "## Launched\n<img src=x onerror=\"window.__pwned = 1\">" });
+	store.start({ id: "int-cancelled", role: "int-cancelled-role", model: "fable" });
+	store.event("int-cancelled", { type: "interim", revision: 1, text: "halfway there" });
+	store.finish("int-cancelled", { status: "cancelled", failure: "implement cancelled", text: "halfway there" });
+	await page.open(url);
+	const label = await page.until<string>(
+		"the interim label in the list",
+		"(() => { const item = Array.from(document.querySelectorAll('.run')).find((node) => node.querySelector('.run-role').textContent === 'int-live-role'); const label = item && item.querySelector('.interim-label'); return label ? label.textContent : ''; })()",
+		(text) => text !== "",
+	);
+	assert.equal(label, "interim r2");
+	assert.equal(await page.evaluate<string>(SELECT_ROLE("int-live-role")), "ok");
+	await page.until<string>("the going run is shown", DETAIL_TITLE, (title) => title === "int-live-role");
+	assert.equal(await page.evaluate<string>("document.querySelector('.tab[aria-selected=\"true\"]').dataset.tab"), "log", "an interim report takes no tab");
+	assert.equal(await page.evaluate<string>("document.querySelector('.tab[data-tab=\"report\"] .badge').textContent"), "interim");
+	await page.evaluate<string>("(() => { document.querySelector('.tab[data-tab=\"report\"]').click(); return 'ok'; })()");
+	const shape = await page.evaluate<Record<string, unknown>>(`(() => {
+		const panel = document.querySelector('#panel-report');
+		return {
+			sections: Array.from(panel.querySelectorAll('.section-title')).map((node) => node.textContent),
+			note: (panel.querySelector('.interim-note') || {}).textContent,
+			heading: (panel.querySelector('.md-heading') || {}).textContent,
+			images: panel.querySelectorAll('img').length,
+			literal: panel.textContent.includes('<img src=x'),
+			waits: Array.from(panel.querySelectorAll('.blockers li')).map((node) => node.textContent),
+			bold: panel.querySelectorAll('.blockers b').length,
+			more: Array.from(panel.querySelectorAll('.note')).map((node) => node.textContent).includes('and 2 more background tasks'),
+			pwned: window.__pwned === 1,
+		};
+	})()`);
+	assert.deepEqual(shape, {
+		sections: ["Interim report", "Waits for"],
+		note: "Not a final report: revision 2, given while background work the run waits for goes on. The final report replaces it.",
+		heading: "Launched",
+		images: 0,
+		literal: true,
+		waits: ["workflow <b>probe</b>"],
+		bold: 0,
+		more: true,
+		pwned: false,
+	});
+	assert.equal(await page.evaluate<string>(SELECT_ROLE("int-cancelled-role")), "ok");
+	await page.until<string>("the cancelled run is shown", DETAIL_TITLE, (title) => title === "int-cancelled-role");
+	await page.evaluate<string>("(() => { document.querySelector('.tab[data-tab=\"report\"]').click(); return 'ok'; })()");
+	const ended = await page.evaluate<Record<string, unknown>>(`(() => {
+		const panel = document.querySelector('#panel-report');
+		return {
+			sections: Array.from(panel.querySelectorAll('.section-title')).map((node) => node.textContent),
+			note: (panel.querySelector('.interim-note') || {}).textContent,
+		};
+	})()`);
+	assert.deepEqual(ended, {
+		sections: ["Failure", "Partial report"],
+		note: "Not a final report: revision 1 of the interim reports the run gave before it ended without succeeding.",
+	}, "the same text is shown once, as partial, after the failure");
+});

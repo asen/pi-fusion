@@ -27,7 +27,7 @@ after(() => {
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 process.env.PI_FUSION_CLAUDE_BIN = path.join(repoRoot, "test", "fake-claude.mjs");
-process.env.FAKE_CLAUDE_SCENARIO = "ok";
+process.env.FAKE_CLAUDE_SCENARIO = "ok-sync";
 process.env.PI_FUSION_DASHBOARD_OPEN = "0";
 
 const entry = (data: Record<string, unknown>) => ({ type: "custom", customType: "pi-fusion", data });

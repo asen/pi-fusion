@@ -196,6 +196,11 @@ const runItem = (run, step) => {
 		label.title = "from the run history: only its saved input, output and basic facts";
 		head.appendChild(label);
 	} else if (run.restored === true) head.appendChild(el("span", "restored", "restored"));
+	if ((run.status === "running" || run.status === "waiting") && num(run.interimRevision) > 0) {
+		const label = el("span", "interim-label", "interim r" + num(run.interimRevision));
+		label.title = "the run gave an interim report and goes on; it is not the final report";
+		head.appendChild(label);
+	}
 	item.appendChild(head);
 	const flags = list(run.reportFlags).map(str).filter(Boolean);
 	if (flags.length > 0) {
@@ -1288,6 +1293,53 @@ const appendReport = (parent, detail) => {
 	parent.appendChild(node);
 };
 
+/**
+ * The latest interim report: provisional while the run goes on, and partial text once it ended without succeeding. A
+ * successful run's detail carries none, because its final report replaces it.
+ */
+const appendInterim = (parent, detail) => {
+	const interim = detail.interim;
+	if (!interim || typeof interim !== "object") return;
+	const body = str(interim.text);
+	if (!body) return;
+	const partial = interim.partial === true;
+	const revision = num(interim.revision);
+	const named = revision > 0 ? "revision " + revision : "the last revision";
+	const node = section(partial ? "Partial report" : "Interim report", body);
+	node.appendChild(
+		el(
+			"p",
+			"note interim-note",
+			partial
+				? "Not a final report: " + named + " of the interim reports the run gave before it ended without succeeding."
+				: "Not a final report: " + named + ", given while background work the run waits for goes on. The final report replaces it.",
+		),
+	);
+	if (interim.truncated === true) node.appendChild(el("p", "note", isArchived(detail) ? "truncated when it was saved to history" : "truncated"));
+	if (state.rawReport) node.appendChild(el("pre", "report", body));
+	else {
+		const report = el("div", "report md");
+		renderMarkdown(report, body);
+		node.appendChild(report);
+	}
+	parent.appendChild(node);
+};
+
+/** What a running run waits for, as its backend last listed it; a task missing here did not necessarily finish. */
+const appendBlockers = (parent, detail) => {
+	const blockers = detail.blockers;
+	if (!blockers || typeof blockers !== "object" || !active(detail)) return;
+	const tasks = list(blockers.tasks);
+	if (tasks.length === 0) return;
+	const node = section("Waits for", "");
+	const items = el("ul", "blockers");
+	for (const task of tasks) items.appendChild(el("li", "", str(task && task.label) || str(task && task.id)));
+	node.appendChild(items);
+	const more = num(blockers.total) - tasks.length;
+	if (more > 0) node.appendChild(el("p", "note", "and " + more + " more background task" + (more === 1 ? "" : "s")));
+	parent.appendChild(node);
+};
+
 const appendBlock = (parent, title, body, truncated, className, copy, archived) => {
 	if (!body) return;
 	const node = section(title, copy ? body : "");
@@ -1443,11 +1495,12 @@ const tabStrip = (detail, panels) => {
 	const running = tasks.filter((task) => task.status === "running").length;
 	const flags = list(detail.reportFlags).length;
 	const failed = str(detail.failure) !== "";
+	const interim = active(detail) && detail.interim && str(detail.interim.text) !== "";
 	const labels = {
 		overview: ["Overview", "", ""],
 		log: ["Log", unseen > 0 ? "+" + unseen : entries.length > 0 ? formatCount(entries.length) : "", unseen > 0 ? "hot" : ""],
 		tasks: ["Tasks", running > 0 ? running + " running" : tasks.length > 0 ? formatCount(tasks.length) : "", running > 0 ? "hot" : ""],
-		report: [failed ? "Failure" : "Report", failed ? "!" : flags > 0 ? String(flags) : "", failed ? "bad" : flags > 0 ? "hot" : ""],
+		report: [failed ? "Failure" : "Report", failed ? "!" : interim ? "interim" : flags > 0 ? String(flags) : "", failed ? "bad" : interim || flags > 0 ? "hot" : ""],
 	};
 	const strip = el("div", "tabs");
 	strip.setAttribute("role", "tablist");
@@ -1526,8 +1579,15 @@ const appendDetail = (parent, detail) => {
 		appendThinking(panels.tasks, list(detail.thinking));
 		if (!panels.tasks.firstChild) panels.tasks.appendChild(el("p", "empty", "No tasks yet."));
 	}
-	appendReport(panels.report, detail);
+	if (active(detail)) {
+		appendInterim(panels.report, detail);
+		appendBlockers(panels.report, detail);
+	}
+	// A run that ended without succeeding often ended on the text of its last interim report; it is shown once, as partial.
+	const partial = !active(detail) && detail.interim && str(detail.interim.text) !== "" ? str(detail.interim.text) : "";
+	if (str(detail.text) !== partial || !partial) appendReport(panels.report, detail);
 	appendBlock(panels.report, "Failure", str(detail.failure), detail.failureTruncated, "failure", false, archived);
+	if (!active(detail)) appendInterim(panels.report, detail);
 	if (!panels.report.firstChild) panels.report.appendChild(el("p", "empty", active(detail) ? "The report arrives when the run ends." : archived ? "No report was saved." : "No report."));
 	top.appendChild(tabStrip(detail, panels));
 	parent.appendChild(top);

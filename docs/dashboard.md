@@ -24,11 +24,13 @@ The selected header summarizes status, question, activity, event age, tools/erro
 | **Overview** | Host tool/call/session facts, prompt and contract, requested child session, models/usage, changed files, and accepted transcript/resume hint |
 | **Log** | Ordered run/tool/agent/task/turn events, expandable tool input/results, and search/filter controls |
 | **Tasks** | Task facts, timeline, phases/agent states where emitted, and latest thinking blocks |
-| **Report** | Final report or failure, Markdown/Raw views, Copy, and Escalation/Review/Open questions sections |
+| **Report** | Final report or failure, Markdown/Raw views, Copy, and Escalation/Review/Open questions sections; while a run goes on, its latest interim report and what it waits for |
 
-Running/waiting runs open on Log. Ended runs open on Report, or Overview if there is no report/failure. Tabs retain scroll positions across refreshes and run selection; left/right arrows on a focused tab move between tabs. The Log tab counts new rows while another tab is visible; Tasks counts tasks/running work; Report shows section badges or `!` for failure.
+Running/waiting runs open on Log, even with an [interim report](runs.md#interim-reports): the list entry then reads `interim rN` and the Report tab carries an `interim` badge, but nothing switches the selection or tab. The Report tab shows **Interim report** (revision, marked not final) and **Waits for**, the backend's bounded task labels with how many more. A successful end replaces both with the final report. A failed, aborted or cancelled run shows the last interim report once, as **Partial report** after the failure; text identical to its last result is not repeated as a report. Ended runs open on Report, or Overview if there is no report/failure. Tabs retain scroll positions across refreshes and run selection; left/right arrows on a focused tab move between tabs. The Log tab counts new rows while another tab is visible; Tasks counts tasks/running work; Report shows section badges or `!` for failure.
 
 A waiting banner offers each waiting run without changing selection until clicked, and the page title shows the waiting count. Entries get an amber stripe. Focus on banner buttons is preserved when their set remains unchanged.
+
+A task that a list of what the run waits for named, and that the latest complete list no longer names, reads `unknown`, never `completed`, whether its start or the list arrived first; a later notification still sets its outcome, and a list that names it again makes it running again. A cut list (more tasks than labels) shows no task leaving. The page remembers at most 400 listed task ids per run.
 
 A run with no real event for 60 seconds gets an amber edge/timer. Thinking deltas count as events, so this highlights missing progress, not merely slow reasoning. The page shows only events the backend emits: Claude workflow/task/model details are not promised for Pi. It holds no subagent transcript; Claude `forwardSubagentText` and `agentProgressSummaries` remain off.
 
@@ -43,6 +45,7 @@ After a restart or `/resume`, the first list is history only. No child is runnin
 An archived detail shows what the history saved:
 
 - prompt, report, failure, the usage counters it kept, changed files, the session request, and the accepted reference/selection;
+- for a run that did not succeed, including one interrupted by a gone process, its last interim report as **Partial report**;
 - labels where the history truncated text or kept a file count without its list.
 
 Logs, tool inputs/results, tasks, timeline, thinking, per-model usage, cache, event times, turns, API time, context and denied tools read **Not saved in history**, never zero. The history holds no child transcript.
@@ -95,7 +98,8 @@ Other limits:
 | --- | --- |
 | Log entries / tasks per run | 100 each |
 | Prompt | 256 KiB |
-| Report / failure | 32 KiB / 4 KiB |
+| Report / interim report / failure | 32 KiB / 32 KiB / 4 KiB |
+| Waits-for labels | 20 per run, 400 characters each (the backend sends at most 200) |
 | Changed files | 500 |
 | Tool input / result | 16 KiB each while its log row is retained |
 | Agent prompt | 32 KiB |

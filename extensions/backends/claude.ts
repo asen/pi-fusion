@@ -16,7 +16,7 @@ import {
 import { z } from "zod";
 import { resultText } from "../cards.ts";
 import { ChildTree, KILL_GRACE_MS } from "../process-tree.ts";
-import { type Ask, type Backend, type ChildControl, type ChildEvent, type ChildRun, failed, type ModelCost, type RunRequest, type SessionIntent, type SessionRef } from "./types.ts";
+import { type Ask, type Backend, BLOCKER_LABEL_CHARS, type ChildControl, type ChildEvent, type ChildRun, failed, MAX_BLOCKERS, type ModelCost, type RunRequest, type SessionIntent, type SessionRef } from "./types.ts";
 
 /**
  * The Claude Code backend: the SDK options a role runs with, the questions bridge the child asks through, and the
@@ -292,13 +292,28 @@ export class ChildInput implements AsyncIterable<SDKUserMessage>, ChildControl {
 	private readonly queue: SDKUserMessage[] = [];
 	private wake?: () => void;
 	private ended = false;
+	private count = 0;
 
 	get open(): boolean {
 		return !this.ended;
 	}
 
+	/**
+	 * How many messages this input has taken, the prompt included. Taken is not read: the run compares it with the count
+	 * at its last result and idle state, so a message taken after either leaves that evidence stale.
+	 */
+	get taken(): number {
+		return this.count;
+	}
+
+	/** Messages taken and not yet handed to the SDK. They still reach the child before EOF, which drains them first. */
+	get pending(): number {
+		return this.queue.length;
+	}
+
 	push(text: string): boolean {
 		if (this.ended) return false;
+		this.count++;
 		this.queue.push({ type: "user", message: { role: "user", content: text }, parent_tool_use_id: null });
 		this.wake?.();
 		return true;
@@ -422,7 +437,52 @@ export async function runChild(opts: RunRequest<Role, ChildSession, ChildInput>)
 	const toolUseIds = new Set<string>();
 	const agentToolUseIds = new Set<string>();
 	const workflowTokens = new Map<string, number>();
-	const pendingTasks = new Map<string, string>();
+	/** The background tasks that keep the child's input open: a pending task's notification starts another turn. */
+	let pendingTasks = new Map<string, string>();
+	/**
+	 * Task ids a membership snapshot has listed, ambient ones included, or that left the membership or ended. Once a
+	 * snapshot has been seen it governs: a start edge, whose order against the snapshots is unspecified, adds only an
+	 * id none of them has ruled on, so a late one never brings back a task that has ended or been listed as ambient.
+	 */
+	const ruledTasks = new Set<string>();
+	/** Whether the child reports its session state; once one valid state arrives, completion also needs idle. */
+	let reportsState = false;
+	/** The input count when the child last reported idle, or undefined while it is not known to be idle. */
+	let idleAt: number | undefined;
+	/** The input count at the last top-level result, or undefined while a top-level turn is known to be in progress. */
+	let resultAt: number | undefined;
+	let questionsOpen = 0;
+	/**
+	 * Closes the child's input once nothing could still start a turn this run waits for: no blocking task, no open
+	 * question, nothing left in the local queue, a top-level result after the last message taken and after any later
+	 * top-level activity, and, from a child that reports its session state, an idle state at least as new. EOF ends
+	 * nothing the child already holds: Claude Code still drains queued input and pending task notifications before it
+	 * exits, so a follow-up turn's result reaches this run. Nothing here waits on quiet time.
+	 */
+	const settle = () => {
+		if (!input.open || pendingTasks.size || questionsOpen || input.pending) return;
+		if (resultAt === undefined || resultAt !== input.taken) return;
+		if (reportsState && idleAt !== input.taken) return;
+		input.end();
+	};
+	/**
+	 * The question callback, counted so that an open question keeps the input open: its answer travels back over that
+	 * input. An answer is new work for the turn or agent that asked, so a result or idle state from before it, the main
+	 * turn's own included, is stale; the answer itself closes nothing, and the result of the turn that reads it, or of
+	 * the turn the asking task's notification starts, brings the evidence that does.
+	 */
+	const ask: Ask | undefined = opts.onQuestion
+		? async (question, signal) => {
+				questionsOpen++;
+				try {
+					return await opts.onQuestion!(question, signal);
+				} finally {
+					questionsOpen--;
+					resultAt = undefined;
+					idleAt = undefined;
+				}
+			}
+		: undefined;
 	const resultIds = new Set<string>();
 	const streamed = new StreamedBlocks();
 	const deltaProgress = throttled(DELTA_PROGRESS_MS, () => opts.onProgress(run));
@@ -431,6 +491,17 @@ export async function runChild(opts: RunRequest<Role, ChildSession, ChildInput>)
 			opts.onEvent?.(event);
 		} catch {}
 	};
+	let blockersSent = "";
+	/** Tells the monitor which tasks the run now waits for, whenever that changes; the set itself stays exact. */
+	const publishBlockers = () => {
+		const tasks = [...pendingTasks].slice(0, MAX_BLOCKERS).map(([id, label]) => ({ id, label: label.length > BLOCKER_LABEL_CHARS ? `${label.slice(0, BLOCKER_LABEL_CHARS)}…` : label }));
+		const key = JSON.stringify([pendingTasks.size, tasks]);
+		if (key === blockersSent) return;
+		blockersSent = key;
+		emit({ type: "blockers", tasks, total: pendingTasks.size });
+	};
+	let interims = 0;
+	let interimResult: string | undefined;
 	const onMessage = (event: any) => {
 		if (event.parent_tool_use_id && event.type === "assistant") {
 			const parts = Array.isArray(event.message?.content) ? event.message.content : [];
@@ -456,6 +527,12 @@ export async function runChild(opts: RunRequest<Role, ChildSession, ChildInput>)
 			}
 		}
 		if (event.parent_tool_use_id) return;
+		// Top-level model output is a turn in progress, so a result and an idle state seen before it are stale.
+		// Subagent frames, returned above, and task events are not: they run beside an idle session.
+		if (event.type === "assistant" || event.type === "stream_event" || event.type === "user") {
+			resultAt = undefined;
+			idleAt = undefined;
+		}
 		if (event.type === "system") {
 			if (event.subtype === "init") {
 				if (typeof event.session_id === "string") {
@@ -473,7 +550,7 @@ export async function runChild(opts: RunRequest<Role, ChildSession, ChildInput>)
 				if (event.task_id !== undefined && event.task_id !== null) {
 					const taskId = String(event.task_id);
 					// Ambient tasks, such as watchers, get no task_notification: Claude Code neither waits for nor sweeps them.
-					if (event.ambient !== true && event.skip_transcript !== true) pendingTasks.set(taskId, `${taskKind(event.task_type)} ${taskName(event, taskId)}`);
+					if (event.ambient !== true && event.skip_transcript !== true && !ruledTasks.has(taskId)) pendingTasks.set(taskId, `${taskKind(event.task_type)} ${taskName(event, taskId)}`);
 					emit({
 						type: "task_started",
 						taskId,
@@ -482,6 +559,7 @@ export async function runChild(opts: RunRequest<Role, ChildSession, ChildInput>)
 						name: taskName(event, taskId),
 						...(typeof event.subagent_type === "string" ? { subagentType: event.subagent_type } : {}),
 					});
+					publishBlockers();
 				}
 				if (typeof event.workflow_name === "string") {
 					run.activity = `Workflow ${event.workflow_name}`;
@@ -489,11 +567,28 @@ export async function runChild(opts: RunRequest<Role, ChildSession, ChildInput>)
 				}
 			}
 			if (event.subtype === "background_tasks_changed" && Array.isArray(event.tasks)) {
-				pendingTasks.clear();
+				// The full live membership, which replaces the set: an ambient entry, or one that turns back from ambient, is
+				// the snapshot's to say. Shrinking it is no new work, so idle stays as it was.
+				const live = new Map<string, string>();
 				for (const task of event.tasks) {
-					if (!task || task.ambient === true || typeof task.task_id !== "string") continue;
-					pendingTasks.set(task.task_id, `${taskKind(task.task_type)} ${taskName(task, task.task_id)}`);
+					if (!task || typeof task.task_id !== "string") continue;
+					ruledTasks.add(task.task_id);
+					if (task.ambient !== true) live.set(task.task_id, `${taskKind(task.task_type)} ${taskName(task, task.task_id)}`);
 				}
+				for (const taskId of pendingTasks.keys()) ruledTasks.add(taskId);
+				pendingTasks = live;
+				publishBlockers();
+				settle();
+			}
+			if (event.subtype === "session_state_changed" && (event.state === "idle" || event.state === "running" || event.state === "requires_action")) {
+				reportsState = true;
+				// Running or awaiting action is a turn in progress, so the last result is no longer the current turn's.
+				if (event.state === "idle") idleAt = input.taken;
+				else {
+					idleAt = undefined;
+					resultAt = undefined;
+				}
+				settle();
 			}
 			if ((event.subtype === "task_progress" || event.subtype === "task_notification") && event.task_id !== undefined) {
 				const tokens = event.usage?.total_tokens;
@@ -519,6 +614,7 @@ export async function runChild(opts: RunRequest<Role, ChildSession, ChildInput>)
 					opts.onProgress(run);
 				} else {
 					pendingTasks.delete(String(event.task_id));
+					ruledTasks.add(String(event.task_id));
 					emit({
 						type: "task_ended",
 						taskId: String(event.task_id),
@@ -526,6 +622,8 @@ export async function runChild(opts: RunRequest<Role, ChildSession, ChildInput>)
 						...(typeof event.summary === "string" && event.summary ? { summary: event.summary } : {}),
 						...(typeof tokens === "number" ? { tokens } : {}),
 					});
+					publishBlockers();
+					settle();
 				}
 			}
 		} else if (event.type === "stream_event") {
@@ -603,8 +701,15 @@ export async function runChild(opts: RunRequest<Role, ChildSession, ChildInput>)
 			emit({ type: "turn_result", ok: !event.is_error, ...(event.is_error && message !== undefined ? { message } : {}) });
 			const denials = Array.isArray(event.permission_denials) ? event.permission_denials : [];
 			for (const denial of denials) run.deniedTools = [...(run.deniedTools ?? []), String(denial?.tool_name ?? "?")];
-			// A pending task's notification starts another turn; with none left, nothing but a steer could, so stdin closes.
-			if (!pendingTasks.size) input.end();
+			resultAt = input.taken;
+			settle();
+			// A report the run keeps going after: the input is still open and a task it waits for still runs. Each
+			// result is one report, so a result seen again under the same id is not a new revision.
+			const identity = typeof event.uuid === "string" ? event.uuid : undefined;
+			if (!event.is_error && text.trim() && input.open && pendingTasks.size && (identity === undefined || identity !== interimResult)) {
+				interimResult = identity;
+				emit({ type: "interim", revision: ++interims, text });
+			}
 			opts.onProgress(run);
 		}
 	};
@@ -615,7 +720,7 @@ export async function runChild(opts: RunRequest<Role, ChildSession, ChildInput>)
 			prompt: input,
 			options: {
 				...childOptions(role, opts.session, opts.title ?? `pi-fusion ${role.name}`),
-				...(opts.onQuestion ? questionOptions(opts.onQuestion, controller.signal) : {}),
+				...(ask ? questionOptions(ask, controller.signal) : {}),
 				...claudeExecutable(),
 				cwd: opts.cwd,
 				env: {
@@ -623,6 +728,8 @@ export async function runChild(opts: RunRequest<Role, ChildSession, ChildInput>)
 					CLAUDE_AGENT_SDK_CLIENT_APP: "pi-fusion",
 					// Headless Claude Code kills background tasks still running 10 min after the turn ends. Only an abort stops the child.
 					CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS: "0",
+					// Session state events are opt-in; their idle is what tells a finished turn from one still holding results back.
+					CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS: "1",
 				},
 				abortController: controller,
 				spawnClaudeCodeProcess: (options) => child.spawn(options),

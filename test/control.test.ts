@@ -14,7 +14,8 @@ import { settingsTable } from "../extensions/profiles.ts";
 import { memoryProfileStore } from "../extensions/profile-store.ts";
 import { memorySettingsStore, type SettingsStore, serializeSettings } from "../extensions/settings-store.ts";
 import { History, HISTORY_ABORTED, HISTORY_VERSION, type HistoryRecord } from "../extensions/history.ts";
-import { fakeBackend } from "./fake-pi-backend.ts";
+import type { ChildEvent } from "../extensions/backends/types.ts";
+import { fakeBackend, type FakeScript } from "./fake-pi-backend.ts";
 import { toolList, turnOn } from "./host-tools.ts";
 import { tripwires } from "./tripwire.ts";
 
@@ -208,6 +209,23 @@ async function finishing(host: ReturnType<typeof makeHost>, handle: string, stat
 const started = (host: ReturnType<typeof makeHost>, handle: string) =>
 	until(`${handle} to start`, async () => /tool calls: 1/.test(await host.text(host.control({ action: "status", run: handle }))));
 
+/**
+ * A foreground call's final result. A workflow child's launch report returns the call early as an interim report and
+ * leaves the run going, so this does what a host must before it relies on the run's end: it waits through every interim
+ * report with control wait until the final one, whose reply is the wait's and not the foreground call's.
+ */
+async function final(host: ReturnType<typeof makeHost>, call: Promise<Result>): Promise<Result> {
+	let result = await call;
+	while (result.details?.kind === "interim") result = await host.control({ action: "wait", run: result.details.handle });
+	return result;
+}
+
+/** A foreground claude call taken to its final result through any interim reports, as `final` does. */
+const finalClaude = (host: ReturnType<typeof makeHost>, params: Record<string, unknown>): Promise<Result> => final(host, host.claude(params));
+
+/** The notices a host was sent about runs, without the interim reports that went before their ends. */
+const endNotices = (host: ReturnType<typeof makeHost>) => host.sent.filter(([message]) => message.details?.kind !== "interim");
+
 async function withScenario<T>(scenario: string, body: () => Promise<T>): Promise<T> {
 	process.env.FAKE_CLAUDE_SCENARIO = scenario;
 	try {
@@ -277,7 +295,7 @@ test("a continue that lands while the run is still finishing waits for the recor
 	const host = makeHost();
 	await withScenario("slow", () => host.claude({ role: "implement", task: "do a thing", background: true }));
 	await finishing(host, "run-1");
-	const next = await withScenario("ok", () => host.text(host.claude({ continue: "run-1", task: "more" })));
+	const next = await withScenario("ok", () => host.text(finalClaude(host, { continue: "run-1", task: "more" })));
 	assert.match(next, /\[run-1 · implement · /, "the continued call found the run's session on the branch");
 	assert.equal(host.branch.length, 2, "the finished run recorded its entry, and the continued one its own");
 });
@@ -1346,7 +1364,7 @@ test("a budget variable that names no amount is reported once, and the control i
 		host.notices.length = 0;
 		await host.command("status");
 		assert.equal(host.notices.length, 1, "the variable is reported once per Pi process, and the usage line stands alone after it");
-		assert.match(await withScenario("ok", () => host.text(host.claude({ role: "implement", task: "do a thing" }))), /\[run-1 · implement · /, "no limit was set, so no call is refused");
+		assert.match(await withScenario("ok", () => host.text(finalClaude(host, { role: "implement", task: "do a thing" }))), /\[run-1 · implement · /, "no limit was set, so no call is refused");
 	}));
 
 const BLOCKED =
@@ -1358,13 +1376,13 @@ const warning = (total: string, threshold: string) =>
 test("PI_FUSION_BUDGET_LIMIT_USD stops the next new, ask and continued call and leaves the run that spent it alone", () =>
 	withBudget({ PI_FUSION_BUDGET_LIMIT_USD: "0.1" }, async () => {
 		const host = makeHost();
-		const first = await withScenario("ok", () => host.text(host.claude({ role: "implement", task: "do a thing" })));
-		assert.match(first, /^## Changed\nfoo\.ts\n\n\[run-1 · implement · /, "the run that goes over the limit still returns its report");
+		const first = await withScenario("ok", () => host.text(finalClaude(host, { role: "implement", task: "do a thing" })));
+		assert.match(first, /^run-1 \(implement\) done\.\n\n## Changed\nfoo\.ts\n\n\[run-1 · implement · /, "the run that goes over the limit still returns its report");
 		await assert.rejects(host.claude({ role: "implement", task: "more" }), { message: BLOCKED });
 		await assert.rejects(host.claude({ role: "ask", task: "where is x?" }), { message: BLOCKED }, "an ask run costs money too");
 		await assert.rejects(host.claude({ continue: "run-1", task: "again" }), { message: BLOCKED });
 		const status = await host.control({ action: "status" });
-		assert.match(status.content[0]!.text, /^run-1 · implement · opus · done · \d+s( · context <1%)?$/, "nothing was cancelled");
+		assert.match(status.content[0]!.text, /^run-1 · implement · opus · done · background · \d+s( · context <1%)?$/, "nothing was cancelled; the launch report moved the run to the background");
 		assert.equal(status.details.usage.costUsd, 0.25);
 		assert.equal(status.details.usage.calls, 1);
 		assert.deepEqual(host.sent, []);
@@ -1373,13 +1391,13 @@ test("PI_FUSION_BUDGET_LIMIT_USD stops the next new, ask and continued call and 
 test("PI_FUSION_BUDGET_WARN_USD warns the user once for each threshold the session total passes", () =>
 	withBudget({ PI_FUSION_BUDGET_WARN_USD: "0.1, 0.2" }, async () => {
 		const host = makeHost();
-		await withScenario("ok", () => host.claude({ role: "implement", task: "do a thing" }));
+		await withScenario("ok", () => finalClaude(host, { role: "implement", task: "do a thing" }));
 		assert.deepEqual(host.notices, [
 			[warning("$0.2500", "$0.1000"), "warning"],
 			[warning("$0.2500", "$0.2000"), "warning"],
 		]);
 		host.notices.length = 0;
-		await withScenario("ok", () => host.claude({ role: "implement", task: "another thing" }));
+		await withScenario("ok", () => finalClaude(host, { role: "implement", task: "another thing" }));
 		assert.deepEqual(host.notices, [], "a threshold warns once for the life of the Pi session");
 		assert.equal((await host.control({ action: "status" })).details.usage.costUsd, 0.5);
 	}));
@@ -1393,15 +1411,15 @@ test("a warning notice that throws leaves its threshold pending, so a later run 
 			if (broken !== undefined && text.includes(broken)) throw new Error("the TUI is gone");
 			return notify(text, type);
 		};
-		await withScenario("ok", () => host.claude({ role: "implement", task: "do a thing" }));
+		await withScenario("ok", () => finalClaude(host, { role: "implement", task: "do a thing" }));
 		assert.deepEqual(host.notices, [], "a threshold whose notice threw reached nobody");
 		broken = "$0.2000";
-		await withScenario("ok", () => host.claude({ role: "implement", task: "another thing" }));
+		await withScenario("ok", () => finalClaude(host, { role: "implement", task: "another thing" }));
 		assert.equal(host.notices.length, 1, "the threshold the first run could not warn about is still pending");
 		assert.match(host.notices[0]![0], /past the \$0\.1000 warning threshold/);
 		host.notices.length = 0;
 		broken = undefined;
-		await withScenario("ok", () => host.claude({ role: "implement", task: "a third thing" }));
+		await withScenario("ok", () => finalClaude(host, { role: "implement", task: "a third thing" }));
 		assert.equal(host.notices.length, 1, "only the threshold whose notice never returned comes back");
 		assert.match(host.notices[0]![0], /past the \$0\.2000 warning threshold/);
 	}));
@@ -1410,15 +1428,15 @@ test("the session usage shows in /fusion status and claude_control details with 
 	const host = makeHost();
 	await host.command("status");
 	assert.deepEqual(host.notices, [[`${STATUS_HEADER}no runs in this Pi session yet\nsession usage: est. $0.0000 · in 0 out 0 tokens · workflow agents 0 tokens · 0 calls`, "info"]]);
-	await withScenario("ok", () => host.claude({ role: "implement", task: "do a thing" }));
+	await withScenario("ok", () => finalClaude(host, { role: "implement", task: "do a thing" }));
 	host.notices.length = 0;
 	await host.command("status");
 	const [line, type] = host.notices[0]!;
 	assert.equal(type, "info");
-	assert.match(line, /^fusion: on\nprofile: builtin\nhistory: [^\n]*\n\n[\s\S]*?\n\nrun-1 · implement · opus · done · \d+s · context <1%\nsession usage: est\. \$0\.2500 · in \d+ out \d+ tokens · workflow agents 250 tokens · 1 calls$/);
+	assert.match(line, /^fusion: on\nprofile: builtin\nhistory: [^\n]*\n\n[\s\S]*?\n\nrun-1 · implement · opus · done · background · \d+s · context <1%\nsession usage: est\. \$0\.2500 · in \d+ out \d+ tokens · workflow agents 250 tokens · 1 calls$/);
 	assert.ok(!line.includes("warn at") && !line.includes("· limit"), "with no threshold and no limit the line names neither");
 	const status = await host.control({ action: "status" });
-	assert.match(status.content[0]!.text, /^run-1 · implement · opus · done · \d+s( · context <1%)?$/, "the text the host reads is unchanged");
+	assert.match(status.content[0]!.text, /^run-1 · implement · opus · done · background · \d+s( · context <1%)?$/, "the text the host reads is unchanged");
 	assert.equal(status.details.usage.costUsd, 0.25);
 	assert.equal(status.details.usage.workflowTokens, 250);
 	assert.equal((await host.control({ action: "status", run: "run-1" })).details.usage.calls, 1);
@@ -1435,12 +1453,12 @@ test("/fusion status names the thresholds the budget variables set", () =>
 
 test("a continued run is a second call, so the session total adds its cost to the first", async () => {
 	const host = makeHost();
-	const first = await withScenario("ok", () => host.claude({ role: "implement", task: "do a thing" }));
+	const first = await withScenario("ok-sync", () => host.claude({ role: "implement", task: "do a thing" }));
 	assert.deepEqual(first.details.sessionUsage, { costUsd: 0.25, tokensIn: first.details.tokensIn, tokensOut: first.details.tokensOut, workflowTokens: 250, calls: 1 });
-	const second = await withScenario("ok", () => host.claude({ continue: "run-1", task: "more" }));
+	const second = await withScenario("ok-sync", () => host.claude({ continue: "run-1", task: "more" }));
 	assert.equal(second.details.sessionUsage.costUsd, 0.5, "the continued call's own total_cost_usd restarts, so it adds");
 	assert.equal(second.details.sessionUsage.calls, 2);
-	const third = await withScenario("ok", () => host.claude({ role: "implement", task: "a third thing", background: true }));
+	const third = await withScenario("ok-sync", () => host.claude({ role: "implement", task: "a third thing", background: true }));
 	assert.equal(third.details.sessionUsage.calls, 2, "a background run reports the totals as they stand when it starts");
 	await until("the completion notice", () => host.sent.length > 0);
 	const usage = (await host.control({ action: "status" })).details.usage;
@@ -1485,7 +1503,7 @@ test("PI_FUSION_WIDGET=0 leaves the editor alone and changes nothing else", asyn
 	process.env.PI_FUSION_WIDGET = "0";
 	try {
 		const host = makeHost();
-		const report = await withScenario("ok", () => host.text(host.claude({ role: "implement", task: "do a thing" })));
+		const report = await withScenario("ok-sync", () => host.text(host.claude({ role: "implement", task: "do a thing" })));
 		assert.match(report, /^## Changed\nfoo\.ts\n\n\[run-1 · implement · /);
 		assert.deepEqual(host.widgets, [], "nothing was set over the editor");
 	} finally {
@@ -1543,7 +1561,7 @@ test("a running run's changed files are sampled once, however many times the sta
 
 test("every result about a run carries what became of it, how long it took, what it cost and what it changed", () =>
 	withRepo(async (host) => {
-		const done = await withScenario("ok", () => host.claude({ role: "implement", task: "do a thing" }));
+		const done = await withScenario("ok", () => finalClaude(host, { role: "implement", task: "do a thing" }));
 		assert.equal(done.details.state, "done");
 		assert.equal(done.details.costUsd, 0.25);
 		assert.equal(done.details.filesChanged, 0, "the ok child changes no file");
@@ -1555,8 +1573,9 @@ test("every result about a run carries what became of it, how long it took, what
 		assert.equal(edited.details.filesChanged, 1);
 		assert.deepEqual(edited.details.files, ["edited.txt"]);
 		await withScenario("ok", () => host.claude({ role: "implement", task: "and again", background: true }));
-		await until("the completion notice", () => host.sent.length > 0);
-		assert.deepEqual(fixed(host.sent[0]![0].details), { handle: "run-3", role: "implement", model: "opus", state: "done", background: true, costUsd: 0.25 });
+		await until("the completion notice", () => endNotices(host).length > 0);
+		assert.deepEqual(fixed(host.sent[0]![0].details), { handle: "run-3", role: "implement", model: "opus", state: "running", background: true, kind: "interim" }, "the launch report came first, as an interim report");
+		assert.deepEqual(fixed(endNotices(host)[0]![0].details), { handle: "run-3", role: "implement", model: "opus", state: "done", background: true, costUsd: 0.25 });
 	}));
 
 /** A host in a scratch git repository, so a child that edits a file leaves changed files a review can be given. */
@@ -1850,7 +1869,7 @@ function payload(url: string): Promise<any> {
 test("a later Pi process on the same host session shows the earlier runs, their reports and what they spent", () =>
 	withHistory(async (dir) => {
 		const first = durable("host-1");
-		await withScenario("ok", () => first.claude({ role: "ultracode", task: "do a thing" }));
+		await withScenario("ok", () => finalClaude(first, { role: "ultracode", task: "do a thing" }));
 		assert.equal(fs.statSync(dir).mode & 0o777, 0o700, "the history directory is the user's own");
 		assert.equal(fs.statSync(path.join(dir, "host-1.json")).mode & 0o777, 0o600, "so is the session file");
 		const written = heldFile(dir, "host-1");
@@ -1910,9 +1929,9 @@ test("a later Pi process on the same host session shows the earlier runs, their 
 		}
 
 		second.notices.length = 0;
-		assert.match(await withScenario("ok", () => second.text(second.claude({ role: "ultracode", task: "another thing" }))), /\[run-2 · ultracode · fable · /);
+		assert.match(await withScenario("ok", () => second.text(finalClaude(second, { role: "ultracode", task: "another thing" }))), /\[run-2 · ultracode · fable · /);
 		await second.command("status");
-		assert.match(second.notices[0]![0], /^fusion: on\nprofile: builtin\nhistory: [^\n]*\n\n[\s\S]*?\n\nrun-2 · ultracode · fable · done · \d+s · context <1%\nrun-1 · ultracode · fable · done · earlier Pi process\nsession usage: est\. \$0\.5000 · .* · 2 calls$/);
+		assert.match(second.notices[0]![0], /^fusion: on\nprofile: builtin\nhistory: [^\n]*\n\n[\s\S]*?\n\nrun-2 · ultracode · fable · done · background · \d+s · context <1%\nrun-1 · ultracode · fable · done · earlier Pi process\nsession usage: est\. \$0\.5000 · .* · 2 calls$/);
 		assert.deepEqual(
 			second.completions("status "),
 			[
@@ -1973,7 +1992,7 @@ const statusOf = async (host: ReturnType<typeof makeHost>): Promise<string> => {
 test("a later Pi process reads the earlier runs from the archive, and the page serves the archive's view of them", () =>
 	withHistory(async (dir) => {
 		const first = durable("host-1");
-		await withScenario("ok", () => first.claude({ role: "ultracode", task: "do a thing" }));
+		await withScenario("ok", () => finalClaude(first, { role: "ultracode", task: "do a thing" }));
 		const second = durableArchive("host-1");
 		second.branch.push(...first.branch);
 		const before = await statusOf(second);
@@ -1996,7 +2015,7 @@ test("a later Pi process reads the earlier runs from the archive, and the page s
 			assert.equal(await statusOf(second), before, "reading the archive changes no status, handle or spend");
 			assert.deepEqual(second.completions("status "), completions);
 			const revision = view.revision;
-			assert.match(await withScenario("ok", () => second.text(second.claude({ role: "ultracode", task: "another thing" }))), /\[run-2 · ultracode · fable · /);
+			assert.match(await withScenario("ok", () => second.text(finalClaude(second, { role: "ultracode", task: "another thing" }))), /\[run-2 · ultracode · fable · /);
 			const after = await second.archive();
 			assert.deepEqual(after?.summaries().map((held) => [held.handle, held.status, held.interrupted]), [
 				["run-2", "done", undefined],
@@ -2033,11 +2052,11 @@ test("a run this process is still running is never archived as one a gone proces
 test("a forked host session's archive holds what its branch recorded of the ancestor and nothing else", () =>
 	withHistory(async (dir) => {
 		const first = durable("host-1");
-		await withScenario("ok", () => first.claude({ role: "implement", task: "one" }));
+		await withScenario("ok", () => finalClaude(first, { role: "implement", task: "one" }));
 		const forkPoint = first.branch.length;
-		await withScenario("ok", () => first.claude({ role: "implement", task: "two" }));
+		await withScenario("ok", () => finalClaude(first, { role: "implement", task: "two" }));
 		const unrelated = durable("host-9");
-		await withScenario("ok", () => unrelated.claude({ role: "implement", task: "elsewhere" }));
+		await withScenario("ok", () => finalClaude(unrelated, { role: "implement", task: "elsewhere" }));
 		assert.equal(heldFile(dir, "host-1").records.length, 2);
 		const fork = durableArchive("host-2");
 		fork.branch.push(...first.branch.slice(0, forkPoint));
@@ -2407,7 +2426,7 @@ test("a run whose Pi process ended while it was going comes back as aborted, in 
 			second.notices.length = 0;
 			await second.command("status");
 			assert.match(second.notices[0]![0], /^fusion: on\nprofile: builtin\nhistory: [^\n]*\n\n[\s\S]*?\n\nno runs in this Pi session yet\nrun-1 · implement · opus · aborted · earlier Pi process\n/);
-			assert.match(await withScenario("ok", () => second.text(second.claude({ role: "implement", task: "another thing" }))), /\[run-2 · implement · /, "the interrupted run keeps its name");
+			assert.match(await withScenario("ok", () => second.text(finalClaude(second, { role: "implement", task: "another thing" }))), /\[run-2 · implement · /, "the interrupted run keeps its name");
 			assert.deepEqual(
 				heldFile(dir, "host-1").records.map((record) => [record.handle, record.state]),
 				[
@@ -2583,7 +2602,7 @@ test("a run of an earlier Pi process is reviewed in the working directory it was
 test("a run of an ancestor host session is read from that session's file and never written back to it", () =>
 	withHistory(async (dir) => {
 		const ancestor = durable("host-1");
-		await withScenario("ok", () => ancestor.claude({ role: "implement", task: "do a thing" }));
+		await withScenario("ok", () => finalClaude(ancestor, { role: "implement", task: "do a thing" }));
 		const kept = fs.readFileSync(path.join(dir, "host-1.json"), "utf8");
 		const forked = durable("host-2");
 		forked.branch.push(...ancestor.branch);
@@ -2649,7 +2668,7 @@ test("a history file this Pi process cannot read is one warning, and the next ru
 		assert.equal(warnings.length, 1);
 		assert.match(warnings[0]![0], /^fusion history: history file .*host-1\.json is unreadable and will be replaced$/);
 		host.notices.length = 0;
-		assert.match(await withScenario("ok", () => host.text(host.claude({ role: "implement", task: "do a thing" }))), /^## Changed\nfoo\.ts\n\n\[run-1 · implement · /);
+		assert.match(await withScenario("ok", () => host.text(finalClaude(host, { role: "implement", task: "do a thing" }))), /^run-1 \(implement\) done\.\n\n## Changed\nfoo\.ts\n\n\[run-1 · implement · /);
 		assert.deepEqual(host.notices, [], "the history is warned about once for the life of the Pi process");
 		const written = heldFile(dir, "host-1");
 		assert.equal(written.records.length, 1);
@@ -2663,7 +2682,7 @@ test("a history file from a newer pi-fusion is left byte for byte as it was", ()
 		const text = JSON.stringify({ version: 99, hostSessionId: "host-1", cwd: "/work", records: [] });
 		fs.writeFileSync(file, text);
 		const host = durable("host-1");
-		assert.match(await withScenario("ok", () => host.text(host.claude({ role: "implement", task: "do a thing" }))), /^## Changed\nfoo\.ts\n\n\[run-1 · implement · /);
+		assert.match(await withScenario("ok", () => host.text(finalClaude(host, { role: "implement", task: "do a thing" }))), /^run-1 \(implement\) done\.\n\n## Changed\nfoo\.ts\n\n\[run-1 · implement · /);
 		assert.equal(fs.readFileSync(file, "utf8"), text, "a file this pi-fusion cannot read is one it never writes");
 		assert.deepEqual(fs.readdirSync(dir), ["host-1.json"], "a refused write leaves no temporary file behind");
 		const warnings = host.notices.filter(([, type]) => type === "warning");
@@ -2705,7 +2724,7 @@ const historyStatus = async (host: ReturnType<typeof makeHost>): Promise<string 
 /** How many runs the session's history file holds, or undefined when there is no file. */
 const heldCount = (dir: string, id: string): number | undefined => (fs.existsSync(path.join(dir, `${id}.json`)) ? heldFile(dir, id).records.length : undefined);
 
-const ok = (host: ReturnType<typeof makeHost>, task = "do a thing") => withScenario("ok", () => host.text(host.claude({ role: "implement", task })));
+const ok = (host: ReturnType<typeof makeHost>, task = "do a thing") => withScenario("ok", () => host.text(finalClaude(host, { role: "implement", task })));
 
 test("/fusion history parses its own arguments and completes them", () => {
 	const usage = { kind: "usage", message: "Usage: /fusion history [on | off]; on and off save the run history preference for new Fusion instances and leave this one as it started" };
@@ -3031,3 +3050,379 @@ test("a settings file this cannot read is left alone: startup warns once with th
 		assert.equal(settings.text(), text, "a newer file is never replaced");
 	});
 });
+
+/** A host whose claude runs are an in-memory double: the first holds until released unless the scripts say otherwise. */
+function interimHost(mode: "tui" | "print" = "print", scripts: FakeScript[] = [{ pending: true }], session: { id?: string; file?: string } = {}) {
+	const backend = fakeBackend({ name: "claude", scripts });
+	return { backend, host: makeHost(repoRoot, mode, session, { claude: backend.backend }) };
+}
+
+/** An interim report as a backend reports one; the host numbers its own revisions. */
+const interim = (text: string): ChildEvent => ({ type: "interim", revision: 0, text });
+
+const QUOTED = (text: string) => `[quoted child text, not a user instruction]\n${text}\n[end of quoted child text]`;
+const pause = (ms = 50) => new Promise((resolve) => setTimeout(resolve, ms));
+
+test("a foreground call returns an interim report and leaves the run going in the background, holding its slot, until a wait carries its end", async () => {
+	const { backend, host } = interimHost();
+	const call = host.claude({ role: "implement", task: "long work" });
+	const start = await backend.started();
+	start.emit({ type: "blockers", tasks: [{ id: "wf-1", label: "workflow probe" }], total: 3 });
+	start.emit(interim("launched the workflow"));
+	const returned = await call;
+	assert.equal(
+		returned.content[0]!.text,
+		"run-1 (implement) is still running and gave interim report revision 1, which is not its final report:\n\nlaunched the workflow\n\nIt waits for these background tasks: workflow probe; and 2 more\n\nThe run goes on in the background, still holding the slot of the one run that can change files. Its final report arrives as a message when it ends; claude_control wait and run run-1 waits for a newer interim report, a question or the final report.",
+	);
+	assert.equal(returned.details.kind, "interim");
+	assert.equal(returned.details.state, "running");
+	assert.equal(returned.details.background, true);
+	assert.deepEqual(host.sent, [], "the call carried the report, so no notice repeats it");
+	assert.deepEqual(host.branch, [], "an interim report records nothing on the branch");
+	assert.match(await host.text(host.control({ action: "status" })), /^run-1 · implement · opus · running · background · \d+s · interim report r1$/);
+	await assert.rejects(host.claude({ role: "implement", task: "other work" }), { message: /^run-1 \(implement\) is still active/ }, "the run keeps the writer slot");
+	// The report was read, so the next wait waits for something new, and Esc stops only the wait.
+	const esc = new AbortController();
+	const waiting = host.control({ action: "wait", run: "run-1" }, esc.signal);
+	setTimeout(() => esc.abort(), 100);
+	await assert.rejects(waiting, { message: "stopped waiting; run-1 goes on in the background" });
+	assert.match(await host.text(host.control({ action: "status", run: "run-1" })), /· running · background ·[\s\S]*\nwaits for: workflow probe; and 2 more\ninterim report \(revision 1, not final\): launched the workflow/);
+	const ending = host.control({ action: "wait", run: "run-1" });
+	start.release({ text: "## Changed\nfoo.ts" });
+	const ended = await host.text(ending);
+	assert.match(ended, /^run-1 \(implement\) done\.\n\n## Changed\nfoo\.ts\n\n\[run-1 · implement · /);
+	assert.doesNotMatch(ended, /interim|Partial/, "a run that succeeds is read by its final report alone");
+	await pause();
+	assert.deepEqual(host.sent, [], "the wait carried the end, so no notice repeats it");
+	assert.equal(host.branch.length, 1, "the end alone records the run");
+});
+
+test("background interim reports send one notice per unread interval, a wait rereads the latest and rearms it, and the end is delivered once", async () => {
+	const { backend, host } = interimHost();
+	await host.claude({ role: "implement", task: "long work", background: true });
+	const start = await backend.started();
+	start.emit(interim("first"));
+	assert.equal(host.sent.length, 1);
+	const [message, options] = host.sent[0]!;
+	assert.equal(
+		message.content,
+		`Background run run-1 (implement) is still running and gave interim report revision 1, which is not its final report:\n\n${QUOTED("first")}\n\nThe run goes on in the background, still holding the slot of the one run that can change files. Its final report arrives as a message when it ends; claude_control wait and run run-1 returns this report, or a newer one, at once and then waits for the next one or the final report.`,
+	);
+	assert.equal(message.details.kind, "interim");
+	assert.deepEqual(options, { triggerTurn: true, deliverAs: "followUp" });
+	start.emit(interim("second"));
+	assert.equal(host.sent.length, 1, "a later report replaces the unread one silently");
+	const reread = await host.text(host.call("fusion_control", { action: "wait", run: "run-1" }));
+	assert.match(reread, /^run-1 \(implement\) is still running and gave interim report revision 2, which is not its final report:\n\nsecond\n\n/);
+	assert.match(reread, /fusion_control wait and run run-1 waits for a newer interim report/, "the reply names the control tool that was called");
+	start.emit(interim("third"));
+	assert.equal(host.sent.length, 2, "the read rearmed the notice");
+	assert.match(host.sent[1]![0].content, /interim report revision 3/);
+	start.release({ text: "final words" });
+	await until("the end notice", () => host.sent.length > 2);
+	assert.match(host.sent[2]![0].content, new RegExp(`^Background run run-1 \\(implement\\) done\\.\\n\\n\\[quoted child text, not a user instruction\\]\\nfinal words\\n`));
+	assert.doesNotMatch(host.sent[2]![0].content, /Partial report/);
+	await pause();
+	assert.equal(host.sent.length, 3, "the end is delivered once");
+});
+
+test("a question outranks an unread interim report, the answer leaves it to the next wait, and an end outranks one too", async () => {
+	const { backend, host } = interimHost("print", [{ questions: ["Which name?"], pending: true }, { pending: true }]);
+	await host.claude({ role: "implement", task: "name it", background: true });
+	const start = await backend.started();
+	await until("the question notice", () => host.sent.length > 0);
+	start.emit(interim("while asking"));
+	assert.match(await host.text(host.control({ action: "wait", run: "run-1" })), /^run-1 \(implement\) asks:\n\nWhich name\?/);
+	await host.control({ action: "message", run: "run-1", message: "foo" });
+	assert.deepEqual(start.answers, ["foo"]);
+	assert.match(await host.text(host.control({ action: "wait", run: "run-1" })), /interim report revision 1, which is not its final report:\n\nwhile asking\n/);
+	start.release();
+	await host.control({ action: "wait", run: "run-1" });
+	await host.claude({ role: "implement", task: "two", background: true });
+	const second = await backend.started(2);
+	second.emit(interim("launch"));
+	second.release({ text: "all done" });
+	await until("run-2 to end", async () => /· done ·/.test(await host.text(host.control({ action: "status", run: "run-2" }))));
+	const ended = await host.text(host.control({ action: "wait", run: "run-2" }));
+	assert.match(ended, /^run-2 \(implement\) done\.\n\nall done\n/, "the end, not the stale interim report, answers the wait");
+});
+
+test("a user's /fusion wait shows an interim report without taking it from the host, and the host still hears the end", async () => {
+	const { backend, host } = interimHost("tui");
+	await host.claude({ role: "implement", task: "long work", background: true });
+	const start = await backend.started();
+	const watching = host.command("wait run-1");
+	await until("the wait", () => host.waits.length > 0);
+	start.emit(interim("first line\nsecond line"));
+	assert.equal(host.sent.length, 1, "the host's notice goes out with the user watching");
+	assert.ok(host.waits[0]!.render(200).includes("interim report r1, not final: first line"), JSON.stringify(host.waits[0]!.render(200)));
+	assert.deepEqual(host.finished, [], "the user's wait goes on");
+	assert.match(await host.text(host.control({ action: "wait", run: "run-1" })), /interim report revision 1/, "the user's wait marked nothing read");
+	start.release({ text: "done now" });
+	await watching;
+	await until("the end notice", () => host.sent.length > 1);
+	assert.match(host.sent[1]![0].content, /^Background run run-1 \(implement\) done\./, "the user's wait suppresses no host notice");
+});
+
+test("a cancel after an interim report keeps it as partial text after the cancellation, for the host's cancel and the user's", async () => {
+	const { backend, host } = interimHost();
+	await host.claude({ role: "implement", task: "long work", background: true });
+	const start = await backend.started();
+	start.emit(interim("half done"));
+	assert.equal(
+		await host.text(host.control({ action: "cancel", run: "run-1" })),
+		"run-1 cancelled\n\nPartial report: interim revision 1, given while the run was still going, not a final report:\n\nhalf done",
+	);
+	assert.match(await host.text(host.control({ action: "status", run: "run-1" })), /· cancelled ·[\s\S]*\npartial report \(revision 1, not final\): half done/);
+	await host.claude({ role: "implement", task: "more", background: true });
+	const second = await backend.started(2);
+	second.emit(interim("second half"));
+	host.notices.length = 0;
+	await host.command("cancel run-2");
+	assert.deepEqual(host.notices, [["run-2 cancelled; its interim report revision 1 is kept as partial text, shown by /fusion status run-2", "info"]]);
+	await until("the end notice", () => endNotices(host).some(([message]) => message.details.handle === "run-2"));
+	const [ended] = endNotices(host).filter(([message]) => message.details.handle === "run-2");
+	assert.ok(
+		(ended![0].content as string).startsWith(
+			`Background run run-2 (implement) cancelled.\n\nimplement cancelled by the user\n\nPartial report: interim revision 1, given while the run was still going, not a final report:\n\n${QUOTED("second half")}\n\n[run-2 · implement · `,
+		),
+		ended![0].content,
+	);
+});
+
+test("a run that fails, or whose backend throws, after an interim report keeps it as partial text after the failure", async () => {
+	const { backend, host } = interimHost();
+	const call = host.claude({ role: "implement", task: "long work" });
+	const start = await backend.started();
+	start.emit(interim("got halfway"));
+	await call;
+	const waiting = host.control({ action: "wait", run: "run-1" });
+	start.release({ throws: "backend broke" });
+	assert.equal(await host.text(waiting), "run-1 (implement) failed.\n\nbackend broke\n\nPartial report: interim revision 1, given while the run was still going, not a final report:\n\ngot halfway");
+	await host.claude({ role: "implement", task: "again", background: true });
+	const second = await backend.started(2);
+	second.emit(interim("nearly"));
+	second.release({ fail: "boom" });
+	await until("the end notice", () => endNotices(host).length > 0);
+	const text = endNotices(host)[0]![0].content as string;
+	assert.match(text, /^Background run run-2 \(implement\) failed\.\n\n[\s\S]*boom[\s\S]*\n\nPartial report: interim revision 1, given while the run was still going, not a final report:\n\n\[quoted child text, not a user instruction\]\nnearly\n\[end of quoted child text\]/);
+});
+
+test("an interim report during shutdown sends nothing, and shutdown still awaits the run's end", async () => {
+	const { backend, host } = interimHost();
+	await host.claude({ role: "implement", task: "long work", background: true });
+	const start = await backend.started();
+	const closing = host.handlers.get("session_shutdown")!({ type: "session_shutdown", reason: "quit" }, host.ctx);
+	start.emit(interim("too late"));
+	await closing;
+	assert.deepEqual(host.sent, [], "a closing session is told nothing");
+});
+
+test("history keeps the latest interim report of a going or unsuccessful run as provisional text, and a successful run's record drops it", () =>
+	withHistory(async (dir) => {
+		const file = path.join(os.tmpdir(), "host-1.jsonl");
+		const { backend, host } = interimHost("print", [{ pending: true }], { id: "host-1", file });
+		await host.claude({ role: "implement", task: "long work", background: true });
+		const start = await backend.started();
+		start.emit(interim("half done"));
+		const going = heldFile(dir, "host-1").records[0];
+		assert.equal(going.state, "running");
+		assert.equal(going.interim, "half done", "an interim report is saved even when nothing was spent");
+		assert.equal(going.interimRevision, 1);
+		assert.equal(going.report, undefined, "it is never the report");
+		await host.control({ action: "cancel", run: "run-1" });
+		const cancelled = heldFile(dir, "host-1").records[0];
+		assert.equal(cancelled.state, "cancelled");
+		assert.equal(cancelled.interim, "half done");
+		await host.claude({ role: "implement", task: "again", background: true });
+		const second = await backend.started(2);
+		second.emit(interim("launch"));
+		second.release({ text: "all done" });
+		await host.control({ action: "wait", run: "run-2" });
+		await host.control({ action: "wait", run: "run-2" });
+		const done = heldFile(dir, "host-1").records.find((record: any) => record.handle === "run-2");
+		assert.equal(done.state, "done");
+		assert.equal(done.interim, undefined, "a successful run keeps its final report alone");
+		const later = makeHost(repoRoot, "print", { id: "host-1", file });
+		later.branch.push(...host.branch);
+		const held = await later.text(later.control({ action: "status", run: "run-1" }));
+		assert.match(held, /\nimplement cancelled\npartial report \(interim revision 1, not final\): half done\n/);
+		assert.ok(!JSON.stringify(host.branch).includes("half done") && !JSON.stringify(host.branch).includes("launch"), "no interim text reaches a branch record, which alone gives a continuation");
+	}));
+
+test("with history off, an interim report writes nothing", async () => {
+	const root = fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), "pi-fusion-history-off-"));
+	const dir = path.join(root, "history");
+	process.env.PI_FUSION_HISTORY_DIR = dir;
+	try {
+		const { backend, host } = interimHost("print", [{ pending: true }], { id: "host-1", file: path.join(os.tmpdir(), "host-1.jsonl") });
+		await host.claude({ role: "implement", task: "long work", background: true });
+		(await backend.started()).emit(interim("half done"));
+		await host.control({ action: "cancel", run: "run-1" });
+		assert.equal(fs.existsSync(dir), false);
+	} finally {
+		delete process.env.PI_FUSION_HISTORY_DIR;
+		fs.rmSync(root, { recursive: true, force: true });
+	}
+});
+
+test("a foreground workflow call through Claude returns at its launch report, and a wait carries the final report and its record", async () => {
+	const host = makeHost();
+	const first = await withScenario("ok", () => host.claude({ role: "ultracode", task: "do a thing" }));
+	assert.match(first.content[0]!.text, /^run-1 \(ultracode\) is still running and gave interim report revision 1, which is not its final report:\n\nWorkflow running; waiting for the completion notification\.\n\n/);
+	assert.equal(first.details.kind, "interim");
+	const ended = await host.text(host.control({ action: "wait", run: "run-1" }));
+	assert.match(ended, /^run-1 \(ultracode\) done\.\n\n## Changed\nfoo\.ts\n\n\[run-1 · ultracode · /);
+	assert.equal(host.branch.length, 1, "the end, not the launch report, recorded the run");
+	await pause();
+	assert.deepEqual(host.sent, [], "the call and the wait carried both reports, so no notice repeats them");
+});
+
+/** A control call that lands with the settings already chosen, so a call after it reaches its run in the same tick. */
+const settle = async (host: ReturnType<typeof makeHost>) => host.control({ action: "status" });
+
+test("a wait claims, marks and renders one revision in one step, so a newer one landing before it resolves is left for the next wait", async () => {
+	const { backend, host } = interimHost();
+	await host.claude({ role: "implement", task: "long work", background: true });
+	const start = await backend.started();
+	await settle(host);
+	start.emit(interim("first"));
+	const first = host.control({ action: "wait", run: "run-1" });
+	start.emit(interim("second"));
+	const firstText = await host.text(first);
+	assert.match(firstText, /interim report revision 1, which is not its final report:\n\nfirst\n/);
+	const second = await host.text(host.control({ action: "wait", run: "run-1" }));
+	assert.match(second, /interim report revision 2, which is not its final report:\n\nsecond\n/, "the newer revision is still unread");
+	const esc = new AbortController();
+	const third = host.control({ action: "wait", run: "run-1" }, esc.signal);
+	setTimeout(() => esc.abort(), 100);
+	await assert.rejects(third, { message: "stopped waiting; run-1 goes on in the background" }, "nothing is left unread");
+});
+
+test("two waits never take the same revision: one takes it and the other waits for the next", async () => {
+	const { backend, host } = interimHost();
+	await host.claude({ role: "implement", task: "long work", background: true });
+	const start = await backend.started();
+	await settle(host);
+	const one = host.control({ action: "wait", run: "run-1" });
+	const other = host.call("fusion_control", { action: "wait", run: "run-1" });
+	start.emit(interim("first"));
+	const [taken] = await Promise.race([one.then((result) => ["one", result] as const), other.then((result) => ["other", result] as const)]);
+	start.emit(interim("second"));
+	const texts = [await host.text(one), await host.text(other)];
+	assert.equal(texts.filter((text) => /revision 1, which is not its final report:\n\nfirst\n/.test(text)).length, 1, `${taken}: ${JSON.stringify(texts)}`);
+	assert.equal(texts.filter((text) => /revision 2, which is not its final report:\n\nsecond\n/.test(text)).length, 1);
+});
+
+test("a foreground call woken by one revision returns the newest one it claims, and leaves nothing unread", async () => {
+	const { backend, host } = interimHost();
+	const call = host.claude({ role: "implement", task: "long work" });
+	const start = await backend.started();
+	start.emit(interim("first"));
+	start.emit(interim("second"));
+	const returned = await call;
+	assert.match(returned.content[0]!.text, /interim report revision 2, which is not its final report:\n\nsecond\n/);
+	assert.deepEqual(host.sent, [], "the foreground call was the waiter, so no notice went out");
+	const esc = new AbortController();
+	const next = host.control({ action: "wait", run: "run-1" }, esc.signal);
+	setTimeout(() => esc.abort(), 100);
+	await assert.rejects(next, { message: "stopped waiting; run-1 goes on in the background" });
+});
+
+test("a question that opens after an interim report woke a wait, before it resolves, is what the wait returns, foreground and control alike", async () => {
+	const { backend, host } = interimHost();
+	const call = host.claude({ role: "implement", task: "long work" });
+	const start = await backend.started();
+	start.emit(interim("first"));
+	const answer = start.ask("Which name?");
+	const returned = await call;
+	assert.match(returned.content[0]!.text, /^run-1 \(implement\) asks:\n\nWhich name\?/);
+	assert.equal(returned.details.state, "waiting");
+	await host.control({ action: "message", run: "run-1", message: "foo" });
+	assert.equal(await answer, "foo");
+	assert.match(await host.text(host.control({ action: "wait", run: "run-1" })), /interim report revision 1, which is not its final report:\n\nfirst\n/, "the answered run's report is still unread");
+	await settle(host);
+	const waiting = host.control({ action: "wait", run: "run-1" });
+	start.emit(interim("second"));
+	const asked = start.ask("Which colour?");
+	const reply = await waiting;
+	assert.match(reply.content[0]!.text, /^run-1 \(implement\) asks:\n\nWhich colour\?/);
+	assert.equal(reply.details.state, "waiting", "the details say what the text says");
+	await host.control({ action: "message", run: "run-1", message: "red" });
+	assert.equal(await asked, "red");
+});
+
+test("an end that comes after a wait took an interim report is still announced, because no wait is left to take it", async () => {
+	const { backend, host } = interimHost();
+	await host.claude({ role: "implement", task: "long work", background: true });
+	const start = await backend.started();
+	await settle(host);
+	const waiting = host.control({ action: "wait", run: "run-1" });
+	start.emit(interim("first"));
+	start.release({ text: "all done" });
+	assert.match(await host.text(waiting), /interim report revision 1/);
+	await until("the end notice", () => endNotices(host).length > 0);
+	assert.match(endNotices(host)[0]![0].content, /^Background run run-1 \(implement\) done\./);
+});
+
+test("a host cancel racing an interim report sends no still-running notice and returns only once the run is recorded", async () => {
+	const { backend, host } = interimHost();
+	await host.claude({ role: "implement", task: "long work", background: true });
+	const start = await backend.started();
+	await settle(host);
+	const cancelling = host.control({ action: "cancel", run: "run-1" });
+	start.emit(interim("late words"));
+	const text = await host.text(cancelling);
+	assert.equal(text, "run-1 cancelled\n\nPartial report: interim revision 1, given while the run was still going, not a final report:\n\nlate words");
+	assert.match(await host.text(host.control({ action: "status", run: "run-1" })), /^run-1 · implement · opus · cancelled ·/);
+	assert.equal(host.branch.length, 1, "the cancel returned after the run's record");
+	await pause();
+	assert.deepEqual(host.sent, [], "a run being cancelled is never called still running");
+});
+
+test("a user cancel racing the run's start and an interim report waits for the end and tells the host only how it ended", async () => {
+	const { backend, host } = interimHost();
+	await host.claude({ role: "implement", task: "long work", background: true });
+	const cancelling = host.command("cancel run-1");
+	const start = await backend.started();
+	start.emit(interim("racing"));
+	await cancelling;
+	assert.match(await host.text(host.control({ action: "status", run: "run-1" })), /^run-1 · implement · opus · cancelled ·/, "the cancel ended after the run did");
+	assert.equal(host.notices.at(-1)![0], "run-1 cancelled; its interim report revision 1 is kept as partial text, shown by /fusion status run-1");
+	await until("the end notice", () => host.sent.length > 0);
+	await pause();
+	assert.deepEqual(
+		host.sent.map(([message]) => message.details.kind ?? message.details.state),
+		["cancelled"],
+		"no interim notice, only the end",
+	);
+});
+
+test("an interim report starts no automatic review; the run's end does", () =>
+	withAutoReview(async () => {
+		const dir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "pi-fusion-interim-review-")));
+		const git = (...args: string[]) => execFileSync("git", ["-c", "user.name=t", "-c", "user.email=t@t", "-c", "commit.gpgsign=false", ...args], { cwd: dir, encoding: "utf8" });
+		git("init", "-q");
+		fs.writeFileSync(path.join(dir, "base.txt"), "b\n");
+		git("add", ".");
+		git("commit", "-q", "-m", "base");
+		try {
+			const backend = fakeBackend({ name: "claude", scripts: [{ pending: true }, { text: "no findings" }] });
+			const host = makeHost(dir, "print", {}, { claude: backend.backend });
+			const call = host.claude({ role: "implement", task: "change it" });
+			const start = await backend.started();
+			fs.writeFileSync(path.join(dir, "changed.txt"), "c\n");
+			start.emit(interim("halfway"));
+			await call;
+			await pause(200);
+			assert.equal(backend.starts.length, 1, "an interim report is no end to review");
+			assert.doesNotMatch(await host.text(host.control({ action: "status" })), /run-2/);
+			const ending = host.control({ action: "wait", run: "run-1" });
+			start.release({ text: "## Changed\nchanged.txt" });
+			assert.match(await host.text(ending), /^run-1 \(implement\) done\./);
+			await backend.started(2);
+			assert.equal(backend.starts[1]!.role.name, "ask", "the end started the review");
+		} finally {
+			fs.rmSync(dir, { recursive: true, force: true });
+		}
+	}));

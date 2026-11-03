@@ -1,4 +1,4 @@
-import type { Backend, BackendName, ChildControl, ChildRun, HostBackend, HostRole, HostSession, ResolvedSelection, RunRequest, SessionIntent, SessionRef } from "../extensions/backends/types.ts";
+import type { Backend, BackendName, ChildControl, ChildEvent, ChildRun, HostBackend, HostRole, HostSession, ResolvedSelection, RunRequest, SessionIntent, SessionRef } from "../extensions/backends/types.ts";
 import { hostBackend } from "../extensions/backends/types.ts";
 
 /**
@@ -88,8 +88,12 @@ export interface FakeStart {
 	answers: string[];
 	/** Resolves with the next steer that arrives, or at once with one that arrived and no waiter took. */
 	nextSteer(): Promise<string>;
-	/** Lets a pending run settle, with these fields over the ones it was scripted with. */
+	/** Lets a pending run settle, with these fields over the ones it was scripted with; `throws` makes `run` throw then. */
 	release(over?: Partial<FakeScript>): void;
+	/** Reports an event as the run's backend would while it runs, such as an interim report or what it waits for. */
+	emit(event: ChildEvent): void;
+	/** Asks the host a question now, as a child of this run would, and resolves with the answer. */
+	ask(question: string): Promise<string>;
 	/** Resolves when the run's outcome has been handed back to the host. */
 	ended: Promise<void>;
 }
@@ -244,6 +248,11 @@ export function fakeBackend(options: FakeBackendOptions = {}): FakeBackend {
 				answers: [],
 				nextSteer: () => input.next(),
 				release: (over) => gate.resolve(over ?? {}),
+				emit: (event) => request.onEvent?.(event),
+				ask: (question) => {
+					if (!request.onQuestion) return Promise.reject(new Error("the run was started without a question channel"));
+					return request.onQuestion(question, request.signal ?? new AbortController().signal);
+				},
 				ended: done.promise,
 			};
 			starts.push(start);
@@ -266,6 +275,7 @@ export function fakeBackend(options: FakeBackendOptions = {}): FakeBackend {
 							start.answers.push(await request.onQuestion(text, request.signal ?? new AbortController().signal));
 						}
 						if (script.pending) over = await Promise.race([gate.promise, stopped.then(() => ({}))]);
+						if (over.throws) throw new Error(over.throws);
 					} catch (error) {
 						if (!request.signal?.aborted) throw error;
 					}

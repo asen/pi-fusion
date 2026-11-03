@@ -25,6 +25,7 @@ import {
 	MAX_AGENTS_PER_TASK,
 	MAX_DENIED_TOOLS,
 	MAX_FILES,
+	MAX_LISTED_BLOCKERS,
 	MAX_LOG_PER_RUN,
 	MAX_MODELS,
 	MAX_RUNS,
@@ -2060,4 +2061,137 @@ test("runs the history pruned to fit its byte budget leave the archive too, with
 			assert.equal(json(await get("api/runs")).archive.total, kept.length);
 		});
 	});
+});
+
+test("an interim report and what the run waits for show while it runs, as partial text once it fails, and not at all once it succeeds", () => {
+	const { store, tick } = started();
+	store.event("run-1", { type: "task_started", taskId: "wf-1", name: "probe" });
+	store.event("run-1", { type: "blockers", tasks: [{ id: "wf-1", label: "workflow probe" }], total: 1 });
+	tick();
+	store.event("run-1", { type: "interim", revision: 1, text: "launched" });
+	store.event("run-1", { type: "interim", revision: 2, text: "midway" });
+	let detail = detailOf(store);
+	assert.deepEqual(detail.interim, { revision: 2, text: "midway", truncated: false, at: START + 1, partial: false });
+	assert.deepEqual(detail.blockers, { tasks: [{ id: "wf-1", label: "workflow probe" }], total: 1 });
+	assert.equal(detail.text, "", "an interim report is never the report");
+	assert.equal(store.summaries()[0]!.interimRevision, 2);
+	assert.deepEqual(detail.log.slice(-2).map(bare).map((entry) => entry.text), ["interim report revision 1", "interim report revision 2"]);
+	store.finish("run-1", { status: "cancelled", failure: "implement cancelled", text: "midway" });
+	detail = detailOf(store);
+	assert.deepEqual(detail.interim, { revision: 2, text: "midway", truncated: false, at: START + 1, partial: true });
+	assert.equal(detail.blockers, undefined, "an ended run waits for nothing");
+	store.start({ id: "run-2", role: "implement", model: "opus" });
+	store.event("run-2", { type: "interim", revision: 1, text: "launched" });
+	store.finish("run-2", { status: "done", text: "final" });
+	assert.equal(detailOf(store, "run-2").interim, undefined, "the final report replaces it");
+	assert.equal(store.summaries().find((run) => run.id === "run-2")!.interimRevision, undefined);
+	store.event("run-2", { type: "interim", revision: 2, text: "too late" });
+	assert.equal(detailOf(store, "run-2").interim, undefined, "an ended run takes no interim report");
+});
+
+test("an interim report is capped like a report, and blockers are capped in count and length", () => {
+	const { store } = started();
+	store.event("run-1", { type: "interim", revision: 1, text: "é".repeat(TEXT_CAP_BYTES) });
+	const interim = detailOf(store).interim!;
+	assert.equal(interim.truncated, true);
+	assert.ok(Buffer.byteLength(interim.text) <= TEXT_CAP_BYTES);
+	assert.ok(!interim.text.includes("\ufffd"));
+	const tasks = Array.from({ length: 30 }, (_, index) => ({ id: `t-${index}`, label: "x".repeat(MAX_STRING_CHARS * 2) }));
+	store.event("run-1", { type: "blockers", tasks, total: 30 });
+	const blockers = detailOf(store).blockers!;
+	assert.equal(blockers.tasks.length, 20);
+	assert.equal(blockers.total, 30);
+	assert.ok(blockers.tasks.every((task) => task.label.length === MAX_STRING_CHARS));
+});
+
+const statusOf = (store: RunStore, id: string) => detailOf(store).tasks.find((task) => task.id === id)?.status;
+
+test("a task the list named before its start edge, then dropped, reads unknown", () => {
+	const { store } = started();
+	store.event("run-1", { type: "blockers", tasks: [{ id: "b", label: "bash task" }], total: 1 });
+	store.event("run-1", { type: "task_started", taskId: "b", name: "bash task" });
+	assert.equal(statusOf(store, "b"), "running");
+	store.event("run-1", { type: "blockers", tasks: [], total: 0 });
+	assert.equal(statusOf(store, "b"), "unknown");
+});
+
+test("a task whose start edge came before the list, then dropped, reads unknown", () => {
+	const { store } = started();
+	store.event("run-1", { type: "task_started", taskId: "b", name: "bash task" });
+	store.event("run-1", { type: "blockers", tasks: [{ id: "b", label: "bash task" }], total: 1 });
+	store.event("run-1", { type: "blockers", tasks: [], total: 0 });
+	assert.equal(statusOf(store, "b"), "unknown");
+});
+
+test("a start edge that arrives after the list that dropped its task reads unknown at once", () => {
+	const { store } = started();
+	store.event("run-1", { type: "blockers", tasks: [{ id: "b", label: "bash task" }], total: 1 });
+	store.event("run-1", { type: "blockers", tasks: [], total: 0 });
+	store.event("run-1", { type: "task_started", taskId: "b", name: "bash task" });
+	assert.equal(statusOf(store, "b"), "unknown");
+	store.event("run-1", { type: "task_started", taskId: "n", name: "never listed" });
+	assert.equal(statusOf(store, "n"), "running", "a task no list has named is not taken for one that left");
+});
+
+test("a task a list names again is running again, and an explicit outcome is never undone", () => {
+	const { store } = started();
+	store.event("run-1", { type: "task_started", taskId: "m", name: "monitor" });
+	store.event("run-1", { type: "task_started", taskId: "d", name: "done one" });
+	store.event("run-1", { type: "blockers", tasks: [{ id: "m", label: "monitor" }, { id: "d", label: "done one" }], total: 2 });
+	store.event("run-1", { type: "task_ended", taskId: "d", status: "completed" });
+	store.event("run-1", { type: "blockers", tasks: [], total: 0 });
+	assert.equal(statusOf(store, "m"), "unknown", "turned ambient, it left the list");
+	assert.equal(statusOf(store, "d"), "completed");
+	store.event("run-1", { type: "blockers", tasks: [{ id: "m", label: "monitor" }, { id: "d", label: "done one" }], total: 2 });
+	assert.equal(statusOf(store, "m"), "running", "back from ambient, it blocks again");
+	assert.equal(detailOf(store).tasks.find((task) => task.id === "m")!.endedAt, undefined);
+	assert.equal(statusOf(store, "d"), "completed", "a notification's outcome stands");
+});
+
+test("a cut list shows nobody leaving, though the tasks it names count as listed", () => {
+	const { store } = started();
+	store.event("run-1", { type: "blockers", tasks: [{ id: "a", label: "a" }], total: 2 });
+	store.event("run-1", { type: "task_started", taskId: "a", name: "a" });
+	store.event("run-1", { type: "blockers", tasks: [{ id: "x", label: "x" }], total: 2 });
+	assert.equal(statusOf(store, "a"), "running");
+	store.event("run-1", { type: "blockers", tasks: [{ id: "x", label: "x" }], total: 1 });
+	assert.equal(statusOf(store, "a"), "unknown");
+});
+
+test("a run remembers a bounded number of listed task ids", () => {
+	const { store } = started();
+	for (let batch = 0; batch < 30; batch++) {
+		const tasks = Array.from({ length: 20 }, (_, index) => ({ id: `t-${batch}-${index}`, label: "t" }));
+		store.event("run-1", { type: "blockers", tasks, total: 20 });
+	}
+	store.event("run-1", { type: "task_started", taskId: "t-0-0", name: "oldest" });
+	assert.equal(statusOf(store, "t-0-0"), "running", `beyond ${MAX_LISTED_BLOCKERS} ids the oldest are forgotten, so nothing is claimed of them`);
+	store.event("run-1", { type: "task_started", taskId: "t-28-0", name: "recent" });
+	assert.equal(statusOf(store, "t-28-0"), "unknown", "a recent one is remembered");
+});
+
+test("a task that leaves a whole blocker list without a notification reads unknown, never completed, and a notice still settles it", () => {
+	const { store } = started();
+	store.event("run-1", { type: "task_started", taskId: "a", name: "a" });
+	store.event("run-1", { type: "task_started", taskId: "b", name: "b" });
+	store.event("run-1", { type: "task_started", taskId: "w", name: "watcher" });
+	store.event("run-1", { type: "blockers", tasks: [{ id: "a", label: "a" }, { id: "b", label: "b" }], total: 2 });
+	store.event("run-1", { type: "blockers", tasks: [{ id: "b", label: "b" }], total: 2 });
+	assert.equal(detailOf(store).tasks.find((task) => task.id === "a")!.status, "running", "a cut list says nothing about who left");
+	store.event("run-1", { type: "blockers", tasks: [{ id: "b", label: "b" }], total: 1 });
+	const tasks = detailOf(store).tasks;
+	assert.equal(tasks.find((task) => task.id === "a")!.status, "unknown");
+	assert.equal(tasks.find((task) => task.id === "w")!.status, "running", "a task never listed is not touched");
+	store.event("run-1", { type: "task_ended", taskId: "a", status: "completed" });
+	assert.equal(detailOf(store).tasks.find((task) => task.id === "a")!.status, "completed", "a later notification says how it ended");
+});
+
+test("a restored run keeps the partial text of an unsuccessful end and none of a successful one", () => {
+	const unsuccessful = restoredView({ id: "x", role: "implement", model: "opus", state: "cancelled", startedAt: 1, interim: "half", interimRevision: 2 }, 5);
+	assert.deepEqual(unsuccessful?.interim, { text: "half", truncated: false, revision: 2 });
+	const successful = restoredView({ id: "y", role: "implement", model: "opus", state: "done", startedAt: 1, report: "final", interim: "half" }, 5);
+	assert.equal(successful?.interim, undefined);
+	const { store } = makeStore();
+	assert.equal(store.restore({ id: "x", role: "implement", model: "opus", state: "failed", startedAt: 1, interim: "half", interimRevision: 2 }), true);
+	assert.deepEqual(detailOf(store, "x").interim, { revision: 2, text: "half", truncated: false, partial: true });
 });

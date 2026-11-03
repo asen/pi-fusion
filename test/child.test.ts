@@ -4,7 +4,8 @@ import * as os from "node:os";
 import * as path from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
-import { type ChildEvent, type ChildRun, type Role, childOptions, claudeExecutable, failed, failureMessage, questionAnswers, questionText, runChild } from "../extensions/fusion.ts";
+import { BLOCKER_LABEL_CHARS, MAX_BLOCKERS } from "../extensions/backends/types.ts";
+import { type ChildEvent, ChildInput, type ChildRun, type Role, childOptions, claudeExecutable, failed, failureMessage, questionAnswers, questionText, runChild } from "../extensions/fusion.ts";
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const fakeClaude = path.join(repoRoot, "test", "fake-claude.mjs");
@@ -34,6 +35,8 @@ function run(
 		killGraceMs?: number;
 		onProgress?: (run: ChildRun) => void;
 		onEvent?: (event: ChildEvent) => void;
+		input?: ChildInput;
+		onQuestion?: (question: string, signal: AbortSignal) => Promise<string>;
 	} = {},
 ): Promise<ChildRun> {
 	process.env.FAKE_CLAUDE_SCENARIO = scenario;
@@ -45,8 +48,37 @@ function run(
 		onProgress: opts.onProgress ?? (() => {}),
 		onEvent: opts.onEvent,
 		killGraceMs: opts.killGraceMs,
+		...(opts.input ? { input: opts.input } : {}),
+		...(opts.onQuestion ? { onQuestion: opts.onQuestion } : {}),
 	});
 }
+
+/**
+ * Runs a lifecycle scenario, which ends only once the run closes its input, and checks it ended cleanly with `text`.
+ * A run still going after 15 seconds is aborted, so a regression fails here instead of leaving a child alive.
+ */
+async function closes(scenario: string, text: string, opts: Parameters<typeof run>[1] = {}): Promise<ChildRun> {
+	const input = opts.input ?? new ChildInput();
+	const controller = new AbortController();
+	const timer = setTimeout(() => controller.abort(), 15000);
+	const child = await run(scenario, { ...opts, input, signal: controller.signal }).finally(() => clearTimeout(timer));
+	assert.equal(child.aborted, false, "the input never closed");
+	assert.equal(child.text, text);
+	assert.equal(failed(child), false, child.errorMessage);
+	assert.equal(child.abandonedTasks, undefined);
+	assert.equal(input.open, false);
+	return child;
+}
+
+/** A host steer, pushed after the event that prompted it has been handled, as a control call's would be. */
+const steerOnFirstResult = (input: ChildInput, message: string) => {
+	let sent = false;
+	return (event: ChildEvent) => {
+		if (event.type !== "turn_result" || sent) return;
+		sent = true;
+		setTimeout(() => input.push(message), 0);
+	};
+};
 
 const distinct = (seen: string[]) => seen.filter((item, index) => item !== seen[index - 1]);
 
@@ -94,6 +126,7 @@ test("a workflow run reports its tasks as events", async () => {
 		{ type: "init", sessionId: "sess-1" },
 		{ type: "tool_call", name: "Workflow", brief: "", id: "tu-1", input: { script: "export const meta = {}" } },
 		{ type: "task_started", taskId: "wf-1", taskType: "local_workflow", name: "probe" },
+		{ type: "blockers", tasks: [{ id: "wf-1", label: "workflow probe" }], total: 1 },
 		{
 			type: "task_progress",
 			taskId: "wf-1",
@@ -106,7 +139,9 @@ test("a workflow run reports its tasks as events", async () => {
 			],
 		},
 		{ type: "turn_result", ok: true },
+		{ type: "interim", revision: 1, text: "Workflow running; waiting for the completion notification." },
 		{ type: "task_ended", taskId: "wf-1", status: "completed", tokens: 250 },
+		{ type: "blockers", tasks: [], total: 0 },
 		{ type: "tool_call", name: "Bash", brief: "npm test", id: "tu-2", input: { command: "npm test" } },
 		{ type: "turn_result", ok: true },
 	]);
@@ -144,10 +179,12 @@ test("an agent's tool calls are reported as events and stay out of the root run"
 		{ type: "init", sessionId: "sess-1" },
 		{ type: "tool_call", name: "Agent", brief: "probe files", id: "tu-1", input: { description: "probe files", prompt: "look" } },
 		{ type: "task_started", taskId: "ag-1", toolUseId: "tu-1", taskType: "local_agent", name: "probe files" },
+		{ type: "blockers", tasks: [{ id: "ag-1", label: "agent probe files" }], total: 1 },
 		{ type: "agent_tool_call", parentToolUseId: "tu-1", name: "Read", id: "tu-sub-1", input: { file_path: "a.ts" } },
 		{ type: "tool_result", toolUseId: "tu-sub-1", text: "no such file", isError: true },
 		{ type: "task_progress", taskId: "ag-1", description: "probe files", lastTool: "Read", tokens: 50, toolUses: 1 },
 		{ type: "task_ended", taskId: "ag-1", status: "completed", summary: "found it", tokens: 80 },
+		{ type: "blockers", tasks: [], total: 0 },
 		{ type: "tool_result", toolUseId: "tu-1", text: "found it", isError: false },
 		{ type: "turn_result", ok: true },
 	]);
@@ -198,14 +235,145 @@ test("an ambient task, such as a watcher, never counts as abandoned", async () =
 });
 
 test("background_tasks_changed replaces the pending set and skips ambient tasks", async () => {
-	const cleared = await run("tasks-cleared");
-	assert.equal(failed(cleared), false);
-	assert.equal(cleared.abandonedTasks, undefined);
+	await closes("tasks-cleared", "partial");
 
 	const late = await run("tasks-changed");
 	assert.equal(failed(late), true);
 	assert.deepEqual(late.abandonedTasks, ["workflow late probe"]);
 	assert.match(failureMessage(late), /^ultracode exited with workflow late probe still running/);
+});
+
+test("the input closes at idle after the last result, and not before idle once the child reports its state", async () => {
+	await closes("state-plain", "done");
+});
+
+test("a report first, then the membership clearing, then idle, closes the input without another result", async () => {
+	await closes("state-clear-idle", "report first");
+});
+
+test("idle with a background shell still live keeps the input open; the shell clearing closes it and the drained follow-up is the report", async () => {
+	await closes("state-bash-idle", "build finished after EOF");
+});
+
+test("a task that turns ambient stops blocking", async () => {
+	await closes("state-ambient-flip", "watching");
+});
+
+test("genuine background work keeps the input open until an abort", async () => {
+	const input = new ChildInput();
+	const controller = new AbortController();
+	const pending = run("state-stuck", { input, signal: controller.signal });
+	await new Promise((resolve) => setTimeout(resolve, 800));
+	assert.equal(input.open, true);
+	controller.abort();
+	const child = await pending;
+	assert.equal(child.stopReason, "aborted");
+	assert.equal(child.text, "report while the server runs");
+	assert.equal(input.open, false);
+});
+
+test("membership clearing mid-turn waits for that turn's result and idle, across tool results", async () => {
+	await closes("state-clear-mid-turn", "final");
+});
+
+test("a steer taken after idle makes that idle and a stale one after it insufficient until the steer's own turn ends", async () => {
+	const input = new ChildInput();
+	await closes("state-steer-after-idle", "steered: use b", { input, onEvent: steerOnFirstResult(input, "use b") });
+});
+
+test("an open question keeps the input open and leaves the idle before it stale", async () => {
+	await closes("state-question", "answered: beta", { onQuestion: async () => "beta" });
+});
+
+test("snapshots govern membership whichever side of them a task edge arrives, and late edges neither revive a task nor add an ambient one", async () => {
+	await closes("state-late-edges", "report with two shells");
+});
+
+test("a running state makes the last result stale, so an idle before the new turn's result closes nothing", async () => {
+	await closes("state-running-stale-result", "new report");
+});
+
+test("subagent frames and task progress after idle are not new work", async () => {
+	await closes("state-idle-noise", "report");
+});
+
+test("without state events, a membership cleared after the result closes the input and the follow-up drained after EOF is the report", async () => {
+	await closes("nostate-drain", "final after the follow-up");
+});
+
+test("without state events, an open question keeps the input open, since its answer comes back over it", async () => {
+	const later = async () => {
+		await new Promise((resolve) => setTimeout(resolve, 500));
+		return "beta";
+	};
+	await closes("nostate-question", "answered: beta", { onQuestion: later });
+});
+
+test("an open question outlasting a result keeps the input open until a cancel ends the run", async () => {
+	const input = new ChildInput();
+	const controller = new AbortController();
+	const unanswered = (_question: string, signal: AbortSignal) =>
+		new Promise<string>((_, reject) => signal.addEventListener("abort", () => reject(new Error("cancelled")), { once: true }));
+	const pending = run("nostate-question", { input, signal: controller.signal, onQuestion: unanswered });
+	await new Promise((resolve) => setTimeout(resolve, 800));
+	assert.equal(input.open, true);
+	controller.abort();
+	const child = await pending;
+	assert.equal(child.stopReason, "aborted");
+	assert.equal(child.text, "agent started");
+	assert.equal(input.open, false);
+});
+
+test("without state events, the last task ending mid-turn waits for that turn's result", async () => {
+	await closes("nostate-mid-turn", "final");
+});
+
+test("without state events, a steer taken after the result waits for a later result", async () => {
+	const input = new ChildInput();
+	await closes("nostate-steer-after-result", "steered: use b", { input, onEvent: steerOnFirstResult(input, "use b") });
+});
+
+test("a result while background tasks still run is an interim report, once per result, and the final one is not", async () => {
+	const events: ChildEvent[] = [];
+	const child = await closes("interim-revisions", "final", { onEvent: (event) => events.push(event) });
+	assert.deepEqual(
+		events.filter((event) => event.type === "interim"),
+		[
+			{ type: "interim", revision: 1, text: "first report" },
+			{ type: "interim", revision: 2, text: "second report" },
+		],
+		"a repeated result, a blank one and the final one add no revision",
+	);
+	assert.deepEqual(
+		events.filter((event) => event.type === "blockers"),
+		[
+			{ type: "blockers", tasks: [{ id: "wf-1", label: "workflow probe" }], total: 1 },
+			{ type: "blockers", tasks: [{ id: "wf-1", label: "workflow probe" }, { id: "wf-2", label: "workflow scan" }], total: 2 },
+			{ type: "blockers", tasks: [{ id: "wf-2", label: "workflow scan" }], total: 1 },
+			{ type: "blockers", tasks: [], total: 0 },
+		],
+		"each change of what the run waits for is published once",
+	);
+	assert.equal(child.stopReason, "stop");
+});
+
+test("an error result while a task still runs is no interim report", async () => {
+	const events: ChildEvent[] = [];
+	const child = await run("interim-error", { onEvent: (event) => events.push(event) });
+	assert.equal(failed(child), true);
+	assert.deepEqual(events.filter((event) => event.type === "interim"), []);
+});
+
+test("what the run waits for is published bounded, with labels cut and the whole count, while the set itself stays exact", async () => {
+	const events: ChildEvent[] = [];
+	const child = await run("many-blockers", { onEvent: (event) => events.push(event) });
+	const [blockers] = events.filter((event) => event.type === "blockers");
+	assert.ok(blockers?.type === "blockers");
+	assert.equal(blockers.total, 25);
+	assert.equal(blockers.tasks.length, MAX_BLOCKERS);
+	assert.ok(blockers.tasks.every((task) => task.label.length === BLOCKER_LABEL_CHARS + 1 && task.label.endsWith("…")), JSON.stringify(blockers.tasks[0]));
+	assert.equal(child.abandonedTasks?.length, 25, "the run's own set is not cut");
+	assert.deepEqual(events.filter((event) => event.type === "interim"), [{ type: "interim", revision: 1, text: "many going" }]);
 });
 
 test("partial messages show thinking, text and tool calls as activity", async () => {

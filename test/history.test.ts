@@ -7,6 +7,7 @@ import {
 	boundRecord,
 	History,
 	HISTORY_FAILURE_CAP_BYTES,
+	HISTORY_INTERIM_CAP_BYTES,
 	HISTORY_PROMPT_CAP_BYTES,
 	HISTORY_REPORT_CAP_BYTES,
 	HISTORY_VERSION,
@@ -662,3 +663,21 @@ test("a pi session a run only started has no id yet, and a reference this host c
 		assert.equal(loaded.records[1]!.selection, undefined, "a model that is not a provider and a model id is no selection to repeat");
 	});
 });
+
+test("a record keeps a bounded latest interim report with its revision, and an older record without one reads as it did", () =>
+	withDir((root) => {
+		const long = "é".repeat(HISTORY_INTERIM_CAP_BYTES);
+		const bound = boundRecord(record({ state: "failed", interim: long, interimRevision: 3 }));
+		assert.equal(bound.interimTruncated, true);
+		assert.ok(Buffer.byteLength(bound.interim!) <= HISTORY_INTERIM_CAP_BYTES);
+		assert.equal(bound.interimRevision, 3);
+		const dir = path.join(root, "history");
+		const history = new History(dir);
+		history.save("host-1", "/work", record({ id: "id-1", state: "cancelled", interim: "half", interimRevision: 1 }));
+		history.save("host-1", "/work", record({ id: "id-2", handle: "run-2" }));
+		const [kept, older] = history.load("host-1").records;
+		assert.deepEqual([kept!.interim, kept!.interimRevision, kept!.interimTruncated], ["half", 1, undefined]);
+		assert.equal(kept!.report, undefined, "it is never the report");
+		assert.equal(older!.interim, undefined);
+		assert.equal(older!.interimRevision, undefined);
+	}));

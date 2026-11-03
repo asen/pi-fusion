@@ -42,6 +42,8 @@ The question tool is an in-process MCP server served by the Agent SDK. Fixed-too
 
 Ultracode's native `AskUserQuestion` also follows this flow through a `PreToolUse` hook. With unattended `permissionPrompts: "none"`, the SDK does not call `canUseTool`, so that is not the bridge. The hook joins questions/options into one numbered request, then supplies the original input with an answer map. One answer line per question maps separately; otherwise all questions receive the whole answer.
 
+An open question keeps the child's input open, since its answer travels over it: a result that arrives meanwhile closes nothing, and after the answer the run waits for the result of a later turn. A child that exits by itself still ends the run and drops its question. See [When a Claude child finishes](runs.md#when-a-claude-child-finishes).
+
 The MCP tool timeout is `2147483647` ms and hook timeout `2147483` seconds, about 24.8 days; these avoid ordinary short timeouts, not a literally infinite wall-clock limit. The hook otherwise defaults to ten minutes. These limits were read from Claude Code 2.1.273, not measured against its real binary; deterministic tests drive the control requests through the fake binary.
 
 ## On the pi backend
