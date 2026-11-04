@@ -198,6 +198,23 @@ for (const tool of TOOLS) {
 	});
 }
 
+test("both tools describe interim reports without naming a disabled role, using their supplied control names", () => {
+	const configuration = input(enabling(["implement"]));
+	configuration.names = { fusion: "delegate", fusionControl: "delegate_control", claude: "compat", claudeControl: "compat_control" };
+	for (const [tool, control, guidance] of [
+		["delegate", "delegate_control", fusionGuidance(configuration)],
+		["compat", "compat_control", claudeGuidance(configuration)],
+	] as const) {
+		assert.match(guidance.description, /return that report at once as an interim report, marked as not final/);
+		assert.ok(guidance.description.includes(`${control} wait returns a newer interim report, a question or the final report`));
+		const interim = guidance.promptGuidelines.filter((line) => line.startsWith(`A ${tool} call, a ${control} wait or a notification can give you an interim report:`));
+		assert.equal(interim.length, 1);
+		assert.match(interim[0]!, /It is not completion\. The run goes on in the background and keeps its slot/);
+		assert.match(interim[0]!, /Wait for the final report before work that depends on the run's result\./);
+		assert.doesNotMatch(interim[0]!, /ultracode|fusion_control|claude_control/);
+	}
+});
+
 test("the built-in configuration with every role enabled says what each backend runs, security included", () => {
 	const all = input(enabling(KNOWN_ROLE_NAMES));
 	const fusion = fusionGuidance(all);

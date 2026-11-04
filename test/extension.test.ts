@@ -23,7 +23,7 @@ import { toolList, turnOn } from "./host-tools.ts";
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 process.env.PI_FUSION_CLAUDE_BIN = path.join(repoRoot, "test", "fake-claude.mjs");
-process.env.FAKE_CLAUDE_SCENARIO = "ok";
+process.env.FAKE_CLAUDE_SCENARIO = "ok-sync";
 process.env.PI_FUSION_DASHBOARD_OPEN = "0";
 /** Where this file's runs would be kept if the history were on, so a test can show that nothing writes it. */
 const historyHome = path.join(fs.realpathSync(os.tmpdir()), `pi-fusion-history-${process.pid}`);
@@ -157,6 +157,7 @@ function assertCommon(run: Invocation, contract: string) {
 	assert.ok(!run.argv.includes("--setting-sources"), "children load Claude Code's default setting sources");
 	assert.equal(run.env.CLAUDE_AGENT_SDK_CLIENT_APP, "pi-fusion");
 	assert.equal(run.env.CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS, "0");
+	assert.equal(run.env.CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS, "1");
 	assert.match(run.text, /\n\n\[.+ · \d+ tool calls · in \d+ out \d+ · context [\d.]+k\/[\d.]+M \(<1%\) · workflow agents 250 tokens · claude --resume [^\]]+\]$/);
 }
 
@@ -877,7 +878,7 @@ test("the status line ticks every second while the child is silent", async () =>
 			recording,
 		);
 	} finally {
-		process.env.FAKE_CLAUDE_SCENARIO = "ok";
+		process.env.FAKE_CLAUDE_SCENARIO = "ok-sync";
 	}
 	assert.match(statuses[0] ?? "", /^run-\d+ implement · 0s · starting$/);
 	assert.ok(statuses.some((line) => /^run-\d+ implement · 0s · 1 tool calls · Bash npm test$/.test(line ?? "")), JSON.stringify(statuses));
@@ -894,7 +895,7 @@ test("a failed child surfaces the failure as a tool error", async () => {
 			/ultracode model error: boom\n\n\[run-\d+ · ultracode · fable · \d+s · 0 tool calls · in \d+ out \d+ · claude --resume [0-9a-f-]{36}\]$/,
 		);
 	} finally {
-		process.env.FAKE_CLAUDE_SCENARIO = "ok";
+		process.env.FAKE_CLAUDE_SCENARIO = "ok-sync";
 	}
 });
 
@@ -1019,9 +1020,15 @@ test("a successful ultracode run keeps its report, its workflow task and its log
 test("a child that leaves a task running fails the run and stops the task with it", async () => {
 	process.env.FAKE_CLAUDE_SCENARIO = "wind-down";
 	try {
-		await assert.rejects(invoke("claude", { role: "ultracode", task: "do a thing" }), /still running/);
+		// The turn's placeholder came while the workflow ran, so the call returns it as an interim report, and the wait
+		// that follows, as a host's must, carries the failure.
+		const interim = await invoke("claude", { role: "ultracode", task: "do a thing" });
+		assert.match(interim.text, /is still running and gave interim report revision 1, which is not its final report/);
+		const handle = /^(run-\d+) /.exec(interim.text)![1]!;
+		const waited = await byName("claude_control").execute("call-2", { action: "wait", run: handle }, undefined, undefined, ctx);
+		assert.match(waited.content[0]!.text, /still running/);
 	} finally {
-		process.env.FAKE_CLAUDE_SCENARIO = "ok";
+		process.env.FAKE_CLAUDE_SCENARIO = "ok-sync";
 	}
 	const payload = (await getJson(`${dashboardUrl}api/runs`)) as { runs: Array<{ id: string; role: string; status: string; endedAt?: number }> };
 	interface Detail {

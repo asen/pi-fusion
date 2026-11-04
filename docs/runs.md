@@ -166,14 +166,14 @@ The variable accepts percentages from 0 to 100; `0` disables both handoff-by-cap
 
 `background: true` returns a handle immediately. At most one file-changing run (`plan`, `implement`, `ultracode`, or enabled `security`) can be active across backends; waiting counts too. `ask` runs can run alongside it. Continuing an active handle refuses and points to a control `message` action instead.
 
-A completed background run normally sends a `pi-fusion-run` follow-up that starts a host turn when idle or queues behind its current turn. A report collected by a host control `wait`, or a run cancelled by a host control, sends no duplicate end message. User `/fusion cancel` and `/fusion wait` do not suppress the host's end notice. A foreground child asking a question returns early and waits in the background; see [Questions](questions.md).
+A completed background run normally sends a `pi-fusion-run` follow-up that starts a host turn when idle or queues behind its current turn. A report collected by a host control `wait`, or a run cancelled by a host control, sends no duplicate end message. User `/fusion cancel` and `/fusion wait` do not suppress the host's end notice. A foreground child asking a question returns early and waits in the background; see [Questions](questions.md). So does one that gives an [interim report](#interim-reports).
 
 Both `fusion_control` and `claude_control` take `action`, optional `run`, and `message`, and manage every run:
 
 | Action | Effect |
 | --- | --- |
-| `status` | Without a handle, list runs; with one, show activity, tools, open question, and live changed files for coding runs. It does not return the report. |
-| `wait` | Wait for final recording/report or a question. Esc leaves the run going. |
+| `status` | Without a handle, list runs; with one, show activity, tools, open question, what it waits for, its latest interim or partial report, and live changed files for coding runs. It does not return the final report and marks no interim report read. |
+| `wait` | Wait for final recording/report or a question, or return an [interim report](#interim-reports) not yet read. Esc leaves the run going. |
 | `message` | Answer a waiting question or steer a running child. An ended run receives nothing; the reply gives its final state/report summary and offers continuation only when permitted. |
 | `cancel` | Stop the run and mark it cancelled, carrying any cleanup warning. |
 
@@ -184,6 +184,48 @@ Codex buffers steers from admission until its turn is named, then sends each onc
 A running child's input can refuse a message while it stays open, as a full Codex queue (32 waiting) does: the control reply and `/fusion steer` then say at once that it was not accepted now, and nothing was sent, queued or kept for a retry. A message that meets a closed input is the run ending, reported as above.
 
 Ordinary editor text targets the host. `/fusion steer run-N <text>` targets the child and logs the instruction in the host conversation. A waiting child instead needs `/fusion answer`; the host may forward an ordinary instruction through a control tool at its discretion.
+
+### Interim reports
+
+A Claude child can report while background tasks it waits for still run: a top-level, non-error result with text, while its input is open and its [blocking membership](#when-a-claude-child-finishes) is not empty. An ultracode workflow launch is the common case. That text is an **interim report**: provisional, never the final report, and never read as completion. The run stays `running`, keeps the writer slot, and finishes only as below. Pi and Codex runs give none.
+
+```text
+child result while tasks run --> interim revision N (latest replaces earlier)
+   foreground call waiting --> returns it, marked not final; run moves to background
+   host control wait       --> returns it at once if unread; otherwise waits for newer/question/end
+   neither                 --> one notice per unread interval (background runs)
+```
+
+- **Revisions** count up per run in the host. Only the latest is kept; the host bounds it to 32 KiB, marked when cut.
+- **Read** means a host control `wait` (either pair) or a foreground return carried it. Choosing the revision, marking it read and writing the reply are one step, so the reply carries exactly the revision it marked, and two waits never take the same one. That read rearms the notice. A notice carries the report but marks nothing read, so a `wait` after a notice can return the same text again. After a read, the next `wait` blocks for something new.
+- **Priority:** a question or the run's end wins over an unread interim report; a stale one never answers a wait for either. A run being cancelled or aborted offers none: its waits go on to the end, and no notice calls it still running; a report it gives meanwhile is kept as partial text.
+- **Coalescing:** one automatic `interim report` notice per unread interval; later revisions replace it silently until a read. The end notice follows the usual rules, so a final report is delivered once.
+- **Not read:** `status`, `/fusion status` and the dashboard show the report without marking it read or suppressing the host's notices. The user's `/fusion wait` does neither either: in the TUI it previews the first line of the latest one while it waits for a question or the end; in print mode it shows nothing before the end.
+- **What it waits for** is task-only: the bounded labels (at most 20, each up to 200 characters) of the blocking tasks, out of a total. A task leaving that list did not necessarily finish.
+- **Child text** in notices, including task labels and partial text, sits between the [quotation markers](#labelled-child-text); tool results stay unquoted.
+
+A foreground workflow call therefore usually returns at its launch report. That is an intentional change: wait with a control `wait` for later reports and the final report before work that depends on the result.
+
+A run that succeeds is read by its final report alone. One that fails, aborts or is cancelled, including a backend that threw with no outcome, appends its last interim report after the host's own ending line, labelled `Partial report: interim revision N`, in the end notice, control `wait`/`cancel` replies, foreground errors and `status`; the user's `/fusion cancel` says it is kept. It never becomes the report, a branch record, review input, plan-handoff text or a continuation.
+
+### When a Claude child finishes
+
+A Claude child reads stream-json on stdin, which Fusion keeps open for steers and question answers. Closing it (EOF) is how the run finishes: Claude Code then handles queued input and pending task notifications, and exits. Fusion closes it once all of these hold:
+
+- **No blocking task.** Once a `background_tasks_changed` snapshot has arrived, the latest one decides, with ambient entries excluded; before that, `task_started`/`task_notification` edges do. A start edge never re-adds an id that a snapshot already listed (ambient included) or that has ended.
+- **No open question** (its answer comes back over stdin), and no message left in the local queue.
+- **A top-level result** newer than the last message taken, any later top-level model output, `running` or `requires_action` state, and any answered question.
+- **Idle**, from a child that has sent a valid `session_state_changed`: an `idle` at least as new as the last message taken, with no `running`, top-level output or answered question since. Fusion sets `CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS=1` to get these events.
+
+Idle survives a shrinking membership, a task turning ambient, task progress and notifications, and subagent output. The check reruns on each result, snapshot, task notification and state change; no quiet-time timer exists. Nothing here kills a task, releases the writer slot, or declares completion: the run ends when the child's stream ends, and its outcome is classified as before, including `exited with <task> still running`.
+
+Limits, derived from the source of Claude Code 2.1.281 (pinned SDK 0.3.281), not measured natively:
+
+- Claude Code reports idle while a background shell (`local_bash`) still runs; the membership keeps that shell blocking.
+- **Taken is not read.** A steer taken during a turn counts as covered by that turn's result. If the child had not read it, EOF still delivers it before Claude Code exits, but no later steer is accepted. Nothing replays a steer.
+- Closing after the last task leaves can precede that task's notification turn. Claude Code drains it after EOF, waiting a bounded time for the notification to enqueue, and that turn's result becomes the report.
+- A child that sends no state events (an older binary, or one named by `PI_FUSION_CLAUDE_BIN`) gets the result-based check alone; its EOF draining is assumed from 2.1.281's source.
+- An answered question needs a later result (and idle, where reported). An asker outside the tracked membership may leave none, so the run stays open until cancelled. Endless background work likewise keeps the run and the writer slot until cancelled.
 
 Generated questions/cards/handoffs use the invoking tool pair (`fusion`/`fusion_control` or `claude`/`claude_control`); a control reply uses the name called. Pi and Codex continuation hints always use `fusion`. Reviews with no initiating delegation tool use the primary pair. User commands always remain `/fusion ...`.
 
@@ -249,16 +291,18 @@ The lineage rule is display only. It creates no reference, selection, continuati
 
 ### History data and limits
 
-**This writes project content to disk:** prompts, reports, failure text, changed paths, and accepted session/selection. The directory defaults to `<agent dir>/pi-fusion/history`, or `PI_FUSION_HISTORY_DIR`. Directories are private (`0700`), files private (`0600`), with one JSON file per host session.
+**This writes project content to disk:** prompts, reports, interim reports, failure text, changed paths, and accepted session/selection. The directory defaults to `<agent dir>/pi-fusion/history`, or `PI_FUSION_HISTORY_DIR`. Directories are private (`0700`), files private (`0600`), with one JSON file per host session.
 
 | Limit | Value |
 | --- | --- |
 | Records per session file | 100 |
 | Session files | 200 |
 | File size | 1 MiB |
-| Prompt / report | 32 KiB each |
+| Prompt / report / interim report | 32 KiB each |
 | Failure text | 4 KiB |
 | Changed paths per run | 500 |
+
+A record keeps the latest [interim report](#interim-reports) and its revision only while the run is going or after it failed, aborted or was cancelled; a successful run's record drops it. Each interim report saves the record, even when nothing new was spent. Older records without the field read as before. It is provisional text: no continuation, review or reference comes from it, and the status of a run from an earlier process shows it as a partial report.
 
 Oldest records/files go first, by count or by bytes: large records can leave far fewer than 100 in a file. A single oversized record can lose its path list to fit while preserving counts. Pruned or never-saved data cannot be recovered, and there is no migration. Dashboard retention (`PI_FUSION_DASHBOARD_MAX_RUNS`, `/fusion dashboard limit`) is memory only and never prunes these files. Accepted reference/selection fields are exact; over-32768-character values are omitted, never shortened into another file/model. Live history writes keep no session identity until an outcome is accepted, so a process killed mid-run offers no transcript path from unverified progress.
 

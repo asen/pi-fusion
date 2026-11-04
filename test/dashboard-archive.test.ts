@@ -17,7 +17,7 @@ import {
 	archiveSessions,
 	archiveSummary,
 } from "../extensions/dashboard-archive.ts";
-import { RunStore } from "../extensions/dashboard.ts";
+import { archivedRunDetail, RunStore } from "../extensions/dashboard.ts";
 import { branchEvidence, runRecords } from "../extensions/fusion.ts";
 import { asEnded, History, HISTORY_ABORTED, HISTORY_PROMPT_CAP_BYTES, HISTORY_VERSION, type HistoryRecord, MAX_HISTORY_FILE_BYTES } from "../extensions/history.ts";
 
@@ -971,4 +971,20 @@ test("only a claude id a run reported, on a record shown through its request alo
 		// A pure detail is read with no branch, so it says nothing either way.
 		assert.equal(archiveDetail(history.load("host-2").records.find((held) => held.id === "failed")!)?.diagnosticSessionId, undefined);
 	});
+});
+
+test("an archived run that did not succeed carries its interim report as partial text, never as its report or a live run", () => {
+	const going = record({ id: "going", state: "running", interim: "half done", interimRevision: 2 });
+	delete going.report;
+	const interrupted = archiveDetail(going);
+	assert.ok(interrupted);
+	assert.equal(interrupted.status, "aborted", "a run a gone process left going is not live");
+	assert.equal(interrupted.interrupted, true);
+	assert.deepEqual(interrupted.interim, { text: "half done", truncated: false, revision: 2 });
+	assert.equal(interrupted.report, undefined);
+	const page = archivedRunDetail(interrupted);
+	assert.deepEqual(page.interim, { revision: 2, text: "half done", truncated: false, partial: true });
+	assert.equal(page.text, undefined, "the page's report stays the saved report alone");
+	const done = archiveDetail(record({ id: "done", state: "done", report: "final", interim: "half done" }));
+	assert.equal(done?.interim, undefined, "a successful run is read by its final report alone");
 });

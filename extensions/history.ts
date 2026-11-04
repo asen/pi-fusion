@@ -13,6 +13,8 @@ export const MAX_HISTORY_FILES = 200;
 export const HISTORY_PROMPT_CAP_BYTES = 32_768;
 export const HISTORY_REPORT_CAP_BYTES = 32_768;
 export const HISTORY_FAILURE_CAP_BYTES = 4_096;
+/** The most of a run's latest interim report a record keeps. */
+export const HISTORY_INTERIM_CAP_BYTES = 32_768;
 export const MAX_HISTORY_FILES_PER_RUN = 500;
 /** How large one session file may get: the oldest records go once the serialised file passes it, cap or no cap. */
 export const MAX_HISTORY_FILE_BYTES = 1_048_576;
@@ -64,6 +66,14 @@ export interface HistoryRecord {
 	reportTruncated?: boolean;
 	failure?: string;
 	failureTruncated?: boolean;
+	/**
+	 * The latest interim report of a run that had not succeeded when this was written: provisional text the child gave
+	 * while background work it waited for still ran, never the final report and never a session, review or continuation
+	 * input. A run that succeeds writes none. `interimRevision` is the host's count of those reports for the run.
+	 */
+	interim?: string;
+	interimTruncated?: boolean;
+	interimRevision?: number;
 	files?: Array<{ path: string; status: string; added?: number; removed?: number }>;
 	/** How many files the run changed, which is more than `files` holds once the per-run cap cuts the list. */
 	filesTotal?: number;
@@ -218,6 +228,13 @@ export function boundRecord(record: HistoryRecord): HistoryRecord {
 		const failure = capBytes(String(record.failure), HISTORY_FAILURE_CAP_BYTES);
 		bound.failure = failure.text;
 		if (failure.truncated || record.failureTruncated === true) bound.failureTruncated = true;
+	}
+	if (record.interim !== undefined) {
+		const interim = capBytes(String(record.interim), HISTORY_INTERIM_CAP_BYTES);
+		bound.interim = interim.text;
+		if (interim.truncated || record.interimTruncated === true) bound.interimTruncated = true;
+		const revision = num(record.interimRevision);
+		if (revision !== undefined) bound.interimRevision = revision;
 	}
 	if (record.files !== undefined) {
 		bound.files = record.files.slice(0, MAX_HISTORY_FILES_PER_RUN).map((file) => {
@@ -375,6 +392,12 @@ function recordOf(value: unknown): HistoryRecord | undefined {
 	if (data.reportTruncated === true) record.reportTruncated = true;
 	if (typeof data.failure === "string") record.failure = data.failure;
 	if (data.failureTruncated === true) record.failureTruncated = true;
+	if (typeof data.interim === "string") {
+		record.interim = data.interim;
+		if (data.interimTruncated === true) record.interimTruncated = true;
+		const revision = num(data.interimRevision);
+		if (revision !== undefined) record.interimRevision = revision;
+	}
 	const files = filesOf(data.files);
 	if (files !== undefined) record.files = files;
 	const filesTotal = num(data.filesTotal);

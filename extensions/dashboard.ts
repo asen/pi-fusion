@@ -3,7 +3,7 @@ import * as fs from "node:fs";
 import { createServer } from "node:http";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
-import { type BackendName, type ChildEvent, isBackendName, keptRef, keptSelection, type ResolvedSelection, type SessionRef } from "./backends/types.ts";
+import { type BackendName, type ChildEvent, isBackendName, keptRef, keptSelection, MAX_BLOCKERS, type ResolvedSelection, type SessionRef } from "./backends/types.ts";
 import type { UsageTotals } from "./budget.ts";
 import type { ChangedFile } from "./changes.ts";
 import type { ArchiveAbsence, ArchiveDetail, ArchiveSummary } from "./dashboard-archive.ts";
@@ -13,6 +13,8 @@ import type { RunOrigin } from "./fusion.ts";
 export const MAX_RUNS = 30;
 export const MAX_LOG_PER_RUN = 100;
 export const MAX_TASKS_PER_RUN = 100;
+/** How many task ids a run remembers from its blocker lists, so a list that drops one can say so. */
+export const MAX_LISTED_BLOCKERS = 400;
 export const TEXT_CAP_BYTES = 32_768;
 export const FAILURE_CAP_BYTES = 4_096;
 export const PROMPT_CAP_BYTES = 262_144;
@@ -53,7 +55,26 @@ export function dashboardProblems(env: NodeJS.ProcessEnv = process.env): string[
 }
 
 export type RunStatus = "running" | "waiting" | "done" | "failed" | "aborted" | "cancelled";
-export type TaskStatus = "running" | "completed" | "failed" | "stopped";
+/** `unknown` is a task that left the run's background list with no notification saying how it ended. */
+export type TaskStatus = "running" | "completed" | "failed" | "stopped" | "unknown";
+
+/**
+ * The latest interim report of a run: provisional text its child gave while background work it waited for still
+ * ran. `partial` marks one kept from a run that ended without succeeding; a successful run shows its final report.
+ */
+export interface InterimView {
+	revision: number;
+	text: string;
+	truncated: boolean;
+	at?: number;
+	partial: boolean;
+}
+
+/** The background tasks a running run waits for, bounded, out of `total`. */
+export interface BlockersView {
+	tasks: Array<{ id: string; label: string }>;
+	total: number;
+}
 
 export interface ModelUsageView {
 	model: string;
@@ -136,6 +157,8 @@ export interface RunSummary {
 	contextWindow?: number;
 	/** Which of `REPORT_FLAGS` the report has as a heading. */
 	reportFlags?: string[];
+	/** The revision of the latest interim report of a run still going, or one that ended without succeeding. */
+	interimRevision?: number;
 	/** How many files the run changed, when the working directory is a git work tree. */
 	filesChanged?: number;
 	/** True for a run of an earlier Pi process, read back from the on-disk history. */
@@ -258,6 +281,9 @@ export interface RestoredRun {
 	reportTruncated?: boolean;
 	failure?: string;
 	failureTruncated?: boolean;
+	interim?: string;
+	interimTruncated?: boolean;
+	interimRevision?: number;
 	files?: ReadonlyArray<ChangedFile>;
 	filesTotal?: number;
 	usage?: { costUsd?: number; tokensIn?: number; tokensOut?: number; workflowTokens?: number; toolCalls?: number };
@@ -298,6 +324,8 @@ export interface RestoredView {
 	reportFlags?: string[];
 	failure?: string;
 	failureTruncated: boolean;
+	/** The partial text of a run that ended without succeeding, as the history kept it; never one of a successful run. */
+	interim?: { text: string; truncated: boolean; revision?: number };
 	files?: ChangedFile[];
 	filesTotal?: number;
 	usage?: { costUsd?: number; tokensIn?: number; tokensOut?: number; workflowTokens?: number; toolCalls?: number };
@@ -325,6 +353,10 @@ export interface RunDetail extends RunSummary {
 	textTruncated: boolean;
 	failure?: string;
 	failureTruncated: boolean;
+	/** The latest interim report, while the run goes on or as the partial text of one that ended without succeeding. */
+	interim?: InterimView;
+	/** What a running run waits for. */
+	blockers?: BlockersView;
 }
 
 interface StoredRun {
@@ -387,6 +419,12 @@ interface StoredRun {
 	textTruncated: boolean;
 	failure?: string;
 	failureTruncated: boolean;
+	interim?: { revision: number; text: string; truncated: boolean; at?: number };
+	blockers?: BlockersView;
+	/** Task ids any blocker list of this run has named, oldest first and bounded, whether or not a task row exists yet. */
+	listedBlockers?: Set<string>;
+	/** The ids of the latest blocker list when it was whole, or undefined when it was cut and says nothing of absence. */
+	blockingNow?: Set<string>;
 }
 
 export function cap(value: string, max = MAX_STRING_CHARS): string {
@@ -455,6 +493,7 @@ function summaryOf(run: StoredRun): RunSummary {
 	if (run.contextTokens !== undefined) summary.contextTokens = run.contextTokens;
 	if (run.contextWindow !== undefined) summary.contextWindow = run.contextWindow;
 	if (run.reportFlags !== undefined) summary.reportFlags = [...run.reportFlags];
+	if (run.interim !== undefined && run.status !== "done") summary.interimRevision = run.interim.revision;
 	if (run.filesTotal !== undefined) summary.filesChanged = run.filesTotal;
 	if (run.restored) summary.restored = true;
 	return summary;
@@ -599,6 +638,13 @@ export function restoredView(input: RestoredRun, now: number): RestoredView | un
 		const failure = capBytes(String(input.failure), FAILURE_CAP_BYTES);
 		view.failure = failure.text;
 		view.failureTruncated = failure.truncated || input.failureTruncated === true;
+	}
+	// Partial text belongs to a run that did not succeed: one that did is read by its final report alone.
+	if (input.interim !== undefined && status !== "done") {
+		const interim = capBytes(String(input.interim), TEXT_CAP_BYTES);
+		view.interim = { text: interim.text, truncated: interim.truncated || input.interimTruncated === true };
+		const revision = num(input.interimRevision);
+		if (revision !== undefined) view.interim.revision = revision;
 	}
 	if (input.files !== undefined) {
 		view.files = input.files.slice(0, MAX_FILES).map(fileOf);
@@ -751,6 +797,7 @@ export class RunStore {
 		if (view.sessionId !== undefined) run.sessionId = view.sessionId;
 		if (view.ref !== undefined) run.ref = view.ref;
 		if (view.failure !== undefined) run.failure = view.failure;
+		if (view.interim !== undefined) run.interim = { revision: view.interim.revision ?? 0, text: view.interim.text, truncated: view.interim.truncated };
 		if (view.files !== undefined) run.files = view.files;
 		if (view.filesTotal !== undefined) run.filesTotal = view.filesTotal;
 		if (view.reportFlags !== undefined) run.reportFlags = view.reportFlags;
@@ -819,6 +866,8 @@ export class RunStore {
 				if (event.subagentType !== undefined) task.subagentType = cap(String(event.subagentType));
 				const prompt = task.toolUseId === undefined ? undefined : run.agentPrompts.get(task.toolUseId);
 				if (prompt !== undefined) task.prompt = prompt;
+				// The edge can come after the list that already named or dropped this task, so the list still decides.
+				this.reconcile(run, task, at);
 			}
 			this.record(run, at, "task", `${name} started`);
 		} else if (event.type === "task_progress") {
@@ -850,7 +899,25 @@ export class RunStore {
 		} else if (event.type === "turn_result") {
 			const message = event.message === undefined ? "" : cap(String(event.message));
 			this.record(run, at, "turn", event.ok ? "turn ended" : message ? `turn failed: ${message}` : "turn failed");
+		} else if (event.type === "interim") {
+			const revision = num(event.revision);
+			if (revision !== undefined && typeof event.text === "string" && (run.status === "running" || run.status === "waiting")) {
+				const text = capBytes(event.text, TEXT_CAP_BYTES);
+				run.interim = { revision, text: text.text, truncated: text.truncated, at };
+				this.record(run, at, "run", `interim report revision ${revision}`);
+			}
+		} else if (event.type === "blockers") {
+			this.blockers(run, event, at);
 		}
+		this.mark(run);
+	}
+
+	/** A foreground run whose call returned an interim report goes on in the background. */
+	backgrounded(id: string): void {
+		const run = this.runs.get(cap(String(id)));
+		if (!run) return;
+		run.background = true;
+		this.record(run, this.clock(), "run", "interim report returned; the run goes on in the background");
 		this.mark(run);
 	}
 
@@ -895,6 +962,7 @@ export class RunStore {
 		run.status = outcome.status;
 		run.endedAt = at;
 		delete run.question;
+		delete run.blockers;
 		if (outcome.snapshot) this.apply(run, outcome.snapshot);
 		// After the snapshot, because the snapshot is what would have set the line: a caller that already put what the
 		// ending left into this run's failure asks for the activity to go rather than say the same thing a second time.
@@ -951,6 +1019,10 @@ export class RunStore {
 			failureTruncated: run.failureTruncated,
 		};
 		if (run.failure !== undefined) detail.failure = run.failure;
+		const live = run.status === "running" || run.status === "waiting";
+		// A successful run is read by its final report alone; any other keeps its last interim report, as partial text once ended.
+		if (run.interim !== undefined && run.status !== "done") detail.interim = { ...run.interim, partial: !live };
+		if (live && run.blockers !== undefined) detail.blockers = { tasks: run.blockers.tasks.map((task) => ({ ...task })), total: run.blockers.total };
 		if (run.contract !== undefined) detail.contract = run.contract;
 		if (run.session !== undefined) detail.session = sessionOf(run.session);
 		if (run.ref !== undefined) detail.ref = { ...run.ref };
@@ -1009,6 +1081,45 @@ export class RunStore {
 		if (workflowTokens !== undefined) run.workflowTokens = workflowTokens;
 		if (snapshot.sessionId !== undefined) run.sessionId = cap(String(snapshot.sessionId));
 		if (Array.isArray(snapshot.deniedTools)) run.deniedTools = toolNames(snapshot.deniedTools);
+	}
+
+	/**
+	 * Replaces what the run waits for and reconciles every task row with it, whichever arrived first, the list or the
+	 * task's start edge. The ids a list names are remembered, bounded, without waiting for their rows.
+	 */
+	private blockers(run: StoredRun, event: { tasks?: unknown; total?: unknown }, at: number): void {
+		const listed = Array.isArray(event.tasks) ? event.tasks : [];
+		const tasks = listed.slice(0, MAX_BLOCKERS).map((task: any) => ({ id: cap(String(task?.id ?? "")), label: cap(String(task?.label ?? task?.id ?? "")) }));
+		const total = num(event.total) ?? tasks.length;
+		run.blockers = { tasks, total };
+		const named = (run.listedBlockers ??= new Set());
+		for (const task of tasks) {
+			named.delete(task.id);
+			named.add(task.id);
+		}
+		for (const id of named) {
+			if (named.size <= MAX_LISTED_BLOCKERS) break;
+			named.delete(id);
+		}
+		run.blockingNow = tasks.length < total ? undefined : new Set(tasks.map((task) => task.id));
+		for (const task of run.tasks.values()) this.reconcile(run, task, at);
+	}
+
+	/**
+	 * A task some list named and the latest whole list no longer names, still shown running, left without a notification
+	 * saying how: its outcome is unknown, never completed, until one arrives. One a list names again is running again.
+	 * A notification's own outcome is never touched, and a cut list says nothing about who left.
+	 */
+	private reconcile(run: StoredRun, task: TaskView, at: number): void {
+		if (task.status === "unknown" && run.blockers?.tasks.some((listed) => listed.id === task.id)) {
+			task.status = "running";
+			delete task.endedAt;
+			this.record(run, at, "task", `${task.name} is in the background list again`);
+		} else if (task.status === "running" && run.blockingNow !== undefined && run.listedBlockers?.has(task.id) && !run.blockingNow.has(task.id)) {
+			task.status = "unknown";
+			task.endedAt = at;
+			this.record(run, at, "task", `${task.name} left the background list; how it ended is unknown`);
+		}
 	}
 
 	private task(run: StoredRun, id: string, name: string, at: number): TaskView | undefined {
@@ -1160,7 +1271,7 @@ export type ArchivedRun = Partial<Omit<RunSummary, "restored">> &
 
 /** An archived run in full as the page's detail reads it: its saved report is the text a live run's detail carries. */
 export type ArchivedRunDetail = Omit<ArchivedRun, "history"> &
-	Partial<Pick<RunDetail, "prompt" | "promptTruncated" | "contract" | "session" | "ref" | "files" | "filesTruncated" | "text" | "textTruncated" | "failure" | "failureTruncated">> & {
+	Partial<Pick<RunDetail, "prompt" | "promptTruncated" | "contract" | "session" | "ref" | "files" | "filesTruncated" | "text" | "textTruncated" | "failure" | "failureTruncated" | "interim">> & {
 		history: ArchiveDetail;
 	};
 
@@ -1222,6 +1333,7 @@ export function archivedRunDetail(detail: ArchiveDetail): ArchivedRunDetail {
 		run.failure = detail.failure;
 		run.failureTruncated = detail.failureTruncated;
 	}
+	if (detail.interim !== undefined) run.interim = { revision: detail.interim.revision ?? 0, text: detail.interim.text, truncated: detail.interim.truncated, partial: true };
 	return run;
 }
 

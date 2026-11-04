@@ -330,7 +330,22 @@ export type ChildEvent =
 	| { type: "task_started"; taskId: string; toolUseId?: string; taskType?: string; name: string; subagentType?: string }
 	| { type: "task_progress"; taskId: string; description?: string; summary?: string; lastTool?: string; tokens?: number; toolUses?: number; phase?: string; agents?: Array<{ label: string; state: string }> }
 	| { type: "task_ended"; taskId: string; status: "completed" | "failed" | "stopped"; summary?: string; tokens?: number }
-	| { type: "turn_result"; ok: boolean; message?: string };
+	| { type: "turn_result"; ok: boolean; message?: string }
+	/**
+	 * A report the child gave while background work it waits for still runs: provisional, superseded by any later one
+	 * and by the final report, and never an outcome. `revision` counts up from 1 within the run.
+	 */
+	| { type: "interim"; revision: number; text: string }
+	/**
+	 * The background tasks the run currently waits for, replacing the last such event: at most `MAX_BLOCKERS` of them, by
+	 * id and with bounded child-written labels, out of `total`. A task that leaves the list did not necessarily finish.
+	 */
+	| { type: "blockers"; tasks: Array<{ id: string; label: string }>; total: number };
+
+/** The most blocking tasks a `blockers` event lists; `total` says how many there are. */
+export const MAX_BLOCKERS = 20;
+/** The longest label a `blockers` event carries for one task, in characters. */
+export const BLOCKER_LABEL_CHARS = 200;
 
 /** Answers a child's question, and rejects when the signal aborts, which is what cancelling a waiting run does. */
 export type Ask = (question: string, signal: AbortSignal) => Promise<string>;

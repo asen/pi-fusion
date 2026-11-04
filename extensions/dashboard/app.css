@@ -473,6 +473,22 @@ body {
 	color: var(--warn);
 }
 
+.status-unknown {
+	color: var(--muted);
+}
+
+.interim-label {
+	color: var(--accent);
+	font-size: 11px;
+	font-weight: 600;
+	white-space: nowrap;
+}
+
+.blockers {
+	margin: 4px 0;
+	padding-left: 20px;
+}
+
 .empty {
 	margin: 24px 0;
 	color: var(--muted);
@@ -1204,6 +1220,10 @@ button.flag {
 
 .bar-stopped {
 	background: var(--warn);
+}
+
+.bar-unknown {
+	background: var(--muted);
 }
 
 .timeline-axis {

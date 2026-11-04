@@ -52,7 +52,7 @@ import {
 import { budgetConfig, budgetProblems, type CallUsage, Ledger } from "./budget.ts";
 import { bodyLines, Card, CARD_FILES, CARD_QUESTION_CHARS, type CardDetails, cardDetails, type CardMode, type CardTheme, headerLine, plainText, resultText, unpricedText, type WidgetRun, widgetLines } from "./cards.ts";
 import { type ChangedFile, changedFiles, type Snapshot, snapshot } from "./changes.ts";
-import { type Dashboard, dashboardMaxRuns, dashboardProblems, parseRunLimit, RunStore, startDashboard } from "./dashboard.ts";
+import { capBytes, type Dashboard, dashboardMaxRuns, dashboardProblems, parseRunLimit, RunStore, startDashboard, TEXT_CAP_BYTES } from "./dashboard.ts";
 import { ArchiveIndex } from "./dashboard-archive.ts";
 import { contextShare, continueNote, handoffBlocked, handoffNote, handoffPrompt, handoffShare, planContextPct, planProblems, sharePercent, type HandoffReason } from "./handoff.ts";
 import { asEnded, History, type HistoryRecord, historyDir, historyEnabled, sameChild } from "./history.ts";
@@ -1101,6 +1101,7 @@ const NOTICE_LABELS = new Map([
 	["steer", "user steer"],
 	["answer", "user answer"],
 	["review", "user review"],
+	["interim", "interim report"],
 ]);
 /** How long a going run's record may stay as it is on disk, on top of the write every turn that spent tokens gets. */
 const HISTORY_SPEND_MS = 15_000;
@@ -1203,6 +1204,21 @@ interface LiveRun {
 	userAnswer?: { questionId: string; text: string; at: number; acknowledged: boolean };
 	/** True once a tool result carried the outcome, so no completion notice repeats it. */
 	delivered: boolean;
+	/**
+	 * The child's latest provisional report, given while background work it waits for still ran, with this host's own
+	 * revision count. It is never `report`: no branch record, review, handoff or continuation reads it, and a run that
+	 * succeeds shows its final report alone. A run that fails, aborts or is cancelled shows it as partial.
+	 */
+	interim?: { revision: number; text: string; at: number };
+	/** The background tasks the run waits for, as its backend last listed them: bounded labels out of `total`. */
+	blockers?: { labels: string[]; total: number };
+	/** The newest interim revision a host wait or a foreground return has carried to the host. */
+	interimRead: number;
+	/**
+	 * True while an automatic notice of an interim report is out and the host has read none since: later revisions then
+	 * replace it silently, and a host read rearms the notice. The notice itself marks nothing read.
+	 */
+	interimNoticed: boolean;
 	/** Called once when the run ends or opens a question. */
 	waiters: Set<() => void>;
 	/** The user's own observers of those events; unlike a waiter, one never keeps the run's notice from the host. */
@@ -1333,7 +1349,8 @@ function statusLine(run: LiveRun): string {
 	const reviews = run.reviews ? ` · review of ${run.reviews}` : "";
 	const share = contextShare(run.latest);
 	const context = share === undefined ? "" : ` · context ${sharePercent(share)}`;
-	return `${run.handle} · ${run.role.name} · ${modelText(run.role, run.latest?.modelId)} · ${run.state}${run.background ? " · background" : ""} · ${secs}s${context}${reviews}${question}`;
+	const interim = isActive(run) && run.interim ? ` · interim report r${run.interim.revision}` : "";
+	return `${run.handle} · ${run.role.name} · ${modelText(run.role, run.latest?.modelId)} · ${run.state}${run.background ? " · background" : ""} · ${secs}s${context}${interim}${reviews}${question}`;
 }
 
 function firstLine(text: string): string {
@@ -1366,6 +1383,38 @@ function reviewLine(handle: string): string {
 	return `${handle} reviews this run in the background; its report arrives as a message.`;
 }
 
+/** The tasks a run waits for, as one line of bounded labels with how many more there are, or undefined for none. */
+function blockersLine(run: LiveRun): string | undefined {
+	const blockers = run.blockers;
+	if (!blockers || blockers.total <= 0 || !blockers.labels.length) return undefined;
+	const more = blockers.total - blockers.labels.length;
+	return `${blockers.labels.join("; ")}${more > 0 ? `; and ${more} more` : ""}`;
+}
+
+/**
+ * The interim report of a run that did not succeed, labelled as the partial text it is, after whatever the host already
+ * said about its ending; empty for a successful run, whose final report is all it shows, and for a run that gave none.
+ */
+function partialText(run: LiveRun, quote: boolean): string {
+	if (run.state === "done" || run.interim === undefined) return "";
+	const text = run.interim.text;
+	return `\n\nPartial report: interim revision ${run.interim.revision}, given while the run was still going, not a final report:\n\n${quote ? quoteChild(text) : text}`;
+}
+
+/**
+ * What an interim report tells the host: the run goes on, this is not its final report, and what reads the next one.
+ * `notice` is the automatic message, which marks nothing read, so a wait returns the same report at once.
+ */
+function interimText(run: LiveRun, control: string, notice: boolean): string {
+	const interim = run.interim!;
+	const waits = blockersLine(run);
+	const slot = canChangeFiles(run.role.name) ? ", still holding the slot of the one run that can change files" : "";
+	const next = notice
+		? `${control} wait and run ${run.handle} returns this report, or a newer one, at once and then waits for the next one or the final report`
+		: `${control} wait and run ${run.handle} waits for a newer interim report, a question or the final report`;
+	return `${run.handle} (${roleText(run)}) is still running and gave interim report revision ${interim.revision}, which is not its final report:\n\n${notice ? quoteChild(interim.text) : interim.text}${waits ? `\n\nIt waits for these background tasks: ${notice ? quoteChild(waits) : waits}` : ""}\n\nThe run goes on in the background${slot}. Its final report arrives as a message when it ends; ${next}.`;
+}
+
 /**
  * `quote` labels the report or failure text for a host notification. Host-written text stays unlabelled: the
  * fallbacks and a cancellation's own wording, which is ours; a failure can carry the child's or backend's words.
@@ -1375,7 +1424,7 @@ function finalText(run: LiveRun, quote = false): string {
 	const body = text ? (quote && run.state !== "cancelled" ? quoteChild(text) : text) : run.state === "done" ? "(no output)" : run.state;
 	const reviewed = run.reviewedBy ? `\n\n${reviewLine(run.reviewedBy)}` : "";
 	const note = run.note ? `${run.note}\n\n` : "";
-	return `${note}${run.handle} (${roleText(run)}) ${run.state}.\n\n${body}${run.stats ? `\n\n[${run.stats}]` : ""}${reviewed}`;
+	return `${note}${run.handle} (${roleText(run)}) ${run.state}.\n\n${body}${partialText(run, quote)}${run.stats ? `\n\n[${run.stats}]` : ""}${reviewed}`;
 }
 
 /** Why the run the on-disk history kept cannot be reviewed, or undefined when it can be. */
@@ -1393,6 +1442,9 @@ function heldText(held: HistoryRecord, branch: RunRecord | undefined, cwd: strin
 	const body = (held.state === "done" ? held.report : held.failure)?.trim() ?? "";
 	const lines = [`${held.handle} (${held.role}) ran in an earlier Pi process: ${held.state}, ${secs}s, ${files} changed files`];
 	if (body) lines.push(body.length > SUMMARY_CHARS ? `${body.slice(0, SUMMARY_CHARS)}…` : body);
+	// The history keeps an interim report only as what a run that did not succeed had said before it ended.
+	const partial = held.state === "done" ? "" : (held.interim?.trim() ?? "");
+	if (partial) lines.push(`partial report (interim revision ${held.interimRevision ?? "?"}, not final): ${partial.length > SUMMARY_CHARS ? `${partial.slice(0, SUMMARY_CHARS)}…` : partial}`);
 	// Only a run the branch recorded has a child session to resume; a run killed in flight recorded none, and a
 	// record this host will not act on says why instead of offering a continuation the next call would refuse.
 	if (branch?.refusal) lines.push(branch.refusal);
@@ -2019,6 +2071,8 @@ export default function fusion(pi: ExtensionAPI, options: FusionOptions = {}) {
 		prompt: run.prompt,
 		...(run.report === undefined ? {} : { report: run.report }),
 		...(run.failure === undefined ? {} : { failure: run.failure }),
+		// Provisional text only: a run that succeeds keeps its final report alone, and nothing reads this as one.
+		...(run.interim === undefined || state === "done" ? {} : { interim: run.interim.text, interimRevision: run.interim.revision }),
 		...(run.files === undefined ? {} : { files: run.files, filesTotal: run.files.length }),
 		// The flat id and checkpoint stay Claude's own, so a reader that only knows them never offers a resume for a Pi run.
 		...(run.backend !== "claude" || child?.sessionId === undefined ? {} : { sessionId: child.sessionId }),
@@ -2267,9 +2321,9 @@ export default function fusion(pi: ExtensionAPI, options: FusionOptions = {}) {
 		} catch {}
 	};
 
-	const notify = (run: LiveRun, text: string) => {
+	const notify = (run: LiveRun, text: string, extra: Partial<CardDetails> = {}) => {
 		send(
-			{ customType: NOTICE_TYPE, content: `Background run ${text}`, display: true, details: runDetails(run) },
+			{ customType: NOTICE_TYPE, content: `Background run ${text}`, display: true, details: { ...runDetails(run), ...extra } },
 			{ triggerTurn: true, deliverAs: "followUp" },
 		);
 	};
@@ -2305,6 +2359,44 @@ export default function fusion(pi: ExtensionAPI, options: FusionOptions = {}) {
 
 	/** The same wait for the user, which leaves the run's notice to the host. */
 	const watched = (run: LiveRun, signal?: AbortSignal): Promise<boolean> => waitOn(run, run.watchers, signal);
+
+	/**
+	 * Wakes the host's waiters alone, for an interim report, and says whether one heard. The user's watchers are not
+	 * woken: they wait for a question or the end, as the cancel barriers that share them do.
+	 */
+	const wakeHost = (run: LiveRun): boolean => {
+		const waiters = [...run.waiters];
+		run.waiters.clear();
+		for (const waiter of waiters) waiter();
+		return waiters.length > 0;
+	};
+
+	/**
+	 * What a host wait may settle on now: the run's question, then its end, then an interim report the host has not
+	 * read, which claiming marks read and rearms its notice, so of two waits only one takes a revision. A run being
+	 * stopped offers no interim report: a wait on it goes on to its end, and nothing calls it still running.
+	 */
+	const claimFor = (run: LiveRun): "question" | "interim" | "end" | undefined => {
+		if (run.state === "waiting") return "question";
+		if (run.state !== "running") return "end";
+		if (run.interim === undefined || run.interim.revision <= run.interimRead || run.controller.signal.aborted) return undefined;
+		run.interimRead = run.interim.revision;
+		run.interimNoticed = false;
+		return "interim";
+	};
+
+	/**
+	 * Waits until there is something to claim, checked again on every wake, then claims it and has `answer` build the
+	 * reply in the same synchronous step: the reply reads the very question, interim revision or ending that was claimed,
+	 * and nothing the run does can land between the two. Undefined when the signal stops the wait first.
+	 */
+	const hostWait = async <T>(run: LiveRun, signal: AbortSignal | undefined, answer: (claim: "question" | "interim" | "end") => T): Promise<T | undefined> => {
+		for (;;) {
+			const claim = claimFor(run);
+			if (claim) return answer(claim);
+			if (!(await settled(run, signal))) return undefined;
+		}
+	};
 
 	/**
 	 * Answers the run's oldest open question, if the run still waits for one. Everything up to the resolve is
@@ -2462,6 +2554,8 @@ export default function fusion(pi: ExtensionAPI, options: FusionOptions = {}) {
 			cwd: ctx.cwd,
 			questions: [],
 			delivered: false,
+			interimRead: 0,
+			interimNoticed: false,
 			waiters: new Set(),
 			watchers: new Set(),
 			finished: false,
@@ -2530,6 +2624,23 @@ export default function fusion(pi: ExtensionAPI, options: FusionOptions = {}) {
 				run.questions.push(question);
 				if (run.questions.length === 1) opened(true);
 			});
+		/**
+		 * Keeps the child's latest interim report under this host's own revision and tells the host: a host wait, the
+		 * foreground call's included, takes it, and otherwise a background run gets one notice per unread interval.
+		 */
+		const takeInterim = (value: unknown): void => {
+			if (!isActive(run) || typeof value !== "string" || !value.trim()) return;
+			const kept = capBytes(value, TEXT_CAP_BYTES);
+			run.interim = { revision: (run.interim?.revision ?? 0) + 1, text: kept.truncated ? `${kept.text}\n[interim report truncated]` : kept.text, at: Date.now() };
+			const revision = run.interim.revision;
+			record(() => store.event(id, { type: "interim", revision, text: run.interim!.text }));
+			saveHistory(ctx, run.hostSessionId, historyRecord(run, run.state, run.latest));
+			render();
+			// A run being stopped keeps the report as partial text, and says nothing that would call it still running.
+			if (run.controller.signal.aborted || wakeHost(run) || run.interimNoticed || !run.background || shuttingDown) return;
+			run.interimNoticed = true;
+			notify(run, interimText(run, controlWith(run.tool), true), { kind: "interim" });
+		};
 		const before = canChangeFiles(role.name) ? await snapshot(ctx.cwd) : undefined;
 		run.before = before;
 		/** Monitoring only: a git failure leaves the file list out and never fails the run. */
@@ -2572,7 +2683,14 @@ export default function fusion(pi: ExtensionAPI, options: FusionOptions = {}) {
 							saveSpend();
 							render();
 						},
-						onEvent: (event) => record(() => store.event(id, event)),
+						onEvent: (event) => {
+							if (event.type === "blockers") {
+								const labels = Array.isArray(event.tasks) ? event.tasks.map((task) => String(task?.label ?? task?.id ?? "")) : [];
+								run.blockers = { labels, total: typeof event.total === "number" ? event.total : labels.length };
+							}
+							if (event.type === "interim") return takeInterim(event.text);
+							record(() => store.event(id, event));
+						},
 					});
 				} catch (error) {
 					// A backend that threw returned no outcome, so the last progress stays this run's latest snapshot:
@@ -2772,7 +2890,7 @@ export default function fusion(pi: ExtensionAPI, options: FusionOptions = {}) {
 
 	/** The finished result of a foreground run, as the claude tool returns it. */
 	const outcome = (run: LiveRun) => {
-		if (run.state !== "done") throw new Error(run.stats ? `${run.failure}\n\n[${run.stats}]` : run.failure);
+		if (run.state !== "done") throw new Error(`${run.failure}${partialText(run, false)}${run.stats ? `\n\n[${run.stats}]` : ""}`);
 		const child = run.latest;
 		const reviewed = run.reviewedBy ? `\n\n${reviewLine(run.reviewedBy)}` : "";
 		const note = run.note ? `${run.note}\n\n` : "";
@@ -2824,6 +2942,14 @@ export default function fusion(pi: ExtensionAPI, options: FusionOptions = {}) {
 	const runStatus = async (run: LiveRun): Promise<string[]> => {
 		const lines = [statusLine(run)];
 		if (run.state === "running" && run.latest?.activity) lines.push(`activity: ${run.latest.activity}`);
+		// Read here without being marked read: only a wait or a foreground return carries a report to the host.
+		const waits = isActive(run) ? blockersLine(run) : undefined;
+		if (waits) lines.push(`waits for: ${waits}`);
+		if (run.interim && run.state !== "done") {
+			const text = run.interim.text.trim();
+			const shown = text.length > SUMMARY_CHARS ? `${text.slice(0, SUMMARY_CHARS)}…` : text;
+			lines.push(`${isActive(run) ? "interim" : "partial"} report (revision ${run.interim.revision}, not final): ${shown}`);
+		}
 		lines.push(`tool calls: ${run.latest?.toolCalls ?? 0}`);
 		const files = await currentFiles(run);
 		if (files) lines.push(files.length ? `changed files:\n${files.map((file) => `${file.status} ${file.path}`).join("\n")}` : "changed files: none");
@@ -2865,7 +2991,11 @@ export default function fusion(pi: ExtensionAPI, options: FusionOptions = {}) {
 				if (heard) finish(false);
 			});
 			return {
-				render: (width: number) => [truncateToWidth(activityLine(run), width), truncateToWidth(theme.fg("dim", `Esc leaves ${run.handle} running`), width)],
+				render: (width: number) => [
+					truncateToWidth(activityLine(run), width),
+					...(run.interim ? [truncateToWidth(plainText(`interim report r${run.interim.revision}, not final: ${firstLine(run.interim.text)}`), width)] : []),
+					truncateToWidth(theme.fg("dim", `Esc leaves ${run.handle} running`), width),
+				],
 				handleInput: (data: string) => {
 					if (matchesKey(data, "escape")) finish(true);
 				},
@@ -3510,7 +3640,8 @@ export default function fusion(pi: ExtensionAPI, options: FusionOptions = {}) {
 				// A backend that had something to say about what the stop left behind says it here too, because this
 				// notice is the whole of what the user who cancelled the run sees of its end.
 				const left = run.cleanupNotice;
-				notice(left === undefined ? `${run.handle} cancelled` : `${run.handle} cancelled; ${left}`, left === undefined ? "info" : "warning");
+				const partial = run.interim ? `; its interim report revision ${run.interim.revision} is kept as partial text, shown by /fusion status ${run.handle}` : "";
+				notice(left === undefined ? `${run.handle} cancelled${partial}` : `${run.handle} cancelled; ${left}${partial}`, left === undefined ? "info" : "warning");
 				return;
 			}
 			if (command.kind === "steer") {
@@ -3717,19 +3848,31 @@ export default function fusion(pi: ExtensionAPI, options: FusionOptions = {}) {
 		const onAbort = () => run.controller.abort();
 		if (signal?.aborted) onAbort();
 		else signal?.addEventListener("abort", onAbort, { once: true });
+		let early: { content: Array<{ type: "text"; text: string }>; details: Record<string, unknown> } | null | undefined;
 		try {
-			await settled(run);
+			early = await hostWait(run, undefined, (claim) => {
+				if (claim === "end") return null;
+				// As a question does, an interim report returns the call and leaves the run going in the background: Esc on
+				// this call no longer reaches it, and the slot it holds stays held until it ends.
+				signal?.removeEventListener("abort", onAbort);
+				run.background = true;
+				delete run.onUpdate;
+				if (claim === "question") {
+					return {
+						content: [{ type: "text" as const, text: `${note ? `${note}\n\n` : ""}${askedText(run)}` }],
+						details: { ...runDetails(run), handle, role: role.name, model: modelText(role, run.latest?.modelId), background: true, state: "waiting", sessionUsage: ledger.totals() },
+					};
+				}
+				record(() => store.backgrounded(run.id));
+				return {
+					content: [{ type: "text" as const, text: `${note ? `${note}\n\n` : ""}${interimText(run, controlName, false)}` }],
+					details: { ...runDetails(run), handle, role: role.name, model: modelText(role, run.latest?.modelId), background: true, state: run.state, kind: "interim", sessionUsage: ledger.totals() },
+				};
+			});
 		} finally {
 			signal?.removeEventListener("abort", onAbort);
 		}
-		if (run.state === "waiting") {
-			run.background = true;
-			delete run.onUpdate;
-			return {
-				content: [{ type: "text" as const, text: `${note ? `${note}\n\n` : ""}${askedText(run)}` }],
-				details: { ...runDetails(run), handle, role: role.name, model: modelText(role, run.latest?.modelId), background: true, state: "waiting", sessionUsage: ledger.totals() },
-			};
-		}
+		if (early) return early;
 		await run.ended;
 		run.delivered = true;
 		return outcome(run);
@@ -3911,15 +4054,20 @@ export default function fusion(pi: ExtensionAPI, options: FusionOptions = {}) {
 			return reply(lines.join("\n"), { ...runDetails(run), handle, state: run.state, usage: ledger.totals() });
 		}
 		if (params.action === "wait") {
-			if (!(await settled(run, signal))) throw new Error(`stopped waiting; ${handle} goes on in the background`);
-			const answered = run.userAnswer;
-			if (answered) answered.acknowledged = true;
-			const answerLine = answered ? `\n\nanswered by the user: ${answered.text}` : "";
-			if (run.state === "waiting") return reply(`${askedText(run, tool)}${answerLine}`, { ...runDetails(run), handle, state: run.state });
-			// Taken before the run is awaited: a wait that lands while the run is still finishing carries the report too.
-			run.delivered = true;
+			const claimed = await hostWait(run, signal, (claim) => {
+				const answered = run.userAnswer;
+				if (answered) answered.acknowledged = true;
+				const answerLine = answered ? `\n\nanswered by the user: ${answered.text}` : "";
+				if (claim === "question") return { reply: reply(`${askedText(run, tool)}${answerLine}`, { ...runDetails(run), handle, state: run.state }) };
+				if (claim === "interim") return { reply: reply(`${interimText(run, tool, false)}${answerLine}`, { ...runDetails(run), handle, state: run.state, kind: "interim" }) };
+				// Taken before the run is awaited: a wait that lands while the run is still finishing carries the report too.
+				run.delivered = true;
+				return { answerLine };
+			});
+			if (!claimed) throw new Error(`stopped waiting; ${handle} goes on in the background`);
+			if (claimed.reply) return claimed.reply;
 			await run.ended;
-			return reply(`${finalText(run)}${answerLine}`, { ...runDetails(run), handle, state: run.state });
+			return reply(`${finalText(run)}${claimed.answerLine ?? ""}`, { ...runDetails(run), handle, state: run.state });
 		}
 		if (params.action === "message") {
 			if (run.state === "waiting") {
@@ -3985,7 +4133,7 @@ export default function fusion(pi: ExtensionAPI, options: FusionOptions = {}) {
 		await run.ended;
 		// The cancel takes the run's report, so what its backend said the stop left behind travels with this reply or
 		// with nothing: the host is told no other way about a run it cancelled itself.
-		return reply(run.cleanupNotice === undefined ? `${handle} cancelled` : `${handle} cancelled; ${run.cleanupNotice}`, { ...runDetails(run), handle, state: run.state });
+		return reply(`${run.cleanupNotice === undefined ? `${handle} cancelled` : `${handle} cancelled; ${run.cleanupNotice}`}${partialText(run, false)}`, { ...runDetails(run), handle, state: run.state });
 	};
 
 	pi.registerTool({
@@ -3993,7 +4141,7 @@ export default function fusion(pi: ExtensionAPI, options: FusionOptions = {}) {
 		executionMode: "sequential",
 		label: "Fusion control",
 		description:
-			"Act on the runs of this Pi session, whatever started them, by handle. A run is running, waiting (its child asked a question and waits for the answer), or has ended. status: without run, list every run with role, model, state, elapsed time and open question; with run, add its current activity, tool call count and, for a run that can change files, the work tree changes seen so far. wait: block until the run ends and return its report, or until it asks a question and return the question; Esc stops the wait, not the run. message: to a waiting run, the answer to its question; to a running child, a steer it reads when it next takes input (on codex, sent once to the run's current turn with no retry, where being taken does not show the child read it); a message a running child's input does not accept now, closed or full, is not sent, and the reply says so; to a run that has ended it sends nothing and returns the run's state and a summary of its report, so you can decide to continue the run with fusion or take no action. cancel: stop the run.",
+			"Act on the runs of this Pi session, whatever started them, by handle. A run is running, waiting (its child asked a question and waits for the answer), or has ended. status: without run, list every run with role, model, state, elapsed time and open question; with run, add its current activity, tool call count and, for a run that can change files, the work tree changes seen so far. wait: block until the run ends and return its report, or until it asks a question and return the question; a run still going that gave an interim report the last wait or call did not return returns that report at once, marked as not final, and the next wait waits for something newer; Esc stops the wait, not the run. message: to a waiting run, the answer to its question; to a running child, a steer it reads when it next takes input (on codex, sent once to the run's current turn with no retry, where being taken does not show the child read it); a message a running child's input does not accept now, closed or full, is not sent, and the reply says so; to a run that has ended it sends nothing and returns the run's state and a summary of its report, so you can decide to continue the run with fusion or take no action. cancel: stop the run.",
 		promptSnippet: "Check, wait for, answer, steer or cancel a run by its handle",
 		parameters: Type.Object({
 			action: stringEnum(CONTROL_ACTIONS, "status, wait, message or cancel."),
@@ -4014,7 +4162,7 @@ export default function fusion(pi: ExtensionAPI, options: FusionOptions = {}) {
 		executionMode: "sequential",
 		label: "Claude control",
 		description:
-			"Act on the runs of this Pi session by handle, whichever tool started them and whichever backend runs them. A run is running, waiting (its child asked a question and waits for the answer), or has ended. status: without run, list every run with role, model, state, elapsed time and open question; with run, add its current activity, tool call count and, for a run that can change files, the work tree changes seen so far. wait: block until the run ends and return its report, or until it asks a question and return the question; Esc stops the wait, not the run. message: to a waiting run, the answer to its question; to a running child, a steer it reads when it next takes input (on codex, sent once to the run's current turn with no retry, where being taken does not show the child read it); a message a running child's input does not accept now, closed or full, is not sent, and the reply says so; to a run that has ended it sends nothing and returns the run's state and a summary of its report, so you can decide to continue the run with claude (fusion for a Pi run) or take no action. cancel: stop the run.",
+			"Act on the runs of this Pi session by handle, whichever tool started them and whichever backend runs them. A run is running, waiting (its child asked a question and waits for the answer), or has ended. status: without run, list every run with role, model, state, elapsed time and open question; with run, add its current activity, tool call count and, for a run that can change files, the work tree changes seen so far. wait: block until the run ends and return its report, or until it asks a question and return the question; a run still going that gave an interim report the last wait or call did not return returns that report at once, marked as not final, and the next wait waits for something newer; Esc stops the wait, not the run. message: to a waiting run, the answer to its question; to a running child, a steer it reads when it next takes input (on codex, sent once to the run's current turn with no retry, where being taken does not show the child read it); a message a running child's input does not accept now, closed or full, is not sent, and the reply says so; to a run that has ended it sends nothing and returns the run's state and a summary of its report, so you can decide to continue the run with claude (fusion for a Pi run) or take no action. cancel: stop the run.",
 		promptSnippet: "Check, wait for, answer, steer or cancel a run by its handle",
 		parameters: Type.Object({
 			action: stringEnum(CONTROL_ACTIONS, "status, wait, message or cancel."),

@@ -214,6 +214,8 @@ export interface ArchiveDetail extends ArchiveSummary {
 	reportTruncated: boolean;
 	failure?: string;
 	failureTruncated: boolean;
+	/** The partial text of a run that ended without succeeding: its last interim report, never a final one. */
+	interim?: { text: string; truncated: boolean; revision?: number };
 	/**
 	 * Set when `sessionId` is only what the run reported: the branch showed this run for the parent its request named,
 	 * never for that id, and no reference the host accepted names it. It stays readable, and nothing offers to resume it.
@@ -300,6 +302,7 @@ export function archiveDetail(record: HistoryRecord, source: string = record.hos
 	if (view.files !== undefined) detail.files = view.files.map((file) => ({ ...file }));
 	if (view.report !== undefined) detail.report = view.report;
 	if (view.failure !== undefined) detail.failure = view.failure;
+	if (view.interim !== undefined) detail.interim = { ...view.interim };
 	return detail;
 }
 
