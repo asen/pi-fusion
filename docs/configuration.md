@@ -58,17 +58,18 @@ At startup, Fusion resolves and validates [role contracts](#role-contract-overri
 `<agent dir>/pi-fusion/settings.json`, with agent dir resolved by Pi (`PI_CODING_AGENT_DIR`, normally `~/.pi/agent`). It belongs to Fusion and is separate from Pi's own `settings.json` and from [`profiles.json`](profiles.md#the-profiles-file). It holds user-global startup settings, used by every project and Pi process of this user:
 
 ```json
-{ "version": 1, "history": { "enabled": true }, "plan": { "contextPct": 60 } }
+{ "version": 1, "history": { "enabled": true }, "plan": { "contextPct": 60 }, "compactPct": 60 }
 ```
 
-Both sections are optional:
+Every setting except `version` is optional:
 
 - `history.enabled` is `true` or `false`; the saved preference beats `PI_FUSION_HISTORY`. See [Turning history on and off](runs.md#turning-history-on-and-off).
 - `plan.contextPct` is a number from **0 to 100**, fractions included; `0` disables context-based handoffs and continuation warnings. A non-blank `PI_FUSION_PLAN_CONTEXT_PCT` overrides it; with neither, the cap is **35%**. An invalid non-blank variable keeps the 35% default and warns, rather than using the saved value. See [The context cap](runs.md#the-context-cap).
+- `compactPct` is a whole number from **0 to 100** that every child's native compaction setting is asked for. Unset and `0` ask for nothing; `100` is a request, not the same as unset. It has no default, variable, command, profile or per-call field. It is advisory, not a ceiling, and differs by backend: see [Child compaction](runs.md#child-compaction). The `60` above is an example only.
 
-A missing file or field means no value is saved. Fusion reads the file once per instance, at startup; edits take effect after restarting Pi, `/reload`, or replacing the session. Only `/fusion history on|off` writes it, preserving the plan setting; edit `plan.contextPct` by hand.
+A missing file or field means no value is saved. Fusion reads the file once per instance, at startup; edits take effect after restarting Pi, `/reload`, or replacing the session. Only `/fusion history on|off` writes it, preserving the plan setting and `compactPct`; edit those by hand.
 
-Validation is local. A non-object, a version other than `1`, an unknown field, a non-boolean `enabled` or an invalid `contextPct` makes the whole file unreadable. At startup that leaves the file untouched, captured variables/defaults decide, and one warning names the resulting history and context-cap behavior. A save over such a file, or over a file from a newer pi-fusion, is refused so you can fix it by hand.
+Validation is local. A non-object, a version other than `1`, an unknown field, a non-boolean `enabled`, an invalid `contextPct` or a `compactPct` that is not a whole number from 0 to 100 makes the whole file unreadable. At startup that leaves the file untouched, captured variables/defaults decide, children compact natively, and one warning names the resulting history and context-cap behavior. An older pi-fusion, which does not know `compactPct`, treats a file holding it as unreadable in the same way. A save over such a file, or over a file from a newer pi-fusion, is refused so you can fix it by hand.
 
 Writes follow the [profiles file](profiles.md#how-the-file-is-written) rules. A missing file creates nothing until a save. A save creates the private directory (`0700`) and file (`0600`) where platform modes apply. It rereads the file, changes only the history preference, and replaces the file through a private temporary sibling and a rename. A failed write leaves the old file. Writes are queued within one process. Separate Pi processes and manual edits have **no lock**: the last rename wins, and nothing watches the file.
 

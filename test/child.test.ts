@@ -5,6 +5,7 @@ import * as path from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 import { BLOCKER_LABEL_CHARS, MAX_BLOCKERS } from "../extensions/backends/types.ts";
+import { CLAUDE_COMPACT_VARIABLE, compactionEnv } from "../extensions/backends/claude.ts";
 import { type ChildEvent, ChildInput, type ChildRun, type Role, childOptions, claudeExecutable, failed, failureMessage, questionAnswers, questionText, runChild } from "../extensions/fusion.ts";
 import { parseRoleContract } from "../extensions/role-contracts.ts";
 
@@ -39,6 +40,7 @@ function run(
 		onEvent?: (event: ChildEvent) => void;
 		input?: ChildInput;
 		onQuestion?: (question: string, signal: AbortSignal) => Promise<string>;
+		compactPct?: number;
 	} = {},
 ): Promise<ChildRun> {
 	process.env.FAKE_CLAUDE_SCENARIO = scenario;
@@ -53,6 +55,7 @@ function run(
 		killGraceMs: opts.killGraceMs,
 		...(opts.input ? { input: opts.input } : {}),
 		...(opts.onQuestion ? { onQuestion: opts.onQuestion } : {}),
+		...(opts.compactPct === undefined ? {} : { compactPct: opts.compactPct }),
 	});
 }
 
@@ -598,6 +601,63 @@ test("a startup-resolved body reaches the Claude SDK without rereading a file or
 	} finally {
 		if (previous === undefined) delete process.env.FAKE_CLAUDE_ARGV_OUT;
 		else process.env.FAKE_CLAUDE_ARGV_OUT = previous;
+	}
+});
+
+test("a compaction request lowers Claude Code's native auto-compact percentage and never raises one already exported", () => {
+	assert.equal(CLAUDE_COMPACT_VARIABLE, "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE");
+	// Unset and 0 add nothing, so whatever the host exports reaches the child exactly as it would without Fusion.
+	assert.deepEqual(compactionEnv(undefined, {}), {});
+	assert.deepEqual(compactionEnv(0, { [CLAUDE_COMPACT_VARIABLE]: "90" }), {});
+	assert.deepEqual(compactionEnv(60, {}), { [CLAUDE_COMPACT_VARIABLE]: "60" });
+	assert.deepEqual(compactionEnv(100, {}), { [CLAUDE_COMPACT_VARIABLE]: "100" }, "100 is a request, not the same as unset");
+	// The child parses the value with parseFloat and uses it above 0 and up to 100: a lower one it would use is kept.
+	assert.deepEqual(compactionEnv(60, { [CLAUDE_COMPACT_VARIABLE]: "40" }), {});
+	assert.deepEqual(compactionEnv(60, { [CLAUDE_COMPACT_VARIABLE]: "60" }), {});
+	assert.deepEqual(compactionEnv(60, { [CLAUDE_COMPACT_VARIABLE]: "45.5" }), {});
+	// A higher one, or one the child would ignore, is replaced by the request.
+	for (const ignored of ["80", "", "0", "-5", "150", "abc"]) assert.deepEqual(compactionEnv(60, { [CLAUDE_COMPACT_VARIABLE]: ignored }), { [CLAUDE_COMPACT_VARIABLE]: "60" }, ignored);
+	// The overlay is that one variable: a disable or a window the host exports is not part of it, so it passes through.
+	assert.deepEqual(compactionEnv(60, { DISABLE_AUTO_COMPACT: "1", DISABLE_COMPACT: "1", CLAUDE_CODE_AUTO_COMPACT_WINDOW: "300000" }), { [CLAUDE_COMPACT_VARIABLE]: "60" });
+});
+
+test("a run's compaction request reaches the Claude child's environment, and an unset one leaves it alone", async (t) => {
+	const dir = fs.mkdtempSync(path.join(os.tmpdir(), "fusion-claude-compact-"));
+	t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+	const out = path.join(dir, "argv.json");
+	const PRESERVED = ["DISABLE_AUTO_COMPACT", "DISABLE_COMPACT", "CLAUDE_CODE_AUTO_COMPACT_WINDOW"] as const;
+	const PRESERVED_VALUES: Record<(typeof PRESERVED)[number], string> = { DISABLE_AUTO_COMPACT: "1", DISABLE_COMPACT: "1", CLAUDE_CODE_AUTO_COMPACT_WINDOW: "300000" };
+	const previous = { out: process.env.FAKE_CLAUDE_ARGV_OUT, pct: process.env[CLAUDE_COMPACT_VARIABLE], preserved: Object.fromEntries(PRESERVED.map((name) => [name, process.env[name]])) as Record<string, string | undefined> };
+	process.env.FAKE_CLAUDE_ARGV_OUT = out;
+	const childPct = async (compactPct: number | undefined): Promise<unknown> => {
+		const result = await run("ok", { role: implementRole, ...(compactPct === undefined ? {} : { compactPct }) });
+		assert.equal(failed(result), false);
+		assert.equal(result.compactionNotice, undefined, "Claude reports no compaction notice: nothing it applies is read back");
+		return JSON.parse(fs.readFileSync(out, "utf8")).env[CLAUDE_COMPACT_VARIABLE];
+	};
+	try {
+		delete process.env[CLAUDE_COMPACT_VARIABLE];
+		assert.equal(await childPct(undefined), undefined);
+		assert.equal(await childPct(60), "60");
+		process.env[CLAUDE_COMPACT_VARIABLE] = "30";
+		assert.equal(await childPct(60), "30", "the host's lower value is the one the child gets");
+		assert.equal(await childPct(undefined), "30", "and an unset request passes the host's own through");
+		process.env[CLAUDE_COMPACT_VARIABLE] = "90";
+		assert.equal(await childPct(60), "60");
+		// The host's own disables and window reach the child beside the overlay, untouched.
+		for (const name of PRESERVED) process.env[name] = PRESERVED_VALUES[name];
+		assert.equal(await childPct(60), "60");
+		const env = JSON.parse(fs.readFileSync(out, "utf8")).env;
+		for (const name of PRESERVED) assert.equal(env[name], PRESERVED_VALUES[name], name);
+	} finally {
+		for (const name of PRESERVED) {
+			if (previous.preserved[name] === undefined) delete process.env[name];
+			else process.env[name] = previous.preserved[name];
+		}
+		if (previous.out === undefined) delete process.env.FAKE_CLAUDE_ARGV_OUT;
+		else process.env.FAKE_CLAUDE_ARGV_OUT = previous.out;
+		if (previous.pct === undefined) delete process.env[CLAUDE_COMPACT_VARIABLE];
+		else process.env[CLAUDE_COMPACT_VARIABLE] = previous.pct;
 	}
 });
 

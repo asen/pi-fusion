@@ -93,6 +93,8 @@ export interface BootstrapInput {
 	questionTool: boolean;
 	/** The role contract's prose, read by the host: the bootstrap appends this text and opens no contract file. */
 	contract: string;
+	/** The context percentage, 1 to 100, at which the child is asked to compact earlier. Absent asks for nothing. */
+	compactPct?: number;
 	/**
 	 * Local resource paths, absolute: the role's own lists with this call's internal additions after them, composed and
 	 * validated for their syntax here. Every role in this build names none, so a child of it loads none; a path that is
@@ -124,6 +126,8 @@ export interface BootstrapRequest {
 	questions?: boolean;
 	/** The contract's prose, already read by the host. */
 	contract: string;
+	/** The run's compaction request, carried when it is a whole number from 1 to 100 and dropped otherwise. */
+	compactPct?: number;
 	/**
 	 * Resources this one call adds to the role's own lists, appended after them. Internal, for a caller inside Fusion:
 	 * there is no parameter, variable or file a user names a resource through, and a role's own metadata is where a
@@ -193,6 +197,9 @@ const roleTools = (role: PiRole, questions: boolean): string[] => {
 	return tools;
 };
 
+/** A compaction request a child can take, or undefined: unset, `0` and anything but a whole number to 100 ask for nothing. */
+const compactRequest = (value: number | undefined): number | undefined => (value !== undefined && Number.isInteger(value) && value >= 1 && value <= 100 ? value : undefined);
+
 /**
  * The input one call's child is launched with. `allowModelNetwork` is true here and said so explicitly rather than
  * left to Pi's default, which is false: a child may refresh the catalog it shares with the other children of this
@@ -213,6 +220,7 @@ export function bootstrapInput(request: BootstrapRequest): BootstrapInput {
 	const extensions = resources("extensions", request.role.extensions, request.extensions, cwd);
 	const skills = resources("skills", request.role.skills, request.skills, cwd);
 	const session: BootstrapSession = request.session.kind === "new" ? { kind: "new" } : { ...request.session, file: absolute("a recorded session file", request.session.file) };
+	const compactPct = compactRequest(request.compactPct);
 	return {
 		version: BOOTSTRAP_INPUT_VERSION,
 		role: request.role.name,
@@ -227,6 +235,7 @@ export function bootstrapInput(request: BootstrapRequest): BootstrapInput {
 		tools: roleTools(request.role, questions),
 		questionTool: questions,
 		contract,
+		...(compactPct === undefined ? {} : { compactPct }),
 		extensions,
 		skills,
 		allowModelNetwork: true,

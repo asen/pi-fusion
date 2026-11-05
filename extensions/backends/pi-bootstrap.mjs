@@ -1,7 +1,7 @@
 import { accessSync, constants, readFileSync, realpathSync, statSync } from "node:fs";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
-import { DIAGNOSTIC_EVENT, STARTUP_EXIT_CODE } from "./pi-bootstrap-protocol.mjs";
+import { COMPACTION_CODES, DIAGNOSTIC_EVENT, STARTUP_EXIT_CODE } from "./pi-bootstrap-protocol.mjs";
 import { CONTROL_COMMANDS, CONTROL_EXTENSION_PATH, controlExtension } from "./pi-control-extension.mjs";
 import { HELPER_UNAVAILABLE, withHelperRetry } from "./pi-helper-retry.mjs";
 import { QUESTION_TOOL_NAME, questionTool } from "./pi-question-tool.mjs";
@@ -83,6 +83,15 @@ export function diagnostic(stage, detail = {}) {
 	if (detail.sdk !== undefined) line.sdk = detail.sdk;
 	if (detail.error !== undefined) line.error = String(detail.error);
 	return JSON.stringify(line);
+}
+
+/**
+ * The line that says what became of a call's compaction request: the marker and one of the protocol's fixed words, and
+ * no stage, so it neither advances nor replaces the stage a startup failure names.
+ */
+export function compactionLine(code) {
+	if (!COMPACTION_CODES.includes(code)) throw new TypeError(`${JSON.stringify(code)} is not a compaction code`);
+	return JSON.stringify({ event: DIAGNOSTIC_EVENT, compaction: code });
 }
 
 /** Writes one diagnostic line to stderr. stdout belongs to `runRpcMode` alone, so nothing here ever writes there. */
@@ -283,6 +292,10 @@ export function checkInput(value, probe = resourceProbe) {
 		);
 	}
 	if (!isText(value.contract)) throw new StartupError("input", "the call input carries no contract text; the child's prompt is Pi's own plus the role contract");
+	// Absent is no compaction request, which is the child exactly as it runs without one.
+	if (value.compactPct !== undefined && !(Number.isInteger(value.compactPct) && value.compactPct >= 1 && value.compactPct <= 100)) {
+		throw new StartupError("input", "the call input's compactPct is not a whole number from 1 to 100");
+	}
 	for (const field of ["extensions", "skills"]) {
 		if (!Array.isArray(value[field])) throw new StartupError("input", `the call input's ${field} is not a list`);
 		for (let index = 0; index < value[field].length; index++) resourceEntry(field, index, value[field][index], probe);
@@ -435,6 +448,43 @@ export function buildSettings(input, sdk) {
 		},
 		{ projectTrusted: false },
 	);
+}
+
+/** The api a virtual catalog entry names: Pi routes each of its requests to another model, with that model's window. */
+const VIRTUAL_MODEL_API = "pi-virtual";
+
+const tokenCount = (value) => Number.isSafeInteger(value) && value >= 0;
+
+/**
+ * A call's compaction request as this child's in-memory settings, decided once the exact model is known and before
+ * the session that prompts on it is built. Pi compacts when the context exceeds `contextWindow - reserveTokens`, so a
+ * request for `pct` asks for a reserve of `window - floor(window * pct / 100)`; the reserve set is the larger of that
+ * and the one Pi already resolves for this model, so a native threshold that is earlier is never postponed, and
+ * `keepRecentTokens` and `enabled` are not touched. Answers a protocol word and never throws: a request is advisory,
+ * so what could not be applied leaves Pi's own reserve and is said, rather than refusing the call.
+ *
+ * Nothing is applied for a virtual model, whose requests are checked against the window of whichever model each one
+ * routes to, so one reserve worked out from its own window would be the wrong share of all the others; nor for a model
+ * with no positive window; nor where the public settings api is missing or answers outside its own shape; nor when
+ * the target is no more than what a compaction keeps, which would compact again on every check.
+ */
+export function applyCompaction(settingsManager, model, pct) {
+	try {
+		if (model?.api === VIRTUAL_MODEL_API) return "virtual";
+		const window = model?.contextWindow;
+		if (!Number.isSafeInteger(window) || window <= 0) return "window";
+		if (typeof settingsManager?.getCompactionSettings !== "function" || typeof settingsManager.applyOverrides !== "function") return "api";
+		const native = settingsManager.getCompactionSettings(model);
+		if (!tokenCount(native?.reserveTokens) || !tokenCount(native.keepRecentTokens)) return "api";
+		const target = Math.floor((window * pct) / 100);
+		if (target <= native.keepRecentTokens) return "low";
+		const reserve = window - target;
+		if (reserve <= native.reserveTokens) return "native";
+		settingsManager.applyOverrides({ compaction: { reserveTokens: reserve } });
+		return settingsManager.getCompactionSettings(model)?.reserveTokens === reserve ? "applied" : "api";
+	} catch {
+		return "api";
+	}
 }
 
 /**
@@ -1062,6 +1112,7 @@ export async function createRuntime(input, sdk) {
 	const settingsManager = await guarded(() => buildSettings(input, sdk), settingsRefused);
 	const sessionManager = await guarded(() => openSessionManager(input, sdk), sessionStoreRefused);
 	const modelRuntime = await createModelRuntime(input, sdk);
+	let compaction;
 	const createSession = async ({ cwd, agentDir, sessionManager: manager, sessionStartEvent }) => {
 		const services = await guarded(
 			() =>
@@ -1084,6 +1135,12 @@ export async function createRuntime(input, sdk) {
 		const model = modelRuntime.getModel(input.model.provider, input.model.model);
 		if (!model) {
 			throw new StartupError("runtime", `the model ${input.model.provider}/${input.model.model} is not in this child's model configuration; configure that provider and model id, because no other model is selected in its place`);
+		}
+		// Once per child, on the settings every session of it shares: a second session the runtime builds for a restore
+		// would otherwise find the reserve this set and call it native.
+		if (input.compactPct !== undefined && compaction === undefined) {
+			compaction = applyCompaction(settingsManager, model, input.compactPct);
+			process.stderr.write(`${compactionLine(compaction)}\n`);
 		}
 		const created = await guarded(() => {
 			// A custom definition replaces the builtin of the same name, which is what makes the retry the same `grep` and

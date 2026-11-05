@@ -454,9 +454,15 @@ export const CODEX_CLIENT_INFO: Readonly<CodexClientInfo> = Object.freeze({ name
 /**
  * What one thread/start sends: the selection a call named, the sandbox mode, the approval policy and the role's
  * developer instructions, and nothing more. No cwd — the launch's process cwd is the thread's, and naming one can make
- * Codex record a trust entry in the user's configuration — no effort, which thread/start does not take, no sandbox
- * policy and no configuration map. `developerInstructions` is a stable field of 0.160.0's `ThreadStartParams` (no
- * experimental marker at rust-v0.160.0, source inspection only) and is how a role's contract reaches the thread.
+ * Codex record a trust entry in the user's configuration — no effort, which thread/start does not take, and no sandbox
+ * policy. `developerInstructions` is a stable field of 0.160.0's `ThreadStartParams` (no experimental marker at
+ * rust-v0.160.0, source inspection only) and is how a role's contract reaches the thread.
+ *
+ * The configuration map is sent for one key alone, and only when a call asks for it: 0.160.0's
+ * `model_post_turn_compact_threshold_percent`, an integer from 1 to 100 that compacts after a final answer once the
+ * context reaches that share of the model's usable window. Source inspection only: it replaces any post-turn
+ * percentage the user configured for this thread, leaves every in-turn compaction limit as configured, and is skipped
+ * natively when Codex's token-budget feature is on. Nothing reads back whether it was applied.
  */
 export interface CodexThreadStartParams {
 	model?: string;
@@ -465,7 +471,12 @@ export interface CodexThreadStartParams {
 	approvalPolicy: "never";
 	/** The role's shared contract, non-empty and at most `maxInstructionsBytes`. */
 	developerInstructions: string;
+	/** The post-turn compaction percentage, a whole number from 1 to 100. Absent sends no configuration map at all. */
+	postTurnCompactPct?: number;
 }
+
+/** The one configuration key a thread-opening request may carry. */
+export const CODEX_POST_TURN_COMPACT_KEY = "model_post_turn_compact_threshold_percent";
 
 /**
  * What one thread/resume sends: the persisted thread to load and the same fields a thread/start takes, and
@@ -1269,6 +1280,11 @@ class CodexChildImpl implements CodexChild {
 		const body: Record<string, unknown> = { sandbox: params.sandbox, approvalPolicy: params.approvalPolicy, developerInstructions: params.developerInstructions };
 		if (params.model !== undefined) body.model = params.model;
 		if (params.modelProvider !== undefined) body.modelProvider = params.modelProvider;
+		const pct = params.postTurnCompactPct;
+		if (pct !== undefined) {
+			if (!Number.isInteger(pct) || pct < 1 || pct > 100) return new TypeError("postTurnCompactPct is a whole number from 1 to 100 when named");
+			body.config = { [CODEX_POST_TURN_COMPACT_KEY]: pct };
+		}
 		return body;
 	}
 

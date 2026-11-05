@@ -1,7 +1,7 @@
 import { StringDecoder } from "node:string_decoder";
 import type { Readable, Writable } from "node:stream";
 import { ChildTree, type CleanupReport, type ExitOutcome, KILL_GRACE_MS, type LaunchedProcess, type LaunchOptions, type OwnedCleanup } from "../process-tree.ts";
-import { DIAGNOSTIC_EVENT, STARTUP_EXIT_CODE } from "./pi-bootstrap-protocol.mjs";
+import { COMPACTION_CODES, DIAGNOSTIC_EVENT, STARTUP_EXIT_CODE } from "./pi-bootstrap-protocol.mjs";
 
 /**
  * The Pi transport: one child process, read and written as the native RPC protocol, and the bounds everything it can
@@ -359,6 +359,11 @@ export interface PiStderrRecord {
 	stageCount: number;
 	sdk?: string;
 	failure?: PiStderrFailure;
+	/**
+	 * The last compaction word the bootstrap wrote: one of the protocol's fixed codes, recognized by the same marker
+	 * convention as a stage and with no stage of its own, so it moves neither `lastStage` nor `stageCount`.
+	 */
+	compaction?: string;
 	/** Lines the line cap cut. None of them was parsed, and none of them reached the tail. */
 	truncatedLines: number;
 	/** Every line read at all: recognized diagnostics, tail lines, cut lines and one unterminated last line. */
@@ -443,6 +448,7 @@ export class StderrReader {
 	private lastStage: string | undefined;
 	private sdk: string | undefined;
 	private failure: PiStderrFailure | undefined;
+	private compaction: string | undefined;
 	private tail = "";
 	private tailBytes = 0;
 	private evicted = 0;
@@ -477,6 +483,7 @@ export class StderrReader {
 			stageCount: this.state.stageCount,
 			...(this.sdk === undefined ? {} : { sdk: this.sdk }),
 			...(this.failure === undefined ? {} : { failure: { ...this.failure } }),
+			...(this.compaction === undefined ? {} : { compaction: this.compaction }),
 			truncatedLines: this.state.truncatedLines,
 			lines: this.state.lines,
 			tail: this.tail,
@@ -507,6 +514,10 @@ export class StderrReader {
 		if (!value || typeof value !== "object" || Array.isArray(value)) return false;
 		const record = value as { [key: string]: unknown };
 		if (record.event !== DIAGNOSTIC_EVENT) return false;
+		if (record.stage === undefined && typeof record.compaction === "string" && COMPACTION_CODES.includes(record.compaction)) {
+			this.compaction = record.compaction;
+			return true;
+		}
 		const stage = shortField(record.stage);
 		if (stage === undefined) return false;
 		this.state.stageCount += 1;

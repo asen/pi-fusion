@@ -85,6 +85,10 @@ export declare function readInput(file: unknown): BootstrapInput;
 export declare function preflightSession(session: Extract<BootstrapSession, { kind: "open" }>, sdk: BootstrapSdk): { entries: number };
 export declare function openSessionManager(input: BootstrapInput, sdk: BootstrapSdk): unknown;
 export declare function buildSettings(input: BootstrapInput, sdk: BootstrapSdk): unknown;
+/** The one line a compaction request is reported in: the marker and a protocol word. Throws for any other word. */
+export declare function compactionLine(code: string): string;
+/** Applies a compaction request to the child's in-memory settings for the exact model, and says what became of it. */
+export declare function applyCompaction(settingsManager: unknown, model: unknown, pct: number): string;
 /** One instruction file as the loader hands it to an override: its path and its content, and nothing else. */
 export interface AgentsFile {
 	path: string;

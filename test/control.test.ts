@@ -9,7 +9,7 @@ import { fileURLToPath } from "node:url";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { type ArchiveProvider, startDashboard } from "../extensions/dashboard.ts";
 import { ArchiveIndex } from "../extensions/dashboard-archive.ts";
-import fusion, { builtinConfiguration, type FusionOptions, parseFusion, runRecords } from "../extensions/fusion.ts";
+import fusion, { builtinConfiguration, compactionText, type FusionOptions, parseFusion, runRecords } from "../extensions/fusion.ts";
 import { settingsTable } from "../extensions/profiles.ts";
 import { memoryHostPolicyLoader } from "../extensions/host-policy.ts";
 import { memoryRoleContractLoader } from "../extensions/role-contract-loader.ts";
@@ -1608,7 +1608,7 @@ test("every result about a run carries what became of it, how long it took, what
 	}));
 
 /** A host in a scratch git repository, so a child that edits a file leaves changed files a review can be given. */
-async function withRepo(body: (host: ReturnType<typeof makeHost>, dir: string) => Promise<void>, session: { id?: string; file?: string } = {}, extra: Pick<FusionOptions, "roleContracts"> = {}): Promise<void> {
+async function withRepo(body: (host: ReturnType<typeof makeHost>, dir: string) => Promise<void>, session: { id?: string; file?: string } = {}, extra: Pick<FusionOptions, "roleContracts" | "settings"> = {}): Promise<void> {
 	const dir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "pi-fusion-review-")));
 	const git = (...args: string[]) => execFileSync("git", ["-c", "user.name=t", "-c", "user.email=t@t", "-c", "commit.gpgsign=false", ...args], { cwd: dir, encoding: "utf8" });
 	git("init", "-q");
@@ -1682,6 +1682,121 @@ test("/fusion review starts an ask review child on the run's tree, tells the hos
 		assert.equal(entry.hostSessionId, "host-1");
 		assert.match(await host.text(host.control({ action: "status" })), /\nrun-2 · ask · opus · done · background · \d+s · review of run-1$/);
 	}));
+
+test("a saved compaction request is one startup snapshot that fresh, continued and reviewed runs all carry to their child", async () => {
+	const variable = "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE";
+	const before = process.env[variable];
+	delete process.env[variable];
+	const out = path.join(os.tmpdir(), `pi-fusion-compact-argv-${process.pid}.json`);
+	const childPct = (): unknown => JSON.parse(fs.readFileSync(out, "utf8")).env[variable];
+	const settings = memorySettingsStore(serializeSettings({ version: 1, compactPct: 60 }));
+	process.env.FAKE_CLAUDE_ARGV_OUT = out;
+	try {
+		await withRepo(
+			async (host) => {
+				await withScenario("edit", () => host.claude({ role: "implement", task: "add the retry" }));
+				assert.equal(childPct(), "60");
+				assert.deepEqual(host.notices.filter(([text]) => text.includes("child compaction")), [[`fusion: ${compactionText(60)}`, "info"]], "the instance says once what the request does");
+				// A later edit is the next instance's: this one keeps its startup snapshot.
+				await settings.update((current) => ({ ...current, compactPct: 20 }));
+				fs.rmSync(out, { force: true });
+				await host.command("review run-1");
+				assert.deepEqual(host.notices.at(-1), ["run-2 reviews run-1 in the background; its report arrives as a message", "info"]);
+				await until("the review's report", () => host.sent.some(([message]) => /^Background run run-2 /.test(String(message.content))));
+				assert.equal(childPct(), "60", "a review, which inherits nothing else from its source, carries it");
+				fs.rmSync(out, { force: true });
+				await host.claude({ continue: "run-1", task: "and the backoff" });
+				await host.control({ action: "wait", run: "run-1" });
+				assert.equal(childPct(), "60", "and so does a continuation");
+				const status = await host.text(host.control({ action: "status" }));
+				assert.equal(status.includes(compactionText(60)), false, "the control tool's status stays about runs");
+				host.notices.length = 0;
+				await host.command("status");
+				assert.ok(host.notices[0]?.[0].includes(compactionText(60)), host.notices[0]?.[0]);
+				assert.equal(host.notices.filter(([text]) => text.startsWith("fusion: child compaction")).length, 0, "the once-per-instance notice is not repeated");
+			},
+			{},
+			{ settings },
+		);
+	} finally {
+		delete process.env.FAKE_CLAUDE_ARGV_OUT;
+		fs.rmSync(out, { force: true });
+		if (before === undefined) delete process.env[variable];
+		else process.env[variable] = before;
+	}
+});
+
+test("an unset or zero compaction request hands no run anything and says nothing, and config names the native default", async () => {
+	for (const saved of [undefined, 0]) {
+		const backend = fakeBackend({ name: "claude", scripts: [{ text: "planned" }] });
+		const host = makeHost(repoRoot, "print", {}, { claude: backend.backend }, { settings: memorySettingsStore(serializeSettings({ version: 1, ...(saved === undefined ? {} : { compactPct: saved }) })) });
+		await host.call("fusion", { role: "plan", task: "the goal" });
+		await host.control({ action: "wait", run: "run-1" });
+		assert.equal("compactPct" in backend.starts[0]!, false, `${saved}: nothing reaches the backend`);
+		assert.equal(host.notices.some(([text]) => text.includes("child compaction")), false);
+		host.notices.length = 0;
+		await host.command("config");
+		assert.ok(host.notices[0]?.[0].includes("child compaction: native (compactPct unset)"), host.notices[0]?.[0]);
+	}
+	const backend = fakeBackend({ name: "claude", scripts: [{ text: "planned" }] });
+	const host = makeHost(repoRoot, "print", {}, { claude: backend.backend }, { settings: memorySettingsStore(serializeSettings({ version: 1, compactPct: 100 })) });
+	await host.call("fusion", { role: "plan", task: "the goal" });
+	await host.control({ action: "wait", run: "run-1" });
+	assert.equal(backend.starts[0]!.compactPct, 100, "100 is a request like any other, not the same as unset");
+	host.notices.length = 0;
+	await host.command("config");
+	assert.ok(host.notices[0]?.[0].includes(compactionText(100)), host.notices[0]?.[0]);
+});
+
+test("a run's compaction notice is host text after its stats, outside the quoted child text, on its report, failure and every status, and decides nothing", async () => {
+	const notice = "compactPct was not applied: the pi model reports no usable context window, so pi's own compaction threshold applies.";
+	const script = { text: "the child's report", extra: { compactionNotice: notice } };
+	const failing = { text: "", fail: "the child's own failure", extra: { compactionNotice: notice } };
+	const backend = fakeBackend({ name: "claude", scripts: [script, { ...script, pending: true }, failing, { ...failing, pending: true }] });
+	const host = makeHost(repoRoot, "print", {}, { claude: backend.backend }, { settings: memorySettingsStore(serializeSettings({ version: 1, compactPct: 60 })) });
+	const foreground = await host.text(host.call("fusion", { role: "plan", task: "the goal" }));
+	assert.ok(foreground.startsWith("the child's report\n\n[run-1 · "), foreground);
+	assert.ok(foreground.endsWith(`]\n\n${notice}`), foreground);
+	await host.call("fusion", { role: "plan", task: "another goal", fresh: true, background: true });
+	(await backend.started(2)).release();
+	await until("the background report", () => host.sent.some(([message]) => /^Background run run-2 /.test(String(message.content))));
+	const content = host.sent.find(([message]) => /^Background run run-2 /.test(message.content))![0].content as string;
+	assert.ok(content.includes(`${QUOTED("the child's report")}\n\n[run-2 · `), content);
+	const close = content.indexOf("[end of quoted child text]");
+	assert.ok(content.indexOf(notice) > close, "the notice is after the quote closes");
+	assert.ok(content.endsWith(notice), content);
+	assert.equal((await host.control({ action: "status", run: "run-2" })).details.state, "done", "an advisory notice fails nothing");
+
+	// The same line is readable on demand, whichever surface asks: both controls' status and /fusion status run-N.
+	for (const [what, read] of [
+		["claude_control", () => host.text(host.control({ action: "status", run: "run-2" }))],
+		["fusion_control", () => host.text(host.call("fusion_control", { action: "status", run: "run-2" }))],
+		[
+			"/fusion status run-2",
+			async () => {
+				host.notices.length = 0;
+				await host.command("status run-2");
+				return host.notices.map(([text]) => text).join("\n");
+			},
+		],
+	] as const) {
+		const lines = (await read()).split("\n");
+		assert.equal(lines.filter((line) => line === notice).length, 1, `${what}: the notice is one line of its own`);
+		assert.ok(lines[0]!.startsWith("run-2 · plan · "), `${what}: under the run's own status line`);
+	}
+	const waited = await host.text(host.control({ action: "wait", run: "run-2" }));
+	assert.ok(waited.includes(`the child's report\n\n[run-2 · `) && waited.endsWith(notice), waited);
+
+	// An unsuccessful ending carries it the same way: after the failure and the stats, outside the quote.
+	await assert.rejects(host.call("fusion", { role: "plan", task: "a third goal", fresh: true }), (error: Error) => error.message.startsWith("plan exited 1: the child's own failure") && error.message.endsWith(`]\n\n${notice}`));
+	await host.call("fusion", { role: "plan", task: "a fourth goal", fresh: true, background: true });
+	(await backend.started(4)).release();
+	await until("the failed background report", () => host.sent.some(([message]) => /^Background run run-4 /.test(String(message.content))));
+	const failed = host.sent.find(([message]) => /^Background run run-4 /.test(String(message.content)))![0].content as string;
+	assert.ok(failed.includes(QUOTED("plan exited 1: the child's own failure")), failed);
+	assert.ok(failed.indexOf(notice) > failed.indexOf("[end of quoted child text]") && failed.endsWith(notice), failed);
+	assert.equal((await host.control({ action: "status", run: "run-4" })).details.state, "failed", "a genuine failure stays one");
+});
 
 test("a second /fusion review starts another run and the reviewed run names the newest", () =>
 	withRepo(async (host) => {

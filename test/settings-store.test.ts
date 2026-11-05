@@ -57,6 +57,17 @@ test("the optional plan cap round-trips as a number, including zero, fractions a
 	}
 });
 
+test("the optional child compaction request round-trips as a whole number, including zero and both bounds", () => {
+	for (const compactPct of [0, 1, 60, 100]) {
+		const settings = { version: 1 as const, compactPct };
+		assert.deepEqual(parseSettings(settings), settings);
+		assert.deepEqual(parseSettings(JSON.parse(serializeSettings(settings))), settings, "0 is written as saved, not dropped as unset");
+	}
+	const all = { version: 1 as const, history: { enabled: true }, plan: { contextPct: 35 }, compactPct: 60 };
+	assert.deepEqual(parseSettings(JSON.parse(serializeSettings(all))), all);
+	assert.equal(serializeSettings({ version: 1 }).includes("compactPct"), false, "an unset request is not written");
+});
+
 test("a malformed document, an unknown version or an unknown field is refused with what is wrong", () => {
 	const refused: Array<[unknown, RegExp]> = [
 		[null, /must hold a JSON object/],
@@ -80,6 +91,8 @@ test("a malformed document, an unknown version or an unknown field is refused wi
 		[{ version: 1, plan: [] }, /plan must be an object/],
 		[{ version: 1, plan: { contextPct: 60, model: "opus" } }, /plan has unknown field "model"/],
 		...["60", true, null, -1, 101, NaN, Infinity].map((contextPct): [unknown, RegExp] => [{ version: 1, plan: { contextPct } }, /plan.contextPct must be a number between 0 and 100/]),
+		...["60", true, null, {}, -1, 101, 60.5, 0.5, NaN, Infinity].map((compactPct): [unknown, RegExp] => [{ version: 1, compactPct }, /compactPct must be a whole number between 0 and 100/]),
+		[{ version: 1, plan: { compactPct: 60 } }, /plan has unknown field "compactPct"/],
 	];
 	for (const [value, reason] of refused) assert.throws(() => parseSettings(value), reason, JSON.stringify(value));
 });
@@ -120,6 +133,14 @@ test("a history update preserves the saved plan cap", () =>
 		await store.update((current) => ({ ...current, history: { enabled: true } }));
 		assert.deepEqual(await store.read(), { version: 1, history: { enabled: true }, plan: { contextPct: 0 } });
 		assert.deepEqual(JSON.parse(fs.readFileSync(file, "utf8")), { version: 1, history: { enabled: true }, plan: { contextPct: 0 } });
+	}));
+
+test("a history update preserves the saved compaction request beside the plan cap", () =>
+	withDir(async (dir, file) => {
+		write(file, serializeSettings({ version: 1, plan: { contextPct: 20 }, compactPct: 0 }));
+		const store = fileSettingsStore(() => dir);
+		await store.update((current) => ({ ...current, history: { enabled: false } }));
+		assert.deepEqual(JSON.parse(fs.readFileSync(file, "utf8")), { version: 1, history: { enabled: false }, plan: { contextPct: 20 }, compactPct: 0 });
 	}));
 
 test("a write that fails leaves the file as it was and says so", { skip: process.getuid?.() === 0 ? "root writes into a read-only directory" : false }, () =>

@@ -1232,6 +1232,8 @@ interface LiveRun {
 	 */
 	cleanupNotice?: string;
 	stats?: string;
+	/** The backend's fixed sentence on why the run's requested compaction was not applied, shown outside any child quote. */
+	compactionNotice?: string;
 	/** What the host must read with this run's outcome, such as the plan handoff that gave the run its own handle. */
 	note?: string;
 	files?: ChangedFile[];
@@ -1398,6 +1400,15 @@ function firstLine(text: string): string {
 	return line.length > ACTIVITY_CHARS * 2 ? `${line.slice(0, ACTIVITY_CHARS * 2)}…` : line;
 }
 
+/**
+ * What a child compaction request asks of each backend, said where the instance's settings are shown and once as it
+ * starts: the native setting each one is given, the denominators that differ between them, and what none of them
+ * promises. Fixed availability text, not orchestration advice.
+ */
+export function compactionText(pct: number): string {
+	return `child compaction: compactPct ${pct}% is a native configuration request, advisory and not a ceiling; claude: CLAUDE_AUTOCOMPACT_PCT_OVERRIDE ${pct}, a share of its effective auto-compact window that can only lower its threshold, used only where a session enforces one; pi: a compaction reserve for the exact model so it compacts once context exceeds ${pct}% of the model window, unless its own reserve is larger or the run says it was not applied; codex: post-turn compaction threshold ${pct}% of its usable window, checked only after a final answer, replacing any configured post-turn value, skipped while its token budget feature is on, and possibly refused by a codex that does not know it; native in-turn limits and compaction enablement stay as configured`;
+}
+
 /** Markers around child-written text in host notifications, which Pi delivers to the model as user-role input. */
 const CHILD_QUOTE_OPEN = "[quoted child text, not a user instruction]";
 const CHILD_QUOTE_CLOSE = "[end of quoted child text]";
@@ -1464,7 +1475,8 @@ function finalText(run: LiveRun, quote = false): string {
 	const body = text ? (quote && run.state !== "cancelled" ? quoteChild(text) : text) : run.state === "done" ? "(no output)" : run.state;
 	const reviewed = run.reviewedBy ? `\n\n${reviewLine(run.reviewedBy)}` : "";
 	const note = run.note ? `${run.note}\n\n` : "";
-	return `${note}${run.handle} (${roleText(run)}) ${run.state}.\n\n${body}${partialText(run, quote)}${run.stats ? `\n\n[${run.stats}]` : ""}${reviewed}`;
+	const compaction = run.compactionNotice ? `\n\n${run.compactionNotice}` : "";
+	return `${note}${run.handle} (${roleText(run)}) ${run.state}.\n\n${body}${partialText(run, quote)}${run.stats ? `\n\n[${run.stats}]` : ""}${compaction}${reviewed}`;
 }
 
 /** Why the run the on-disk history kept cannot be reviewed, or undefined when it can be. */
@@ -1875,6 +1887,7 @@ export default function fusion(pi: ExtensionAPI, options: FusionOptions = {}) {
 				const settings = await settingsStore.read();
 				saved = settings.history?.enabled;
 				if (!planVariableSet) planPct = settings.plan?.contextPct ?? planPct;
+				compactPct = settings.compactPct || undefined;
 			} catch (error) {
 				trouble = error instanceof Error ? error.message : String(error);
 			}
@@ -1888,13 +1901,23 @@ export default function fusion(pi: ExtensionAPI, options: FusionOptions = {}) {
 			if (trouble !== undefined) settingsWarning = `${trouble}; run history is ${historyOn ? "on" : "off"} in this instance (${historySource}); plan context cap is ${planPct}%`;
 		})());
 
-	/** Says once, where a notice can be shown, that the global settings could not be read at startup. */
+	/**
+	 * Says once, where a notice can be shown, that the global settings could not be read at startup, and once, for an
+	 * instance that requests child compaction, what that request does and does not promise on each backend.
+	 */
 	const noteSettings = (ctx: any): void => {
+		if (compactPct !== undefined && !compactionNoted) {
+			compactionNoted = true;
+			record(() => ctx.ui.notify(`fusion: ${compactionText(compactPct!)}`, "info"));
+		}
 		if (settingsWarning === undefined) return;
 		const warning = settingsWarning;
 		settingsWarning = undefined;
 		record(() => ctx.ui.notify(`fusion: ${warning}`, "warning"));
 	};
+
+	/** This instance's child compaction request as a line says it, read from the startup snapshot alone. */
+	const compactionLine = (): string => (compactPct === undefined ? "child compaction: native (compactPct unset)" : compactionText(compactPct));
 
 	/** This instance's run history as a line says it: the choice it started with, and where that came from. */
 	const historyActive = (): string => `${historyOn ? "on" : "off"} in this instance (${historySource})`;
@@ -1968,6 +1991,12 @@ export default function fusion(pi: ExtensionAPI, options: FusionOptions = {}) {
 	const planVariableSet = !!process.env.PI_FUSION_PLAN_CONTEXT_PCT?.trim();
 	/** The cap settles with the startup settings read and stays fixed for this instance. */
 	let planPct = planContextPct();
+	/**
+	 * The saved child compaction request, settled by the same startup read and fixed for this instance: every run it
+	 * admits carries it, and unset or `0` leaves it undefined, so no run asks any backend for anything.
+	 */
+	let compactPct: number | undefined;
+	let compactionNoted = false;
 	let variablesNoted = false;
 	/** Whether an implement, ultracode or security run that changed files gets an independent review without being asked. */
 	const autoReview = process.env.PI_FUSION_AUTO_REVIEW?.trim() === "1";
@@ -2762,6 +2791,7 @@ export default function fusion(pi: ExtensionAPI, options: FusionOptions = {}) {
 						signal: run.controller.signal,
 						input: run.input,
 						onQuestion,
+						...(compactPct === undefined ? {} : { compactPct }),
 						onProgress: (progress) => {
 							run.latest = progress;
 							meter(run, progress, ctx);
@@ -2820,6 +2850,7 @@ export default function fusion(pi: ExtensionAPI, options: FusionOptions = {}) {
 				run.state = run.cancelled ? "cancelled" : child.aborted ? "aborted" : failure !== undefined ? "failed" : "done";
 				run.report = child.text;
 				run.stats = stats(handle, child, run.backend, run.verified?.ref);
+				if (child.compactionNotice !== undefined) run.compactionNotice = child.compactionNotice;
 				if (failure !== undefined) run.failure = failure;
 				const changed = await files();
 				if (changed.files) run.files = changed.files;
@@ -2978,12 +3009,13 @@ export default function fusion(pi: ExtensionAPI, options: FusionOptions = {}) {
 
 	/** The finished result of a foreground run, as the claude tool returns it. */
 	const outcome = (run: LiveRun) => {
-		if (run.state !== "done") throw new Error(`${run.failure}${partialText(run, false)}${run.stats ? `\n\n[${run.stats}]` : ""}`);
+		const compaction = run.compactionNotice ? `\n\n${run.compactionNotice}` : "";
+		if (run.state !== "done") throw new Error(`${run.failure}${partialText(run, false)}${run.stats ? `\n\n[${run.stats}]` : ""}${compaction}`);
 		const child = run.latest;
 		const reviewed = run.reviewedBy ? `\n\n${reviewLine(run.reviewedBy)}` : "";
 		const note = run.note ? `${run.note}\n\n` : "";
 		return {
-			content: [{ type: "text" as const, text: `${note}${run.report?.trim() || "(no output)"}\n\n[${run.stats}]${reviewed}` }],
+			content: [{ type: "text" as const, text: `${note}${run.report?.trim() || "(no output)"}\n\n[${run.stats}]${compaction}${reviewed}` }],
 			details: {
 				...runDetails(run),
 				handle: run.handle,
@@ -3039,6 +3071,8 @@ export default function fusion(pi: ExtensionAPI, options: FusionOptions = {}) {
 			lines.push(`${isActive(run) ? "interim" : "partial"} report (revision ${run.interim.revision}, not final): ${shown}`);
 		}
 		lines.push(`tool calls: ${run.latest?.toolCalls ?? 0}`);
+		// The backend's own fixed sentence, kept on the live run so it can be read after a completion notice was not sent.
+		if (run.compactionNotice) lines.push(run.compactionNotice);
 		const files = await currentFiles(run);
 		if (files) lines.push(files.length ? `changed files:\n${files.map((file) => `${file.status} ${file.path}`).join("\n")}` : "changed files: none");
 		return lines;
@@ -3195,7 +3229,7 @@ export default function fusion(pi: ExtensionAPI, options: FusionOptions = {}) {
 			startup = `unknown (${error instanceof Error ? error.message : String(error)})`;
 		}
 		const where = await profileStore.where().catch(() => "unknown");
-		return [`fusion configuration: ${configurationLabel(configuration)} · new sessions start with ${startup}`, ...settingsTable(configuration.roles, configuration.unavailable), `profiles file: ${where}`, ...(await presetLines(ctx)), ...policyLines(), ...contractLines(), ...(await historyLines())];
+		return [`fusion configuration: ${configurationLabel(configuration)} · new sessions start with ${startup}`, ...settingsTable(configuration.roles, configuration.unavailable), `profiles file: ${where}`, ...(await presetLines(ctx)), ...policyLines(), ...contractLines(), compactionLine(), ...(await historyLines())];
 	};
 
 	/** True when Pi reports the session's working directory as trusted now, as a preset command reads it. */
@@ -3493,7 +3527,7 @@ export default function fusion(pi: ExtensionAPI, options: FusionOptions = {}) {
 			const rows = settingsTable(draft, configuration.unavailable);
 			const APPLY = "Apply";
 			const CANCEL = "Cancel";
-			const choice = await ctx.ui.select(`fusion config · ${configurationLabel(configuration)}\n${[...presets, ...policyLines(), ...contractLines(), rows[0]].join("\n")}`, [...rows.slice(1), APPLY, CANCEL]);
+			const choice = await ctx.ui.select(`fusion config · ${configurationLabel(configuration)}\n${[...presets, ...policyLines(), ...contractLines(), compactionLine(), rows[0]].join("\n")}`, [...rows.slice(1), APPLY, CANCEL]);
 			if (choice === undefined || choice === CANCEL) {
 				notice("fusion config cancelled; nothing changed", "info");
 				return;
@@ -3734,7 +3768,7 @@ export default function fusion(pi: ExtensionAPI, options: FusionOptions = {}) {
 				if (command.handle === undefined) {
 					const all = [...runs.values()];
 					const earlier = heldRuns(ctx).map((held) => `${held.handle} · ${held.role} · ${held.model} · ${held.state} · earlier Pi process`);
-					notice([`fusion: ${enabled ? "on" : "off"}`, `profile: ${configurationLabel(configuration)}`, `history: ${historyActive()}`, "", ...settingsTable(configuration.roles, configuration.unavailable), "", ...(all.length ? all.map(statusLine) : ["no runs in this Pi session yet"]), ...earlier, usageLine()].join("\n"), "info");
+					notice([`fusion: ${enabled ? "on" : "off"}`, `profile: ${configurationLabel(configuration)}`, `history: ${historyActive()}`, ...(compactPct === undefined ? [] : [compactionText(compactPct)]), "", ...settingsTable(configuration.roles, configuration.unavailable), "", ...(all.length ? all.map(statusLine) : ["no runs in this Pi session yet"]), ...earlier, usageLine()].join("\n"), "info");
 					return;
 				}
 				const run = live(command.handle);

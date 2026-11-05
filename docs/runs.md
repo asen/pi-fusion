@@ -162,6 +162,33 @@ A handoff needs the previous report from this process or enabled history. If a r
 
 The variable accepts percentages from 0 to 100; `0` disables both handoff-by-cap and continuation warnings, not handoff for an explicitly changed model. It is read at extension load; invalid values leave the default and warn once. Stats show `context 400.0k/1.00M (40%)`; status shows `context 40%`, or `<1%` when a positive share rounds to zero.
 
+## Child compaction
+
+`compactPct` in [Fusion's settings file](configuration.md#the-fusion-settings-file) is a native configuration request every child carries (fresh, continued, forked, handed off and review runs alike): each backend's own compaction setting is asked for that percentage. It is read once per instance; a run carries that snapshot. It is **advisory, not a ceiling**: nothing polls or compacts from the host, and when or whether a child actually compacts is not verified. Pi's reserve assignment is read back through its settings API; Claude's and Codex's settings are not read back. Native compaction enablement and safety limits remain as configured; Fusion turns nothing on or off.
+
+A request that could not be applied is a notice and never demotes a successful run or changes its record. A child that refuses the setting, and any protocol, checkpoint or cleanup error, stays that run's error; nothing is retried or replayed without the setting.
+
+| Backend | Native setting Fusion sets | Share of | When it compacts | Not applied when |
+| --- | --- | --- | --- | --- |
+| Claude | `CLAUDE_AUTOCOMPACT_PCT_OVERRIDE` in the child's environment, unless the host already exports a value Claude would use that is no higher; every other variable, including `DISABLE_AUTO_COMPACT`, `DISABLE_COMPACT` and `CLAUDE_CODE_AUTO_COMPACT_WINDOW`, passes through unchanged | The effective auto-compact window (the model window, or a configured smaller one, less output headroom) | At Claude's proactive threshold, which this can only lower, never raise | Claude decides per session: one that waits for the API's prompt-too-long (reactive mode) does not enforce a threshold, and a user `settings.json` `env` block or `DISABLE_AUTO_COMPACT` can change or disable it. Fusion cannot tell |
+| Pi | The in-memory `compaction.reserveTokens` of the exact model, as `window - floor(window * pct / 100)`, only when larger than Pi's own reserve; `keepRecentTokens` unchanged | The model's `contextWindow` from its catalog entry (which a `models.json` default can supply) | When context exceeds (strictly) that share, at the points Pi checks: between turns, before a prompt, and after the final answer | The model is virtual (each request routes to another window), has no positive window, the settings API is missing or did not take the value, or the target is no more than what a compaction keeps. The run then says so in one line |
+| Codex | `config.model_post_turn_compact_threshold_percent` on thread start, resume and fork | The model's usable window (Codex's own effective share of it) | Only after a final answer, inside the same turn | Codex's token-budget feature skips it. An older Codex may refuse the key: that run fails and says so, nothing is resent without it |
+
+```text
+compactPct 60:  claude -> lower proactive threshold     (in turn, if enforced)
+                pi     -> larger reserve for the model  (in turn and after)
+                codex  -> post-answer compaction at 60% (after the answer only)
+                every backend's in-turn limit and overflow recovery stay native
+```
+
+- On Codex the setting replaces any post-turn percentage the user configured, for that thread; Codex's in-turn limit and full-window cap are untouched, so a long single turn still compacts only where Codex would. `100` turns post-answer compaction on at the full usable window, where Codex leaves it off by default. On Claude and Pi, `100` adds nothing their own thresholds do not already do.
+- A compaction is a paid summary request. On Codex every run that ends above the share pays for one, even a run nobody continues; on all three it counts in that run's usage.
+- Context telemetry right after a compaction may be absent, an estimate, or stale, depending on the backend; Fusion reports only the usable evidence it already reads and claims no share otherwise. The [plan cap](#the-context-cap) may therefore hand such runs off less often, and a request below the plan cap can make cap handoffs rare. This is a source reading, not a native measurement.
+- Compaction-leaf checkpoints and continuations after a compaction follow the same checks as any other: Pi takes the leaf as it is, and Codex fails a continuation whose total fell below its baseline rather than guessing. Neither is natively measured with this setting.
+- A run's notice is host text after its stats, outside the [labelled child text](#labelled-child-text), in its report, its failure and its status (`/fusion status run-N` and either control's `status`). `/fusion config` shows the request, or that none is set; `/fusion status` shows a set one; and the instance shows it once, with these caveats in short, as it first acts with a request set.
+
+The backend mappings are read from source (Claude Code 2.1.281's bundled code, Pi 1.4.0's settings and agent session, Codex 0.160.0's app-server and core), not measured with a native child.
+
 ## Background runs
 
 `background: true` returns a handle immediately. At most one file-changing run (`plan`, `implement`, `ultracode`, or enabled `security`) can be active across backends; waiting counts too. `ask` runs can run alongside it. Continuing an active handle refuses and points to a control `message` action instead.

@@ -309,6 +309,12 @@ export interface ChildRun<TRole> {
 	 * it. The lifecycle carries it whole and reads nothing out of it, so a backend that adds nothing changes nothing.
 	 */
 	cleanupNotice?: string;
+	/**
+	 * Why this run's requested native compaction could not be applied, or may not have been, in the backend's own fixed
+	 * text: never anything the child wrote. Set only for a run that asked for compaction and has something to say. It
+	 * is advice for a person and changes nothing about how the run ended.
+	 */
+	compactionNotice?: string;
 	stderr: string;
 }
 
@@ -374,6 +380,14 @@ export interface RunRequest<TRole, TSession, TControl extends ChildControl = Chi
 	onProgress: (run: ChildRun<TRole>) => void;
 	onEvent?: (event: ChildEvent) => void;
 	killGraceMs?: number;
+	/**
+	 * The context percentage, a whole number from 1 to 100, a backend maps to its own native compaction setting: a
+	 * request, not a ceiling. Claude's and Pi's mappings only bring their own threshold earlier; Codex's post-turn key
+	 * replaces whatever post-turn value the thread inherited. Absent leaves the child exactly as it runs without it.
+	 * A request that could not be applied is a notice and never demotes a success; a child that refuses the setting, or
+	 * any protocol, checkpoint or cleanup error, is that run's error as always, and nothing is retried without it.
+	 */
+	compactPct?: number;
 }
 
 /** A harness the host runs a child in. The role and session shapes are the backend's own. */

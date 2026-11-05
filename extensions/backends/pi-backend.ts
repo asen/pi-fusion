@@ -87,6 +87,25 @@ export const CALL_NOT_COMPOSED = "the pi call could not be composed";
 export const STORAGE_RETAINED = "This call's own storage was retained because cleanup did not finish cleanly.";
 
 /**
+ * What a run is told when the compaction it asked for was not applied, by the bootstrap's protocol word: fixed text,
+ * never anything the child or its SDK wrote. `applied` and `native` say nothing, because both leave compaction at
+ * least as early as asked; a child that wrote no word, which one that failed before its model was resolved does not,
+ * says nothing either, because its run already says how it ended.
+ */
+export const PI_COMPACTION_NOTICES: Readonly<Record<string, string>> = {
+	virtual: "compactPct was not applied: the pi model is virtual and routes each request to a model with its own window, so pi's own compaction threshold applies.",
+	window: "compactPct was not applied: the pi model reports no usable context window, so pi's own compaction threshold applies.",
+	api: "compactPct was not applied: this pi's settings api did not take the earlier compaction reserve, so pi's own compaction threshold applies.",
+	low: "compactPct was not applied: its threshold is no more than the recent context a pi compaction keeps, which would compact on every check, so pi's own compaction threshold applies.",
+};
+
+/** The compaction word the child's stderr carried by the time its ending was reported, when the ending has one. */
+const compactionCode = (ended: PiEnded): string | undefined => {
+	const exit = ended.kind === "task" ? ended.result.exit : ended.kind === "prepare" ? ended.refused.exit : undefined;
+	return exit?.stderr?.compaction;
+};
+
+/**
  * Where one call stopped, as this composition itself names it. Each is a place this module decides something: the
  * three in front of the child, the two ways a preparation can end, the task, and the two rejections — a value thrown
  * out of a helper rather than reported by it — that leave this host unable to say what became of a child.
@@ -203,6 +222,10 @@ async function runPiCall(request: RunRequest<PiRole, PiSession, PiSteerQueue>, d
 			} else disposal = STORAGE_KEPT;
 		}
 		const final = finishRun(run, ended, decided, disposal, now() - started);
+		// Only a run that asked: unset and 0 ask for nothing, so no word a child wrote is read for them.
+		const code = request.compactPct ? compactionCode(ended) : undefined;
+		const notice = code === undefined ? undefined : PI_COMPACTION_NOTICES[code];
+		if (notice !== undefined) final.compactionNotice = notice;
 		// Storage kept is a decision this call made, so it is said rather than left implicit: one more fixed sentence after
 		// the diagnostic, which is what says why it was kept, and never the directory's own path. The shorter line a
 		// person is shown for a cancelled run is not composed here: `finishRun` was told the directory stayed, through
@@ -292,6 +315,7 @@ async function runPiCall(request: RunRequest<PiRole, PiSession, PiSteerQueue>, d
 			storage,
 			intent,
 			contract,
+			...(request.compactPct === undefined ? {} : { compactPct: request.compactPct }),
 			onEvent,
 			start,
 			...(request.signal === undefined ? {} : { signal: request.signal }),

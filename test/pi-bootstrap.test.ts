@@ -5,10 +5,12 @@ import * as os from "node:os";
 import * as path from "node:path";
 import test from "node:test";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import { DIAGNOSTIC_EVENT as PROTOCOL_DIAGNOSTIC_EVENT, STARTUP_EXIT_CODE as PROTOCOL_STARTUP_EXIT_CODE } from "../extensions/backends/pi-bootstrap-protocol.mjs";
+import { COMPACTION_CODES, DIAGNOSTIC_EVENT as PROTOCOL_DIAGNOSTIC_EVENT, STARTUP_EXIT_CODE as PROTOCOL_STARTUP_EXIT_CODE } from "../extensions/backends/pi-bootstrap-protocol.mjs";
 import {
+	applyCompaction,
 	type BootstrapSdk,
 	checkInput,
+	compactionLine,
 	checkSdk,
 	createRuntime,
 	DIAGNOSTIC_EVENT,
@@ -3487,4 +3489,164 @@ test("PI_OFFLINE reaches the child exactly as the user set it, absent, empty, fa
 	}
 	const unset = piLaunch({ input: composed, storage: STORAGE, env: { PATH: "/usr/bin" } });
 	assert.equal("PI_OFFLINE" in unset.env, false, "Pi reads whether the variable is there at all, so an unset one stays unset");
+});
+
+/**
+ * A settings manager as far as a compaction request reads one, resolving the way installed Pi 1.4.0's does for an
+ * in-memory document with no model override: the ordinary setting, else the built-in default, with `applyOverrides`
+ * merging into it. `fault` is what a manager of some other version or shape might do instead.
+ */
+function compactionSettings(ordinary: { reserveTokens?: number; keepRecentTokens?: number } = {}, fault: { without?: "applyOverrides" | "getCompactionSettings"; ignores?: true; answers?: unknown; throws?: true } = {}) {
+	let compaction: Record<string, unknown> = { enabled: true, ...ordinary };
+	const applied: unknown[] = [];
+	const manager: Record<string, unknown> = {
+		applied,
+		getCompactionSettings: (_model?: unknown) => {
+			if (fault.throws) throw new Error("Invalid compaction.reserveTokens setting");
+			if (fault.answers !== undefined) return fault.answers;
+			return { enabled: compaction.enabled, reserveTokens: compaction.reserveTokens ?? 16384, keepRecentTokens: compaction.keepRecentTokens ?? 20000 };
+		},
+		applyOverrides: (overrides: { compaction?: Record<string, unknown> }) => {
+			applied.push(overrides);
+			if (!fault.ignores) compaction = { ...compaction, ...overrides.compaction };
+		},
+	};
+	if (fault.without) delete manager[fault.without];
+	return manager as { applied: unknown[]; getCompactionSettings(model?: unknown): any };
+}
+
+const MODEL = { provider: "deepseek", id: "deepseek-chat", api: "openai-completions", contextWindow: 200_000 };
+
+test("a compaction request sets the reserve that compacts at that share of the model window, and nothing else", () => {
+	const settings = compactionSettings();
+	assert.equal(applyCompaction(settings, MODEL, 60), "applied");
+	assert.deepEqual(settings.applied, [{ compaction: { reserveTokens: 80_000 } }], "window - floor(window * pct / 100), and no other field");
+	assert.deepEqual(settings.getCompactionSettings(MODEL), { enabled: true, reserveTokens: 80_000, keepRecentTokens: 20_000 }, "enabled and keepRecentTokens are Pi's own");
+	// The target is floored, so the threshold lands at or below the share asked for, never above it.
+	const odd = compactionSettings();
+	assert.equal(applyCompaction(odd, { ...MODEL, contextWindow: 128_001 }, 33), "applied");
+	assert.deepEqual(odd.applied, [{ compaction: { reserveTokens: 128_001 - 42_240 } }]);
+});
+
+test("a compaction request never postpones Pi's own threshold: a reserve at least as large is left alone", () => {
+	for (const [pct, ordinary] of [
+		[100, {}],
+		[95, {}],
+		[60, { reserveTokens: 100_000 }],
+		[60, { reserveTokens: 80_000 }],
+	] as const) {
+		const settings = compactionSettings(ordinary);
+		assert.equal(applyCompaction(settings, MODEL, pct), "native", `${pct} over ${JSON.stringify(ordinary)}`);
+		assert.deepEqual(settings.applied, [], "nothing is applied when Pi already compacts at least as early");
+	}
+});
+
+test("a compaction request that cannot be applied safely leaves Pi's settings untouched and says why in one word", () => {
+	const cases: Array<[string, unknown, ReturnType<typeof compactionSettings>, number]> = [
+		["virtual", { ...MODEL, api: "pi-virtual" }, compactionSettings(), 60],
+		["window", { ...MODEL, contextWindow: undefined }, compactionSettings(), 60],
+		["window", { ...MODEL, contextWindow: 0 }, compactionSettings(), 60],
+		["window", { ...MODEL, contextWindow: -1 }, compactionSettings(), 60],
+		["window", { ...MODEL, contextWindow: 1.5 }, compactionSettings(), 60],
+		["window", { ...MODEL, contextWindow: Number.NaN }, compactionSettings(), 60],
+		["window", undefined, compactionSettings(), 60],
+		["api", MODEL, compactionSettings({}, { without: "applyOverrides" }), 60],
+		["api", MODEL, compactionSettings({}, { without: "getCompactionSettings" }), 60],
+		["api", MODEL, compactionSettings({}, { throws: true }), 60],
+		["api", MODEL, compactionSettings({}, { answers: { reserveTokens: "16384", keepRecentTokens: 20_000 } }), 60],
+		["api", MODEL, compactionSettings({}, { answers: { reserveTokens: 16_384 } }), 60],
+		["api", MODEL, compactionSettings({}, { answers: null }), 60],
+		// A target no larger than what a compaction keeps would compact again on every check.
+		["low", { ...MODEL, contextWindow: 30_000 }, compactionSettings(), 50],
+		["low", { ...MODEL, contextWindow: 40_000 }, compactionSettings(), 50],
+		["low", MODEL, compactionSettings({ keepRecentTokens: 150_000 }), 60],
+	];
+	for (const [code, model, settings, pct] of cases) {
+		assert.equal(applyCompaction(settings, model, pct), code, `${code}: ${JSON.stringify(model)}`);
+		assert.deepEqual(settings.applied, [], `${code}: nothing is applied`);
+	}
+	// A manager that took the override and still answers its old reserve is not one this claims applied anything to.
+	const ignored = compactionSettings({}, { ignores: true });
+	assert.equal(applyCompaction(ignored, MODEL, 60), "api");
+});
+
+test("a compaction line carries the marker and one protocol word, and no stage", () => {
+	assert.deepEqual(COMPACTION_CODES, ["applied", "native", "virtual", "window", "api", "low"]);
+	for (const code of COMPACTION_CODES) assert.deepEqual(JSON.parse(compactionLine(code)), { event: DIAGNOSTIC_EVENT, compaction: code });
+	assert.throws(() => compactionLine("anything the sdk said"), TypeError);
+});
+
+test("a call input carries a compaction request only as a whole number from 1 to 100", () => {
+	const composed = (compactPct: number | undefined) => bootstrapInput({ role, storage: STORAGE, session: { kind: "new" }, contract: "# implement\nDo the task.", ...(compactPct === undefined ? {} : { compactPct }) });
+	assert.equal("compactPct" in composed(undefined), false);
+	assert.equal("compactPct" in composed(0), false, "0 asks for nothing, so the input says nothing");
+	assert.equal("compactPct" in composed(60.5), false);
+	assert.equal(composed(1).compactPct, 1);
+	assert.equal(composed(100).compactPct, 100);
+	assert.equal(input({ compactPct: 60 }).compactPct, 60);
+	for (const compactPct of [0, 101, 1.5, -1, "60", null]) {
+		assert.throws(
+			() => input({ compactPct } as unknown as Partial<BootstrapInput>),
+			(error: Error & { stage?: string }) => error.stage === "input" && /compactPct is not a whole number from 1 to 100/.test(error.message),
+			JSON.stringify(compactPct),
+		);
+	}
+});
+
+test("a runtime applies a compaction request once, after the exact model and before any session prompts on it", async () => {
+	const { sdk, calls } = fakeSdk();
+	const settings = compactionSettings();
+	const reserves: number[] = [];
+	const base = sdk as unknown as Record<string, any>;
+	const composed = {
+		...base,
+		SettingsManager: { inMemory: () => settings },
+		ModelRuntime: {
+			create: async (options: unknown) => {
+				const runtime = await base.ModelRuntime.create(options);
+				return { ...runtime, getModel: (provider: string, model: string) => ({ ...runtime.getModel(provider, model), api: "openai-completions", contextWindow: 200_000 }) };
+			},
+		},
+		createAgentSessionFromServices: async (options: unknown) => {
+			reserves.push(settings.getCompactionSettings().reserveTokens);
+			return base.createAgentSessionFromServices(options);
+		},
+		// Two sessions on one runtime, as a restore builds a second one: the request is applied and reported once.
+		createAgentSessionRuntime: async (factory: any, options: Record<string, any>) => {
+			await factory({ cwd: options.cwd, agentDir: options.agentDir, sessionManager: options.sessionManager });
+			// The double's loader accumulates the control commands each build registers; a real reload replaces them.
+			calls.registrations.length = 0;
+			await factory({ cwd: options.cwd, agentDir: options.agentDir, sessionManager: options.sessionManager });
+			return { kind: "runtime" };
+		},
+	} as unknown as BootstrapSdk;
+	const written: string[] = [];
+	const write = process.stderr.write;
+	process.stderr.write = ((chunk: string) => {
+		written.push(String(chunk));
+		return true;
+	}) as typeof process.stderr.write;
+	try {
+		await createRuntime(input({ compactPct: 60 }), composed);
+	} finally {
+		process.stderr.write = write;
+	}
+	assert.deepEqual(reserves, [80_000, 80_000], "both sessions are built on the earlier reserve");
+	assert.deepEqual(settings.applied, [{ compaction: { reserveTokens: 80_000 } }]);
+	assert.deepEqual(written, [`${compactionLine("applied")}\n`]);
+
+	// No request: nothing is asked of the settings manager and nothing is written.
+	calls.registrations.length = 0;
+	const quiet = compactionSettings();
+	const unrequested: string[] = [];
+	process.stderr.write = ((chunk: string) => {
+		unrequested.push(String(chunk));
+		return true;
+	}) as typeof process.stderr.write;
+	try {
+		await createRuntime(input(), { ...composed, SettingsManager: { inMemory: () => quiet } } as unknown as BootstrapSdk);
+	} finally {
+		process.stderr.write = write;
+	}
+	assert.deepEqual([quiet.applied, unrequested], [[], []]);
 });

@@ -83,6 +83,8 @@ export interface FakeStart {
 	session?: FakeSession;
 	/** The intent the host mapped into that session, which is what a continuation test reads. */
 	intent?: SessionIntent;
+	/** The compaction request the host handed this run, absent when it handed none. */
+	compactPct?: number;
 	/** The steers the host pushed into this run, in order. */
 	steers: string[];
 	/** The answers the run's questions got, in order. */
@@ -246,6 +248,7 @@ export function fakeBackend(options: FakeBackendOptions = {}): FakeBackend {
 				contract: request.contract,
 				...(request.title === undefined ? {} : { title: request.title }),
 				...(request.session === undefined ? {} : { session: request.session, intent: request.session.intent }),
+				...(request.compactPct === undefined ? {} : { compactPct: request.compactPct }),
 				steers: input.pushed,
 				answers: [],
 				nextSteer: () => input.next(),

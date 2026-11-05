@@ -390,6 +390,20 @@ test("the bootstrap's own stages are read from its diagnostics, and the record i
 	assert.deepEqual(Object.keys(record).sort(), ["dropped", "lastStage", "lines", "sdk", "serving", "stageCount", "tail", "truncatedLines"]);
 });
 
+test("a compaction word is read beside the stages without becoming one, and anything else in that shape is text", () => {
+	const reader = new StderrReader();
+	reader.push(buf(`${[diagnostic({ stage: "runtime", sdk: "1.4.0" }), diagnostic({ compaction: "low" }), diagnostic({ compaction: "applied" }), diagnostic({ stage: "serving", sdk: "1.4.0" })].join("\n")}\n`));
+	const record = reader.record;
+	assert.equal(record.compaction, "applied", "the last word written is the one kept");
+	assert.deepEqual([record.serving, record.lastStage, record.stageCount, record.tail], [true, "serving", 2, ""], "a compaction line moves no stage");
+	// A word outside the protocol's list, a non-string, and a line that also names a stage are not compaction words.
+	const other = new StderrReader();
+	other.push(buf(`${[diagnostic({ compaction: "maybe" }), diagnostic({ compaction: 60 }), diagnostic({ stage: "runtime", compaction: "applied" })].join("\n")}\n`));
+	assert.equal(other.record.compaction, undefined);
+	assert.equal(other.record.lastStage, "runtime");
+	assert.equal(other.record.tail.split("\n").filter(Boolean).length, 2, "the two unrecognized lines are the child's text");
+});
+
 test("a stage that keeps failing leaves the last of it and a count, and no list of the ones before", () => {
 	const reader = new StderrReader();
 	for (let attempt = 1; attempt <= 500; attempt += 1) reader.push(buf(`${diagnostic({ stage: "runtime", sdk: "0.85.1", error: `attempt ${attempt}` })}\n`));

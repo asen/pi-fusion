@@ -95,6 +95,26 @@ export function claudeExecutable(): Pick<Options, "pathToClaudeCodeExecutable" |
 	return { pathToClaudeCodeExecutable: bin };
 }
 
+/** The variable Claude Code reads a lower proactive auto-compact percentage from. */
+export const CLAUDE_COMPACT_VARIABLE = "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE";
+
+/**
+ * What a run's compaction request adds to the child's environment. Claude Code's bundled source (CLI 2.1.281, read,
+ * not measured) parses the variable with `parseFloat`, uses it only above 0 and at most 100, and takes the lower of
+ * that share of its effective auto-compact window and its own threshold: it can bring compaction earlier and never
+ * later, and it turns nothing on. A value the host already exports that Claude Code would read as no higher is kept,
+ * so this never postpones the user's own; the window, `DISABLE_AUTO_COMPACT` and every settings file are untouched.
+ * Whether a session enforces that threshold at all, rather than waiting for the API's prompt-too-long, is the
+ * child's decision and nothing here reads it back.
+ */
+export function compactionEnv(compactPct: number | undefined, env: NodeJS.ProcessEnv): Record<string, string> {
+	if (compactPct === undefined || compactPct <= 0) return {};
+	const raw = env[CLAUDE_COMPACT_VARIABLE];
+	const existing = raw ? Number.parseFloat(raw) : Number.NaN;
+	if (existing > 0 && existing <= compactPct) return {};
+	return { [CLAUDE_COMPACT_VARIABLE]: String(compactPct) };
+}
+
 /** The SDK's typed effort levels stop at max; `ultracode` is only a CLI flag value. */
 function effortOptions(effort: string): Pick<Options, "effort" | "extraArgs"> {
 	return effort === "ultracode" ? { extraArgs: { effort } } : { effort: effort as EffortLevel };
@@ -731,6 +751,7 @@ export async function runChild(opts: RunRequest<Role, ChildSession, ChildInput>)
 					CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS: "0",
 					// Session state events are opt-in; their idle is what tells a finished turn from one still holding results back.
 					CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS: "1",
+					...compactionEnv(opts.compactPct, process.env),
 				},
 				abortController: controller,
 				spawnClaudeCodeProcess: (options) => child.spawn(options),

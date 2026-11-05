@@ -82,7 +82,8 @@ import { type Backend, type ChildControl, type ChildEvent, failed, type RunReque
  * resolved; a cancellation or a transport failure that already finalized the child makes that call the same memoized
  * finalization rather than a second one. Nothing above the mapping writes a cleanup sentence of its own.
  *
- * **What it never does.** No request names a cwd, a configuration map, base instructions, a dynamic tool other than
+ * **What it never does.** No request names a cwd, a configuration map beyond the one post-turn compaction key a
+ * `compactPct` request adds to thread start, resume and fork, base instructions, a dynamic tool other than
  * the question tool on a fresh thread, or an effort on a thread request; no turn/start names a model,
  * provider, cwd or sandbox policy. Nothing rewinds, replays or names a path. Fusion writes no trust entry, configuration or auth file: what the child inherits — the host's Codex home,
  * configuration, MCP servers, multi-agent features — is the host's, and nothing here isolates a run from it.
@@ -261,6 +262,15 @@ interface Driven {
 	start?: string;
 	evidence?: CodexTurnEvidence;
 }
+
+/** A compaction request this backend sends: a whole number from 1 to 100. Unset and `0` send no configuration map. */
+const compactRequested = (value: number | undefined): value is number => value !== undefined && Number.isInteger(value) && value >= 1 && value <= 100;
+
+/**
+ * What a run whose thread request was refused is told when that request carried a compaction setting: whether the
+ * setting was the reason is not something the child's answer is read for, so this says it may have been.
+ */
+export const CODEX_COMPACTION_REFUSED = "compactPct sent codex the model_post_turn_compact_threshold_percent setting, which an older codex may refuse; nothing was resent without it, and clearing compactPct runs codex without it.";
 
 /** Why a run was handed a session no `codexSession` made: refused before anything is read, located or started. */
 export const CODEX_SESSION_INVALID = "the codex backend was handed a session it did not map, so nothing was started";
@@ -448,6 +458,7 @@ async function drive(
 		sandbox: role.sandboxMode,
 		approvalPolicy: role.approvalPolicy,
 		developerInstructions: instructions,
+		...(compactRequested(request.compactPct) ? { postTurnCompactPct: request.compactPct } : {}),
 	};
 	let start: CodexThreadStart | CodexThreadResume;
 	try {
@@ -458,6 +469,9 @@ async function drive(
 					? await child.resumeThread({ threadId: session.id, ...fields })
 					: await child.forkThread({ threadId: session.from, lastTurnId: session.at, ...fields });
 	} catch (error) {
+		// An older Codex may refuse the one configuration key a compaction request adds. Nothing is resent without it:
+		// the run fails as the child answered, and a person is told which setting to clear to run without it.
+		if (compactRequested(request.compactPct) && error instanceof CodexTransportError && error.kind === "rejected") run.compactionNotice = CODEX_COMPACTION_REFUSED;
 		return failedWith("thread", error, context.cancelled());
 	}
 	// A fork's answer must name a thread of its own, forked from the one asked for when it says what it forked from. The

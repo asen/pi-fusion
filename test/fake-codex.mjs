@@ -34,6 +34,13 @@ import * as path from "node:path";
  * asks on a resumed or forked thread, as a thread whose tools Codex restored from its history would, so it is one of
  * the `FOUNDATIONS` scenarios. Whether a tool was registered is the host's request to show; the fake asks regardless.
  *
+ * The compaction scenarios script what a source reading of 0.160.0 says a post-turn compaction leaves on the wire: the
+ * final answer, its usage, a `contextCompaction` item, and a later usage update whose total adds the summary request
+ * and whose `last` is an estimate with no input. `compact-after` does that on a fresh thread; `resume-compact-drop`, one
+ * of the `FOUNDATIONS` scenarios, has the later total fall below the loaded thread's seed. `config-refused` answers any
+ * thread-opening request that carries a configuration map with an error, as an older Codex that did not know the key
+ * might. None of it is a measurement of what Codex does.
+ *
  * It stays alive through its stdin reader, so a host's own shutdown — which ends stdin first — is what ends it, and the
  * owned cleanup's report is about a process that was really there. Two scenarios differ on purpose: `hang` ignores the
  * end of stdin and `no-read` stops reading it, and both stay up on a bounded keepalive until the cleanup signals them.
@@ -111,7 +118,7 @@ let lastResult;
 const usage = (input, cached, output, reasoning) => ({ inputTokens: input, cachedInputTokens: cached, outputTokens: output, reasoningOutputTokens: reasoning, totalTokens: input + output });
 
 /** The scenarios that answer the resume, fork, latest-turn and steer methods. */
-const FOUNDATIONS = new Set(["resume-ok", "resume-reset", "resume-moved", "resume-mismatch", "fork-ok", "fork-same-id", "fork-tip-missing", "turns-interrupted", "steer-ok", "steer-rejected", "steer-script", "question-inherited"]);
+const FOUNDATIONS = new Set(["resume-compact-drop", "resume-ok", "resume-reset", "resume-moved", "resume-mismatch", "fork-ok", "fork-same-id", "fork-tip-missing", "turns-interrupted", "steer-ok", "steer-rejected", "steer-script", "question-inherited"]);
 /** What a persisted thread's cumulative total already is when it is loaded: the fake's seed, never a request's. */
 const SEED = HISTORY.seed ?? usage(5_000, 2_000, 200, 50);
 let forkCount = 0;
@@ -173,6 +180,7 @@ function initialize(id) {
 }
 
 function startThread(id, params) {
+	if (SCENARIO === "config-refused" && params?.config !== undefined) return fail(id, -32602, "unknown configuration key");
 	threadCount += 1;
 	const threadId = `${PREFIX}thr-${threadCount}`;
 	const model = params?.model ?? "gpt-host-default";
@@ -401,6 +409,27 @@ function startTurn(id, params) {
 			notify("item/completed", { threadId, turnId, completedAtMs: 2, item: { type: "agentMessage", id: "msg-1", text: "loaded answer", phase: null } });
 			tokenUsage(threadId, turnId, total, last);
 			if (REEMIT) tokenUsage(threadId, turnId, total, last);
+			completed(threadId, turnId);
+			return;
+		}
+		case "compact-after": {
+			answer();
+			notify("item/completed", { threadId, turnId, completedAtMs: 2, item: { type: "agentMessage", id: "msg-1", text: "compacted answer", phase: null } });
+			tokenUsage(threadId, turnId, usage(1_000, 400, 100, 20), usage(600, 400, 60, 10));
+			notify("item/started", { threadId, turnId, startedAtMs: 3, item: { type: "contextCompaction", id: "compact-1" } });
+			notify("item/completed", { threadId, turnId, completedAtMs: 4, item: { type: "contextCompaction", id: "compact-1" } });
+			tokenUsage(threadId, turnId, usage(1_500, 400, 180, 20), { inputTokens: 0, cachedInputTokens: 0, outputTokens: 0, reasoningOutputTokens: 0, totalTokens: 350 });
+			completed(threadId, turnId);
+			return;
+		}
+		case "resume-compact-drop": {
+			answer();
+			const last = usage(400, 300, 20, 5);
+			const total = plus(thread.seed ?? usage(0, 0, 0, 0), last);
+			notify("item/completed", { threadId, turnId, completedAtMs: 2, item: { type: "agentMessage", id: "msg-1", text: "loaded answer", phase: null } });
+			tokenUsage(threadId, turnId, total, last);
+			notify("item/completed", { threadId, turnId, completedAtMs: 3, item: { type: "contextCompaction", id: "compact-1" } });
+			tokenUsage(threadId, turnId, { ...total, inputTokens: 4_900, totalTokens: 4_900 + total.outputTokens }, { inputTokens: 0, cachedInputTokens: 0, outputTokens: 0, reasoningOutputTokens: 0, totalTokens: 300 });
 			completed(threadId, turnId);
 			return;
 		}

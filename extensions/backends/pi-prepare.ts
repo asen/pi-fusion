@@ -150,6 +150,8 @@ export interface PiPrepareRequest {
 	intent: SessionIntent;
 	/** The role contract's prose, already read by the host: nothing here opens a contract file. */
 	contract: string;
+	/** The run's compaction request, which the launch input carries to the child and nothing here reads. */
+	compactPct?: number;
 	signal?: AbortSignal;
 	/**
 	 * Where a child's question goes. Its presence is the whole of what turns questions on: it composes the input's
@@ -472,7 +474,7 @@ export async function preparePiChild(request: PiPrepareRequest): Promise<PiPrepa
 	if (request.signal?.aborted === true) return { ok: false, reason: "aborted" };
 
 	const action = sessionAction(request.intent);
-	const input = bootstrapInput({ role: request.role, storage: request.storage, session: action, questions: request.onQuestion !== undefined, contract: request.contract });
+	const input = bootstrapInput({ role: request.role, storage: request.storage, session: action, questions: request.onQuestion !== undefined, contract: request.contract, ...(request.compactPct === undefined ? {} : { compactPct: request.compactPct }) });
 	writeCallInput(request.storage, input);
 	const launch = piLaunch({
 		input,

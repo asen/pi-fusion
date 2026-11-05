@@ -7,7 +7,7 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import ts from "typescript";
 import { CODEX_CONTRACT_FILES, type CodexCall, codexRole } from "../extensions/backends/codex-binding.ts";
 import { CODEX_APP_SERVER_ARGS, type CodexLaunch, type CodexLaunchRequest } from "../extensions/backends/codex-launch.ts";
-import { CODEX_CLIENT_VERSION_UNKNOWN, CODEX_QUESTION_REQUIRED, CODEX_SESSION_INVALID, CONTRACT_UNREADABLE, type CodexBackendDeps, type CodexCallReport, codexClientInfo, createCodexBackend } from "../extensions/backends/codex.ts";
+import { CODEX_CLIENT_VERSION_UNKNOWN, CODEX_COMPACTION_REFUSED, CODEX_QUESTION_REQUIRED, CODEX_SESSION_INVALID, CONTRACT_UNREADABLE, type CodexBackendDeps, type CodexCallReport, codexClientInfo, createCodexBackend } from "../extensions/backends/codex.ts";
 import {
 	CLEANUP_ATTENTION,
 	CLEANUP_UNCERTAIN,
@@ -165,6 +165,8 @@ interface CaseOptions {
 	steers?: string[];
 	/** Overrides the fixture's fail-on-unexpected-question callback, always handed to the backend as the host does. */
 	onQuestion?: (question: string, signal: AbortSignal) => Promise<string>;
+	/** The run's compaction request, as the host hands it to every backend. */
+	compactPct?: number;
 }
 
 interface Fixture {
@@ -258,6 +260,7 @@ async function withBackend(scenario: string, body: (fixture: Fixture) => Promise
 						options.onEvent?.(event);
 					},
 					killGraceMs: 1_000,
+					...(options.compactPct === undefined ? {} : { compactPct: options.compactPct }),
 				}),
 			);
 			return { run, events, progress, report: report!, input, ...(shutdowns === undefined ? {} : { shutdowns: shutdowns() }) };
@@ -805,6 +808,76 @@ for (const [what, scenario, intent, message, session] of FORK_REFUSALS) {
 		});
 	});
 }
+
+/* ------------------------------------------------------------------------------------------------------------------
+ * Compaction requests
+ * ---------------------------------------------------------------------------------------------------------------- */
+
+const POST_TURN = "model_post_turn_compact_threshold_percent";
+
+test("a compaction request is one post-turn configuration key on every thread opening, and unset or 0 send no map", async () => {
+	for (const compactPct of [undefined, 0, 60, 100]) {
+		await withBackend("ok", async (fixture) => {
+			const outcome = await fixture.call({ role: "implement" }, compactPct === undefined ? {} : { compactPct });
+			ended(outcome, "stop");
+			const params = sent(fixture, "thread/start")[0].params;
+			if (compactPct) assert.deepEqual(params.config, { [POST_TURN]: compactPct }, `${compactPct}: the one key and nothing beside it`);
+			else assert.equal("config" in params, false, `${compactPct}: no configuration map at all`);
+			assert.equal(outcome.run.compactionNotice, undefined, "nothing is read back, so a request that went out says nothing more");
+			assert.deepEqual(sent(fixture, "turn/start")[0].params, { threadId: "thr-1", input: [{ type: "text", text: "do the task" }] }, "turn/start carries no configuration");
+		});
+	}
+	await withBackend("resume-ok", async (fixture) => {
+		const outcome = await fixture.call({ role: "implement" }, { intent: resume(), recorded: RECORDED, compactPct: 40 });
+		ended(outcome, "stop");
+		assert.deepEqual(sent(fixture, "thread/resume")[0].params, { threadId: "thr-old", model: "gpt-5", modelProvider: "openai", sandbox: "workspace-write", approvalPolicy: "never", developerInstructions: INSTRUCTIONS("implement"), config: { [POST_TURN]: 40 }, excludeTurns: true });
+	});
+	await withBackend("fork-ok", async (fixture) => {
+		const outcome = await fixture.call({ role: "ask" }, { intent: fork(), recorded: RECORDED, compactPct: 100 });
+		ended(outcome, "stop");
+		assert.deepEqual(sent(fixture, "thread/fork")[0].params.config, { [POST_TURN]: 100 });
+	});
+});
+
+test("a thread request refused with a compaction key fails as the child answered, is never resent, and says which setting to clear", async () => {
+	await withBackend("config-refused", async (fixture) => {
+		const outcome = await fixture.call({ role: "implement" }, { compactPct: 60 });
+		ended(outcome, "thread");
+		assert.equal(sent(fixture, "thread/start").length, 1, "nothing is resent without the key");
+		assert.equal(sent(fixture, "turn/start").length, 0);
+		assert.match(outcome.run.errorMessage ?? "", /unknown configuration key/);
+		assert.equal(outcome.run.compactionNotice, CODEX_COMPACTION_REFUSED);
+		assert.equal(outcome.run.text.includes(CODEX_COMPACTION_REFUSED), false, "the notice is the host's, never in the run's text");
+	});
+	await withBackend("config-refused", async (fixture) => {
+		const outcome = await fixture.call({ role: "implement" });
+		ended(outcome, "stop");
+		assert.equal(outcome.run.compactionNotice, undefined);
+	});
+});
+
+test("a turn that compacted after its answer keeps that answer, settles on its own turn, and counts the summary in its usage", async () => {
+	await withBackend("compact-after", async (fixture) => {
+		const outcome = await fixture.call({ role: "implement" }, { compactPct: 60 });
+		ended(outcome, "stop");
+		const { run } = outcome;
+		assert.match(run.text, /^compacted answer\n\n/, "the final message is the agent's; the compaction item carries none");
+		assert.deepEqual(run.session, { backend: "codex", sessionId: "thr-1", checkpoint: "turn-1", baseline: { inputTokens: 1_500, cachedInputTokens: 400, outputTokens: 180, reasoningOutputTokens: 20, totalTokens: 1_680, cacheWriteInputTokens: 0 } });
+		assert.deepEqual([run.tokensIn, run.tokensOut, run.cacheRead], [1_500, 180, 400], "the thread's total, which includes the summary request");
+		assert.equal(run.contextTokens, undefined, "an estimate with no input is no share of the window");
+	});
+});
+
+test("a continuation whose total fell below its baseline across a compaction fails closed and publishes no checkpoint or baseline", async () => {
+	await withBackend("resume-compact-drop", async (fixture) => {
+		const outcome = await fixture.call({ role: "implement" }, { intent: resume(), recorded: RECORDED, compactPct: 60 });
+		ended(outcome, "verify");
+		assert.equal(outcome.run.errorMessage, USAGE_BASELINE_INCONSISTENT);
+		assert.deepEqual(outcome.run.session, { backend: "codex", sessionId: "thr-old" }, "no checkpoint and no baseline are published");
+		// The share the display last attributed, before the total fell, stays shown; nothing is computed from the fallen one.
+		assert.deepEqual([outcome.run.tokensIn, outcome.run.tokensOut, outcome.run.cacheRead], [400, 20, 300]);
+	});
+});
 
 /* ------------------------------------------------------------------------------------------------------------------
  * Usage against a baseline

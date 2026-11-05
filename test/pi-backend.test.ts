@@ -11,6 +11,7 @@ import {
 	CALL_NOT_COMPOSED,
 	CONTRACT_UNREADABLE,
 	createPiBackend,
+	PI_COMPACTION_NOTICES,
 	PI_CONTRACTS_DIR,
 	type PiBackendDeps,
 	type PiCallReport,
@@ -359,14 +360,14 @@ const happyScript = (over: { exit?: PiExit | Thrown; after?: PiResponse } = {}):
 const HAPPY_STEPS = ["get_state", "get_session_stats", "get_tree", "turn", "get_state", "get_tree", "get_session_stats", "get_last_assistant_text", "shutdown"];
 
 /** One scripted restore: the session the child opened, the control command, the move, and the readbacks after it. */
-const restoreScript = (kind: "resume" | "fork"): ChildScript => {
+const restoreScript = (kind: "resume" | "fork", checkpoint: string = CHECKPOINT): ChildScript => {
 	const moved = kind === "resume" ? { sessionId: SOURCE_ID, sessionFile: SOURCE_FILE } : { sessionId: FORK_ID, sessionFile: FORK_FILE };
 	return {
 		requests: {
 			get_state: [ok("get_state", stateOf({ sessionId: SOURCE_ID, sessionFile: SOURCE_FILE })), ok("get_state", stateOf(moved))],
 			get_commands: [ok("get_commands", { commands: [commandRow(kind === "resume" ? NAVIGATE_COMMAND : FORK_COMMAND)] })],
 			// The restore's own readback, and then the task's, which is the leaf every one of these cases stops at.
-			get_tree: [ok("get_tree", { leafId: CHECKPOINT }), ok("get_tree", { tree: [], leafId: "moved-away" })],
+			get_tree: [ok("get_tree", { leafId: checkpoint }), ok("get_tree", { tree: [], leafId: "moved-away" })],
 			get_session_stats: [ok("get_session_stats", statsOf(moved))],
 		},
 		turn: turnOf({ outcome: "acknowledged", ack: ok("prompt", undefined), events: 1 }),
@@ -481,6 +482,71 @@ test("a resume and a fork are launched from the recorded session, and what each 
 	const decision = recordDecision({ ...call, intent: forkIntent }, outcomeOf(forked)) as { entry: Record<string, unknown> };
 	assert.deepEqual(decision.entry.session, { backend: "pi", sessionId: FORK_ID, sessionFile: FORK_FILE, checkpoint: CHECKPOINT });
 	assert.deepEqual(decision.entry.selection, { model: MODEL, effort: "medium" });
+});
+
+test("a compaction request reaches the child's input, and the child's word becomes a notice only when nothing was applied", async (t) => {
+	for (const [code, notice] of [
+		["applied", undefined],
+		["native", undefined],
+		["virtual", PI_COMPACTION_NOTICES.virtual],
+		["window", PI_COMPACTION_NOTICES.window],
+		["api", PI_COMPACTION_NOTICES.api],
+		["low", PI_COMPACTION_NOTICES.low],
+		[undefined, undefined],
+	] as const) {
+		const exit = exitOf();
+		const harness = harnessOf(t, { script: happyScript({ exit: exitOf({ stderr: { ...exit.stderr, ...(code === undefined ? {} : { compaction: code }) } }) }) });
+		const run = await harness.call({ compactPct: 60 });
+		assert.equal(harness.inputs[0]?.compactPct, 60, `${code}: the request is in the input the child reads`);
+		assert.equal(failed(run), false, `${code}: an advisory request that was not applied fails nothing`);
+		assert.deepEqual(run.session, { backend: "pi", sessionId: SESSION_ID, sessionFile: SESSION_FILE, checkpoint: LEAF });
+		assert.equal(run.text, ANSWER, "the notice is never part of the child's report");
+		assert.equal(run.compactionNotice, notice, String(code));
+		assert.equal(terminal(harness.events).ok, true);
+	}
+	for (const compactPct of [undefined, 0]) {
+		const exit = exitOf();
+		const harness = harnessOf(t, { script: happyScript({ exit: exitOf({ stderr: { ...exit.stderr, compaction: "low" } }) }) });
+		const run = await harness.call(compactPct === undefined ? {} : { compactPct });
+		assert.equal("compactPct" in (harness.inputs[0] ?? {}), false, `${compactPct}: no request reaches the child`);
+		assert.equal(run.compactionNotice, undefined, "and a run that asked for nothing is told nothing about it");
+	}
+	const resumeHarness = harnessOf(t, { script: restoreScript("resume") });
+	await resumeHarness.call({ compactPct: 40, session: resumeHarness.backend.session({ kind: "resume", ref: { ...SOURCE } }) });
+	assert.equal(resumeHarness.inputs[0]?.compactPct, 40, "a continuation's child is asked the same");
+});
+
+test("a turn that compacted after its answer publishes the compaction leaf as its checkpoint and counts the summary's usage", async (t) => {
+	const COMPACTION_LEAF = "compaction-entry-9";
+	const script = happyScript({ after: ok("get_tree", { tree: [], leafId: COMPACTION_LEAF }) });
+	script.requests!.get_session_stats = [
+		ok("get_session_stats", statsOf()),
+		// The summary request's usage is in the session's totals, and a session that has just compacted has no estimate.
+		ok("get_session_stats", afterStats({ cost: 0.95, tokens: { input: 900, output: 160, cacheRead: 10, cacheWrite: 5, total: 1_075 }, contextUsage: { tokens: null, contextWindow: 64_000, percent: null } })),
+	];
+	script.turn = (stream) => {
+		const events: PiEvent[] = [...TURN_EVENTS, { type: "compaction_start", reason: "threshold" }, { type: "compaction_end", reason: "threshold", aborted: false, willRetry: false }];
+		for (const event of events) stream(event);
+		return turnOf({ events: events.length });
+	};
+	const harness = harnessOf(t, { script });
+	const run = await harness.call({ compactPct: 60 });
+	assert.equal(failed(run), false, run.errorMessage);
+	assert.equal(run.text, ANSWER, "the answer is the assistant's, not the summary's");
+	assert.deepEqual(run.session, { backend: "pi", sessionId: SESSION_ID, sessionFile: SESSION_FILE, checkpoint: COMPACTION_LEAF }, "the leaf is taken as it is, whatever kind of entry it is");
+	assert.deepEqual([run.tokensIn, run.tokensOut, run.cacheRead, run.cacheWrite], [815, 140, 10, 5], "the turn's delta, the summary's usage included");
+	assert.equal(run.costUsd, 0.7);
+	assert.deepEqual([run.contextTokens, run.contextWindow], [undefined, 64_000], "no share is claimed for a context that was just compacted");
+	const call = { handle: "f1", role: "implement", backend: "pi" as const, hostSessionId: "host-1" };
+	const decision = recordDecision({ ...call, intent: { kind: "new" } }, outcomeOf(run)) as { entry: Record<string, unknown> };
+	assert.deepEqual(decision.entry.session, { backend: "pi", sessionId: SESSION_ID, sessionFile: SESSION_FILE, checkpoint: COMPACTION_LEAF });
+
+	// A continuation from it goes to that exact entry and to nothing near it.
+	const source = { backend: "pi", sessionId: SOURCE_ID, sessionFile: SOURCE_FILE, checkpoint: COMPACTION_LEAF } as const;
+	const resumeHarness = harnessOf(t, { script: restoreScript("resume", COMPACTION_LEAF) });
+	await resumeHarness.call({ session: resumeHarness.backend.session({ kind: "resume", ref: source }) });
+	assert.deepEqual(resumeHarness.inputs[0]?.session, { kind: "open", file: SOURCE_FILE, sessionId: SOURCE_ID, checkpoint: COMPACTION_LEAF });
+	assert.equal(resumeHarness.seen.turns[0]?.text, `/${NAVIGATE_COMMAND} ${JSON.stringify(COMPACTION_LEAF)}`);
 });
 
 test("a preparation that refused reports its own stage, and its storage goes exactly when its child's ending left nothing", async (t) => {

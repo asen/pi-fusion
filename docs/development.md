@@ -45,7 +45,7 @@ fusion.ts                     host lifecycle and registration
 | `role-contract-loader.ts`, `role-contracts.ts` | Startup selection of six shipped/user/project contract files (per-role fail-closed for unusable overrides), strict frontmatter validation (`host`, `disabled`, `defaults`, checked against the role with `profiles.ts`) and child-body parsing; one metadata/body/source/availability/defaults snapshot injected through `FusionOptions.roleContracts`. The host passes the resolved body in `RunRequest.contract`, which backends check only for being nonblank; standalone backend callers may omit it for their lazy shipped-file reader, which refuses a disabled or blank canonical contract |
 | `roles.ts` | Supported backends, writer-slot and review eligibility per role |
 | `profiles.ts`, `profile-store.ts` | Captured legacy defaults, settings validation/copies, global profiles file and queued atomic replacement |
-| `settings-store.ts` | Fusion's own `settings.json`: the saved history preference and plan context cap, validation, and file/memory stores over the profile store's queue and atomic write |
+| `settings-store.ts` | Fusion's own `settings.json`: the saved history preference, plan context cap and child compaction request, validation, and file/memory stores over the profile store's queue and atomic write |
 | `backends/types.ts` | Session references/intents, selection, request/outcome/event/callback shapes; imports nothing |
 | `backends/claude.ts` | Claude SDK options, input/question bridges, stream loop; SDK concerns stay here |
 | `backends/pi-binding.ts` | Pure Pi role/model/effort binding, contracts, and tool/resource lists |
@@ -56,7 +56,7 @@ fusion.ts                     host lifecycle and registration
 | `backends/codex.ts`, `codex-outcome.ts` | Lazy call composition, checks, steer queue and one shutdown; pure selection, disposition, checkpoint/baseline, usage and display mapping. Factory construction reads, locates and starts nothing. See [Codex architecture](codex-backend.md#architecture) and [evidence](codex-backend.md#evidence) |
 | `backends/pi-storage.ts`, `pi-launch.ts` | Owned layout/catalog publication, call input, environment, launch options, and lazy host agent/package accessors |
 | `backends/pi-bootstrap.mjs` | Child-only public SDK construction, strict input/resource/session checks, in-memory settings, and native RPC serving |
-| `backends/pi-sdk-resolve.mjs`, `pi-bootstrap-protocol.mjs` | Child resolve preload; separately, import-free startup constants shared with transport |
+| `backends/pi-sdk-resolve.mjs`, `pi-bootstrap-protocol.mjs` | Child resolve preload; separately, import-free startup constants and compaction words shared with transport |
 | `backends/pi-control-extension.mjs`, `pi-session-restore.ts` | Child navigation/fork commands and host restore/readback sequence |
 | `backends/pi-question-tool.mjs`, `pi-question-routing.ts` | Blocking child input tool and host dialog arbitration |
 | `backends/pi-helper-retry.mjs` | One bounded retry around public search tools, not an SDK patch |

@@ -60,6 +60,7 @@ Fusion does not isolate or re-audit the inherited configuration
 - Lookup/launch are POSIX-only. Windows refuses when a run starts; macOS executes the same code but is unmeasured. Linux qualification is limited to the host/version in [Evidence](#evidence).
 - Writable roots, network access, shell policy, MCP, remote-control and multi-agent features remain the user's. Enabled servers/features are live; subagent work and spend are outside Fusion's reports.
 - Only the reported sandbox **tag** is checked against the role. Continuations request/check the mode again; no historical sandbox record or comparison exists.
+- Thread requests carry no configuration map, except one key when [`compactPct`](runs.md#child-compaction) is set: `model_post_turn_compact_threshold_percent`, on start, resume and fork. It overrides that thread's post-turn percentage and nothing else; it is not written to `config.toml`.
 - Hosted web search is inherited, neither enabled nor disabled by Fusion. Q4 observed no search item; that is not proof that search is disabled. The shared ask contract requires sources or an explicit unchecked fact.
 
 **Requests omit cwd.** In Codex 0.160.0 source, naming a cwd can write a trust entry for an untrusted writable project. Fusion instead binds the process cwd by realpath and checks the reported cwd. Q2/Q9 measured this without changing `config.toml` on one host. A cwd-naming fallback is **not implemented** and would require explicit consent because of that possible trust write.
@@ -304,6 +305,7 @@ Unmeasured natively:
 - `plan` calls/handoffs; `implement` continuations, steers and questions; callback admission and shared-contract-only continuations; host answer/writer/lifecycle races (fake/double-tested).
 - Fork through an older checkpoint, hosted search, named-effort override (Q3b not run), cache-write/input relationship, exact context occupancy, USD cost, or CLI recovery via `codex resume`.
 - Host answer UI, a question abandoned or held until timeout, other versions/platforms, or provider/model/default switches.
+- The `compactPct` post-turn key: acceptance by an installed Codex, when it compacts, the usage and checkpoint after it, and a resume or fork from such a turn. Its fake cases script a source reading of 0.160.0.
 - Sandbox/kernel policy was not audited. Whole-connection experimental opt-in may enable other features; nothing claims isolation or absence of other network/inference activity.
 
 ### Qualification harness
