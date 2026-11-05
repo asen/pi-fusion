@@ -174,8 +174,12 @@ test("a broken shipped policy fails the load, and a valid override does not hide
 test("the host policy module imports no Pi SDK and resolves the agent directory only through the seam it is given", () => {
 	const source = fs.readFileSync(path.resolve(import.meta.dirname, "..", "extensions", "host-policy.ts"), "utf8");
 	const imports = [...source.matchAll(/^import .* from "([^"]+)";$/gm)].map((match) => match[1]);
-	assert.deepEqual(imports, ["node:path", "node:url", "./backends/pi-storage.ts", "./instruction-files.ts"]);
+	assert.deepEqual(imports, ["node:path", "node:url", "./backends/pi-storage.ts", "./instruction-files.ts", "./presets.ts"]);
 	assert.doesNotMatch(source, /import\(/, "no dynamic import either");
+	// The preset selection it reads is pure configuration too: no SDK, and the agent directory only through a seam.
+	const presets = fs.readFileSync(path.resolve(import.meta.dirname, "..", "extensions", "presets.ts"), "utf8");
+	assert.deepEqual([...presets.matchAll(/^import .* from "([^"]+)";$/gm)].map((match) => match[1]), ["node:path", "node:url", "./backends/pi-storage.ts", "./instruction-files.ts", "./profile-store.ts"]);
+	assert.doesNotMatch(presets, /import\(/);
 });
 
 /** The descriptors this process has open, where the platform lists them; undefined elsewhere. */

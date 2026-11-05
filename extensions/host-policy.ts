@@ -1,10 +1,11 @@
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import { FUSION_DIR } from "./backends/pi-storage.ts";
-import { instructionBytes, INSTRUCTION_MAX_BYTES, instructionOverride, type InstructionContext, type InstructionSource, instructionText, readInstructionFile, selectInstruction, shippedInstruction } from "./instruction-files.ts";
+import { fallbackInstruction, fileScope, instructionBytes, INSTRUCTION_MAX_BYTES, type InstructionContext, type InstructionRead, type InstructionScope, type InstructionSource, instructionText, readInstructionFile, shippedInstruction } from "./instruction-files.ts";
+import { ARCHITECT_DIR, DEFAULT_PRESET, type PresetName, UNTRUSTED_PROJECT } from "./presets.ts";
 
 /**
- * Plain Markdown telling the host how to orchestrate, never child instructions. Project/user files replace shipped
+ * Plain Markdown telling the host how to orchestrate, never child instructions. A selected preset's file replaces shipped
  * text whole, without templating, includes or frontmatter. Loading reads only and never copies or creates a file.
  * File bounds, strict UTF-8, fallback and diagnostics are shared with role-contract loading.
  */
@@ -19,41 +20,80 @@ export interface HostPolicy extends InstructionSource {
 }
 
 export interface HostPolicyLoader {
-	/** Reads configured sources afresh; the host supplies its startup cwd/trust once per instance. */
+	/** Reads configured sources afresh; the host supplies its startup cwd, trust and preset once per instance. */
 	load(context?: InstructionContext): Promise<HostPolicy>;
 }
 
 const policy = (text: string): { text: string } => ({ text });
 
-/** Validate the shipped policy first, then locate and select its optional whole-file replacement. */
-export function fileHostPolicyLoader(sources: { shipped: string; override: () => string | Promise<string>; project?: () => string | Promise<string> }): HostPolicyLoader {
+/**
+ * The policy a selected preset loads. The shipped policy is validated first whatever the preset, so no selection can
+ * hide a broken install. builtin is that policy alone; architect is its bundled policy alone, failing startup when
+ * unusable; user and project consult their one scope before builtin; auto consults the trusted project, then the user.
+ * A scope the preset does not name is never located or read.
+ */
+async function selectedPolicy(shipped: HostPolicy, preset: PresetName, scopes: { user: InstructionScope; project?: InstructionScope; architect: () => Promise<InstructionRead> | InstructionRead; architectWhere: string }): Promise<HostPolicy> {
+	switch (preset) {
+		case "builtin":
+			return shipped;
+		case "architect":
+			return { ...shippedInstruction(await scopes.architect(), scopes.architectWhere, "architect preset host policy", policy), source: "bundled" };
+		case "user":
+			return fallbackInstruction(shipped, [scopes.user], "host policy", policy);
+		case "project":
+			if (!scopes.project) throw new Error(UNTRUSTED_PROJECT);
+			return fallbackInstruction(shipped, [scopes.project], "host policy", policy);
+		case "auto":
+			return fallbackInstruction(shipped, [...(scopes.project ? [scopes.project] : []), scopes.user], "host policy", policy);
+	}
+}
+
+/** Validate the shipped policy first, then select within the scopes the startup preset names. */
+export function fileHostPolicyLoader(sources: { shipped: string; override: () => string | Promise<string>; project?: () => string | Promise<string>; architect?: string }): HostPolicyLoader {
 	return {
-		load: async () => {
+		load: async (context) => {
 			const shipped = shippedInstruction(await readInstructionFile(sources.shipped), sources.shipped, "host policy", policy);
-			return instructionOverride(shipped, sources.override, "host policy", policy, sources.project);
+			const architectWhere = path.join(sources.architect ?? ARCHITECT_DIR, HOST_POLICY_FILE);
+			return selectedPolicy(shipped, context?.preset ?? DEFAULT_PRESET, {
+				user: fileScope("override", sources.override),
+				...(sources.project ? { project: fileScope("project", sources.project) } : {}),
+				architect: () => readInstructionFile(architectWhere),
+				architectWhere,
+			});
 		},
 	};
 }
 
-/** Project lookup uses only an affirmatively trusted session cwd; user lookup stays lazy and is the fallback. */
+/** Project lookup uses only an affirmatively trusted session cwd; user lookup stays lazy. */
 export function hostPolicyLoader(agentDir: () => Promise<string>): HostPolicyLoader {
 	return {
 		load: (context) => fileHostPolicyLoader({
 			shipped: SHIPPED_HOST_POLICY_PATH,
 			override: async () => path.join(await agentDir(), FUSION_DIR, HOST_POLICY_FILE),
 			...(context?.projectTrusted === true ? { project: () => path.join(context.cwd, ".pi", FUSION_DIR, HOST_POLICY_FILE) } : {}),
-		}).load(),
+		}).load(context),
 	};
 }
 
-/** A test host never reads the user's override; omitted shipped text still comes from this build. */
-export function memoryHostPolicyLoader(sources: { shipped?: string | Uint8Array; override?: string | Uint8Array } = {}): HostPolicyLoader {
+/**
+ * A test host never reads the user's or a project's override; omitted shipped text still comes from this build, and
+ * architect is this build's bundled file. `override` is the user scope; `project` is consulted only with affirmative
+ * trust, as in production.
+ */
+export function memoryHostPolicyLoader(sources: { shipped?: string | Uint8Array; override?: string | Uint8Array; project?: string | Uint8Array } = {}): HostPolicyLoader {
+	const memory = (source: InstructionScope["source"], where: string, value: string | Uint8Array | undefined): InstructionScope => ({ source, read: async () => ({ where, read: value === undefined ? { missing: true } : instructionBytes(value) }) });
 	return {
-		load: async () => {
+		load: async (context) => {
 			const where = sources.shipped === undefined ? SHIPPED_HOST_POLICY_PATH : "(shipped, in memory)";
 			const read = sources.shipped === undefined ? await readInstructionFile(where) : instructionBytes(sources.shipped);
 			const shipped = shippedInstruction(read, where, "host policy", policy);
-			return selectInstruction(shipped, sources.override === undefined ? { missing: true } : instructionBytes(sources.override), "(override, in memory)", "host policy", policy);
+			const architectWhere = path.join(ARCHITECT_DIR, HOST_POLICY_FILE);
+			return selectedPolicy(shipped, context?.preset ?? DEFAULT_PRESET, {
+				user: memory("override", "(override, in memory)", sources.override),
+				...(context?.projectTrusted === true ? { project: memory("project", "(project, in memory)", sources.project) } : {}),
+				architect: () => readInstructionFile(architectWhere),
+				architectWhere,
+			});
 		},
 	};
 }

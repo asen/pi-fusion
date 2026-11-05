@@ -1,6 +1,6 @@
 # The Codex backend
 
-**Registered and opt-in.** Codex supports `plan`, `implement`, and `ask`; builtin routes no role there. Name `backend: "codex"` or configure a role in [settings](profiles.md). Code defines current behavior; [Evidence](#evidence) records the narrower qualification scope.
+**Registered and opt-in.** Codex supports `plan`, `implement`, and `ask`; the shipped builtin routes no role there. Name `backend: "codex"`, configure a role in [settings](profiles.md), or set a role contract's [`defaults`](configuration.md#role-availability-and-defaults). Code defines current behavior; [Evidence](#evidence) records the narrower qualification scope.
 
 ## Architecture
 

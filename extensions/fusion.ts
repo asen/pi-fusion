@@ -4,7 +4,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { matchesKey, truncateToWidth } from "@earendil-works/pi-tui";
-import { Type } from "typebox";
+import { type TSchema, Type } from "typebox";
 import {
 	ACTIVITY_CHARS,
 	ChildInput,
@@ -61,6 +61,7 @@ import { HOST_POLICY_FILE, type HostPolicy, type HostPolicyLoader, hostPolicyLoa
 import { type InstructionContext, instructionSourceLabel } from "./instruction-files.ts";
 import { hostProfileStore, type ProfileStore } from "./profile-store.ts";
 import { hostSettingsStore, type SettingsStore } from "./settings-store.ts";
+import { filePresetDefaults, isPresetName, PRESET_ENTRY, PRESET_ENTRY_VERSION, PRESET_NAMES, type PresetDefaultsStore, type PresetEntry, type PresetName, type PresetScope, type PresetSelection, resolvePreset, selectionText, type SessionPreset, sessionPreset } from "./presets.ts";
 import {
 	type Baseline,
 	BUILTIN,
@@ -81,6 +82,7 @@ import {
 	sameSettings,
 	type Selection,
 	settingsTable,
+	type StartupDefault,
 	ULTRACODE_EFFORT,
 } from "./profiles.ts";
 import { reviewable, reviewPrompt } from "./review.ts";
@@ -96,6 +98,9 @@ export { ChildInput, childOptions, claudeExecutable, failed, QUESTION_TOOL, ques
 export type { BackendName, ChildEvent, ChildRun, ChildSession, HostBackend, HostRole, HostSession, ModelCost, ResolvedSelection, Role, SessionIntent, SessionRef };
 
 const SESSION_ENTRY = "pi-fusion";
+
+/** The session's active branch, or none for a host whose context carries no session manager. */
+const branchOf = (ctx: any): readonly unknown[] => (typeof ctx?.sessionManager?.getBranch === "function" ? ctx.sessionManager.getBranch() : []);
 const TICK_MS = 1_000;
 /** How often a running run's changed-file count is sampled: a git call per second per run is too many. */
 const FILE_SAMPLE_MS = 10_000;
@@ -700,12 +705,37 @@ export interface Configuration {
 	modified: boolean;
 	roles: RoleSettings;
 	baseline: Baseline;
+	/**
+	 * The roles this instance's startup role contracts make unavailable, with why. It is not a setting: no profile or
+	 * edit changes it, a role's own `enabled` is kept beside it, and a role named here is refused whatever that says.
+	 */
+	unavailable?: Readonly<Partial<Record<KnownRoleName, string>>>;
+	/** For the built-in configuration, the role contract each role's startup defaults came from, as refusals name it. */
+	defaultsFrom?: Readonly<Partial<Record<KnownRoleName, string>>>;
 }
 
-/** The built-in configuration over a baseline, with security disabled until the user enables it. */
-export function builtinConfiguration(baseline: Baseline = captureBaseline()): Configuration {
-	return { profile: BUILTIN, modified: false, roles: builtinSettings(baseline), baseline };
+/**
+ * The built-in configuration over a baseline, with security disabled until the user enables it. Startup role-contract
+ * defaults choose a role's backend and overlay that backend's baseline field by field; the baseline itself is untouched.
+ */
+export function builtinConfiguration(baseline: Baseline = captureBaseline(), defaults: Partial<Record<KnownRoleName, StartupDefault & { path?: string }>> = {}): Configuration {
+	const from: Partial<Record<KnownRoleName, string>> = {};
+	for (const role of KNOWN_ROLE_NAMES) {
+		const where = Object.hasOwn(defaults, role) ? defaults[role]?.path : undefined;
+		if (where !== undefined) from[role] = `role contract ${where}`;
+	}
+	return { profile: BUILTIN, modified: false, roles: builtinSettings(baseline, defaults), baseline, ...(Object.keys(from).length ? { defaultsFrom: from } : {}) };
 }
+
+/** Why a role cannot run in this instance whatever its setting says, or undefined when its contract makes it available. */
+export const unavailableReason = (role: KnownRoleName, config: Configuration): string | undefined =>
+	config.unavailable && Object.hasOwn(config.unavailable, role) ? config.unavailable[role] : undefined;
+
+/** True when a role may start or continue a run: its contract makes it available and the configuration enables it. */
+export const roleActive = (role: KnownRoleName, config: Configuration): boolean => unavailableReason(role, config) === undefined && config.roles[role].enabled;
+
+/** The roles a delegation tool's `role` enum offers: the ones it runs that may run, in the tool's own order. */
+export const usableRoles = (roles: readonly KnownRoleName[], config: Configuration): KnownRoleName[] => roles.filter((role) => roleActive(role, config));
 
 /** How a configuration names itself in a message: the profile, and whether this session has edited it since. */
 export const configurationLabel = (config: Configuration): string => `${config.profile}${config.modified ? " (modified)" : ""}`;
@@ -761,12 +791,19 @@ function executableRole(role: string): RoleSpec {
 }
 
 /**
- * Refuses a role the configuration disabled, for a fresh run and a continuation alike, whatever backend, model or
- * effort the call names: a disabled role starts nothing, takes no handle and is never asked of a backend.
+ * Refuses a role its contract made unavailable or the configuration disabled, for a fresh run and a continuation alike,
+ * whatever backend, model or effort the call names: such a role starts nothing, takes no handle and is never asked of a
+ * backend. Unavailability is checked first, because no setting can lift it.
  */
 function enabledRole(role: KnownRoleName, config: Configuration): void {
+	const unavailable = unavailableReason(role, config);
+	if (unavailable !== undefined) throw new Error(unavailableRoleText(role, unavailable));
 	if (!config.roles[role].enabled) throw new Error(`role ${role} is disabled in profile ${configurationLabel(config)}; change /fusion config or select another profile`);
 }
+
+/** The refusal of an unavailable role: its contract's reason, and that only the contract and a reload change it. */
+export const unavailableRoleText = (role: KnownRoleName, reason: string): string =>
+	`role ${role} is unavailable in this Fusion instance: ${reason}. No profile, /fusion config change or call parameter enables it; change the selected role contract, then restart Pi, /reload or start a new session`;
 
 /** The backend a new run goes to: the one the call named, or the one the configuration names for the role. */
 function freshBackend(role: string, asked: string | undefined, config: Configuration): BackendName {
@@ -786,8 +823,11 @@ function freshDefaults(role: KnownRoleName, backend: BackendName, config: Config
 	const setting = config.roles[role];
 	if (setting.backend !== backend) return { ...config.baseline[role][backend] };
 	const configured: RouteDefaults = { ...(setting.model === undefined ? {} : { model: setting.model }), ...(setting.effort === undefined ? {} : { effort: setting.effort }) };
-	// The built-in configuration as it started is the role's own variables, which is what a refusal should point at.
-	return config.profile === BUILTIN && !config.modified ? configured : { ...configured, from: `profile ${configurationLabel(config)}` };
+	// The built-in configuration as it started is the role's own variables, or the role contract whose defaults it took,
+	// which is what a refusal should point at.
+	if (config.profile !== BUILTIN || config.modified) return { ...configured, from: `profile ${configurationLabel(config)}` };
+	const contract = config.defaultsFrom && Object.hasOwn(config.defaultsFrom, role) ? config.defaultsFrom[role] : undefined;
+	return contract === undefined ? configured : { ...configured, from: contract };
 }
 
 /**
@@ -1465,14 +1505,17 @@ function handleNumber(handle: string): number {
 	return Number(HANDLE.exec(handle)?.[1] ?? 0);
 }
 
-const FUSION_ARGS = ["dashboard", "dashboard stop", "dashboard limit", "status", "cancel", "steer", "wait", "answer", "review", "on", "off", "config", "profile", "profile list", "profile use", "profile save", "profile default", "history", "history on", "history off"];
+const FUSION_ARGS = ["dashboard", "dashboard stop", "dashboard limit", "status", "cancel", "steer", "wait", "answer", "review", "on", "off", "config", "profile", "profile list", "profile use", "profile save", "profile default", "preset", "preset list", "preset use", "preset reset", "preset default user", "preset default project", "history", "history on", "history off"];
 const USAGE =
-	"Usage: /fusion dashboard | /fusion dashboard stop | /fusion dashboard limit [N] | /fusion status [run-N] | /fusion cancel run-N | /fusion wait run-N | /fusion steer run-N <text> | /fusion answer [run-N] [text] | /fusion review run-N | /fusion on | /fusion off | /fusion config | /fusion profile [list | use <name> | save <name> | default <name>] | /fusion history [on | off]";
+	"Usage: /fusion dashboard | /fusion dashboard stop | /fusion dashboard limit [N] | /fusion status [run-N] | /fusion cancel run-N | /fusion wait run-N | /fusion steer run-N <text> | /fusion answer [run-N] [text] | /fusion review run-N | /fusion on | /fusion off | /fusion config | /fusion profile [list | use <name> | save <name> | default <name>] | /fusion preset [list | use <name> | reset | default user|project <name>|clear] | /fusion history [on | off]";
 const DASHBOARD_LIMIT_USAGE = "Usage: /fusion dashboard limit [N]; N must be a positive decimal safe integer";
 const PROFILE_USAGE = "Usage: /fusion profile [list | use <name> | save <name> | default <name>]; builtin names the built-in configuration for use and default";
+const PRESET_USAGE = `Usage: /fusion preset [list | use <name> | reset | default user|project <name>|clear]; the presets are ${PRESET_NAMES.join(", ")}`;
 const HISTORY_USAGE = "Usage: /fusion history [on | off]; on and off save the run history preference for new Fusion instances and leave this one as it started";
 /** A /fusion profile argument list that names a profile, as far as it is typed, for completion. */
 const PROFILE_ARG = /^profile\s+(use|save|default)\s+(\S*)$/;
+/** A /fusion preset argument list that names a preset, as far as it is typed, for completion. */
+const PRESET_ARG = /^preset\s+(use|default\s+(?:user|project))\s+(\S*)$/;
 /** A /fusion argument list that names a run, as far as it is typed, for completion. */
 const RUN_ARG = /^(status|cancel|wait|steer|answer|review)\s+(\S*)$/;
 const BROWSER_OPENER: Record<string, string> = { darwin: "open", linux: "xdg-open" };
@@ -1495,6 +1538,10 @@ export type FusionCommand =
 	| { kind: "profile-use"; name: string }
 	| { kind: "profile-save"; name: string }
 	| { kind: "profile-default"; name: string }
+	| { kind: "preset" }
+	| { kind: "preset-use"; name: PresetName }
+	| { kind: "preset-reset" }
+	| { kind: "preset-default"; scope: PresetScope; name: PresetName | null }
 	| { kind: "history" }
 	| { kind: "history-set"; enabled: boolean }
 	| { kind: "usage"; message: string };
@@ -1527,6 +1574,18 @@ export function parseFusion(args: string): FusionCommand {
 			return second === "use" ? { kind: "profile-use", name } : second === "save" ? { kind: "profile-save", name } : { kind: "profile-default", name };
 		}
 		return { kind: "usage", message: PROFILE_USAGE };
+	}
+	if (first === "preset") {
+		if (tokens.length === 1 || (tokens.length === 2 && second === "list")) return { kind: "preset" };
+		if (second === "reset" && tokens.length === 2) return { kind: "preset-reset" };
+		const name = tokens.at(-1)!;
+		if (second === "use" && tokens.length === 3) return isPresetName(name) ? { kind: "preset-use", name } : { kind: "usage", message: `no preset is named ${shown(name)}. ${PRESET_USAGE}` };
+		const scope = tokens[2];
+		if (second === "default" && tokens.length === 4 && (scope === "user" || scope === "project")) {
+			if (name === "clear") return { kind: "preset-default", scope, name: null };
+			return isPresetName(name) ? { kind: "preset-default", scope, name } : { kind: "usage", message: `no preset is named ${shown(name)}. ${PRESET_USAGE}` };
+		}
+		return { kind: "usage", message: PRESET_USAGE };
 	}
 	if (first === "history") {
 		if (tokens.length === 1) return { kind: "history" };
@@ -1605,6 +1664,11 @@ export interface FusionOptions {
 	hostPolicy?: HostPolicyLoader;
 	/** Startup contract selection over project/user/shipped files; tests inject memory or temporary roots. */
 	roleContracts?: RoleContractLoader;
+	/**
+	 * Where the user and trusted-project default presets are read and written. Left out, it is `preset.json` under the
+	 * user's Fusion directory and the session cwd's `.pi/pi-fusion/`; every test host passes a memory store of its own.
+	 */
+	presetDefaults?: PresetDefaultsStore;
 	/** How the dashboard server starts. Left out, it is this build's own; a test host passes one that sees what it is given. */
 	dashboard?: typeof startDashboard;
 }
@@ -1697,6 +1761,11 @@ export default function fusion(pi: ExtensionAPI, options: FusionOptions = {}) {
 	let profileWarning: string | undefined;
 	const policyLoader = options.hostPolicy ?? hostPolicyLoader(hostAgentDir);
 	const contractLoader = options.roleContracts ?? roleContractLoader(hostAgentDir);
+	const presetStore = options.presetDefaults ?? filePresetDefaults(hostAgentDir);
+	/** The preset this instance's startup selected, and what selected it; undefined until that selection settles. */
+	let activePreset: PresetSelection | undefined;
+	/** Why this instance's startup failed, for /fusion preset, which still answers after a failed startup. */
+	let startupFailure: string | undefined;
 	let contractWarnings: string[] = [];
 	/**
 	 * The host policy this instance selected at startup, with its source, path and any diagnostic, kept for as long as
@@ -1735,11 +1804,20 @@ export default function fusion(pi: ExtensionAPI, options: FusionOptions = {}) {
 		(initializing ??= (async () => {
 			const choosing = chooseSettings();
 			try {
-				const context: InstructionContext = { cwd: ctx.cwd, projectTrusted: typeof ctx.isProjectTrusted === "function" && ctx.isProjectTrusted() === true };
+				const base: InstructionContext = { cwd: ctx.cwd, projectTrusted: typeof ctx.isProjectTrusted === "function" && ctx.isProjectTrusted() === true };
+				// The branch's choice is read before anything awaits: a preset command that lands while this loads changes
+				// what the next startup selects, never what this one is part way through loading.
+				const session = sessionPreset(branchOf(ctx));
+				const preset = await resolvePreset(session, base, presetStore);
+				const context: InstructionContext = { ...base, preset: preset.preset };
 				const [selected, profile, loaded] = await Promise.all([(async () => policyLoader.load(context))(), defaultProfile(), (async () => contractLoader.load(context))()]);
 				contracts = loaded;
 				contractWarnings = Object.values(loaded.files).flatMap((file) => file.diagnostic === undefined ? [] : [file.diagnostic]);
 				startWith(selected, profile);
+				activePreset = preset;
+			} catch (error) {
+				startupFailure = error instanceof Error ? error.message : String(error);
+				throw error;
 			} finally {
 				await choosing;
 			}
@@ -1777,7 +1855,8 @@ export default function fusion(pi: ExtensionAPI, options: FusionOptions = {}) {
 			}
 		}
 		try {
-			applyConfiguration(configuration, selected);
+			// Without a profile the session starts on the built-in configuration as the selected contracts default it.
+			applyConfiguration(chosen ? configuration : startupBuiltin(), selected);
 		} catch (error) {
 			throw new Error(`pi-fusion: the host policy did not reach the host's tool guidance, so no Fusion run starts in this instance: ${error instanceof Error ? error.message : String(error)}`);
 		}
@@ -1832,15 +1911,22 @@ export default function fusion(pi: ExtensionAPI, options: FusionOptions = {}) {
 	};
 
 	/**
+	 * The built-in configuration as this instance's startup contracts default it: what a session without a profile starts
+	 * on and what `/fusion profile use builtin` restores. The contracts are not read again for it.
+	 */
+	const startupBuiltin = (): Configuration => builtinConfiguration(baseline, contracts?.defaults);
+
+	/**
 	 * Makes a configuration this session's, with the host's tool guidance in the same synchronous step, so the host is
 	 * never told one configuration while calls run on another. The policy is the one already selected unless startup
-	 * passes the one it loaded. A guidance refresh that throws puts both back.
+	 * passes the one it loaded. A guidance refresh that throws puts both back. Every configuration passes through here,
+	 * so each one carries the startup contracts' availability whatever profile or edit it came from.
 	 */
 	const applyConfiguration = (next: Configuration, selected: HostPolicy | undefined = policy): void => {
 		const previous = configuration;
 		const previousPolicy = policy;
 		const activeTools = pi.getActiveTools();
-		configuration = next;
+		configuration = contracts ? { ...next, unavailable: contracts.unavailable } : next;
 		policy = selected;
 		try {
 			registerGuidance(true);
@@ -2821,6 +2907,8 @@ export default function fusion(pi: ExtensionAPI, options: FusionOptions = {}) {
 		if (reason) return { refused: `${source.handle} ${reason}` };
 		// A review is a fresh ask run, so the ask role's own setting decides whether there is one at all: the role of the
 		// run it reads does not, and neither does anything that run recorded.
+		const askUnavailable = unavailableReason("ask", configuration);
+		if (askUnavailable !== undefined) return { refused: `${unavailableRoleText("ask", askUnavailable)}; nothing reviews ${source.handle}` };
 		if (!configuration.roles.ask.enabled) return { refused: `role ask is disabled in profile ${configurationLabel(configuration)}, so nothing reviews ${source.handle}; change /fusion config or select another profile` };
 		const blocked = ledger.blocked();
 		if (blocked) return { refused: budgetBlockMessage(blocked) };
@@ -2880,9 +2968,9 @@ export default function fusion(pi: ExtensionAPI, options: FusionOptions = {}) {
 		return { run: started };
 	};
 
-	/** The review a run that changed files gets on its own, when the user turned automatic reviews on and role ask is enabled. */
+	/** The review a run that changed files gets on its own, when the user turned automatic reviews on and role ask is available and enabled. */
 	const startAutoReview = (run: LiveRun, ctx: any): void => {
-		if (!enabled || !autoReview || !configuration.roles.ask.enabled || run.origin !== "tool" || run.state !== "done" || run.reviewedBy || shuttingDown) return;
+		if (!enabled || !autoReview || !roleActive("ask", configuration) || run.origin !== "tool" || run.state !== "done" || run.reviewedBy || shuttingDown) return;
 		if (notReviewable(run)) return;
 		const started = startReview(liveSource(run, ctx), "auto-review", ctx);
 		if ("refused" in started) ctx.ui.notify(`fusion: auto-review of ${run.handle} did not start: ${started.refused}`, "warning");
@@ -3071,21 +3159,35 @@ export default function fusion(pi: ExtensionAPI, options: FusionOptions = {}) {
 		];
 	};
 
-	/** Report selected sources, never contract contents or fresh reads. */
+	/**
+	 * Report selected sources, availability and the defaults they declare, never contract contents or fresh reads. An
+	 * unusable override is reported as the file it was, not as a contract that was parsed.
+	 */
 	const contractLines = (): string[] => {
 		if (!contracts) return ["role contracts: not loaded in this instance"];
+		const loaded = contracts;
 		return [
 			"role contracts: selected when this instance started; edits apply after restarting Pi, /reload or a new session",
 			...ROLE_CONTRACT_FILES.flatMap((name) => {
-				const file = contracts!.files[name];
-				const source = instructionSourceLabel(file);
+				const file = loaded.files[name];
+				const source = file.unusable ? `${file.source === "project" ? "project" : "user"} override, unusable` : `${instructionSourceLabel(file)}${file.disabled ? ", disabled" : ""}`;
 				return [`role contract ${name}: ${source} · ${file.path}`, ...(file.diagnostic === undefined ? [] : [`role contract diagnostic: ${file.diagnostic}`])];
+			}),
+			...KNOWN_ROLE_NAMES.flatMap((role) => {
+				const reason = Object.hasOwn(loaded.unavailable, role) ? loaded.unavailable[role] : undefined;
+				return reason === undefined ? [] : [`role ${role}: unavailable in this instance (${reason}); its saved enabled setting is kept and no profile or edit enables it; change the contract, then restart Pi, /reload or start a new session`];
+			}),
+			...KNOWN_ROLE_NAMES.flatMap((role) => {
+				const declared = Object.hasOwn(loaded.defaults, role) ? loaded.defaults[role] : undefined;
+				if (declared === undefined) return [];
+				const fields = [`backend ${declared.backend}`, ...(declared.model === undefined ? [] : [`model ${declared.model}`]), ...(declared.effort === undefined ? [] : [`effort ${declared.effort}`])];
+				return [`role ${role}: built-in defaults from ${declared.path}: ${fields.join(", ")}; other fields keep this instance's legacy ${declared.backend} defaults`];
 			}),
 		];
 	};
 
 	/** The configuration's settings and the startup instruction sources in use. */
-	const configurationLines = async (): Promise<string[]> => {
+	const configurationLines = async (ctx: any): Promise<string[]> => {
 		let startup: string;
 		try {
 			startup = (await readProfiles()).defaultProfile ?? BUILTIN;
@@ -3093,7 +3195,92 @@ export default function fusion(pi: ExtensionAPI, options: FusionOptions = {}) {
 			startup = `unknown (${error instanceof Error ? error.message : String(error)})`;
 		}
 		const where = await profileStore.where().catch(() => "unknown");
-		return [`fusion configuration: ${configurationLabel(configuration)} · new sessions start with ${startup}`, ...settingsTable(configuration.roles), `profiles file: ${where}`, ...policyLines(), ...contractLines(), ...(await historyLines())];
+		return [`fusion configuration: ${configurationLabel(configuration)} · new sessions start with ${startup}`, ...settingsTable(configuration.roles, configuration.unavailable), `profiles file: ${where}`, ...(await presetLines(ctx)), ...policyLines(), ...contractLines(), ...(await historyLines())];
+	};
+
+	/** True when Pi reports the session's working directory as trusted now, as a preset command reads it. */
+	const trustedNow = (ctx: any): boolean => typeof ctx.isProjectTrusted === "function" && ctx.isProjectTrusted() === true;
+
+	/** The preset this instance runs on, as a line says it. */
+	const activePresetText = (): string =>
+		activePreset ? selectionText(activePreset) : startupFailure !== undefined ? `none: this instance's startup failed (${startupFailure})` : "not selected yet in this instance";
+
+	/** The branch's own choice, as a line says it: the next startup of this session reads it, this one never does. */
+	const sessionChoiceText = (session: SessionPreset): string =>
+		session.kind === "none" ? "none on this branch" : session.kind === "invalid" ? `unusable (${session.reason})` : session.preset === null ? "cleared on this branch, so the defaults decide" : `${session.preset} on this branch`;
+
+	/** What the next startup of this session would select, from this branch and the default files as they are now; reads only. */
+	const nextPresetText = async (ctx: any): Promise<string> => {
+		try {
+			return `the next startup of this session would select ${selectionText(await resolvePreset(sessionPreset(branchOf(ctx)), { cwd: ctx.cwd, projectTrusted: trustedNow(ctx) }, presetStore))}`;
+		} catch (error) {
+			return `the next startup of this session would refuse: ${error instanceof Error ? error.message : String(error)}`;
+		}
+	};
+
+	/** The preset lines /fusion preset and /fusion config show: active, this branch's choice, the next selection and the defaults. */
+	const presetLines = async (ctx: any): Promise<string[]> => {
+		const trusted = trustedNow(ctx);
+		const defaultLine = async (scope: PresetScope): Promise<string> => {
+			const where = await presetStore.where(scope, ctx.cwd).catch((error) => `unknown (${error instanceof Error ? error.message : String(error)})`);
+			if (scope === "project" && !trusted) return `project default: not read, Pi does not report this working directory as trusted · ${where}`;
+			try {
+				return `${scope} default: ${(await presetStore.read(scope, ctx.cwd)) ?? "unset"} · ${where}`;
+			} catch (error) {
+				return `${scope} default: unusable (${error instanceof Error ? error.message : String(error)})`;
+			}
+		};
+		return [
+			`instruction preset: ${activePresetText()}; selected when this instance started, and another applies only after /reload, a restart or resuming the session`,
+			`session preset choice: ${sessionChoiceText(sessionPreset(branchOf(ctx)))}`,
+			await nextPresetText(ctx),
+			await defaultLine("project"),
+			await defaultLine("user"),
+		];
+	};
+
+	/**
+	 * What /fusion preset does. A session choice is one branch entry for the next startup of this session, appended
+	 * without awaiting anything after its checks, so a run admitted or a shutdown begun in between cannot slip past them.
+	 * A default is a file for instances yet to start. Neither changes this instance's instructions, mode or settings.
+	 */
+	const presetCommand = async (command: Extract<FusionCommand, { kind: "preset" | "preset-use" | "preset-reset" | "preset-default" }>, ctx: any, notice: (text: string, level: "info" | "warning" | "error") => void): Promise<void> => {
+		if (command.kind === "preset") {
+			notice([...(await presetLines(ctx)), `presets: ${PRESET_NAMES.join(", ")}`].join("\n"), "info");
+			return;
+		}
+		if (command.kind === "preset-default") {
+			const { scope, name } = command;
+			if (scope === "project" && !trustedNow(ctx)) {
+				notice("the project default preset was not changed: Pi does not report this working directory as trusted", "warning");
+				return;
+			}
+			try {
+				await presetStore.write(scope, ctx.cwd, name);
+			} catch (error) {
+				notice(`the ${scope} default preset was not changed: ${error instanceof Error ? error.message : String(error)}`, "warning");
+				return;
+			}
+			const where = await presetStore.where(scope, ctx.cwd).catch(() => `the ${scope} preset file`);
+			notice(`${name === null ? `cleared the ${scope} default preset` : `the ${scope} default preset is ${name}`} in ${where}; new Fusion instances read it, and this instance keeps ${activePresetText()}`, "info");
+			return;
+		}
+		if (shuttingDown) {
+			notice("this Fusion instance is shutting down, so the session's preset choice is unchanged", "warning");
+			return;
+		}
+		const names = unfinishedNames();
+		if (names) {
+			notice(`the session's preset choice stays as it is while runs are unfinished: ${names}. Wait for each run or cancel it with /fusion cancel run-N, then retry.`, "warning");
+			return;
+		}
+		const preset = command.kind === "preset-use" ? command.name : null;
+		const entry: PresetEntry = { version: PRESET_ENTRY_VERSION, preset };
+		pi.appendEntry(PRESET_ENTRY, entry);
+		const untrusted = preset === "project" && !trustedNow(ctx) ? "; Pi does not report this working directory as trusted, so that startup will refuse until it is" : "";
+		const kept = `this instance keeps ${activePresetText()}`;
+		if (preset !== null) notice(`this session will use preset ${preset} after /reload, a restart or resuming it${untrusted}; ${kept}`, "info");
+		else notice(`cleared this session's preset choice; after /reload the project and user defaults decide, and an unusable default file still refuses (/fusion preset use builtin bypasses them); ${kept}; ${await nextPresetText(ctx)}`, "info");
 	};
 
 	/** The saved history preference as a line says it, read again now, or why it could not be read. */
@@ -3141,10 +3328,14 @@ export default function fusion(pi: ExtensionAPI, options: FusionOptions = {}) {
 		notice(`fusion: ${saved} in ${where}; ${active}`, "info");
 	};
 
-	/** The roles a configuration disables, as a notice ends with them, so a switch says what it turned off. */
+	/**
+	 * The roles a configuration disables, as a notice ends with them, so a switch says what it turned off, and apart from
+	 * them the roles the startup contracts make unavailable, whatever the configuration says of those.
+	 */
 	const disabledText = (roles: RoleSettings): string => {
-		const off = KNOWN_ROLE_NAMES.filter((role) => !roles[role].enabled);
-		return off.length ? `; disabled: ${off.join(", ")}` : "";
+		const unavailable = KNOWN_ROLE_NAMES.filter((role) => unavailableReason(role, configuration) !== undefined);
+		const off = KNOWN_ROLE_NAMES.filter((role) => !roles[role].enabled && !unavailable.includes(role));
+		return `${off.length ? `; disabled: ${off.join(", ")}` : ""}${unavailable.length ? `; unavailable by role contract: ${unavailable.join(", ")}` : ""}`;
 	};
 
 	/** Loads a saved profile, or the built-in configuration, into this session; the file is read again for it. */
@@ -3155,7 +3346,7 @@ export default function fusion(pi: ExtensionAPI, options: FusionOptions = {}) {
 			return;
 		}
 		let next: Configuration;
-		if (name === BUILTIN) next = builtinConfiguration(baseline);
+		if (name === BUILTIN) next = startupBuiltin();
 		else {
 			let document: ProfileDocument;
 			try {
@@ -3226,12 +3417,16 @@ export default function fusion(pi: ExtensionAPI, options: FusionOptions = {}) {
 		return typed;
 	};
 
-	/** Edits one role of a draft in place, field by field, until the user goes back to the table. */
+	/**
+	 * Edits one role of a draft in place, field by field, until the user goes back to the table. A role its contract made
+	 * unavailable keeps its enabled setting as it is: the editor offers no way to turn it on, because nothing here would.
+	 */
 	const editRole = async (ctx: any, role: KnownRoleName, draft: RoleSettings): Promise<void> => {
 		for (;;) {
 			const setting = draft[role];
+			const unavailable = unavailableReason(role, configuration);
 			const options = [
-				`enabled: ${setting.enabled ? "yes" : "no"}`,
+				unavailable === undefined ? `enabled: ${setting.enabled ? "yes" : "no"}` : `enabled: unavailable by role contract (saved setting ${setting.enabled ? "yes" : "no"})`,
 				`backend: ${setting.backend}`,
 				`model: ${modelShown(setting)}`,
 				`effort: ${effortShown(role, setting)}`,
@@ -3240,7 +3435,13 @@ export default function fusion(pi: ExtensionAPI, options: FusionOptions = {}) {
 			const choice = await ctx.ui.select(`fusion config · ${role}`, options);
 			if (choice === undefined || choice === "Back") return;
 			const field = options.indexOf(choice);
-			if (field === 0) draft[role] = { ...setting, enabled: !setting.enabled };
+			if (field === 0) {
+				if (unavailable !== undefined) {
+					ctx.ui.notify(unavailableRoleText(role, unavailable), "warning");
+					continue;
+				}
+				draft[role] = { ...setting, enabled: !setting.enabled };
+			}
 			else if (field === 1) {
 				const backends = ROLE_SPECS[role].backends;
 				if (backends.length === 1) {
@@ -3286,11 +3487,13 @@ export default function fusion(pi: ExtensionAPI, options: FusionOptions = {}) {
 			return;
 		}
 		const draft = copySettings(configuration.roles);
+		// Read once as the editor opens: the default files are shown, never applied, and the draft does not depend on them.
+		const presets = await presetLines(ctx);
 		for (;;) {
-			const rows = settingsTable(draft);
+			const rows = settingsTable(draft, configuration.unavailable);
 			const APPLY = "Apply";
 			const CANCEL = "Cancel";
-			const choice = await ctx.ui.select(`fusion config · ${configurationLabel(configuration)}\n${[...policyLines(), ...contractLines(), rows[0]].join("\n")}`, [...rows.slice(1), APPLY, CANCEL]);
+			const choice = await ctx.ui.select(`fusion config · ${configurationLabel(configuration)}\n${[...presets, ...policyLines(), ...contractLines(), rows[0]].join("\n")}`, [...rows.slice(1), APPLY, CANCEL]);
 			if (choice === undefined || choice === CANCEL) {
 				notice("fusion config cancelled; nothing changed", "info");
 				return;
@@ -3330,7 +3533,7 @@ export default function fusion(pi: ExtensionAPI, options: FusionOptions = {}) {
 		if (command.kind === "config") {
 			// The editor's Claude model field edits the current model in place, which only the host's editor dialog can do.
 			if (dialogs && typeof ctx.ui.editor === "function") await editConfiguration(ctx, notice);
-			else notice((await configurationLines()).join("\n"), "info");
+			else notice((await configurationLines(ctx)).join("\n"), "info");
 			return;
 		}
 		if (command.kind === "profile-use") return useProfile(command.name, notice);
@@ -3398,7 +3601,7 @@ export default function fusion(pi: ExtensionAPI, options: FusionOptions = {}) {
 	};
 
 	pi.registerCommand("fusion", {
-		description: "Show Fusion's mode and roles, open or close the dashboard or set its run limit, check, cancel, steer, answer, review and wait for this session's runs, turn fusion on or off, or configure roles and profiles",
+		description: "Show Fusion's mode and roles, open or close the dashboard or set its run limit, check, cancel, steer, answer, review and wait for this session's runs, turn fusion on or off, configure roles and profiles, or choose the instruction preset for the next startup",
 		getArgumentCompletions: (prefix: string) => {
 			const profile = PROFILE_ARG.exec(prefix);
 			if (profile) {
@@ -3406,6 +3609,12 @@ export default function fusion(pi: ExtensionAPI, options: FusionOptions = {}) {
 				const names = [...(kind === "save" ? [] : [BUILTIN]), ...Object.keys(knownProfiles?.profiles ?? {}).sort()];
 				const matches = names.filter((name) => name.startsWith(profile[2]!));
 				return matches.length ? matches.map((name) => ({ value: `profile ${kind} ${name}`, label: `profile ${kind} ${name}` })) : null;
+			}
+			const preset = PRESET_ARG.exec(prefix);
+			if (preset) {
+				const kind = preset[1]!.replace(/\s+/g, " ");
+				const names = [...PRESET_NAMES, ...(kind === "use" ? [] : ["clear"])].filter((name) => name.startsWith(preset[2]!));
+				return names.length ? names.map((name) => ({ value: `preset ${kind} ${name}`, label: `preset ${kind} ${name}` })) : null;
 			}
 			const named = RUN_ARG.exec(prefix);
 			if (named) {
@@ -3456,6 +3665,12 @@ export default function fusion(pi: ExtensionAPI, options: FusionOptions = {}) {
 				notice(`fusion: dashboard run limit is ${store.maxRuns}; active runs are never evicted`, "info");
 				return;
 			}
+			// A preset is chosen for a later startup, so these neither wait for this one nor depend on it having succeeded:
+			// they are how a failed startup is recovered from.
+			if (command.kind === "preset" || command.kind === "preset-use" || command.kind === "preset-reset" || command.kind === "preset-default") {
+				await presetCommand(command, ctx, notice);
+				return;
+			}
 			// Every command from here on waits for the default profile and the host policy as a call does: a review or a
 			// setting reads the configuration, and the others have always waited with them. Once both have loaded, nothing
 			// here yields. A startup that failed refuses each of them with its reason, as it refuses every delegation call;
@@ -3472,7 +3687,7 @@ export default function fusion(pi: ExtensionAPI, options: FusionOptions = {}) {
 			noteSettings(ctx);
 			ensureHistory(ctx);
 			if (command.kind === "summary") {
-				notice([`fusion: ${enabled ? "on" : "off"}`, "", ...settingsTable(configuration.roles)].join("\n"), "info");
+				notice([`fusion: ${enabled ? "on" : "off"}`, "", ...settingsTable(configuration.roles, configuration.unavailable)].join("\n"), "info");
 				return;
 			}
 			if (
@@ -3519,7 +3734,7 @@ export default function fusion(pi: ExtensionAPI, options: FusionOptions = {}) {
 				if (command.handle === undefined) {
 					const all = [...runs.values()];
 					const earlier = heldRuns(ctx).map((held) => `${held.handle} · ${held.role} · ${held.model} · ${held.state} · earlier Pi process`);
-					notice([`fusion: ${enabled ? "on" : "off"}`, `profile: ${configurationLabel(configuration)}`, `history: ${historyActive()}`, "", ...settingsTable(configuration.roles), "", ...(all.length ? all.map(statusLine) : ["no runs in this Pi session yet"]), ...earlier, usageLine()].join("\n"), "info");
+					notice([`fusion: ${enabled ? "on" : "off"}`, `profile: ${configurationLabel(configuration)}`, `history: ${historyActive()}`, "", ...settingsTable(configuration.roles, configuration.unavailable), "", ...(all.length ? all.map(statusLine) : ["no runs in this Pi session yet"]), ...earlier, usageLine()].join("\n"), "info");
 					return;
 				}
 				const run = live(command.handle);
@@ -3882,12 +4097,23 @@ export default function fusion(pi: ExtensionAPI, options: FusionOptions = {}) {
 	const guidanceInput = (): GuidanceInput => ({
 		names: { fusion: TOOL_NAME, fusionControl: CONTROL_TOOL_NAME, claude: CLAUDE_TOOL_NAME, claudeControl: CLAUDE_CONTROL_NAME },
 		roles: configuration.roles,
+		unavailable: configuration.unavailable ?? {},
 		roleGuidance: contracts?.guidance ?? unloadedRoleGuidance,
 		baseline: configuration.baseline,
 		claudeRoles: ROLE_NAMES,
 		quote: { open: CHILD_QUOTE_OPEN, close: CHILD_QUOTE_CLOSE },
 		policy: policy?.text,
 	});
+
+	/**
+	 * A tool's role parameter: the roles it runs that this instance makes available and this session enables. With none,
+	 * the parameter is left out rather than declared with an empty or invented enum, and the tool refuses every call.
+	 * A call made against an older schema is still refused by the route, which reads the configuration it runs on.
+	 */
+	const roleParameter = (roles: readonly KnownRoleName[], description: string): Record<string, TSchema> => {
+		const usable = usableRoles(roles, configuration);
+		return usable.length ? { role: Type.Optional(stringEnum(usable, description)) } : {};
+	};
 
 	/** The fusion tool as this session's configuration describes it; its executor and renderers never change. */
 	const fusionTool = () => {
@@ -3899,7 +4125,7 @@ export default function fusion(pi: ExtensionAPI, options: FusionOptions = {}) {
 			label: "Fusion",
 			...fusionGuidance(input),
 			parameters: Type.Object({
-				role: Type.Optional(stringEnum(KNOWN_ROLE_NAMES, help.role)),
+				...roleParameter(KNOWN_ROLE_NAMES, help.role),
 				task: Type.String({ description: help.task }),
 				continue: Type.Optional(Type.String({ description: help.continue })),
 				context: Type.Optional(Type.String({ description: help.context })),
@@ -3939,7 +4165,7 @@ export default function fusion(pi: ExtensionAPI, options: FusionOptions = {}) {
 			label: "Claude",
 			...claudeGuidance(input),
 			parameters: Type.Object({
-				role: Type.Optional(stringEnum(ROLE_NAMES, help.role)),
+				...roleParameter(ROLE_NAMES, help.role),
 				task: Type.String({ description: help.task }),
 				continue: Type.Optional(Type.String({ description: help.continue })),
 				context: Type.Optional(Type.String({ description: help.context })),

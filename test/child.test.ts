@@ -601,6 +601,12 @@ test("a startup-resolved body reaches the Claude SDK without rereading a file or
 	}
 });
 
+test("childOptions takes a supplied contract body as text, unparsed, and refuses a blank one before any child", () => {
+	const headed = "---\ndisabled: true\n---\nAlready resolved.\n";
+	assert.equal((childOptions(implementRole, undefined, "t", headed).systemPrompt as { append: string }).append, headed);
+	assert.throws(() => childOptions(implementRole, undefined, "t", " \n"), /supplied role contract body is blank/);
+});
+
 test("childOptions maps a role to SDK options", () => {
 	const saved = process.env.PI_FUSION_ULTRACODE_WORKFLOW_SIZE;
 	try {

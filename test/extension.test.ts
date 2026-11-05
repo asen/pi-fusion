@@ -14,6 +14,7 @@ import { PI_CHILD_MARKER, PI_CHILD_VARIABLE } from "../extensions/backends/pi-la
 import fusion from "../extensions/fusion.ts";
 import { HOST_POLICY_FILE, memoryHostPolicyLoader, SHIPPED_HOST_POLICY_PATH } from "../extensions/host-policy.ts";
 import { memoryRoleContractLoader } from "../extensions/role-contract-loader.ts";
+import { memoryPresetDefaults } from "../extensions/presets.ts";
 import { memoryProfileStore } from "../extensions/profile-store.ts";
 import { memorySettingsStore } from "../extensions/settings-store.ts";
 import { parseRoleContract } from "../extensions/role-contracts.ts";
@@ -93,7 +94,7 @@ const api = {
 
 // The tripwires in place of the pi and codex backends: nothing in this file runs a pi or codex child, and the one case
 // that reads the production registration makes its own below.
-fusion(api, { backends: { ...tripwires() }, profiles: memoryProfileStore(), settings: memorySettingsStore(), hostPolicy: memoryHostPolicyLoader(), roleContracts: memoryRoleContractLoader() });
+fusion(api, { backends: { ...tripwires() }, profiles: memoryProfileStore(), settings: memorySettingsStore(), hostPolicy: memoryHostPolicyLoader(), roleContracts: memoryRoleContractLoader(), presetDefaults: memoryPresetDefaults() });
 // Fusion starts off; the cases here delegate, so the host turns it on as a user's request for Fusion does.
 void turnOn(tools.find((tool) => tool.name === "fusion_activate"));
 
@@ -189,6 +190,12 @@ test("registers the sequential fusion and claude tool pairs and the two mode too
 		{ value: "profile use", label: "profile use" },
 		{ value: "profile save", label: "profile save" },
 		{ value: "profile default", label: "profile default" },
+		{ value: "preset", label: "preset" },
+		{ value: "preset list", label: "preset list" },
+		{ value: "preset use", label: "preset use" },
+		{ value: "preset reset", label: "preset reset" },
+		{ value: "preset default user", label: "preset default user" },
+		{ value: "preset default project", label: "preset default project" },
 		{ value: "history", label: "history" },
 		{ value: "history on", label: "history on" },
 		{ value: "history off", label: "history off" },
@@ -352,12 +359,12 @@ test("the claude tool keeps the exact schema it had: four roles, five efforts an
 	assert.deepEqual(byName("claude").parameters.required, ["task"]);
 });
 
-test("the fusion tool advertises every role a backend runs and a backend as plain string enums, and its effort as a string each backend checks", () => {
+test("the fusion tool advertises every enabled role and a backend as plain string enums, and its effort as a string each backend checks", () => {
 	const properties = byName("fusion").parameters.properties;
 	assert.deepEqual(Object.keys(properties), ["role", "task", "continue", "context", "background", "fresh", "mode", "backend", "model", "effort"]);
-	assert.deepEqual(properties.role.enum, ["plan", "implement", "ultracode", "ask", "security"], "the primary tool advertises security, which runs on pi alone");
+	assert.deepEqual(properties.role.enum, ["plan", "implement", "ultracode", "ask"], "the primary tool leaves out security, which the built-in configuration keeps off");
 	assert.deepEqual(byName("claude").parameters.properties.role.enum, ["plan", "implement", "ultracode", "ask"], "and the compatibility tool advertises the four roles claude runs");
-	// The enum keeps every role so it is never empty; the help names only enabled roles, with one refusal guideline.
+	// The enum and the help name only enabled roles; one guideline says what a disabled role's call meets.
 	assert.match(properties.role.description, /^plan, implement, ultracode or ask\. Required unless continue is set\.$/);
 	assert.deepEqual(properties.backend.enum, ["claude", "pi", "codex"]);
 	assert.equal(properties.backend.type, "string");
@@ -488,7 +495,7 @@ test("the fusion tool says which harness runs what, and the pi backend it regist
 	// lifecycle. The fake is in-memory and starts nothing: no pi child, process, protocol or provider is behind it.
 	const fake = fakeBackend();
 	const injected = recordedHost();
-	fusion(injected.api, { backends: { ...tripwires(), pi: fake.backend }, profiles: memoryProfileStore(), settings: memorySettingsStore(), hostPolicy: memoryHostPolicyLoader(), roleContracts: memoryRoleContractLoader() });
+	fusion(injected.api, { backends: { ...tripwires(), pi: fake.backend }, profiles: memoryProfileStore(), settings: memorySettingsStore(), hostPolicy: memoryHostPolicyLoader(), roleContracts: memoryRoleContractLoader(), presetDefaults: memoryPresetDefaults() });
 	void turnOn(injected.into.tools.get("fusion_activate"));
 	const injectedFusion = injected.into.tools.get("fusion");
 	assert.ok(injectedFusion, "the registration that injected a pi backend advertises no fusion tool");
@@ -589,7 +596,7 @@ test("a marked pi child registers nothing at all, and any other value registers 
 		try {
 			// What is registered is what this case reads, so the tripwires stand in for pi and codex here too: nothing
 			// below runs a call, and a registration that took the production one would still be one more of them.
-			fusion(recorder, { backends: { ...tripwires() }, profiles: memoryProfileStore(), settings: memorySettingsStore(), hostPolicy: memoryHostPolicyLoader(), roleContracts: memoryRoleContractLoader() });
+			fusion(recorder, { backends: { ...tripwires() }, profiles: memoryProfileStore(), settings: memorySettingsStore(), hostPolicy: memoryHostPolicyLoader(), roleContracts: memoryRoleContractLoader(), presetDefaults: memoryPresetDefaults() });
 		} finally {
 			if (before === undefined) delete process.env[PI_CHILD_VARIABLE];
 			else process.env[PI_CHILD_VARIABLE] = before;
@@ -1088,7 +1095,7 @@ test("a later /fusion dashboard gets a fresh url and session_shutdown closes it,
 
 test("bare /fusion shows only mode and roles, while invalid arguments only warn about usage", async () => {
 	const usage =
-		"Usage: /fusion dashboard | /fusion dashboard stop | /fusion dashboard limit [N] | /fusion status [run-N] | /fusion cancel run-N | /fusion wait run-N | /fusion steer run-N <text> | /fusion answer [run-N] [text] | /fusion review run-N | /fusion on | /fusion off | /fusion config | /fusion profile [list | use <name> | save <name> | default <name>] | /fusion history [on | off]";
+		"Usage: /fusion dashboard | /fusion dashboard stop | /fusion dashboard limit [N] | /fusion status [run-N] | /fusion cancel run-N | /fusion wait run-N | /fusion steer run-N <text> | /fusion answer [run-N] [text] | /fusion review run-N | /fusion on | /fusion off | /fusion config | /fusion profile [list | use <name> | save <name> | default <name>] | /fusion preset [list | use <name> | reset | default user|project <name>|clear] | /fusion history [on | off]";
 	for (const args of ["", "   "]) {
 		const notices = await runCommand(args);
 		assert.equal(notices.length, 1, `for ${JSON.stringify(args)}`);

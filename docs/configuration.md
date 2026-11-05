@@ -30,9 +30,9 @@ Use [profiles and role settings](profiles.md) for session configuration; environ
 | `PI_FUSION_HISTORY` | Unset; compatibility fallback captured at instance start: `1` turns [history](runs.md#turning-history-on-and-off) on when no preference is saved in [the settings file](#the-fusion-settings-file). History saves prompts/reports/usage to private version-1 JSON files for durable host sessions, and lets the dashboard list [archived runs](dashboard.md#archived-runs) |
 | `PI_FUSION_HISTORY_DIR` | Unset; default `<agent dir>/pi-fusion/history` |
 
-Role model/effort variables are read once when the extension instance starts. Changing the shell afterwards requires a new instance. A profile is a complete snapshot and never falls back to a variable for an omitted configured field. An explicit call naming another backend uses that backend's captured legacy defaults, not the model of the configured backend.
+Role model/effort variables are read once when the extension instance starts. Changing the shell afterwards requires a new instance. A profile is a complete snapshot and never falls back to a variable for an omitted configured field. An explicit call naming another backend uses that backend's captured legacy defaults, not the model of the configured backend and not [role-contract defaults](#role-availability-and-defaults).
 
-The built-in configuration enables every role except **security**, whose backend is Pi. `PI_FUSION_PI_SECURITY_MODEL` supplies its model, not its enabled state. Saved profiles retain their own enabled settings. Backend capabilities are code: `ultracode` is Claude-only, `security` Pi-only, and Codex supports `plan`, `implement`, and `ask` runs (see [Codex backend](codex-backend.md)); disabling a role does not unregister a backend.
+The built-in configuration enables every role except **security**, whose backend is Pi. `PI_FUSION_PI_SECURITY_MODEL` supplies its model, not its enabled state. A selected role contract may [change a role's built-in backend, model and effort, or make it unavailable](#role-availability-and-defaults). Saved profiles retain their own enabled settings. Backend capabilities are code: `ultracode` is Claude-only, `security` Pi-only, and Codex supports `plan`, `implement`, and `ask` runs (see [Codex backend](codex-backend.md)); disabling a role does not unregister a backend.
 
 Claude plan effort defaults to `xhigh`; there is no plan-effort environment variable, but a profile or call can set it. Ultracode effort is fixed to `ultracode`, not plain `xhigh`, because the latter drops the workflow opt-in. Its workflow agents' model/effort live in `contracts/ultracode.md`, not a variable.
 
@@ -51,7 +51,7 @@ host:
 ---
 ```
 
-At startup, Fusion resolves and validates [role contracts](#role-contract-overrides) once, using the same selection for both delegation tools' host metadata and every backend's child instructions. Only enabled roles are advertised. The host strips frontmatter before passing the Markdown body to a child; `ask-review.md` may remain headerless. Ask's host metadata describes both answer and review modes. Runtime capabilities, parameters and settings remain generated from code; cross-role orchestration remains the host policy's. This parsing applies to role contracts only: `host.md` is still carried as written.
+At startup, Fusion resolves and validates [role contracts](#role-contract-overrides) once, using the same selection for both delegation tools' host metadata, every backend's child instructions, [role availability and built-in defaults](#role-availability-and-defaults). Only available, enabled roles are advertised: each delegation tool's `role` enum lists the roles it runs that are both, and leaves `role` out when none remain. The host strips frontmatter before passing the Markdown body to a child; `ask-review.md` may remain headerless. Ask's host metadata describes both answer and review modes. Runtime capabilities, parameters and settings remain generated from code; cross-role orchestration remains the host policy's. This parsing applies to role contracts only: `host.md` is still carried as written.
 
 ## The Fusion settings file
 
@@ -74,7 +74,7 @@ Writes follow the [profiles file](profiles.md#how-the-file-is-written) rules. A 
 
 ## Project-local instruction overrides
 
-Fusion can select instructions from the Pi session's working directory:
+Which sources a startup consults is its [preset](presets.md): `auto`, the default, consults project, user and shipped files as described here; `user` and `project` consult one scope over shipped files; `builtin` and `architect` consult no override at all. Fusion can select instructions from the Pi session's working directory:
 
 ```text
 <cwd>/.pi/pi-fusion/
@@ -83,18 +83,18 @@ Fusion can select instructions from the Pi session's working directory:
     implement.md          # only the files you customize
 ```
 
-Selection is **per file**, not per directory:
+Under `auto`, selection is **per file**, not per directory:
 
 ```text
 valid project override -> valid user override -> shipped file
 <cwd>/.pi/pi-fusion/      <agent dir>/pi-fusion/   <install>/contracts/
 ```
 
-You do not need to copy every contract. For example, a project can replace only `implement.md`, while `ask-answer.md` comes from your user directory and `ask-review.md` from the installation. Each selected file replaces the lower-priority version whole; host metadata and child body are never merged from different files. Missing files silently fall through. Invalid or unreadable project files warn and fall through to the user version, then shipped; if both overrides are invalid, the diagnostic retains both reasons. The shipped files must still be valid.
+You do not need to copy every contract. For example, a project can replace only `implement.md`, while `ask-answer.md` comes from your user directory and `ask-review.md` from the installation. Each selected file replaces the lower-priority version whole; host metadata and child body are never merged from different files. Missing files silently fall through. An invalid or unreadable project `host.md` warns and falls through to the user version, then shipped; if both overrides are invalid, the diagnostic retains both reasons. A role contract that is present but unusable does **not** fall through: its role becomes [unavailable](#unusable-role-overrides). The shipped files must still be valid.
 
 Lookup uses the **session context's cwd**, not the process cwd, and does not search parents or infer a Git root. Start Pi in the directory whose `.pi/pi-fusion` you want. Production loaders consult project files only when Pi's `isProjectTrusted()` reports `true`; a false or unavailable accessor skips them. Fusion adds no separate trust prompt or database. Pi may report trust without prompting when no recognized protected project resources exist; `--approve` and `--no-approve` explicitly control Pi's decision. Trust is not isolation.
 
-Both scopes are read once at startup. Edits, deletion, trust changes and profile switches do not change that instance's instruction snapshot; restart or `/reload` to select again. `/fusion config` shows `project override`, `user override` or `shipped`, their selected paths and any fallback diagnostics. Loading creates no directories or files.
+Both scopes are read once at startup. Edits, deletion, trust changes and profile switches do not change that instance's instruction snapshot; restart or `/reload` to select again. `/fusion config` shows `project override`, `user override` or `shipped`, their selected paths and any diagnostics. Loading creates no directories or files.
 
 To customize just the implementer, copy its currently selected complete file, including frontmatter:
 
@@ -104,7 +104,7 @@ cp <selected implement.md path from /fusion config> .pi/pi-fusion/contracts/impl
 $EDITOR .pi/pi-fusion/contracts/implement.md
 ```
 
-The same applies to `.pi/pi-fusion/host.md`. **Profiles and settings remain user-global**: there is no project `profiles.json` or `settings.json` support under `.pi/pi-fusion/`. Role enablement/backend/model settings still come from the current profile or `/fusion config`.
+The same applies to `.pi/pi-fusion/host.md`. **Profiles and settings remain user-global**: there is no project `profiles.json` or `settings.json` support under `.pi/pi-fusion/`. Role enablement/backend/model settings still come from the current profile or `/fusion config`; a project contract can only make a role unavailable or change its built-in defaults, as [below](#role-availability-and-defaults).
 
 ## The host policy file
 
@@ -112,8 +112,9 @@ The same applies to `.pi/pi-fusion/host.md`. **Profiles and settings remain user
 
 ```text
 startup (session_start, or the first call/command needing configuration)
+  select the preset (see Instruction presets); an unusable selector fails startup
   read shipped host.md --unusable--> startup fails
-  select project -> user -> shipped (missing falls through; unusable warns and falls through)
+  select within the preset's scopes (missing falls through; unusable warns and falls through)
   resolve role contracts (see below) and read default profile
   -> policy + contract metadata + profile applied to guidance in one step (also with no saved profile)
 ```
@@ -131,6 +132,7 @@ startup (session_start, or the first call/command needing configuration)
 host policy: shipped · <install>/contracts/host.md · selected when this instance started; an edit applies after restarting Pi, /reload or a new session
 host policy: user override · <agent dir>/pi-fusion/host.md · selected when ...
 host policy: project override · <cwd>/.pi/pi-fusion/host.md · selected when ...
+host policy: bundled preset · <install>/presets/architect/host.md · selected when ...
 host policy: user override (project override set aside) · <agent dir>/pi-fusion/host.md · selected when ...
 host policy: shipped (override set aside) · <install>/contracts/host.md · selected when ...
 host policy diagnostic: the host policy override <agent dir>/pi-fusion/host.md is blank; using the shipped host policy instead
@@ -159,13 +161,61 @@ Then `/reload`, restart Pi, or start a new session, and check `/fusion config`. 
 | `ask-review.md` | Not used; frontmatter is optional | Ask review mode |
 | `security.md` | Security | Security (Pi only) |
 
-Each named override replaces its lower-priority counterpart **whole**, not just its body or frontmatter. The five files supplying host metadata must retain the complete `host` header shown above and a nonblank child body. `ask-review.md` needs only nonblank child instructions; if it has frontmatter, that header must also be valid. Unknown filenames are ignored. The host policy override remains `pi-fusion/host.md`, not `pi-fusion/contracts/host.md`.
+Each named override replaces its lower-priority counterpart **whole**, not just its body or frontmatter. The five files supplying host metadata must retain the complete `host` header shown above and a nonblank child body, unless they [declare their role disabled](#role-availability-and-defaults). `ask-review.md` needs only nonblank child instructions; if it has frontmatter, that header must also be valid and may not declare `disabled` or `defaults`, which belong to `ask-answer.md`. Unknown filenames are ignored. The host policy override remains `pi-fusion/host.md`, not `pi-fusion/contracts/host.md`.
 
-Loading uses the same file machinery as the host policy: regular files, strict UTF-8, nonblank, at most **64 KiB per file**, no templates or includes. Every shipped contract is validated before any role override is consulted, including disabled roles. A broken shipped contract fails startup; an override never hides a broken install. A missing override quietly falls through to the next scope. An unreadable or invalid override falls through with one startup warning naming the file and reason; other valid overrides still apply. Loading creates and writes nothing.
+Loading uses the same file machinery as the host policy: regular files, strict UTF-8, nonblank, at most **64 KiB per file**, no templates or includes. Every shipped contract is validated before any role override is consulted, including disabled roles. A broken shipped contract fails startup; an override never hides a broken install. A missing override quietly falls through to the next scope. Loading creates and writes nothing.
+
+### Role availability and defaults
+
+Besides `host`, a role contract's frontmatter may carry two optional top-level fields. Any other top-level field, or any `host` field besides the four shown above, makes the file invalid, so a misspelt or misplaced key (such as `disabled` under `host`) cannot leave a role available by accident. Diagnostics name the field category and file, never the unknown key or rejected value.
+
+A role that starts on Codex with a chosen model (`defaults` with `backend`, which is required whenever `defaults` is present):
+
+```yaml
+---
+disabled: false           # optional; absent is the same
+defaults:
+  backend: codex
+  model: gpt-6.1-sol      # optional
+  effort: high            # optional
+host:
+  description: Implements one bounded task.
+  guidance:
+    - Supply acceptance criteria and verification commands.
+  task_brief: What to change, where, and how to verify it.
+  snippet: bounded implementation
+---
+
+You are the implementer. ...
+```
+
+A role made unavailable, with the minimal contract it needs (no child body):
+
+```yaml
+---
+disabled: true
+host:
+  description: Not used in this project.
+  guidance: []
+  task_brief: Not used.
+  snippet: unavailable
+---
+```
+
+- **`disabled: true`** makes the role **unavailable** for the instance's life. It is a hard restriction, not a default: no saved profile, `/fusion config` edit, call parameter or explicit request enables it. Fresh calls, continuations, implicit plan continuations and handoffs are refused before a handle, snapshot or backend entry; `ask-answer.md` disabled also refuses manual reviews and quietly skips automatic ones. To use the role again, change the selected contract and restart Pi, `/reload` or start a new session. A disabled contract keeps a valid `host` header (short text is fine) and may omit the child body; it is never sent to a child. `disabled: true` is valid in any scope, and a valid higher-priority file can replace it; this build's shipped contracts are all available.
+- **`defaults`** sets the role's **built-in** starting point (an unavailable role's `defaults` are not applied): the backend a fresh configuration puts it on and, field by field over that backend's [captured legacy defaults](#environment-variables), its model and effort. Omitted fields keep the legacy ones; nothing crosses from another backend. A model-only Claude default keeps Claude's legacy effort; Pi and Codex keep their own optional effort variable. Values are checked as a profile's are: the backend must run the role, a Pi model is `provider/model`, Codex values are single tokens, Claude/Pi efforts come from their lists, ultracode's effort is `ultracode` or omitted. Blank values are invalid, not a reset.
+
+Defaults apply only where the built-in configuration does: a session with no saved default profile, and `/fusion profile use builtin`, which restores the startup selection without rereading. A saved profile is a complete snapshot and wins over them. An explicit call naming another backend, and the editor's backend switch, use that backend's legacy defaults, not the contract's. Continuations keep their recorded selection; older Claude records missing a model or effort still fall back to the legacy defaults, never a contract's. A Pi role a contract leaves without a model is refused, naming that contract.
+
+Saved profiles keep their `enabled` setting for an unavailable role: the role table shows `unavailable` in its place, the editor offers no way to turn it on, and saving the configuration writes the setting unchanged. `/fusion config` lists each unavailable role with its reason, and each role's declared defaults with their path.
+
+### Unusable role overrides
+
+A role-contract override that is present but unreadable or invalid (including invalid `disabled` or `defaults`, or a link whose target is missing, at the file or at a directory above it), or a scope whose directory cannot be located, makes its role **unavailable** with one startup warning and a `/fusion config` diagnostic naming the scope, path and reason. Fusion does not fall back to a lower scope for it, because that file may have restricted the role. An unusable `ask-review.md` makes role `ask` unavailable, so a broken review contract never falls back to the shipped reviewer. If the user agent directory cannot be resolved, every role whose project file is missing becomes unavailable. Fix or remove the file, then restart Pi, `/reload` or start a new session. Other valid overrides still apply, and an invalid `host.md` keeps its own fallback.
 
 The host loads one snapshot at `session_start`, or the first call/command needing configuration. Delegation and configuration wait for it. Both host metadata and child bodies come from that snapshot, including continuations, plan handoffs and reviews, on Claude, Pi and Codex. No run rereads contract files, and profile/settings changes do not reload them. Before startup finishes, role descriptions say their contracts are not loaded yet. A failed load is not retried in that instance and refuses the same gated operations as a failed host-policy load; mode and control tools remain usable.
 
-`/fusion config` and its editor list each selected source and path, plus diagnostics for overrides set aside, never contract contents. These are startup observations, not new reads. To customize one file, copy the shipped path shown there:
+`/fusion config` and its editor list each selected source and path (`, disabled` or `, unusable` where applicable), diagnostics, unavailable roles with their reasons and declared defaults, never contract contents. These are startup observations, not new reads. To customize one file, copy the shipped path shown there:
 
 ```bash
 mkdir -p ~/.pi/agent/pi-fusion/contracts

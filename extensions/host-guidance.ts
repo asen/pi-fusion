@@ -9,10 +9,10 @@ import { KNOWN_ROLE_NAMES, type KnownRoleName, runsOn } from "./roles.ts";
  * text and its own checks decide what a call does. Every name and marker the text quotes is passed in, so this module
  * reads no backend binding and holds no host state.
  *
- * Each tool's text is composed from the roles that tool can run and this session enables, and from what roles.ts says
- * each backend runs. A disabled role is named only where the text says it is disabled: no recommendation, comparison,
- * backend list or task example presents it as usable, and the tool schema's role enum, which keeps every role so it is
- * never empty, is not explanatory text.
+ * Each tool's text is composed from the roles that tool can run, this instance's role contracts make available and this
+ * session enables, and from what roles.ts says each backend runs. A disabled or unavailable role is named only where the
+ * text says it is refused: no recommendation, comparison, backend list or task example presents it as usable. The
+ * schema's role enum, which the host builds from the same roles and leaves out when none remain, is not this text.
  *
  * How the host orchestrates is not decided here. That is the host policy's, which both tools carry as one guideline of
  * its own, the selected Markdown unchanged; the rest of the text says what this session makes available and the fixed
@@ -37,6 +37,8 @@ export interface QuoteMarkers {
 export interface GuidanceInput {
 	names: DelegationNames;
 	roles: RoleSettings;
+	/** The roles this instance's startup role contracts make unavailable, whatever their settings say. */
+	unavailable?: Readonly<Partial<Record<KnownRoleName, string>>>;
 	roleGuidance: RoleGuidanceMap;
 	/** The legacy defaults the instance captured: what the claude tool runs a role configured on another backend as. */
 	baseline: Baseline;
@@ -73,8 +75,9 @@ export interface FusionParameterHelp extends ParameterHelp {
 }
 
 /**
- * One tool's view of the configuration: the roles it advertises, split into the ones this session enables and the
- * ones it disables. The claude tool advertises no security role, so its view neither recommends nor disables it.
+ * One tool's view of the configuration: the roles it advertises, split into the ones this session enables, the ones it
+ * disables and the ones its role contracts make unavailable. The claude tool advertises no security role, so its view
+ * neither recommends nor disables it.
  */
 interface View {
 	tool: string;
@@ -84,13 +87,21 @@ interface View {
 	backend: boolean;
 	enabled: readonly KnownRoleName[];
 	disabled: readonly KnownRoleName[];
+	unavailable: readonly KnownRoleName[];
 	on: (role: KnownRoleName) => boolean;
 }
 
+/** True for a role its contract makes unavailable, which no setting enables. */
+const unavailable = (input: GuidanceInput, role: KnownRoleName): boolean => input.unavailable !== undefined && Object.hasOwn(input.unavailable, role);
+
+/** True for a role that may run: available by contract and enabled in this session. */
+const active = (input: GuidanceInput, role: KnownRoleName): boolean => !unavailable(input, role) && input.roles[role].enabled;
+
 const view = (tool: string, control: string, input: GuidanceInput, backend: boolean): View => {
 	const advertised = backend ? KNOWN_ROLE_NAMES : input.claudeRoles;
-	const enabled = advertised.filter((role) => input.roles[role].enabled);
-	return { tool, control, input, backend, enabled, disabled: advertised.filter((role) => !input.roles[role].enabled), on: (role) => enabled.includes(role) };
+	const enabled = advertised.filter((role) => active(input, role));
+	const off = advertised.filter((role) => unavailable(input, role));
+	return { tool, control, input, backend, enabled, disabled: advertised.filter((role) => !enabled.includes(role) && !off.includes(role)), unavailable: off, on: (role) => enabled.includes(role) };
 };
 
 /** Items as prose: `a`, `a and b`, `a, b and c`. */
@@ -139,9 +150,10 @@ const guidelines = (view: View): string[] => {
 	const planTool = roleTool("plan");
 	const lines: string[] = [`These ${tool} guidelines apply while Fusion is on, as it is now; once Fusion is off they no longer apply and you work directly.`, policyGuideline(input.policy)];
 	const roleGuidelines = (role: KnownRoleName): string[] => input.roleGuidance[role].guidance.map((line) => `For ${tool}${roleTool(role) === tool ? "" : `, use ${roleTool(role)}`} role ${role}: ${line}`);
-	const security = !view.backend && roles.security.enabled ? [`${securityPointer(tool, names.fusion)} ${roleGuidelines("security").join(" ")}`] : [];
+	const security = !view.backend && active(input, "security") ? [`${securityPointer(tool, names.fusion)} ${roleGuidelines("security").join(" ")}`] : [];
 	const commit = `A ${tool} child does not commit, whatever it changed. Commit only when the user asks you to.`;
 	if (view.disabled.length) lines.push(`This session's configuration disables ${view.disabled.map((role) => `role ${role}`).join(", ")}: ${tool} refuses fresh calls and continuations.`);
+	if (view.unavailable.length) lines.push(`This Fusion instance's role contracts make ${view.unavailable.map((role) => `role ${role}`).join(", ")} unavailable: ${tool} refuses fresh calls and continuations, and no profile, /fusion config change or call parameter enables ${view.unavailable.length === 1 ? "it" : "them"} before the contract changes and Fusion reloads.`);
 	if (!view.enabled.length) {
 		lines.push(
 			`No ${tool} role is enabled in this session's configuration, so every ${tool} call is refused, whether it starts a run or continues one; do not call ${tool}. ${control} still reports on, waits for, messages and cancels any run there is.`,
@@ -242,8 +254,8 @@ const selectionText = (role: KnownRoleName, setting: RoleSetting): string => {
 const settingText = (role: KnownRoleName, setting: RoleSetting): string =>
 	`${role} runs on ${setting.backend} with ${selectionText(role, setting)}`;
 
-/** Only enabled settings belong in the inventory; one guideline names disabled roles and their refusal. */
-const configurationText = (roles: RoleSettings): string => `In this session's configuration ${KNOWN_ROLE_NAMES.filter((role) => roles[role].enabled).map((role) => settingText(role, roles[role])).join("; ")}.`;
+/** Only usable settings belong in the inventory; guidelines name disabled and unavailable roles and their refusal. */
+const configurationText = (input: GuidanceInput): string => `In this session's configuration ${KNOWN_ROLE_NAMES.filter((role) => active(input, role)).map((role) => settingText(role, input.roles[role])).join("; ")}.`;
 
 /**
  * What the claude tool runs each of its roles as: the configured setting for a role this session runs on Claude. A
@@ -251,7 +263,7 @@ const configurationText = (roles: RoleSettings): string => `In this session's co
  * forces it onto, so the forced run never reads as the configured route.
  */
 const claudeConfigurationText = (input: GuidanceInput): string =>
-	`In this session's configuration ${input.claudeRoles.filter((role) => input.roles[role].enabled).map((role) => {
+	`In this session's configuration ${input.claudeRoles.filter((role) => active(input, role)).map((role) => {
 		const setting = input.roles[role];
 		if (setting.backend === "claude") return settingText(role, setting);
 		const legacy: RoleSetting = { enabled: true, backend: "claude", ...input.baseline[role].claude };
@@ -310,7 +322,7 @@ const codexText = (view: View): string[] => {
 const backendText = (view: View): string[] => {
 	const idle = BACKEND_NAMES.filter((backend) => !runOn(view.enabled, backend).length);
 	return [
-		"backend picks the harness a child runs in: leave backend unset unless the user names one, and a fresh run goes to the backend the configuration above names for its role, on that role's configured model and effort. A call that names the other backend runs there on that backend's own defaults, never on the settings configured for the role's other backend.",
+		"backend picks the harness a child runs in: leave backend unset unless the user names one, and a fresh run goes to the backend the configuration above names for its role, on that role's configured model and effort. A call that names the other backend runs there on this instance's legacy defaults for that backend, never on the settings configured for the role's other backend or on a role contract's defaults.",
 		...(view.on("ask") ? [CLAUDE_ASK_TOOLS] : []),
 		...piText(view),
 		...codexText(view),
@@ -328,7 +340,7 @@ export function fusionGuidance(input: GuidanceInput): ToolGuidance {
 	const description = [
 		"Delegate work to a child: a headless coding session in this working directory, run through one of this build's backends. The role picks the job.",
 		fusion.enabled.length ? fusion.enabled.map((role) => roleText(role, fusion)).join(" ") : NO_ROLE,
-		...(fusion.enabled.length ? [configurationText(roles), ...backendText(fusion)] : []),
+		...(fusion.enabled.length ? [configurationText(input), ...backendText(fusion)] : []),
 		"Every run gets a handle such as run-3, shown in the stats line. continue with a handle sends the task as a follow-up to that run: the child keeps its context from the run's last successful call, across a resume of this session, /tree and forks, stays on the backend it ran on, and keeps the model and effort that run was started with unless the call names others, whatever profile is selected since. Calls run one at a time: Pi serializes any turn that contains one.",
 		`Returns the child's report, or with background true the handle at once and the report later as a message; manage a background run with ${names.fusionControl}. If the child asks a question, the call returns the question at once and the run waits in the background until you answer it with ${names.fusionControl} message. A claude child that reports while background work it waits for still runs, as a workflow launch does, makes the call return that report at once as an interim report, marked as not final; the run goes on in the background, keeping its slot, and ${names.fusionControl} wait returns a newer interim report, a question or the final report. Only one run that can change files is active at a time, waiting included${ask}. The ${names.claude} tool is this same delegation forced to the claude backend, kept for compatibility, and ${names.fusionControl} and ${names.claudeControl} both act on every run.`,
 	];

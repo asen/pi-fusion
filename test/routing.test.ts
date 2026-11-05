@@ -15,6 +15,7 @@ import { KNOWN_ROLE_NAMES, roleSpec } from "../extensions/roles.ts";
 import { History } from "../extensions/history.ts";
 import { memoryHostPolicyLoader } from "../extensions/host-policy.ts";
 import { memoryRoleContractLoader } from "../extensions/role-contract-loader.ts";
+import { memoryPresetDefaults } from "../extensions/presets.ts";
 import { memoryProfileStore, type ProfileStore } from "../extensions/profile-store.ts";
 import { memorySettingsStore } from "../extensions/settings-store.ts";
 import { builtinSettings, captureBaseline, serializeDocument } from "../extensions/profiles.ts";
@@ -471,7 +472,7 @@ function recorder(): { ext: Extension; api: ExtensionAPI } {
  */
 const makeExtension = (backends: Partial<Record<BackendName, HostBackend>> = {}, profiles: ProfileStore = memoryProfileStore()): Extension => {
 	const { ext, api } = recorder();
-	fusion(api, { backends: { ...tripwires(), ...backends }, profiles, settings: memorySettingsStore(), hostPolicy: memoryHostPolicyLoader(), roleContracts: memoryRoleContractLoader() });
+	fusion(api, { backends: { ...tripwires(), ...backends }, profiles, settings: memorySettingsStore(), hostPolicy: memoryHostPolicyLoader(), roleContracts: memoryRoleContractLoader(), presetDefaults: memoryPresetDefaults() });
 	void turnOn(ext.tools.get("fusion_activate"));
 	return ext;
 };
@@ -1115,10 +1116,10 @@ test("a codex record routes through fusion alone, on the selection and provider 
 
 test("every role the tools advertise has capabilities and a binding on each backend it names, so the lists cannot drift", () => {
 	const ext = makeExtension();
-	// The primary tool advertises every role a record may name, because every one of them runs on a backend of this
-	// build; the compatibility tool advertises the roles claude runs and no other.
+	// The primary tool advertises every role a record may name that the built-in configuration enables, because every one
+	// of them runs on a backend of this build; the compatibility tool advertises the roles claude runs and no other.
 	for (const [tool, roles] of [
-		["fusion", KNOWN_ROLE_NAMES],
+		["fusion", KNOWN_ROLE_NAMES.filter((role) => role !== "security")],
 		["claude", ROLE_NAMES],
 	] as const) {
 		const schema = (ext.tools.get(tool) as unknown as { parameters: { properties: { role: { enum: string[] } } } }).parameters;

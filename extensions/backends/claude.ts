@@ -16,7 +16,7 @@ import {
 import { z } from "zod";
 import { resultText } from "../cards.ts";
 import { ChildTree, KILL_GRACE_MS } from "../process-tree.ts";
-import { parseRoleContract } from "../role-contracts.ts";
+import { canonicalContractBody, suppliedContractBody } from "../role-contracts.ts";
 import { type Ask, type Backend, BLOCKER_LABEL_CHARS, type ChildControl, type ChildEvent, type ChildRun, failed, MAX_BLOCKERS, type ModelCost, type RunRequest, type SessionIntent, type SessionRef } from "./types.ts";
 
 /**
@@ -110,7 +110,7 @@ export function childOptions(role: Role, session: ChildSession | undefined, titl
 		systemPrompt: {
 			type: "preset",
 			preset: "claude_code",
-			append: contract ?? parseRoleContract(fs.readFileSync(path.join(CONTRACTS_DIR, role.contract), "utf8"), role.contract).body,
+			append: contract !== undefined ? suppliedContractBody(contract) : canonicalContractBody((name) => fs.readFileSync(path.join(CONTRACTS_DIR, name), "utf8"), role.contract),
 		},
 		includePartialMessages: true,
 		title,

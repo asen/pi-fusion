@@ -1,5 +1,5 @@
 import { readFileSync } from "node:fs";
-import { parseRoleContract } from "../role-contracts.ts";
+import { canonicalContractBody, suppliedContractBody } from "../role-contracts.ts";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import type { OwnedCleanup } from "../process-tree.ts";
@@ -21,8 +21,9 @@ import { type Backend, type ChildEvent, failed, type RunRequest, type SessionInt
  * entirely, which is how the suite keeps a real Pi child out of its runs. There is no exported instance, because a
  * module-level one would be a second backend nobody decided to build.
  *
- * The host supplies its startup-resolved contract body in the request. Standalone callers may omit it and use the
- * existing lazy shipped-contract reader (or its injected test reader).
+ * The host supplies its startup-resolved contract body in the request, which must be nonblank and is never parsed
+ * again. Standalone callers may omit it and use the lazy shipped-contract reader (or its injected test reader), which
+ * refuses a contract that declares its role disabled or has no child instructions.
  *
  * **The order, which is also the order ownership is taken in.** A signal that has already aborted ends the call
  * before a fallback contract read; then the contract, then the host agent directory, then the call's own storage, and only
@@ -223,7 +224,7 @@ async function runPiCall(request: RunRequest<PiRole, PiSession, PiSteerQueue>, d
 
 		let contract: string;
 		try {
-			contract = request.contract ?? parseRoleContract((deps.readContract ?? readRoleContract)(role.contract), role.contract).body;
+			contract = request.contract !== undefined ? suppliedContractBody(request.contract) : canonicalContractBody(deps.readContract ?? readRoleContract, role.contract);
 		} catch (error) {
 			report.stage = "contract";
 			report.thrown = { error };

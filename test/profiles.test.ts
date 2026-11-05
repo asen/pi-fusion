@@ -8,10 +8,12 @@ import { type ExtensionAPI, ExtensionEditorComponent, initTheme } from "@earendi
 import { KeybindingsManager, type TUI, TUI_KEYBINDINGS } from "@earendil-works/pi-tui";
 import type { PiRole } from "../extensions/backends/pi-binding.ts";
 import type { BackendName, HostBackend } from "../extensions/backends/types.ts";
-import fusion, { builtinConfiguration, type Configuration, claudeRoute, fusionCall, fusionRoute, roleFor, type RunRecords, runRecords } from "../extensions/fusion.ts";
-import { policyGuideline } from "../extensions/host-guidance.ts";
+import fusion, { builtinConfiguration, type Configuration, claudeRoute, fusionCall, fusionRoute, ROLE_NAMES, roleFor, type RunRecords, runRecords, usableRoles } from "../extensions/fusion.ts";
+import { claudeGuidance, claudeParameterHelp, fusionGuidance, fusionParameterHelp, type GuidanceInput, policyGuideline } from "../extensions/host-guidance.ts";
 import { fileHostPolicyLoader, HOST_POLICY_FILE, type HostPolicyLoader, hostPolicyLoader, memoryHostPolicyLoader, SHIPPED_HOST_POLICY_PATH } from "../extensions/host-policy.ts";
-import { fileRoleContractLoader, type RoleContractLoader, memoryRoleContractLoader, ROLE_CONTRACT_FILES, roleContractLoader, SHIPPED_ROLE_CONTRACTS_DIR } from "../extensions/role-contract-loader.ts";
+import { fileRoleContractLoader, type RoleContractLoader, memoryRoleContractLoader, ROLE_CONTRACT_FILES, ROLE_CONTRACTS, roleContractLoader, SHIPPED_ROLE_CONTRACTS_DIR } from "../extensions/role-contract-loader.ts";
+import { KNOWN_ROLE_NAMES, type KnownRoleName } from "../extensions/roles.ts";
+import { filePresetDefaults, memoryPresetDefaults, type PresetDefaultsStore } from "../extensions/presets.ts";
 import { fileProfileStore, memoryProfileStore, PROFILES_FILE, type ProfileStore } from "../extensions/profile-store.ts";
 import { memorySettingsStore, type SettingsStore } from "../extensions/settings-store.ts";
 import {
@@ -466,6 +468,8 @@ interface SdkHostOptions {
 	/** The host policy this instance loads; the shipped one with no override by default. */
 	hostPolicy?: HostPolicyLoader;
 	roleContracts?: RoleContractLoader;
+	/** The default preset files; an empty memory store by default. */
+	presetDefaults?: PresetDefaultsStore;
 	/** Fusion's own settings; an empty memory store by default. */
 	settings?: SettingsStore;
 }
@@ -519,7 +523,7 @@ function sdkHost(options: SdkHostOptions = {}) {
 		registerMessageRenderer: () => {},
 	} as unknown as ExtensionAPI;
 	// Nothing in this file means to run this build's claude backend, so it is fenced too; a case's own double goes over it.
-	fusion(api, { backends: { ...tripwires(), ...claudeTripwire(), ...options.backends }, profiles: options.profiles ?? memoryProfileStore(), settings: options.settings ?? memorySettingsStore(), hostPolicy: options.hostPolicy ?? memoryHostPolicyLoader(), roleContracts: options.roleContracts ?? memoryRoleContractLoader() });
+	fusion(api, { backends: { ...tripwires(), ...claudeTripwire(), ...options.backends }, profiles: options.profiles ?? memoryProfileStore(), settings: options.settings ?? memorySettingsStore(), hostPolicy: options.hostPolicy ?? memoryHostPolicyLoader(), roleContracts: options.roleContracts ?? memoryRoleContractLoader(), presetDefaults: options.presetDefaults ?? memoryPresetDefaults() });
 	const answer = (options: string[]) => {
 		const next = dialogs.shift();
 		return typeof next === "function" ? next(options) : next;
@@ -784,7 +788,14 @@ test("profile save, list, use and default each do one thing, and only use change
 	await host.command("config");
 	const shown = host.last()?.split("\n") ?? [];
 	assert.deepEqual(shown.slice(0, 8), ["fusion configuration: builtin · new sessions start with builtin", ...settingsTable(LEGACY), "profiles file: (in memory)"]);
-	assert.equal(shown[8], policyLine("shipped", SHIPPED_HOST_POLICY_PATH));
+	assert.deepEqual(shown.slice(8, 13), [
+		"instruction preset: auto (nothing selects one, so auto); selected when this instance started, and another applies only after /reload, a restart or resuming the session",
+		"session preset choice: none on this branch",
+		"the next startup of this session would select auto (nothing selects one, so auto)",
+		"project default: not read, Pi does not report this working directory as trusted · (project preset.json, in memory)",
+		"user default: unset · (user preset.json, in memory)",
+	]);
+	assert.equal(shown[13], policyLine("shipped", SHIPPED_HOST_POLICY_PATH));
 	assert.equal(shown.filter((line) => /^role contract [\w-]+\.md: shipped · /.test(line)).length, ROLE_CONTRACT_FILES.length);
 	// The run history is this instance's own and says where the saved preference lives, apart from the profiles.
 	assert.match(shown.slice(-3).join("\n"), /^run history: (on|off) in this instance \([^)]*\)\nsaved history preference for new instances: unset \([^)]*\)\nsettings file: \(in memory\)$/);
@@ -2003,7 +2014,8 @@ test("/fusion config shows the policy from temporary files as startup selected i
 	fs.writeFileSync(override, "\n");
 	await host.command("config");
 	const expected = [policyLine("user override", override)];
-	assert.ok(host.titles[0]!.startsWith(`fusion config · builtin\n${expected.join("\n")}\nrole contracts:`), "the editor shows instruction sources above the table");
+	assert.ok(host.titles[0]!.startsWith("fusion config · builtin\ninstruction preset: auto (nothing selects one, so auto); selected when this instance started"), "the editor shows the preset lines first");
+	assert.ok(host.titles[0]!.includes(`\nuser default: unset · (user preset.json, in memory)\n${expected.join("\n")}\nrole contracts:`), "then the instruction sources above the table");
 	assert.ok(host.titles[0]!.endsWith(`\n${settingsTable(LEGACY)[0]}`));
 	assert.match(host.last() ?? "", /^fusion settings applied to this session/);
 	await host.command("config");
@@ -2110,6 +2122,8 @@ test("a pending startup contract selection gates calls and configuration and is 
 	const starting = host.start();
 	const calling = host.fusion({ role: "implement", task: "work" });
 	const showing = host.command("config");
+	// The preset is selected first, so the loaders start one turn later; everything still waits for them.
+	await new Promise((resolve) => setImmediate(resolve));
 	assert.equal(loads, 1);
 	assert.equal(claude.starts.length, 0);
 	assert.equal(claude.sessions.length, 0, "no session is bound before the contract selection");
@@ -2122,15 +2136,17 @@ test("a pending startup contract selection gates calls and configuration and is 
 	await host.shutdown();
 });
 
-test("an invalid contract override warns once and keeps its diagnostic in config without exposing contract text", async () => {
+test("an invalid contract override warns once, closes its role, and keeps its diagnostic in config without exposing contract text", async () => {
 	const host = sdkHost({ roleContracts: memoryRoleContractLoader({ overrides: { "implement.md": "NO_HOST_METADATA" } }), ui: false });
 	await host.start();
 	const warnings = host.notices.filter(([, level]) => level === "warning");
 	assert.equal(warnings.length, 1);
-	assert.match(warnings[0]![0], /role contract implement\.md override .* has no host frontmatter/);
+	assert.match(warnings[0]![0], /role contract implement\.md override .* has no host frontmatter.*; role implement is unavailable in this instance/);
 	await host.command("config");
-	assert.match(host.last()!, /role contract implement\.md: shipped \(override set aside\)/);
+	assert.match(host.last()!, /role contract implement\.md: user override, unusable · \(override implement\.md, in memory\)/);
 	assert.match(host.last()!, /role contract diagnostic: .*has no host frontmatter/);
+	assert.match(host.last()!, /^implement +unavailable +claude/m);
+	assert.match(host.last()!, /^role implement: unavailable in this instance \(/m);
 	assert.doesNotMatch(host.last()!, /NO_HOST_METADATA/);
 	await host.start();
 	assert.equal(host.notices.filter(([, level]) => level === "warning").length, 1);
@@ -2257,7 +2273,7 @@ test("the first session_start, config command or delegation supplies its actual 
 			assert.equal(claude.starts[0]?.contract, "PROJECT_BODY\n");
 		}
 		assert.match(host.tools.get("fusion")!.description, /PROJECT_IMPLEMENT/);
-		assert.deepEqual(seen, [{ cwd: f.cwd, projectTrusted: true }, { cwd: f.cwd, projectTrusted: true }]);
+		assert.deepEqual(seen, [{ cwd: f.cwd, projectTrusted: true, preset: "auto" }, { cwd: f.cwd, projectTrusted: true, preset: "auto" }]);
 		await host.start();
 		await host.command("config");
 		assert.equal(seen.length, 2, "later entry points do not select new instructions");
@@ -2265,7 +2281,7 @@ test("the first session_start, config command or delegation supplies its actual 
 	}
 });
 
-test("config names the user fallback and project diagnostic once when project instructions are invalid", async () => {
+test("config names the policy's user fallback and the closed project role once when project instructions are invalid", async () => {
 	const f = projectInstructionFixture();
 	fs.writeFileSync(path.join(f.project, "host.md"), " \n");
 	fs.writeFileSync(path.join(f.project, "contracts", "implement.md"), "Invalid project metadata.");
@@ -2274,11 +2290,625 @@ test("config names the user fallback and project diagnostic once when project in
 	assert.equal(host.notices.filter(([, level]) => level === "warning").length, 2);
 	await host.command("config");
 	assert.match(host.last()!, /host policy: user override \(project override set aside\)/);
-	assert.match(host.last()!, /role contract implement\.md: user override \(project override set aside\)/);
+	assert.ok(host.last()!.includes(`role contract implement.md: project override, unusable · ${path.join(f.project, "contracts", "implement.md")}`));
 	assert.ok(host.last()!.includes(path.join(f.project, "host.md")));
-	assert.ok(host.last()!.includes(path.join(f.project, "contracts", "implement.md")));
-	assert.match(host.tools.get("fusion")!.description, /USER_IMPLEMENT/);
+	assert.doesNotMatch(host.tools.get("fusion")!.description, /USER_IMPLEMENT|PROJECT_IMPLEMENT/, "neither the user nor the shipped contract stands in");
+	assert.match(host.tools.get("fusion")!.promptGuidelines!.join("\n"), /role contracts make role implement unavailable/);
 	await host.start();
 	assert.equal(host.notices.filter(([, level]) => level === "warning").length, 2);
 	await host.shutdown();
+});
+
+// ---------------------------------------------------------------------------------------------------------------------
+// Role availability and defaults declared by the startup role contracts.
+
+/** A minimal contract that makes its role unavailable: host metadata and no child body. */
+const disabledRole = (label: string): string => roleOverride(label, "").replace("---\nhost:", "---\ndisabled: true\nhost:");
+
+/** A memory selection whose user overrides make these roles unavailable. */
+const unavailableBy = (roles: readonly KnownRoleName[]): RoleContractLoader => memoryRoleContractLoader({ overrides: Object.fromEntries(roles.map((role) => [ROLE_CONTRACTS[role], disabledRole(role)])) });
+
+const ALL_ON = settings({ security: { enabled: true, backend: "pi", model: "deepseek/deepseek-chat" } });
+const PLAN_IMPLEMENT = settings({ ultracode: { enabled: false, backend: "claude" }, ask: { enabled: false, backend: "claude" } });
+const ALL_OFF = NONE;
+
+test("representative availability and enabled combinations give both registered tools a valid schema and refuse what they leave out", async () => {
+	for (const off of [[], ["plan", "security"], [...KNOWN_ROLE_NAMES]] as const) {
+		for (const [name, profile] of [["all", ALL_ON], ["some", PLAN_IMPLEMENT], ["none", ALL_OFF]] as const) {
+			const what = `unavailable [${off.join(", ")}] · profile ${name}`;
+			const claude = fakeBackend({ name: "claude" });
+			const pi = fakeBackend({ name: "pi" });
+			const host = sdkHost({ profiles: memoryProfileStore(document({ [name]: profile }, name)), roleContracts: unavailableBy(off), backends: { claude: claude.backend, pi: pi.backend }, ui: false });
+			await host.start();
+			await host.on();
+			for (const [tool, advertised] of [["fusion", KNOWN_ROLE_NAMES], ["claude", ROLE_NAMES]] as const) {
+				const expected = advertised.filter((role) => !(off as readonly string[]).includes(role) && profile[role].enabled);
+				const parameters = host.tools.get(tool)!.parameters as { properties: Record<string, { enum?: string[] }>; required: string[] };
+				if (expected.length) assert.deepEqual(parameters.properties.role?.enum, expected, `${what}: ${tool} enum`);
+				else assert.equal(parameters.properties.role, undefined, `${what}: ${tool} leaves role out rather than declare an empty enum`);
+				assert.deepEqual(parameters.required, ["task"], `${what}: ${tool}`);
+				const guidance = host.tools.get(tool)!.promptGuidelines!.join("\n");
+				const closed = advertised.filter((role) => (off as readonly string[]).includes(role));
+				if (closed.length) assert.ok(guidance.includes(`role contracts make ${closed.map((role) => `role ${role}`).join(", ")} unavailable`), `${what}: ${tool} guidance`);
+				else assert.doesNotMatch(guidance, /role contracts make/, `${what}: ${tool} guidance`);
+				for (const role of advertised.filter((role) => !expected.includes(role))) {
+					const error = (await host[tool]({ role, task: "x" })).error ?? "";
+					if ((off as readonly string[]).includes(role)) assert.match(error, new RegExp(`^role ${role} is unavailable in this Fusion instance: the user override \\(override ${ROLE_CONTRACTS[role]}, in memory\\) declares disabled: true\\. No profile, /fusion config change or call parameter enables it`), `${what}: ${tool} ${role}`);
+					else assert.equal(error, `role ${role} is disabled in profile ${name}; change /fusion config or select another profile`, `${what}: ${tool} ${role}`);
+				}
+			}
+			assert.deepEqual([claude.sessions, claude.starts, pi.sessions, pi.starts, host.branch], [[], [], [], [], []], `${what}: no refusal reached a backend or recorded anything`);
+			await host.shutdown();
+		}
+	}
+});
+
+test("a saved profile cannot enable an unavailable role; its enabled intent is kept, shown, saved and refused with the contract's reason", async () => {
+	// A run to continue, made where plan is available.
+	const first = fakeBackend({ name: "claude" });
+	const earlier = sdkHost({ backends: { claude: first.backend }, ui: false });
+	await earlier.start();
+	await earlier.on();
+	assert.equal((await earlier.fusion({ role: "plan", task: "plan it" })).error, undefined);
+	await earlier.call("fusion_control", { action: "wait", run: "run-1" });
+	await earlier.shutdown();
+
+	const store = memoryProfileStore(document({ work: ALL_ON }, "work"));
+	const claude = fakeBackend({ name: "claude" });
+	const pi = fakeBackend({ name: "pi" });
+	const pick = (prefix: string) => (options: string[]) => options.find((option) => option.startsWith(prefix));
+	const offered: string[][] = [];
+	const table = (options: string[]) => (offered.push(options), pick("plan")(options));
+	const host = sdkHost({ profiles: store, roleContracts: unavailableBy(["plan", "security"]), backends: { claude: claude.backend, pi: pi.backend }, dialogs: [table, (options) => (offered.push(options), pick("enabled:")(options)), "Back", "Cancel"] });
+	host.branch.push(...earlier.branch);
+	await host.start();
+	await host.on();
+	await host.command("config");
+	assert.match(offered[0]!.find((row) => row.startsWith("plan"))!, /^plan +unavailable +claude +fable +xhigh$/, "the editor's table says unavailable, not yes");
+	assert.equal(offered[1]![0], "enabled: unavailable by role contract (saved setting yes)");
+	assert.ok(host.notices.some(([text, level]) => level === "warning" && text.startsWith("role plan is unavailable in this Fusion instance")), "the editor refuses to toggle it");
+	assert.equal(host.last(), "fusion config cancelled; nothing changed");
+	await host.command("status");
+	assert.match(host.last()!, /^plan +unavailable /m);
+	assert.match(host.last()!, /^security +unavailable /m);
+	for (const params of [{ role: "plan", task: "x" }, { role: "plan", task: "x", fresh: true }, { continue: "run-1", task: "more" }, { role: "security", task: "x", model: "openai/gpt-5" }]) {
+		assert.match((await host.fusion(params)).error ?? "", /^role (plan|security) is unavailable in this Fusion instance/, JSON.stringify(params));
+	}
+	assert.match((await host.claude({ continue: "run-1", task: "more" })).error ?? "", /^role plan is unavailable/);
+	assert.deepEqual([claude.sessions, pi.sessions], [[], []], "no continuation or implicit plan reached a backend");
+	await host.command("profile save copy");
+	await host.command("profile use builtin");
+	assert.match(host.last()!, /unavailable by role contract: plan, security$/);
+	await host.command("profile use copy");
+	const saved = await store.read();
+	assert.equal(saved.profiles.work!.plan.enabled, true, "the stored profile is unchanged");
+	assert.deepEqual(saved.profiles.copy, ALL_ON, "a profile saved here keeps every enabled setting as it was");
+	assert.equal((await host.fusion({ role: "implement", task: "still runs" })).error, undefined, "an available role runs as before");
+	await host.call("fusion_control", { action: "wait", run: "run-2" });
+	await host.shutdown();
+});
+
+test("contract defaults choose the built-in backend and overlay its legacy selection; saved profiles and explicit backends keep their own", async () => {
+	const withDefaults = (role: string, defaults: string): string => roleOverride(role, `Child ${role}.\n`).replace("---\nhost:", `---\ndefaults:\n${defaults}\nhost:`);
+	const contracts = memoryRoleContractLoader({
+		overrides: {
+			"implement.md": withDefaults("implement", "  backend: codex\n  model: gpt-x"),
+			"plan.md": withDefaults("plan", "  backend: claude\n  model: haiku"),
+			"ask-answer.md": withDefaults("ask", "  backend: pi"),
+		},
+	});
+	const claude = fakeBackend({ name: "claude" });
+	const codex = fakeBackend({ name: "codex" });
+	const pi = fakeBackend({ name: "pi" });
+	const host = sdkHost({ profiles: memoryProfileStore(document({ work: WORK }, "work")), roleContracts: contracts, backends: { claude: claude.backend, codex: codex.backend, pi: pi.backend }, ui: false });
+	await host.start();
+	await host.on();
+	await host.command("status");
+	assert.match(host.last()!, /^implement +yes +claude +sonnet +low$/m, "a saved profile is a complete snapshot over contract defaults");
+
+	await host.command("profile use builtin");
+	await host.command("status");
+	assert.match(host.last()!, /^implement +yes +codex +gpt-x /m);
+	assert.match(host.last()!, /^plan +yes +claude +haiku +xhigh$/m, "a model-only default keeps the backend's legacy effort");
+	assert.match(host.last()!, /^ask +yes +pi +unconfigured +child default$/m);
+	await host.command("config");
+	assert.ok(host.last()!.includes("role implement: built-in defaults from (override implement.md, in memory): backend codex, model gpt-x; other fields keep this instance's legacy codex defaults"));
+
+	// The in-memory double reports no codex thread, so the run's record is refused afterwards; what it was started on is the point.
+	await host.fusion({ role: "implement", task: "x" });
+	assert.equal(codex.starts.length, 1);
+	assert.equal((codex.starts[0]!.role as { model?: string }).model, "gpt-x");
+	assert.equal((await host.fusion({ role: "implement", task: "x", backend: "claude" })).error, undefined);
+	await host.call("fusion_control", { action: "wait", run: "run-2" });
+	assert.deepEqual([claude.starts[0]!.role.model, (claude.starts[0]!.role as { effort?: string }).effort], ["opus", "high"], "an explicit other backend runs on the legacy defaults");
+	assert.equal((await host.fusion({ role: "ask", task: "x" })).error, "role ask has no model for the pi backend in role contract (override ask-answer.md, in memory): choose a provider and a model id, such as deepseek/deepseek-chat, with /fusion config, or name one in the call's model parameter. The pi backend has no default model and resolves none for you");
+	assert.deepEqual(pi.sessions, []);
+	await host.shutdown();
+});
+
+test("the editor's backend switch starts from the legacy defaults, not a role contract's", async () => {
+	const contracts = memoryRoleContractLoader({ overrides: { "implement.md": roleOverride("implement", "Child.\n").replace("---\nhost:", "---\ndefaults:\n  backend: codex\n  model: gpt-x\nhost:") } });
+	const pick = (prefix: string) => (options: string[]) => options.find((option) => option.startsWith(prefix));
+	const host = sdkHost({ roleContracts: contracts, dialogs: [pick("implement"), pick("backend:"), "claude", pick("backend:"), "codex", "Back", "Apply"] });
+	await host.start();
+	await host.command("config");
+	await host.command("status");
+	assert.match(host.last()!, /^implement +yes +codex +host default +host default$/m, "back on codex, it takes codex's legacy defaults, not the contract's model");
+	await host.shutdown();
+});
+
+test("contract defaults overlay their own backend's baseline field by field and leave the legacy baseline and record backfill alone", () => {
+	const env = { PI_FUSION_PI_IMPLEMENT_EFFORT: "high", PI_FUSION_CODEX_ASK_EFFORT: "low" } as NodeJS.ProcessEnv;
+	const captured = captureBaseline(env);
+	const before = structuredClone(captured);
+	const roles = builtinSettings(captured, { plan: { backend: "claude", model: "haiku" }, implement: { backend: "pi", model: "deepseek/deepseek-chat" }, ask: { backend: "codex" }, ultracode: { backend: "claude", model: "opus" } });
+	assert.deepEqual(roles.plan, { enabled: true, backend: "claude", model: "haiku", effort: "xhigh" });
+	assert.deepEqual(roles.implement, { enabled: true, backend: "pi", model: "deepseek/deepseek-chat", effort: "high" }, "the pi effort is pi's own; claude's never leaks");
+	assert.deepEqual(roles.ask, { enabled: true, backend: "codex", effort: "low" }, "a backend-only default keeps that backend's baseline");
+	assert.deepEqual(roles.ultracode, { enabled: true, backend: "claude", model: "opus", effort: "ultracode" });
+	assert.deepEqual(roles.security, { enabled: false, backend: "pi" });
+	assert.deepEqual(captured, before, "the legacy baseline is untouched");
+	assert.deepEqual(parseSettings(roles), roles, "the result is a configuration a profile could hold");
+	const config = builtinConfiguration(captured, { plan: { backend: "claude", model: "haiku", path: "/c/plan.md" }, implement: { backend: "pi", model: "deepseek/deepseek-chat", path: "/c/implement.md" } });
+	assert.deepEqual(fusionRoute({ role: "implement", task: "x" }, records(), 35, config).defaults, { model: "deepseek/deepseek-chat", effort: "high", from: "role contract /c/implement.md" });
+	assert.deepEqual(fusionRoute({ role: "implement", task: "x", backend: "claude" }, records(), 35, config).defaults, { model: "opus", effort: "high" }, "another backend gets the legacy defaults");
+	assert.deepEqual(fusionRoute({ role: "implement", task: "x", backend: "codex" }, records(), 35, config).defaults, {});
+	// An older Claude record that kept no model runs on the legacy default, not the contract's, and says so.
+	const old = records({ run: "run-1", role: "plan", backend: "claude", hostSessionId: "host-1", sessionId: "s-1", checkpoint: "c-1" });
+	const legacy = fusionCall({ continue: "run-1", task: "more" }, old, 35, config);
+	assert.deepEqual([legacy.bound.model, legacy.bound.effort], ["fable", "xhigh"]);
+	assert.match(legacy.unrecorded ?? "", /runs on the default this Pi process started with: model \(fable\), effort \(xhigh\)/);
+	const implicit = fusionCall({ role: "plan", task: "next" }, old, 35, config);
+	assert.deepEqual([implicit.handle, implicit.bound.model], ["run-1", "fable"], "an implicit plan continuation is not a change of model");
+	// A recorded Pi selection is the record's own, whatever the contract defaults.
+	const recorded = records({ run: "run-1", role: "implement", backend: "pi", hostSessionId: "host-1", session: { backend: "pi", sessionId: "pi-1", sessionFile: "/sessions/pi-1.jsonl", checkpoint: "entry-1" }, selection: { model: "openai/gpt-5", effort: "medium" } });
+	assert.equal(fusionCall({ continue: "run-1", task: "more" }, recorded, 35, config).bound.model, "openai/gpt-5");
+	// Unavailability is checked before any other refusal and names the contract.
+	const closed: Configuration = { ...config, unavailable: { plan: "the project override /p/plan.md declares disabled: true" } };
+	assert.throws(() => fusionRoute({ continue: "run-1", task: "more" }, old, 35, closed), /^Error: role plan is unavailable in this Fusion instance: the project override \/p\/plan\.md declares disabled: true\./);
+	assert.throws(() => fusionRoute({ role: "plan", task: "x", backend: "claude", model: "opus" }, records(), 35, closed), /^Error: role plan is unavailable/);
+	assert.match(settingsTable(closed.roles, closed.unavailable)[1]!, /^plan +unavailable +claude +haiku +xhigh$/);
+});
+
+test("a profile switch refreshes the role enum within the active list, rolls it back on failure, and never adds an unavailable role", async () => {
+	const roleEnum = (host: ReturnType<typeof sdkHost>) => (host.tools.get("fusion")!.parameters as { properties: Record<string, { enum?: string[] }> }).properties.role?.enum;
+	for (const off of [[], ["security"]] as const) {
+		const host = sdkHost({ profiles: memoryProfileStore(document({ all: ALL_ON })), roleContracts: unavailableBy(off), ui: false });
+		await host.start();
+		await host.on();
+		const active = [...host.active];
+		assert.deepEqual(roleEnum(host), ["plan", "implement", "ultracode", "ask"]);
+		if (!off.length) {
+			host.failNextToolChange();
+			await host.command("profile use all");
+			assert.match(host.last() ?? "", /^fusion settings stay as they are: the host's tool guidance did not change/);
+			assert.deepEqual(roleEnum(host), ["plan", "implement", "ultracode", "ask"], "the failed refresh put the old enum back");
+		}
+		await host.command("profile use all");
+		assert.match(host.last() ?? "", /^fusion uses profile all/);
+		assert.deepEqual(roleEnum(host), off.length ? ["plan", "implement", "ultracode", "ask"] : [...KNOWN_ROLE_NAMES]);
+		assert.deepEqual(host.active, active, "the refresh kept the active list");
+		await host.shutdown();
+	}
+});
+
+test("all 32 x 32 availability and enabled masks: both tools' enums, guidance, help and route refusals follow available && enabled", async () => {
+	const roleGuidance = (await memoryRoleContractLoader().load()).guidance;
+	const subsets = Array.from({ length: 1 << KNOWN_ROLE_NAMES.length }, (_, mask) => KNOWN_ROLE_NAMES.filter((_, at) => mask & (1 << at)));
+	const series = (items: readonly string[]): string => (items.length < 2 ? (items[0] ?? "") : `${items.slice(0, -1).join(", ")} or ${items.at(-1)!}`);
+	const tools = [
+		{ name: "fusion", advertised: KNOWN_ROLE_NAMES, guidance: fusionGuidance, help: fusionParameterHelp, route: fusionRoute },
+		{ name: "claude", advertised: ROLE_NAMES, guidance: claudeGuidance, help: claudeParameterHelp, route: claudeRoute },
+	] as const;
+	let combinations = 0;
+	for (const off of subsets) {
+		for (const on of subsets) {
+			const roles = copySettings(ALL_ON);
+			for (const role of KNOWN_ROLE_NAMES) roles[role].enabled = on.includes(role);
+			const unavailable = Object.fromEntries(off.map((role) => [role, `the test contract for ${role} declares disabled: true`]));
+			const config: Configuration = { profile: "p", modified: false, roles, baseline, unavailable };
+			const input: GuidanceInput = { names: { fusion: "fusion", fusionControl: "fusion_control", claude: "claude", claudeControl: "claude_control" }, roles, unavailable, roleGuidance, baseline, claudeRoles: ROLE_NAMES, quote: { open: "[open]", close: "[close]" }, policy: "Policy." };
+			for (const tool of tools) {
+				const what = `${tool.name} · unavailable [${off.join(",")}] · enabled [${on.join(",")}]`;
+				const expected = tool.advertised.filter((role) => !off.includes(role) && on.includes(role));
+				const closed = tool.advertised.filter((role) => off.includes(role));
+				const disabled = tool.advertised.filter((role) => !off.includes(role) && !on.includes(role));
+				assert.deepEqual(usableRoles(tool.advertised, config), expected, what);
+				const text = tool.guidance(input);
+				const guidelines = text.promptGuidelines.join("\n");
+				if (closed.length) assert.ok(guidelines.includes(`role contracts make ${closed.map((role) => `role ${role}`).join(", ")} unavailable: ${tool.name} refuses`), what);
+				else assert.doesNotMatch(guidelines, /role contracts make/, what);
+				if (disabled.length) assert.ok(guidelines.includes(`configuration disables ${disabled.map((role) => `role ${role}`).join(", ")}: ${tool.name} refuses`), what);
+				else assert.doesNotMatch(guidelines, /configuration disables/, what);
+				const help = tool.help(input).role;
+				if (expected.length) assert.equal(help, `${series(expected)}. Required unless continue is set.`, what);
+				else assert.match(help, /no role this tool runs is enabled/, what);
+				for (const role of tool.advertised) {
+					assert.equal(text.description.includes(`${role}: ${roleGuidance[role].description}`), expected.includes(role), `${what}: ${role} description`);
+					const call = () => tool.route({ role, task: "x" }, records(), 35, config);
+					if (off.includes(role)) assert.throws(call, new RegExp(`^Error: role ${role} is unavailable in this Fusion instance: the test contract for ${role}`), `${what}: ${role}`);
+					else if (!on.includes(role)) assert.throws(call, new RegExp(`^Error: role ${role} is disabled in profile p;`), `${what}: ${role}`);
+					else assert.equal(call().role, role, `${what}: ${role}`);
+				}
+			}
+			combinations++;
+		}
+	}
+	assert.equal(combinations, 1024);
+});
+
+test("a valid higher-priority contract makes a role available over a disabled lower one, and a reload after an edit decides again", async () => {
+	const dir = tempDir("availability-precedence");
+	const agent = path.join(dir, "agent");
+	const cwd = path.join(dir, "project");
+	const user = path.join(agent, "pi-fusion", "contracts", "plan.md");
+	const project = path.join(cwd, ".pi", "pi-fusion", "contracts", "plan.md");
+	for (const file of [user, project]) fs.mkdirSync(path.dirname(file), { recursive: true });
+	fs.writeFileSync(user, disabledRole("user plan"));
+	/** One extension instance over these files, as a restart, /reload or new session makes. */
+	const instance = async (projectTrusted: boolean) => {
+		const claude = fakeBackend({ name: "claude" });
+		const host = sdkHost({ cwd, projectTrusted, roleContracts: roleContractLoader(async () => agent), backends: { claude: claude.backend }, ui: false });
+		await host.start();
+		await host.on();
+		const result = await host.fusion({ role: "plan", task: "plan it" });
+		const roleEnum = (host.tools.get("fusion")!.parameters as { properties: Record<string, { enum?: string[] }> }).properties.role?.enum ?? [];
+		await host.shutdown();
+		return { error: result.error, starts: claude.starts, roleEnum };
+	};
+	const closed = await instance(true);
+	assert.match(closed.error ?? "", /^role plan is unavailable in this Fusion instance: the user override .*plan\.md declares disabled: true/);
+	assert.deepEqual([closed.starts, closed.roleEnum.includes("plan")], [[], false]);
+
+	// A valid project contract outranks the disabled user one.
+	fs.writeFileSync(project, roleOverride("project plan", "PROJECT_PLAN_BODY\n"));
+	const opened = await instance(true);
+	assert.equal(opened.error, undefined);
+	assert.equal(opened.starts[0]?.contract, "PROJECT_PLAN_BODY\n");
+	assert.ok(opened.roleEnum.includes("plan"));
+	// Without project trust the disabled user contract decides again.
+	assert.match((await instance(false)).error ?? "", /^role plan is unavailable/);
+
+	// Editing the user contract from disabled to available needs a real body: header only stays closed, with why.
+	fs.rmSync(project);
+	fs.writeFileSync(user, roleOverride("user plan", ""));
+	const empty = await instance(true);
+	assert.match(empty.error ?? "", /^role plan is unavailable in this Fusion instance: the user role contract plan\.md override .* is invalid \(.*child instructions are blank\)/);
+	assert.deepEqual(empty.starts, []);
+	fs.writeFileSync(user, roleOverride("user plan", "USER_PLAN_BODY\n"));
+	const edited = await instance(true);
+	assert.equal(edited.error, undefined);
+	assert.equal(edited.starts[0]?.contract, "USER_PLAN_BODY\n");
+});
+
+test("a misplaced or redacted contract error closes its role in a running host and surfaces without contract text", async () => {
+	const host = sdkHost({
+		roleContracts: memoryRoleContractLoader({
+			overrides: {
+				"plan.md": roleOverride("plan", "Body.\n").replace("host:\n", "host:\n  disabled: true\n"),
+				"implement.md": roleOverride("implement", "Body.\n").replace("---\nhost:", "---\nPRIVATE_HEADER_KEY: PRIVATE_HEADER_VALUE\ndefaults:\n  backend: claude\nhost:"),
+				"ask-answer.md": roleOverride("ask", "Body.\n").replace("---\nhost:", "---\ndefaults:\n  backend: claude\n  effort: PRIVATE_CONTRACT_VALUE\nhost:"),
+			},
+		}),
+		ui: false,
+	});
+	await host.start();
+	await host.on();
+	const warnings = host.notices.filter(([, level]) => level === "warning").map(([text]) => text);
+	assert.equal(warnings.length, 3);
+	await host.command("config");
+	const shown = [...warnings, host.last()!, ...(host.tools.get("fusion")!.promptGuidelines ?? []), host.tools.get("fusion")!.description].join("\n");
+	assert.doesNotMatch(shown, /PRIVATE/);
+	assert.match(shown, /host has an unknown field/);
+	assert.match(shown, /defaults\.effort \(value not shown\) is not a claude effort/);
+	for (const role of ["plan", "implement", "ask"]) assert.match((await host.fusion({ role, task: "x" })).error ?? "", new RegExp(`^role ${role} is unavailable`));
+	await host.shutdown();
+});
+
+// ---------------------------------------------------------------------------------------------------------------------
+// Instruction presets: a session's choice for its next startup, the default files, and what a startup selects.
+
+const presetEntry = (preset: unknown, version = 1) => ({ type: "custom", customType: "pi-fusion-preset", data: { version, preset } });
+const presetEntries = (host: ReturnType<typeof sdkHost>) => host.branch.filter((item) => (item as { customType?: string }).customType === "pi-fusion-preset");
+const errorNotices = (host: ReturnType<typeof sdkHost>) => host.notices.filter(([, level]) => level === "error").map(([text]) => text);
+
+test("preset use records the session's choice for its next startup only, with Fusion off, and changes nothing in this instance", async () => {
+	let loads = 0;
+	const contracts = memoryRoleContractLoader();
+	const claude = fakeBackend({ name: "claude" });
+	const host = sdkHost({ roleContracts: { load: (context) => (loads++, contracts.load(context)) }, backends: { claude: claude.backend }, ui: false });
+	await host.start();
+	const before = { description: host.tools.get("fusion")!.description, guidelines: host.tools.get("fusion")!.promptGuidelines, active: [...host.active] };
+	await host.command("preset use architect");
+	assert.equal(host.last(), "this session will use preset architect after /reload, a restart or resuming it; this instance keeps auto (nothing selects one, so auto)");
+	assert.deepEqual(presetEntries(host), [presetEntry("architect")]);
+	assert.deepEqual([loads, claude.sessions, host.active, host.tools.get("fusion")!.description, host.tools.get("fusion")!.promptGuidelines], [1, [], before.active, before.description, before.guidelines], "nothing was read, started or refreshed");
+	await host.command("preset");
+	assert.match(host.last()!, /^instruction preset: auto \(nothing selects one, so auto\); selected when this instance started/);
+	assert.match(host.last()!, /\nsession preset choice: architect on this branch\nthe next startup of this session would select architect \(this session's choice\)\n/);
+	assert.match(host.last()!, /\npresets: builtin, architect, user, project, auto$/);
+	await host.command("preset use default");
+	assert.match(host.last()!, /^no preset is named "default"\. Usage: \/fusion preset/);
+	await host.shutdown();
+
+	// The next startup of this session, over the same branch, loads the architect preset whole.
+	const next = fakeBackend({ name: "claude" });
+	const reloaded = sdkHost({ backends: { claude: next.backend }, ui: false });
+	reloaded.branch.push(...host.branch);
+	await reloaded.start();
+	await reloaded.on();
+	assert.deepEqual(errorNotices(reloaded), []);
+	assert.match(reloaded.tools.get("fusion")!.promptGuidelines![1]!, /# Architect policy/);
+	assert.deepEqual((reloaded.tools.get("fusion")!.parameters as { properties: Record<string, { enum?: string[] }> }).properties.role?.enum, ["implement", "ask"]);
+	assert.match((await reloaded.fusion({ role: "plan", task: "x" })).error ?? "", /^role plan is unavailable in this Fusion instance: the bundled preset contract .*presets\/architect\/contracts\/plan\.md declares disabled: true/);
+	assert.equal((await reloaded.fusion({ role: "implement", task: "x" })).error, undefined);
+	assert.match(next.starts[0]!.contract ?? "", /^You are the implementer\./);
+	assert.equal(next.starts[0]!.role.model, "opus[1m]", "the preset's implement default is the built-in configuration");
+	await reloaded.command("config");
+	assert.match(reloaded.last()!, /^instruction preset: architect \(this session's choice\)/m);
+	assert.match(reloaded.last()!, /^host policy: bundled preset · .*presets\/architect\/host\.md/m);
+	await reloaded.command("preset reset");
+	assert.match(reloaded.last()!, /^cleared this session's preset choice; after \/reload the project and user defaults decide.*; this instance keeps architect \(this session's choice\); the next startup of this session would select auto \(nothing selects one, so auto\)$/);
+	assert.deepEqual(presetEntries(reloaded).at(-1), presetEntry(null));
+	await reloaded.call("fusion_control", { action: "wait", run: "run-1" });
+	await reloaded.shutdown();
+});
+
+test("an unusable session entry or default file refuses startup; reset recovers an entry, only an explicit choice gets past a default file", async () => {
+	// An unusable latest entry over a valid default: the startup refuses, the preset commands still answer, and reset recovers.
+	const valid = memoryPresetDefaults({ user: "builtin" });
+	const entryHost = sdkHost({ presetDefaults: valid, ui: false });
+	entryHost.branch.push(presetEntry("architect"), presetEntry("builtin", 9));
+	await entryHost.start();
+	assert.match(errorNotices(entryHost)[0] ?? "", /^the latest preset entry on this branch has a version this build does not read\. Choose one with \/fusion preset use <name> or clear it with \/fusion preset reset, then \/reload$/);
+	await entryHost.on();
+	assert.match((await entryHost.fusion({ role: "implement", task: "x" })).error ?? "", /version this build does not read/);
+	await entryHost.command("preset");
+	assert.match(entryHost.last()!, /^instruction preset: none: this instance's startup failed \(the latest preset entry/);
+	await entryHost.command("preset reset");
+	assert.match(entryHost.last()!, /the next startup of this session would select builtin \(the user default\)$/);
+	const recovered = sdkHost({ presetDefaults: valid, ui: false });
+	recovered.branch.push(...entryHost.branch);
+	await recovered.start();
+	assert.deepEqual(errorNotices(recovered), []);
+	await recovered.command("preset");
+	assert.match(recovered.last()!, /^instruction preset: builtin \(the user default\)/);
+
+	// An unusable default file: reset only clears the session's choice, so the next startup still reads it and refuses.
+	const broken = memoryPresetDefaults({ user: { error: "is not valid JSON" } });
+	const first = sdkHost({ presetDefaults: broken, ui: false });
+	await first.start();
+	assert.match(errorNotices(first)[0] ?? "", /^preset file \(user preset\.json, in memory\) is not valid JSON; fix or remove it$/);
+	await first.command("preset reset");
+	const reset = sdkHost({ presetDefaults: broken, ui: false });
+	reset.branch.push(...first.branch);
+	await reset.start();
+	assert.match(errorNotices(reset)[0] ?? "", /is not valid JSON/);
+	await reset.command("preset use builtin");
+	const explicit = sdkHost({ presetDefaults: broken, ui: false });
+	explicit.branch.push(...reset.branch);
+	const readsBefore = broken.reads.length;
+	await explicit.start();
+	assert.deepEqual(errorNotices(explicit), []);
+	assert.equal(broken.reads.length, readsBefore, "an explicit session choice reads no default file");
+	// Defaults can also be repaired from an instance whose startup failed; the store refuses to replace an unusable file.
+	await first.command("preset default user auto");
+	assert.match(first.last()!, /^the user default preset was not changed: preset file .* is not valid JSON/);
+	for (const host of [entryHost, recovered, first, reset, explicit]) await host.shutdown();
+});
+
+test("preset use and reset refuse while a run is running or the instance is shutting down, and append nothing", async () => {
+	const claude = fakeBackend({ name: "claude", scripts: [{ pending: true }, {}] });
+	const host = sdkHost({ backends: { claude: claude.backend }, ui: false });
+	await host.start();
+	await host.on();
+	const run = await heldRun(host, claude);
+	for (const command of ["preset use builtin", "preset reset"]) {
+		await host.command(command);
+		assert.equal(host.last(), "the session's preset choice stays as it is while runs are unfinished: run-1 (implement). Wait for each run or cancel it with /fusion cancel run-N, then retry.");
+	}
+	// Defaults are for instances yet to start, so a run does not hold them.
+	await host.command("preset default user architect");
+	assert.match(host.last()!, /^the user default preset is architect in \(user preset\.json, in memory\); new Fusion instances read it, and this instance keeps auto/);
+	run.release();
+	await run.call;
+	await host.call("fusion_control", { action: "wait", run: "run-1" });
+	const shutting = host.shutdown();
+	for (const command of ["preset use builtin", "preset reset"]) {
+		await host.command(command);
+		assert.equal(host.last(), "this Fusion instance is shutting down, so the session's preset choice is unchanged", command);
+	}
+	await shutting;
+	for (const command of ["preset use builtin", "preset reset"]) {
+		await host.command(command);
+		assert.equal(host.last(), "this Fusion instance is shutting down, so the session's preset choice is unchanged", `${command} after shutdown`);
+	}
+	assert.deepEqual(presetEntries(host), []);
+});
+
+test("a startup selects from the branch as it was when it began; a choice made while it loads, or a branch move, is only pending", async () => {
+	let release!: () => void;
+	const gate = new Promise<void>((resolve) => (release = resolve));
+	const memory = memoryPresetDefaults();
+	const store: PresetDefaultsStore = { ...memory, read: async (scope, cwd) => (await gate, memory.read(scope, cwd)) };
+	const host = sdkHost({ presetDefaults: store, ui: false });
+	const starting = host.start();
+	await host.command("preset use architect");
+	release();
+	await starting;
+	await host.command("preset");
+	assert.match(host.last()!, /^instruction preset: auto \(nothing selects one, so auto\)/);
+	assert.match(host.last()!, /\nsession preset choice: architect on this branch\n/);
+	// /tree moving the leaf past the entry leaves the next startup with the destination branch's choice.
+	host.branch.splice(host.branch.length - 1, 1);
+	await host.command("preset");
+	assert.match(host.last()!, /\nsession preset choice: none on this branch\nthe next startup of this session would select auto/);
+	await host.shutdown();
+});
+
+test("default presets: user and trusted project files decide a later startup in that order; project needs trust and is this cwd's", async () => {
+	const store = memoryPresetDefaults();
+	const untrusted = sdkHost({ presetDefaults: store, projectTrusted: false, ui: false });
+	await untrusted.start();
+	await untrusted.command("preset default project architect");
+	assert.equal(untrusted.last(), "the project default preset was not changed: Pi does not report this working directory as trusted");
+	await untrusted.command("preset default user builtin");
+	await untrusted.command("preset default team builtin");
+	assert.match(untrusted.last()!, /^Usage: \/fusion preset/);
+	const trusted = sdkHost({ presetDefaults: store, projectTrusted: true, ui: false });
+	await trusted.start();
+	await trusted.command("preset");
+	assert.match(trusted.last()!, /^instruction preset: builtin \(the user default\)/);
+	await trusted.command("preset default project architect");
+	assert.deepEqual([store.value("project"), store.value("user")], ["architect", "builtin"]);
+	await trusted.command("preset");
+	assert.match(trusted.last()!, /^instruction preset: builtin \(the user default\)/, "a default changes no running instance");
+	assert.match(trusted.last()!, /\nthe next startup of this session would select architect \(the project default\)\nproject default: architect · /);
+	// A session whose choice is project, opened where Pi reports no trust, refuses rather than loading builtin.
+	const forked = fakeBackend({ name: "claude" });
+	const elsewhere = sdkHost({ presetDefaults: store, projectTrusted: false, backends: { claude: forked.backend }, ui: false });
+	elsewhere.branch.push(presetEntry("project"));
+	await elsewhere.start();
+	await elsewhere.on();
+	assert.match(errorNotices(elsewhere)[0] ?? "", /^preset project needs a trusted project, .* \(selected by the session's choice\)$/);
+	assert.match((await elsewhere.fusion({ role: "implement", task: "x" })).error ?? "", /^preset project needs a trusted project/);
+	assert.deepEqual(forked.sessions, []);
+	await trusted.command("preset default user clear");
+	await trusted.command("preset default project clear");
+	assert.deepEqual([store.value("project"), store.value("user")], [null, null]);
+	for (const host of [untrusted, trusted, elsewhere]) await host.shutdown();
+});
+
+test("under a preset, a saved profile still chooses models but cannot reopen an unavailable role, and continuations take the current snapshot", async () => {
+	const first = fakeBackend({ name: "claude" });
+	const before = sdkHost({ backends: { claude: first.backend }, ui: false });
+	await before.start();
+	await before.on();
+	assert.equal((await before.fusion({ role: "implement", task: "x" })).error, undefined);
+	await before.call("fusion_control", { action: "wait", run: "run-1" });
+	await before.command("preset use architect");
+	await before.shutdown();
+	const next = fakeBackend({ name: "claude" });
+	const host = sdkHost({ profiles: memoryProfileStore(document({ work: WORK }, "work")), backends: { claude: next.backend }, ui: false });
+	host.branch.push(...before.branch);
+	await host.start();
+	await host.on();
+	assert.equal(WORK.plan.enabled, true);
+	assert.match((await host.fusion({ role: "plan", task: "x" })).error ?? "", /^role plan is unavailable/);
+	assert.equal((await host.fusion({ continue: "run-1", task: "more" })).error, undefined);
+	assert.match(next.starts[0]!.contract ?? "", /^You are the implementer\./, "the continuation runs under the instructions this instance loaded");
+	assert.equal(next.starts[0]!.role.model, "opus", "and keeps the model its record names");
+	assert.equal((await host.fusion({ role: "implement", task: "fresh" })).error, undefined);
+	assert.equal(next.starts[1]!.role.model, "sonnet", "the saved profile's model, over the preset's default");
+	await host.call("fusion_control", { action: "wait", run: "run-2" });
+	await host.shutdown();
+});
+
+test("preset completion offers the five fixed names, and clear for defaults; parsing accepts nothing else", async () => {
+	const host = sdkHost({ ui: false });
+	assert.deepEqual(host.completions("preset use a"), [{ value: "preset use architect", label: "preset use architect" }, { value: "preset use auto", label: "preset use auto" }]);
+	assert.deepEqual(host.completions("preset default project c"), [{ value: "preset default project clear", label: "preset default project clear" }]);
+	assert.equal(host.completions("preset use x"), null);
+	for (const args of ["preset use", "preset use builtin extra", "preset default user", "preset default team builtin", "preset reset now", "preset default user /tmp/x"]) {
+		await host.command(args);
+		assert.match(host.last() ?? "", /Usage: \/fusion preset \[list \| use <name> \| reset \| default user\|project <name>\|clear\]; the presets are builtin, architect, user, project, auto$/, args);
+	}
+	assert.deepEqual(presetEntries(host), [], "no usage error appends anything");
+	await host.shutdown();
+});
+
+test("the config editor shows the active preset, this branch's pending choice and the default files, and changes nothing by showing them", async () => {
+	let loads = 0;
+	const contracts = memoryRoleContractLoader();
+	const store = memoryPresetDefaults({ user: "auto" });
+	const host = sdkHost({ presetDefaults: store, roleContracts: { load: (context) => (loads++, contracts.load(context)) }, dialogs: ["Cancel"] });
+	await host.start();
+	await host.command("preset use architect");
+	const registrations = host.registrations.length;
+	const active = [...host.active];
+	const description = host.tools.get("fusion")!.description;
+	await host.command("config");
+	const title = host.titles.at(-1)!;
+	assert.ok(title.startsWith([
+		"fusion config · builtin",
+		"instruction preset: auto (the user default); selected when this instance started, and another applies only after /reload, a restart or resuming the session",
+		"session preset choice: architect on this branch",
+		"the next startup of this session would select architect (this session's choice)",
+		"project default: not read, Pi does not report this working directory as trusted · (project preset.json, in memory)",
+		"user default: auto · (user preset.json, in memory)",
+		"host policy: shipped · ",
+	].join("\n")), title);
+	assert.equal(host.last(), "fusion config cancelled; nothing changed");
+	assert.deepEqual([loads, host.registrations.length, host.active, host.tools.get("fusion")!.description], [1, registrations, active, description], "no instruction reread, re-registration or tool-list change");
+	assert.deepEqual(presetEntries(host), [presetEntry("architect")]);
+	assert.equal(store.value("user"), "auto");
+	await host.shutdown();
+});
+
+test("preset use and reset are refused while a run waits for an answer, and answer, cancel or start nothing", async () => {
+	const claude = fakeBackend({ name: "claude", scripts: [{ questions: ["Which name?"] }, {}] });
+	const host = sdkHost({ backends: { claude: claude.backend }, ui: false });
+	await host.start();
+	await host.on();
+	assert.equal((await host.fusion({ role: "ask", task: "a question" })).details.state, "waiting");
+	for (const command of ["preset use builtin", "preset reset"]) {
+		await host.command(command);
+		assert.equal(host.last(), "the session's preset choice stays as it is while runs are unfinished: run-1 (ask). Wait for each run or cancel it with /fusion cancel run-N, then retry.", command);
+	}
+	assert.deepEqual(presetEntries(host), []);
+	assert.deepEqual([claude.starts.length, claude.starts[0]!.answers], [1, []], "nothing answered the question or started another run");
+	assert.match((await host.call("fusion_control", { action: "status", run: "run-1" })).text ?? "", /waiting/);
+	await host.call("fusion_control", { action: "message", run: "run-1", message: "call it foo" });
+	await host.call("fusion_control", { action: "wait", run: "run-1" });
+	await host.command("preset reset");
+	assert.match(host.last() ?? "", /^cleared this session's preset choice/);
+	assert.deepEqual(presetEntries(host), [presetEntry(null)]);
+	await host.shutdown();
+});
+
+test("a default command repairs a failed instruction startup for the next instance", async () => {
+	const store = memoryPresetDefaults({ user: "project" });
+	const failed = sdkHost({ presetDefaults: store, projectTrusted: false, ui: false });
+	await failed.start();
+	assert.match(errorNotices(failed)[0] ?? "", /^preset project needs a trusted project, .* \(selected by the user default\)$/);
+	await failed.command("preset default user builtin");
+	assert.match(failed.last()!, /^the user default preset is builtin in \(user preset\.json, in memory\); new Fusion instances read it, and this instance keeps none: this instance's startup failed/);
+	await failed.command("preset");
+	assert.match(failed.last()!, /\nthe next startup of this session would select builtin \(the user default\)\n/);
+	const next = sdkHost({ presetDefaults: store, projectTrusted: false, ui: false });
+	await next.start();
+	assert.deepEqual(errorNotices(next), []);
+	await next.command("preset");
+	assert.match(next.last()!, /^instruction preset: builtin \(the user default\)/);
+	for (const host of [failed, next]) await host.shutdown();
+});
+
+test("over a file store, default commands write only the user and trusted project preset.json under their own roots", async () => {
+	const dir = tempDir("preset-files");
+	const agent = path.join(dir, "agent");
+	const cwd = path.join(dir, "project");
+	fs.mkdirSync(cwd);
+	const store = filePresetDefaults(async () => agent);
+	const host = sdkHost({ presetDefaults: store, cwd, projectTrusted: true, ui: false });
+	await host.start();
+	assert.deepEqual([fs.existsSync(agent), fs.readdirSync(cwd)], [false, []], "startup and its reads create nothing");
+	await host.command("preset");
+	assert.deepEqual([fs.existsSync(agent), fs.readdirSync(cwd)], [false, []], "neither does the list");
+	await host.command("preset default user architect");
+	await host.command("preset default project builtin");
+	const user = path.join(agent, "pi-fusion", "preset.json");
+	const project = path.join(cwd, ".pi", "pi-fusion", "preset.json");
+	assert.deepEqual(JSON.parse(fs.readFileSync(user, "utf8")), { version: 1, defaultPreset: "architect" });
+	assert.deepEqual(JSON.parse(fs.readFileSync(project, "utf8")), { version: 1, defaultPreset: "builtin" });
+	const files = (root: string): string[] => fs.readdirSync(root, { recursive: true, withFileTypes: true }).filter((entry) => entry.isFile()).map((entry) => path.relative(root, path.join(entry.parentPath, entry.name)));
+	assert.deepEqual([files(agent), files(cwd)], [[path.join("pi-fusion", "preset.json")], [path.join(".pi", "pi-fusion", "preset.json")]]);
+	await host.command("preset");
+	assert.match(host.last()!, /^instruction preset: auto \(nothing selects one, so auto\)/, "this instance keeps what it started with");
+	const next = sdkHost({ presetDefaults: store, cwd, projectTrusted: true, ui: false });
+	await next.start();
+	await next.command("preset");
+	assert.match(next.last()!, /^instruction preset: builtin \(the project default\)/);
+	await next.command("preset default project clear");
+	assert.deepEqual(JSON.parse(fs.readFileSync(project, "utf8")), { version: 1, defaultPreset: null });
+	for (const each of [host, next]) await each.shutdown();
 });

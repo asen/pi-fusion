@@ -1,6 +1,6 @@
 # Profiles and role settings
 
-Each role has an enabled setting, backend, model, and effort. A **profile** is a named snapshot of all five roles, stored globally and copied into a session. Use `/fusion config` to edit the session; saving a profile is a separate action.
+Each role has an enabled setting, backend, model, and effort. A **profile** is a named snapshot of all five roles, stored globally and copied into a session. Use `/fusion config` to edit the session; saving a profile is a separate action. Profiles are separate from [instruction presets](presets.md), which choose the instructions a startup loads: the `builtin` profile is the built-in role settings, while the `builtin` preset is this build's shipped contracts.
 
 ## Commands
 
@@ -10,7 +10,7 @@ Each role has an enabled setting, backend, model, and effort. A **profile** is a
 | `/fusion profile` | Choose a saved profile or `builtin`; without dialogs, print list/usage |
 | `/fusion profile list` | List profiles, current choice/modified state, and startup default |
 | `/fusion profile use <name>` | Load a snapshot into this session |
-| `/fusion profile use builtin` | Restore captured built-in settings |
+| `/fusion profile use builtin` | Restore captured built-in settings, including startup role-contract defaults |
 | `/fusion profile save <name>` | Save current settings; replace an existing name with a notice |
 | `/fusion profile default <name>` | Choose the default for future instances, not this session |
 | `/fusion profile default builtin` | Restore built-in startup defaults |
@@ -31,9 +31,13 @@ Applying refreshes tool descriptions/guidance for the host's next response while
 
 Builtin enables every role except **security**. Other roles default to Claude; security is assigned to Pi but must be enabled through settings or a saved profile. `PI_FUSION_PI_SECURITY_MODEL` supplies its model, not activation. Saved profiles—including older ones—keep their own enabled settings.
 
-Models/efforts come from [role variables](configuration.md), captured once per instance. A default saved profile replaces them at startup. Missing default means `builtin`; unreadable/invalid files or absent named defaults also use `builtin` with a warning, leaving the file untouched.
+Models/efforts come from [role variables](configuration.md), captured once per instance. A selected role contract's optional [`defaults`](configuration.md#role-availability-and-defaults) can choose a role's built-in backend and overlay that backend's model/effort field by field; the captured variables themselves are unchanged. A default saved profile replaces all of them at startup. Missing default means `builtin`; an unreadable/invalid **profiles file** or an absent named default also uses `builtin` with a warning, leaving the file untouched.
 
 Starting Pi, `/new`, reload, resume, or fork loads instance defaults again. Current profile choice, edits, and Fusion mode are in memory only. A loaded snapshot never follows another session's saves, later environment changes, or external file edits. Reload a profile to read edits; setting a default changes only future instances. A Pi role saved without a model stays unconfigured.
+
+## Unavailable roles
+
+Role contracts do **not** fall back like the profiles file. A role contract with `disabled: true`, or an [unusable role override](configuration.md#unusable-role-overrides), makes a role **unavailable** for the instance's life. That is not a setting: a profile, the editor or a call cannot enable it, and every fresh call, continuation and review needing it is refused with the contract's reason. Your saved `enabled` value is kept: the table shows `unavailable` in its place, the editor refuses to toggle it, and `/fusion profile save` writes it unchanged. Change the contract and restart Pi, `/reload` or start a new session to use the role again.
 
 ## What a call runs on
 
@@ -45,19 +49,19 @@ fresh run
 
 continuation
   recorded backend -> call overrides, otherwise recorded selection
-  enabled setting still applies
+  availability and enabled setting still apply
 ```
 
 Profiles do not fill omitted configured fields from variables. An explicit call to another backend is a one-off override, not a profile change. `claude` uses that override when a role is configured on Pi or Codex; its description names such a role as configured there, plus the legacy Claude model/effort a `claude` call would force instead. Its guidance recommends `fusion` for Pi and Codex roles unless you explicitly request Claude Code, and says only `fusion` runs Codex roles.
 
-Pi with no model is shown as `unconfigured` and refuses before admission unless the call supplies one. A disabled role also refuses before any handle, child, or file snapshot, for new calls **and continuations**, despite explicit backend/model/effort parameters. Disabling a role unregisters no backend and removes no workflow tool. Enabled security still requires an explicit user security request in host guidance.
+Pi with no model is shown as `unconfigured` and refuses before admission unless the call supplies one. An unavailable or disabled role also refuses before any handle, child, or file snapshot, for new calls **and continuations**, despite explicit backend/model/effort parameters. Disabling a role unregisters no backend and removes no workflow tool. Enabled security still requires an explicit user security request in host guidance.
 
 ## What the host is told
 
-Each delegation tool's description, prompt snippet, guidelines and parameter help come from the session's enabled roles. A tool only covers the roles it runs: `claude` has no `security`.
+Each delegation tool's description, prompt snippet, guidelines and parameter help come from the session's available, enabled roles. A tool only covers the roles it runs: `claude` has no `security`.
 
-- One short guideline per tool names its disabled roles and says fresh calls and continuations are refused. Their descriptions, role-specific guidance, snippets and task briefs are omitted; configuration text, backend role lists and parameter help list only enabled roles. See [Routing](routing.md#choosing-a-role).
-- The schema's `role` enum still lists every role the tool knows, disabled or not, so it is never empty. Runtime refusals are unchanged.
+- One short guideline per tool names its disabled roles and says fresh calls and continuations are refused; another names its unavailable roles and says no profile, edit or call parameter enables them before the contract changes and Fusion reloads. Their descriptions, role-specific guidance, snippets and task briefs are omitted; configuration text, backend role lists and parameter help list only usable roles. See [Routing](routing.md#choosing-a-role).
+- The schema's `role` enum lists only the roles the tool runs that are available and enabled; with none, `role` is left out of the schema rather than given an empty enum. A call made against an older schema is still refused at runtime.
 - A parameter that no enabled role uses says so and asks to leave it unset: for example, `fresh` without `plan`, `mode` without `ask`, or `model`/`effort` when only `ultracode` is enabled. The guideline about honoring your explicit choices offers model/effort overrides only for roles that accept them. It says `ultracode` always runs on its configured model at its fixed effort, so a call that names either for it is refused.
 - With no enabled role, the tool's text says every call is refused, while its control tool can still act on existing runs. With only `security` enabled, `claude` says so and points to `fusion`. If no enabled role implements changes, the guidance says so as a fact; what the host does then is the [host policy](routing.md#the-host-policy)'s.
 - Both tools also carry the selected host policy, unchanged, as one shared guideline. A profile switch changes the generated text around it, never the policy.
@@ -78,6 +82,8 @@ ultracode  no       claude   fable                   ultracode (fixed)
 ask        yes      claude   opus                    high
 security   no       pi       unconfigured            child default
 ```
+
+A role its contract makes unavailable shows `unavailable` in the enabled column; its editor entry says so with the saved setting, and selecting it explains the refusal instead of toggling.
 
 Pick a role to change:
 

@@ -1119,3 +1119,28 @@ test("this suite launches only the fake by its own path: it takes the app-server
 	assert.deepEqual(taken, ["CODEX_APP_SERVER_ARGS"]);
 	assert.ok(importsOf(file).every((name) => !name.includes("@openai")));
 });
+
+test("a lazy contract read refuses a disabled or blank canonical contract, and a supplied body is checked as text only, before any launch", async () => {
+	const disabled = "---\ndisabled: true\nhost:\n  description: Host only.\n  guidance: []\n  task_brief: Task.\n  snippet: Role.\n---\n";
+	let launches = 0;
+	const launch = (): CodexLaunch => {
+		launches += 1;
+		throw new Error("reached");
+	};
+	for (const [what, role, contract, read, why] of [
+		["a disabled role contract", codexRole({ role: "implement" }, undefined, {}), undefined, () => disabled, /declares its role disabled/],
+		["a review mode whose role is disabled", codexRole({ role: "ask", mode: "review" }, undefined, {}), undefined, (name: string) => (name === "ask-answer.md" ? disabled : "Review.\n"), /ask-answer\.md declares its role disabled/],
+		["a review mode whose role's contract is blank", codexRole({ role: "ask", mode: "review" }, undefined, {}), undefined, (name: string) => (name === "ask-answer.md" ? " \n" : "Review.\n"), /ask-answer\.md has blank child instructions/],
+		["a blank role file", codexRole({ role: "implement" }, undefined, {}), undefined, () => " \n", /implement\.md has blank child instructions/],
+		["a supplied blank body", codexRole({ role: "implement" }, undefined, {}), "  ", () => { throw new Error("must not read"); }, /supplied role contract body is blank/],
+	] as const) {
+		const backend = createCodexBackend({ readContract: read, launch });
+		const request = { role, prompt: "x", cwd: repoRoot, signal: undefined, onQuestion: unexpectedQuestion, onProgress: () => {}, ...(contract === undefined ? {} : { contract }) };
+		await assert.rejects(backend.run(request), (error: Error) => {
+			assert.equal(error.message, CONTRACT_UNREADABLE, what);
+			assert.match((error.cause as Error).message, why, what);
+			return true;
+		});
+	}
+	assert.equal(launches, 0);
+});

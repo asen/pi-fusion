@@ -101,25 +101,34 @@ test("invalid project policies fall back with diagnostics, retaining reasons whe
 	assert.match((await hostPolicyLoader(async () => f.agent).load(context)).diagnostic!, /not a regular file/);
 });
 
-test("invalid project contracts fall back whole, never mixing project bodies with user metadata", async (t) => {
+test("an invalid project contract closes its role rather than falling back to a valid user or shipped one", async (t) => {
 	const f = fixture(t);
-	const user = write(path.join(f.user, "contracts", "implement.md"), contract("user"));
+	write(path.join(f.user, "contracts", "implement.md"), contract("user"));
 	const project = write(path.join(f.project, "contracts", "implement.md"), "Project body without its required metadata.\n");
 	write(path.join(f.project, "contracts", "ask-review.md"), "Project review.\n");
 	const context = { cwd: f.cwd, projectTrusted: true };
 	const first = await roleContractLoader(async () => f.agent).load(context);
-	assert.equal(first.files["implement.md"].path, user);
-	assert.equal(first.files["implement.md"].body, "Child user.\n");
-	assert.equal(first.guidance.implement.description, "Host user.");
-	assert.match(first.files["implement.md"].diagnostic!, /no host frontmatter/);
+	assert.equal(first.files["implement.md"].path, project);
+	assert.equal(first.files["implement.md"].source, "project");
+	assert.equal(first.files["implement.md"].unusable, true);
+	assert.equal(first.files["implement.md"].body, "");
+	assert.match(first.files["implement.md"].diagnostic!, /^the project role contract implement\.md override .* is invalid \(.*no host frontmatter\); role implement is unavailable/);
+	assert.equal(first.unavailable.implement, first.files["implement.md"].diagnostic);
 	assert.equal(first.files["ask-review.md"].source, "project", "a bad file does not discard another project override");
 	write(project, "---\nhost: [PRIVATE_PROJECT_VALUE\n---\nBody.");
-	write(user, "Invalid user contract without metadata.");
-	const both = (await roleContractLoader(async () => f.agent).load(context)).files["implement.md"];
-	assert.equal(both.source, "shipped");
-	assert.ok(both.diagnostic!.includes(project));
-	assert.ok(both.diagnostic!.includes(user));
-	assert.doesNotMatch(both.diagnostic!, /PRIVATE_PROJECT_VALUE/);
+	const yaml = (await roleContractLoader(async () => f.agent).load(context)).files["implement.md"];
+	assert.equal(yaml.unusable, true);
+	assert.ok(yaml.diagnostic!.includes(project));
+	assert.doesNotMatch(yaml.diagnostic!, /PRIVATE_PROJECT_VALUE/);
+	// A missing project file still falls through to the user file, which is the only fallback there is.
+	fs.rmSync(project);
+	const fallen = await roleContractLoader(async () => f.agent).load(context);
+	assert.equal(fallen.files["implement.md"].source, "override");
+	assert.equal(fallen.unavailable.implement, undefined);
+	// And a disabled project file outranks an available user one.
+	write(project, contract("project").replace("---\nhost:", "---\ndisabled: true\nhost:"));
+	const disabled = await roleContractLoader(async () => f.agent).load(context);
+	assert.equal(disabled.unavailable.implement, `the project override ${project} declares disabled: true`);
 });
 
 test("project lookup requires affirmative context trust; memory loaders never consult project files", async (t) => {
@@ -158,7 +167,7 @@ test("lookup uses the supplied session cwd, searches no ancestors, and snapshots
 	assert.equal((await roles.load({ cwd: f.cwd, projectTrusted: true })).files["implement.md"].body, "Child edited.\n");
 });
 
-test("project path-resolution failures fall back, and a failed contract directory is resolved only once", async (t) => {
+test("a project path-resolution failure falls back for the policy, closes every role, and is resolved only once", async (t) => {
 	const f = fixture(t);
 	const userPolicy = write(path.join(f.user, "host.md"), "User policy.\n");
 	const shippedPolicy = write(path.join(f.root, "shipped.md"), "Shipped policy.\n");
@@ -169,9 +178,22 @@ test("project path-resolution failures fall back, and a failed contract director
 	let resolutions = 0;
 	const roles = await fileRoleContractLoader({ shipped: SHIPPED_ROLE_CONTRACTS_DIR, override: () => path.join(f.user, "contracts"), project: () => { resolutions++; throw new Error("no project directory"); } }).load();
 	assert.equal(resolutions, 1);
-	assert.equal(roles.files["implement.md"].source, "override");
-	assert.equal(roles.files["implement.md"].body, "Child user.\n");
-	assert.ok(Object.values(roles.files).every((file) => file.diagnostic!.includes("no project directory")));
+	assert.equal(roles.files["implement.md"].source, "project");
+	assert.equal(roles.files["implement.md"].unusable, true, "the valid user file does not stand in for a project scope that could not be searched");
+	assert.ok(Object.values(roles.files).every((file) => file.unusable && file.diagnostic!.includes("project role contract") && file.diagnostic!.includes("no project directory")));
+	assert.deepEqual(Object.keys(roles.unavailable).sort(), ["ask", "implement", "plan", "security", "ultracode"]);
+});
+
+test("a dangling host-policy link warns and falls through, as any unusable host-policy override does", async (t) => {
+	const f = fixture(t);
+	write(path.join(f.user, "host.md"), "User policy.\n");
+	fs.mkdirSync(f.project, { recursive: true });
+	fs.symlinkSync(path.join(f.root, "absent.md"), path.join(f.project, "host.md"));
+	const selected = await hostPolicyLoader(async () => f.agent).load({ cwd: f.cwd, projectTrusted: true });
+	assert.equal(selected.source, "override");
+	assert.match(selected.diagnostic!, /host\.md is a link to a missing file; using the user host policy instead$/);
+	const roles = await roleContractLoader(async () => f.agent).load({ cwd: f.cwd, projectTrusted: true });
+	assert.deepEqual(roles.unavailable, {}, "a bad host.md link closes no role");
 });
 
 test("broken shipped files fail before either project or user paths are resolved", async (t) => {

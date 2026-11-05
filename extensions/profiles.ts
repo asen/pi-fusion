@@ -90,12 +90,29 @@ export const defaultBackend = (role: KnownRoleName): BackendName => {
 	return backends.length === 1 ? backends[0]! : "claude";
 };
 
-/** The built-in role defaults: security is opt-in; model and effort defaults come from the captured baseline. */
-export function builtinSettings(baseline: Baseline): RoleSettings {
+/**
+ * A role contract's startup defaults as the host checked them: the backend the role starts on and, overlaid field
+ * by field on that backend's legacy defaults, a model and effort. Omitted fields keep the legacy ones.
+ */
+export interface StartupDefault {
+	backend: BackendName;
+	model?: string;
+	effort?: string;
+}
+
+export type StartupDefaults = Partial<Record<KnownRoleName, StartupDefault>>;
+
+/**
+ * The built-in role defaults: security is opt-in; the backend is the role's own unless its contract names another, and
+ * model and effort come from that backend's captured baseline with the contract's own fields over them. Nothing from
+ * one backend's baseline is carried to another.
+ */
+export function builtinSettings(baseline: Baseline, defaults: StartupDefaults = {}): RoleSettings {
 	const settings = {} as RoleSettings;
 	for (const role of KNOWN_ROLE_NAMES) {
-		const backend = defaultBackend(role);
-		settings[role] = { enabled: role !== "security", backend, ...copySelection(baseline[role][backend]) };
+		const declared = Object.hasOwn(defaults, role) ? defaults[role] : undefined;
+		const backend = declared?.backend ?? defaultBackend(role);
+		settings[role] = { enabled: role !== "security", backend, ...copySelection(baseline[role][backend]), ...copySelection(declared) };
 	}
 	return settings;
 }
@@ -142,10 +159,13 @@ const isRecord = (value: unknown): value is Record<string, unknown> => typeof va
 
 const ROLE_FIELDS = new Set(["enabled", "backend", "model", "effort"]);
 
-/** One role's setting, checked whole, or an error naming the field that is wrong and where it is. */
-function roleSetting(role: KnownRoleName, value: unknown, where: string): RoleSetting {
+/**
+ * One role's setting, checked whole, or an error naming the field that is wrong and where it is. `show` is how a
+ * supplied key or value appears in that error: a profile's are quoted, a role contract's are withheld.
+ */
+function roleSetting(role: KnownRoleName, value: unknown, where: string, show: (value: unknown) => string = shown): RoleSetting {
 	if (!isRecord(value)) throw new Error(`${where} must be an object`);
-	for (const key of Object.keys(value)) if (!ROLE_FIELDS.has(key)) throw new Error(`${where} has unknown field ${JSON.stringify(key)}; use enabled, backend, model and effort`);
+	for (const key of Object.keys(value)) if (!ROLE_FIELDS.has(key)) throw new Error(`${where} has unknown field ${show(key)}; use enabled, backend, model and effort`);
 	if (typeof value.enabled !== "boolean") throw new Error(`${where}.enabled must be true or false`);
 	if (!isBackendName(value.backend)) throw new Error(`${where}.backend must be claude, pi or codex`);
 	const backend = value.backend;
@@ -155,9 +175,9 @@ function roleSetting(role: KnownRoleName, value: unknown, where: string): RoleSe
 	if (value.model !== undefined) {
 		// A blank model is a mistake rather than a way of saying none: leaving the field out is how a role has none.
 		if (typeof value.model !== "string" || !value.model.trim()) throw new Error(`${where}.model must be a non-empty string; leave it out instead`);
-		if (value.model !== value.model.trim()) throw new Error(`${where}.model ${shown(value.model)} has spaces around it`);
-		if (backend === "pi" && !isPiModel(value.model)) throw new Error(`${where}.model ${shown(value.model)} is not a pi provider and model id such as deepseek/deepseek-chat`);
-		if (backend === "codex" && !isCodexToken(value.model)) throw new Error(`${where}.model ${shown(value.model)} has whitespace in it, which no codex model id has`);
+		if (value.model !== value.model.trim()) throw new Error(`${where}.model ${show(value.model)} has spaces around it`);
+		if (backend === "pi" && !isPiModel(value.model)) throw new Error(`${where}.model ${show(value.model)} is not a pi provider and model id such as deepseek/deepseek-chat`);
+		if (backend === "codex" && !isCodexToken(value.model)) throw new Error(`${where}.model ${show(value.model)} has whitespace in it, which no codex model id has`);
 		setting.model = value.model;
 	}
 	if (value.effort !== undefined) {
@@ -165,9 +185,9 @@ function roleSetting(role: KnownRoleName, value: unknown, where: string): RoleSe
 			if (value.effort !== ULTRACODE_EFFORT) throw new Error(`${where}.effort must be ${ULTRACODE_EFFORT} or left out: role ultracode runs at no other level`);
 		} else if (backend === "codex") {
 			// Which levels a Codex model takes is the model's own, so any single token is accepted here and the child refuses one it lacks.
-			if (!isCodexToken(value.effort)) throw new Error(`${where}.effort ${shown(value.effort)} is not a codex effort; name one level, such as ${CODEX_EFFORT_SUGGESTIONS.join(", ")}, with no spaces in it`);
+			if (!isCodexToken(value.effort)) throw new Error(`${where}.effort ${show(value.effort)} is not a codex effort; name one level, such as ${CODEX_EFFORT_SUGGESTIONS.join(", ")}, with no spaces in it`);
 		} else if (typeof value.effort !== "string" || !effortsFor(role, backend).includes(value.effort)) {
-			throw new Error(`${where}.effort ${shown(value.effort)} is not a ${backend} effort; use one of ${effortsFor(role, backend).join(", ")}`);
+			throw new Error(`${where}.effort ${show(value.effort)} is not a ${backend} effort; use one of ${effortsFor(role, backend).join(", ")}`);
 		}
 		setting.effort = value.effort;
 	}
@@ -180,6 +200,16 @@ function roleSetting(role: KnownRoleName, value: unknown, where: string): RoleSe
 		if (role !== "ultracode" && setting.effort === undefined) throw new Error(`${where} is enabled on claude and names no effort`);
 	}
 	return setting;
+}
+
+/**
+ * A role contract's defaults as the host accepts them: a backend the role runs on, and a model and effort that backend
+ * takes, checked as a profile's are without demanding a field the contract leaves to the legacy defaults.
+ */
+export function startupDefault(role: KnownRoleName, value: StartupDefault, where: string): StartupDefault {
+	// Contract text reaches startup warnings and /fusion config, so a rejected value is described, never repeated.
+	const { enabled: _, ...checked } = roleSetting(role, { enabled: false, ...value }, where, () => "(value not shown)");
+	return checked;
 }
 
 /** A complete configuration, every known role in it and nothing else, or an error naming what is wrong. */
@@ -256,12 +286,16 @@ export const effortShown = (role: KnownRoleName, setting: RoleSetting): string =
 /** The model a role's setting runs on, as a person reads it: a Codex role that names none takes the host's own default. */
 export const modelShown = (setting: RoleSetting): string => setting.model ?? (setting.backend === "codex" ? CODEX_HOST_DEFAULT : "unconfigured");
 
-/** One line per role, in columns: what `/fusion config` shows and what the editor offers to change. */
-export function settingsTable(settings: RoleSettings): string[] {
+/**
+ * One line per role, in columns: what `/fusion config` shows and what the editor offers to change. A role its contract
+ * makes unavailable says so in place of its enabled setting, which is kept and not what decides.
+ */
+export function settingsTable(settings: RoleSettings, unavailable: Partial<Record<KnownRoleName, unknown>> = {}): string[] {
 	const rows = [["role", "enabled", "backend", "model", "effort"]];
 	for (const role of KNOWN_ROLE_NAMES) {
 		const setting = settings[role];
-		rows.push([role, setting.enabled ? "yes" : "no", setting.backend, modelShown(setting), effortShown(role, setting)]);
+		const enabled = Object.hasOwn(unavailable, role) ? "unavailable" : setting.enabled ? "yes" : "no";
+		rows.push([role, enabled, setting.backend, modelShown(setting), effortShown(role, setting)]);
 	}
 	const widths = rows[0]!.map((_, column) => Math.max(...rows.map((row) => row[column]!.length)));
 	return rows.map((row) => row.map((cell, column) => (column === row.length - 1 ? cell : cell.padEnd(widths[column]!))).join("  "));

@@ -13,6 +13,7 @@ import fusion, { builtinConfiguration, type FusionOptions, parseFusion, runRecor
 import { settingsTable } from "../extensions/profiles.ts";
 import { memoryHostPolicyLoader } from "../extensions/host-policy.ts";
 import { memoryRoleContractLoader } from "../extensions/role-contract-loader.ts";
+import { memoryPresetDefaults } from "../extensions/presets.ts";
 import { memoryProfileStore } from "../extensions/profile-store.ts";
 import { memorySettingsStore, type SettingsStore, serializeSettings } from "../extensions/settings-store.ts";
 import { History, HISTORY_ABORTED, HISTORY_VERSION, type HistoryRecord } from "../extensions/history.ts";
@@ -57,7 +58,7 @@ type WaitFactory = (tui: { requestRender: () => void }, theme: any, keybindings:
 type Renderer = (message: any, options: { expanded: boolean; outputPad: number }, theme: any) => { render: (width: number) => string[] } | undefined;
 
 const USAGE =
-	"Usage: /fusion dashboard | /fusion dashboard stop | /fusion dashboard limit [N] | /fusion status [run-N] | /fusion cancel run-N | /fusion wait run-N | /fusion steer run-N <text> | /fusion answer [run-N] [text] | /fusion review run-N | /fusion on | /fusion off | /fusion config | /fusion profile [list | use <name> | save <name> | default <name>] | /fusion history [on | off]";
+	"Usage: /fusion dashboard | /fusion dashboard stop | /fusion dashboard limit [N] | /fusion status [run-N] | /fusion cancel run-N | /fusion wait run-N | /fusion steer run-N <text> | /fusion answer [run-N] [text] | /fusion review run-N | /fusion on | /fusion off | /fusion config | /fusion profile [list | use <name> | save <name> | default <name>] | /fusion preset [list | use <name> | reset | default user|project <name>|clear] | /fusion history [on | off]";
 const DASHBOARD_LIMIT_USAGE = "Usage: /fusion dashboard limit [N]; N must be a positive decimal safe integer";
 const PROFILE_USAGE = "Usage: /fusion profile [list | use <name> | save <name> | default <name>]; builtin names the built-in configuration for use and default";
 /** What status says of a host's run history when nothing is saved and the variable is unset, and when the variable says 1. */
@@ -94,7 +95,7 @@ afterEach(async () => {
 	}
 });
 
-function makeHost(cwd = repoRoot, mode: "tui" | "print" = "print", session: { id?: string; file?: string } = {}, backends: FusionOptions["backends"] = {}, extra: Pick<FusionOptions, "dashboard" | "settings"> = {}) {
+function makeHost(cwd = repoRoot, mode: "tui" | "print" = "print", session: { id?: string; file?: string } = {}, backends: FusionOptions["backends"] = {}, extra: Pick<FusionOptions, "dashboard" | "settings" | "roleContracts"> = {}) {
 	const tools = new Map<string, Tool>();
 	const commands = new Map<string, Command>();
 	const handlers = new Map<string, (event: any, ctx: any) => Promise<unknown> | unknown>();
@@ -120,7 +121,7 @@ function makeHost(cwd = repoRoot, mode: "tui" | "print" = "print", session: { id
 		registerMessageRenderer: (customType: string, renderer: Renderer) => renderers.set(customType, renderer),
 	} as unknown as ExtensionAPI;
 	// These cases run only claude, through its fake protocol or an in-memory backend; accidental pi and codex routing stays fenced.
-	fusion(api, { ...extra, backends: { ...tripwires(), ...backends }, profiles: memoryProfileStore(), settings: extra.settings ?? memorySettingsStore(), hostPolicy: memoryHostPolicyLoader(), roleContracts: memoryRoleContractLoader() });
+	fusion(api, { ...extra, backends: { ...tripwires(), ...backends }, profiles: memoryProfileStore(), settings: extra.settings ?? memorySettingsStore(), hostPolicy: memoryHostPolicyLoader(), roleContracts: extra.roleContracts ?? memoryRoleContractLoader(), presetDefaults: memoryPresetDefaults() });
 	const theme = { fg: (_color: string, text: string) => text, bold: (text: string) => text, dim: (text: string) => text };
 	const ui = {
 		setStatus(_key: string, _text: string | undefined) {},
@@ -617,6 +618,26 @@ test("/fusion off is refused while a run that has ended is still finishing, and 
 		await host.command("off");
 		assert.deepEqual(host.notices, [["fusion is off; no run can start until /fusion on", "info"]]);
 		assert.deepEqual(host.activeTools, ["read", "bash", "fusion_activate"]);
+	}));
+
+test("/fusion preset use and reset are refused while a run that has ended is still finishing, and go through once its entry is recorded", () =>
+	withGitHold(async (host, hold) => {
+		await heldInFinalSnapshot(host, hold);
+		for (const command of ["preset use builtin", "preset reset"]) {
+			await host.command(command);
+			assert.deepEqual(host.notices, [["the session's preset choice stays as it is while runs are unfinished: run-1 (implement, finishing). Wait for each run or cancel it with /fusion cancel run-N, then retry.", "warning"]], command);
+			host.notices.length = 0;
+		}
+		assert.deepEqual(host.branch, [], "no preset entry, and the held entry is still held");
+		assert.deepEqual(host.sent, [], "nothing was cancelled or reported early");
+		fs.rmSync(hold, { force: true });
+		// The wait carries the report, so no notice repeats it; it returns once the entry is recorded.
+		await host.control({ action: "wait", run: "run-1" });
+		assert.equal((host.branch[0] as any).data.run, "run-1");
+		host.notices.length = 0;
+		await host.command("preset use builtin");
+		assert.match(host.notices[0]?.[0] ?? "", /^this session will use preset builtin after \/reload/);
+		assert.deepEqual((host.branch.at(-1) as any).data, { version: 1, preset: "builtin" });
 	}));
 
 test("session_shutdown waits for a run that has ended but not yet recorded its entry, and sends no notice", () =>
@@ -1194,6 +1215,12 @@ test("/fusion completes the first word, and then the runs each command can still
 		{ value: "profile use", label: "profile use" },
 		{ value: "profile save", label: "profile save" },
 		{ value: "profile default", label: "profile default" },
+		{ value: "preset", label: "preset" },
+		{ value: "preset list", label: "preset list" },
+		{ value: "preset use", label: "preset use" },
+		{ value: "preset reset", label: "preset reset" },
+		{ value: "preset default user", label: "preset default user" },
+		{ value: "preset default project", label: "preset default project" },
 		{ value: "history", label: "history" },
 		{ value: "history on", label: "history on" },
 		{ value: "history off", label: "history off" },
@@ -1581,14 +1608,14 @@ test("every result about a run carries what became of it, how long it took, what
 	}));
 
 /** A host in a scratch git repository, so a child that edits a file leaves changed files a review can be given. */
-async function withRepo(body: (host: ReturnType<typeof makeHost>, dir: string) => Promise<void>, session: { id?: string; file?: string } = {}): Promise<void> {
+async function withRepo(body: (host: ReturnType<typeof makeHost>, dir: string) => Promise<void>, session: { id?: string; file?: string } = {}, extra: Pick<FusionOptions, "roleContracts"> = {}): Promise<void> {
 	const dir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "pi-fusion-review-")));
 	const git = (...args: string[]) => execFileSync("git", ["-c", "user.name=t", "-c", "user.email=t@t", "-c", "commit.gpgsign=false", ...args], { cwd: dir, encoding: "utf8" });
 	git("init", "-q");
 	fs.writeFileSync(path.join(dir, "base.txt"), "b\n");
 	git("add", ".");
 	git("commit", "-q", "-m", "base");
-	const host = makeHost(dir, "print", session);
+	const host = makeHost(dir, "print", session, {}, extra);
 	try {
 		await body(host, dir);
 	} finally {
@@ -1730,6 +1757,26 @@ test("the end notice of a background run carries the link to its automatic revie
 			assert.match(host.sent[1]![0].content, /^Background run run-2 \(ask, review of run-1\) done\./);
 		}),
 	));
+
+test("an ask role its contracts make unavailable refuses a manual review and quietly skips an automatic one", () =>
+	withAutoReview(async () => {
+		for (const overrides of [{ "ask-review.md": { error: "could not be read (EACCES)" } }, { "ask-answer.md": "---\ndisabled: true\nhost:\n  description: Off.\n  guidance: []\n  task_brief: None.\n  snippet: off\n---\n" }] as const) {
+			await withRepo(async (host) => {
+				const done = await withScenario("edit", () => host.claude({ role: "implement", task: "add the retry" }));
+				assert.equal(done.details.reviewedBy, undefined, "no automatic review started");
+				assert.ok(!done.content[0]!.text.includes("reviews this run"), done.content[0]!.text);
+				assert.ok(!host.notices.some(([text]) => /auto-review/.test(text)), "the skip is quiet");
+				host.notices.length = 0;
+				await host.command("review run-1");
+				assert.equal(host.notices.length, 1);
+				assert.match(host.notices[0]![0], /^role ask is unavailable in this Fusion instance: .*ask-(review|answer)\.md.*; nothing reviews run-1$/);
+				assert.equal(host.notices[0]![1], "warning");
+				assert.equal((await host.control({ action: "status", run: "run-1" })).details.reviewedBy, undefined);
+				assert.ok(!(await host.text(host.control({ action: "status" }))).includes("run-2"), "no review run exists");
+				assert.deepEqual(host.sent, []);
+			}, {}, { roleContracts: memoryRoleContractLoader({ overrides }) });
+		}
+	}));
 
 test("without PI_FUSION_AUTO_REVIEW a run that changed files starts no review", () =>
 	withRepo(async (host) => {

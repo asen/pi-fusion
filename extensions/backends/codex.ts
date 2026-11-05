@@ -1,5 +1,5 @@
 import { readFileSync, realpathSync } from "node:fs";
-import { parseRoleContract } from "../role-contracts.ts";
+import { canonicalContractBody, suppliedContractBody } from "../role-contracts.ts";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import type { OwnedCleanup } from "../process-tree.ts";
@@ -52,8 +52,8 @@ import { type Backend, type ChildControl, type ChildEvent, failed, type RunReque
  * callback (G2), and `ask` questions on fresh, resumed and forked threads plus a cancellation while one waited (G3); the
  * rest is exercised only against `test/fake-codex.mjs` (see docs/codex-backend.md#evidence). The host registers one
  * backend from `createCodexBackend` when the extension loads, and neither importing this module nor that construction
- * starts, locates or reads anything. A run takes the host's startup-resolved contract body; standalone callers may
- * omit it for a lazy shipped-contract read. Binary lookup and client-version reads happen only when a run is requested.
+ * starts, locates or reads anything. A run takes the host's startup-resolved, nonblank contract body as given;
+ * standalone callers may omit it for a lazy shipped-contract read, which refuses a disabled or blank contract. Binary lookup and client-version reads happen only when a run is requested.
  *
  * **The order.** A cancelled signal ends the call before anything is read; a missing question callback refuses it
  * before any contract read or launch. Then the shared role contract, the launch — the host's own cwd and inherited
@@ -315,7 +315,7 @@ async function runCodexCall(request: RunRequest<CodexRole, CodexSession, ChildCo
 		let instructions: string;
 		try {
 			const read = deps.readContract ?? readRoleContract;
-			instructions = `${(request.contract ?? parseRoleContract(read(role.contract), role.contract).body).trimEnd()}\n`;
+			instructions = `${(request.contract !== undefined ? suppliedContractBody(request.contract) : canonicalContractBody(read, role.contract)).trimEnd()}\n`;
 		} catch (error) {
 			report.stage = "contract";
 			report.thrown = { error };

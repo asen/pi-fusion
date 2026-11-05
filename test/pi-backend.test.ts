@@ -912,3 +912,31 @@ test("the host's own callbacks cannot change what a call reports, and the host e
 	const defaultStart = "(deps.start ?? startPiChild)(options)";
 	assert.equal(source.split(defaultStart).length - 1, 1, `the default start binding must be chosen in exactly one place, as ${defaultStart}`);
 });
+
+test("a lazy contract read refuses a disabled or blank canonical contract, and a supplied body is checked as text only, all before storage", async (t) => {
+	const header = "---\nhost:\n  description: Host only.\n  guidance: []\n  task_brief: Task.\n  snippet: Role.\n---\n";
+	const disabled = header.replace("---\nhost:", "---\ndisabled: true\nhost:");
+	for (const [what, request, readContract, why] of [
+		["a disabled role contract", {}, () => `${disabled}\nStill not run.\n`, /declares its role disabled/],
+		["a minimal disabled contract", {}, () => disabled, /declares its role disabled/],
+		["a review mode whose role is disabled", { role: roleOf({ name: "ask", contract: "ask-review.md", mode: "review" } as Partial<PiRole>) }, (name: string) => (name === "ask-answer.md" ? disabled : "Review instructions.\n"), /ask-answer\.md declares its role disabled/],
+		["a review mode whose role's contract is blank", { role: roleOf({ name: "ask", contract: "ask-review.md", mode: "review" } as Partial<PiRole>) }, (name: string) => (name === "ask-answer.md" ? " \n" : "Review instructions.\n"), /ask-answer\.md has blank child instructions/],
+		["a blank role file", {}, () => " \n", /implement\.md has blank child instructions/],
+		["a role file with a header and no body", {}, () => header, /child instructions are blank/],
+		["a supplied blank body", { contract: " \n" }, () => { throw new Error("must not read"); }, /supplied role contract body is blank/],
+	] as const) {
+		const harness = harnessOf(t, { deps: { readContract } });
+		await assert.rejects(harness.call(request as Partial<RunRequest<PiRole, PiSession, PiSteerQueue>>), (error: Error) => {
+			assert.equal(error.message, CONTRACT_UNREADABLE, what);
+			assert.match((error.cause as Error).message, why, what);
+			return true;
+		});
+		const report = reportOf(harness.reports);
+		assert.equal(report.stage, "contract", what);
+		assert.deepEqual([report.startCalled, report.storage], [false, undefined], `${what}: no storage and no child`);
+	}
+	// A supplied body that looks like a header is the host's already-parsed text, run as it is.
+	const supplied = harnessOf(t, { script: happyScript(), deps: { readContract: () => { throw new Error("must not read"); } } });
+	assert.equal(failed(await supplied.call({ contract: `${disabled}\nBody.\n` })), false);
+	assert.equal(supplied.inputs[0]?.contract, `${disabled}\nBody.`);
+});

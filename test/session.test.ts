@@ -9,6 +9,7 @@ import fusion, { nextSession, runRecords } from "../extensions/fusion.ts";
 import { planContextPct, planProblems } from "../extensions/handoff.ts";
 import { memoryHostPolicyLoader } from "../extensions/host-policy.ts";
 import { memoryRoleContractLoader } from "../extensions/role-contract-loader.ts";
+import { memoryPresetDefaults } from "../extensions/presets.ts";
 import { memoryProfileStore } from "../extensions/profile-store.ts";
 import { memorySettingsStore } from "../extensions/settings-store.ts";
 import { tripwires } from "./tripwire.ts";
@@ -61,7 +62,7 @@ function makeExtension(): Extension {
 		registerMessageRenderer: () => {},
 	} as unknown as ExtensionAPI;
 	// Nothing here runs a pi or codex child, so the tripwires stand where those backends would be registered.
-	fusion(api, { backends: { ...tripwires() }, profiles: memoryProfileStore(), settings: memorySettingsStore(), hostPolicy: memoryHostPolicyLoader(), roleContracts: memoryRoleContractLoader() });
+	fusion(api, { backends: { ...tripwires() }, profiles: memoryProfileStore(), settings: memorySettingsStore(), hostPolicy: memoryHostPolicyLoader(), roleContracts: memoryRoleContractLoader(), presetDefaults: memoryPresetDefaults() });
 	void turnOn(ext.tools.get("fusion_activate"));
 	return ext;
 }

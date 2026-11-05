@@ -12,6 +12,10 @@ _Avoid_: orchestrator, main model, parent
 The Markdown that tells the host how to orchestrate while Fusion is on: the shipped `contracts/host.md`, or a user/project override replacing it whole. Guidance to the host model, not enforcement. See [The host policy](docs/routing.md#the-host-policy).
 _Avoid_: system prompt, host contract, orchestration rules
 
+**Preset**:
+The one instruction source a Fusion instance loads its host policy and role contracts from, chosen at startup: `builtin`, `architect`, `user`, `project` or `auto`. Not a profile, which chooses role settings. See [Instruction presets](docs/presets.md).
+_Avoid_: profile, mode, template (as synonyms for preset)
+
 **Child**:
 A headless coding session doing work the host handed off: Claude Code, Pi, or Codex, according to its backend.
 _Avoid_: subagent, worker, delegate

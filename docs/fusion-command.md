@@ -14,8 +14,9 @@ User commands act on the same runs as either control tool. Run-changing `steer`,
 | `/fusion wait run-N` | Show activity/elapsed time until the run ends or asks a question; Esc leaves it going and never takes the report away from the host |
 | `/fusion answer [run-N] [text]` | Answer a waiting question; no text opens an editor; no handle selects the sole waiting run |
 | `/fusion review run-N` | Start an independent background review of eligible ended work |
-| `/fusion config` | Show/edit the session's role settings; printed output also shows the profiles file, this instance's [host policy](configuration.md#seeing-and-replacing-the-policy) and role-contract sources/paths (project, user or shipped, plus any set-aside reasons), this instance's history, the saved history preference and the settings file. The editor shows the instruction-source lines above the role table |
+| `/fusion config` | Show/edit the session's role settings; printed output also shows the profiles file, the [instruction preset](presets.md) lines, this instance's [host policy](configuration.md#seeing-and-replacing-the-policy) and role-contract sources/paths (project, user or shipped, plus any set-aside reasons), this instance's history, the saved history preference and the settings file. The editor shows the instruction-source lines above the role table |
 | `/fusion profile [list \| use <name> \| save <name> \| default <name>]` | Choose/manage global named profiles |
+| `/fusion preset [list \| use <name> \| reset \| default user\|project <name>\|clear]` | Show or choose the [instruction preset](presets.md) for this session's next startup, or set a default for new instances. Never changes this instance. Works with Fusion off and after a failed startup |
 | `/fusion history [on \| off]` | Show this instance's history, the saved preference and the settings file; `on`/`off` save the preference for new instances only. Works with Fusion off and runs unfinished. See [Turning history on and off](runs.md#turning-history-on-and-off) |
 | `/fusion dashboard`, `/fusion dashboard stop` | Open/reuse or close the read-only monitoring page |
 | `/fusion dashboard limit [N]` | Inspect or set this instance's in-memory run-retention target; defaults to 30, never evicts active work. See [Dashboard](dashboard.md#rendering-and-retained-data) |
@@ -32,7 +33,7 @@ run-N cancelled; cleaning up needs attention: leftovers; this call's storage is 
 
 The same warning appears once in the failure/report/history/dashboard. It carries no path or foreign error text. Cancellation does not undo files, and cleanup can need [manual attention](runs.md#aborting-a-run).
 
-Completion offers forms and relevant handles: all runs for status, active ones for cancel/wait, running ones that take a steer for steer, waiting ones for answer, and reviewable ones for review. Profile completion uses the last-read saved names, with `builtin` for use/default. `history` completes to `history on` and `history off`.
+Completion offers forms and relevant handles: all runs for status, active ones for cancel/wait, running ones that take a steer for steer, waiting ones for answer, and reviewable ones for review. Profile completion uses the last-read saved names, with `builtin` for use/default. Preset completion offers the five preset names, plus `clear` for defaults. `history` completes to `history on` and `history off`.
 
 ### Turning Fusion on and off
 

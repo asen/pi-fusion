@@ -99,6 +99,7 @@ While on, the shipped host policy asks the host to delegate implementation and i
 - [User commands and terminal UI](docs/fusion-command.md): activation, reminders, cards, and the widget.
 - [Profiles and role settings](docs/profiles.md): configure roles and save named profiles.
 - [Configuration](docs/configuration.md): environment variables, the settings and host policy files, and the session budget.
+- [Instruction presets](docs/presets.md): choosing builtin, the bundled architect workflow, user, project or auto instructions per session.
 - [Independent reviews](docs/reviews.md): manual and automatic `ask` review runs.
 - [Ultracode](docs/ultracode.md): Claude workflows, permission modes, and cost.
 - [Dashboard](docs/dashboard.md): local, read-only monitoring and sensitive-output limits.
