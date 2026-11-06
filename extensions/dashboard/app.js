@@ -621,7 +621,8 @@ const factsList = (detail) => {
 	addFact(facts, "Backend", backendOf(detail));
 	if (str(detail.modelId)) addFact(facts, "Model id", str(detail.modelId));
 	if (str(detail.effort)) addFact(facts, "Effort", str(detail.effort));
-	if (isNum(detail.contextTokens) && isNum(detail.contextWindow) && detail.contextWindow > 0) addFact(facts, "Context", contextMeter(detail));
+	if (detail.contextUnknown === true) addFact(facts, "Context", "Unknown");
+	else if (isNum(detail.contextTokens) && isNum(detail.contextWindow) && detail.contextWindow > 0) addFact(facts, "Context", contextMeter(detail));
 	if (str(detail.tool)) addFact(facts, "Pi tool", str(detail.tool));
 	if (str(detail.toolCallId)) addFact(facts, "Pi tool call", str(detail.toolCallId));
 	if (str(detail.hostSessionId)) addFact(facts, "Pi session", str(detail.hostSessionId));
@@ -1458,7 +1459,8 @@ const statsLine = (detail) => {
 	stat(line, formatCount(detail.tokensIn), "in");
 	stat(line, formatCount(detail.tokensOut), "out");
 	if (isNum(detail.costUsd)) stat(line, formatUsd(detail.costUsd), "");
-	if (isNum(detail.contextTokens) && isNum(detail.contextWindow) && detail.contextWindow > 0) line.appendChild(contextMeter(detail));
+	if (detail.contextUnknown === true) line.appendChild(el("span", "stat context-unknown", "Context unknown"));
+	else if (isNum(detail.contextTokens) && isNum(detail.contextWindow) && detail.contextWindow > 0) line.appendChild(contextMeter(detail));
 	if (str(detail.activity)) {
 		const now = el("span", "stat", "now ");
 		now.appendChild(el("b", "", str(detail.activity)));

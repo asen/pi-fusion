@@ -721,6 +721,30 @@ test("a run shows its cost, cache, context meter, model usage and latest thinkin
 	assert.ok((await page.evaluate<string>("Array.from(document.querySelectorAll('.run-count')).map((node) => node.textContent).join(' ')")).includes("$0.2500"));
 });
 
+test("unknown context replaces stale meters in the header and facts, then a fresh measurement restores them", { skip }, async () => {
+	const { page, store } = await opened();
+	assert.equal(await page.evaluate<string>(CLICK_OLD), "clicked");
+	await page.until<string>("the finished run is shown", DETAIL_TITLE, (title) => title === "fable");
+	const original = store.detail("old")!;
+	const { contextTokens: _tokens, contextWindow: _window, contextUnknown: _unknown, ...progress } = original;
+	try {
+		store.progress("old", { ...progress, contextUnknown: true });
+		await page.until<string>("the context is unknown", FACT_VALUE("Context"), (text) => text === "Unknown");
+		assert.equal(await page.evaluate<string>("(document.querySelector('.stats .context-unknown') || {}).textContent || ''"), "Context unknown");
+		assert.equal(await page.evaluate<number>("document.querySelectorAll('.context-fill').length"), 0, "neither surface retains a percentage or a zero meter");
+		store.progress("old", { ...progress, toolCalls: original.toolCalls + 1 });
+		await page.until<string>("a partial update arrives", TOOL_CALLS_FACT, (text) => text === String(original.toolCalls + 1));
+		assert.equal(await page.evaluate<string>(FACT_VALUE("Context")), "Unknown");
+		assert.equal(await page.evaluate<string>(FACT_VALUE("Cost (estimate)")), "$0.2500", "context invalidation never resets spend");
+		store.progress("old", { ...progress, contextTokens: 250_000, contextWindow: 1_000_000 });
+		await page.until<string>("fresh context replaces unknown", FACT_VALUE("Context"), (text) => text === "250,000 / 1,000,000 (25%)");
+		assert.equal(await page.evaluate<number>("document.querySelectorAll('.context-unknown').length"), 0);
+		assert.deepEqual(await page.evaluate<string[]>("Array.from(document.querySelectorAll('.context-fill')).map((node) => node.style.width)"), ["25%", "25%"]);
+	} finally {
+		store.progress("old", original);
+	}
+});
+
 test("the log filters by text, kind and errors, and the filter survives a live render", { skip }, async () => {
 	const { page, store } = await opened();
 	assert.equal(await page.evaluate<string>(CLICK_OLD), "clicked");

@@ -18,6 +18,7 @@ import {
 	type Dashboard,
 	dashboardMaxRuns,
 	dashboardProblems,
+	dashboardProgress,
 	CALL_CAP_BYTES,
 	FAILURE_CAP_BYTES,
 	type LogEntry,
@@ -412,6 +413,53 @@ test("progress copies cost, cache, context, model usage and thinking, and caps t
 	assert.equal(summary.modelId, "claude-fable-5-1[1m]");
 	assert.equal(summary.contextTokens, 1_206);
 	assert.ok(!("thinking" in summary) && !("models" in summary), "the run list stays small");
+});
+
+test("context can become explicitly unknown and recover without changing usage or ordinary partial updates", () => {
+	const { store } = started();
+	const usage = { toolCalls: 2, tokensIn: 900_000, tokensOut: 500, cacheRead: 100_000, cacheWrite: 200, costUsd: 2 };
+	const known = { ...usage, contextTokens: 750_000, contextWindow: 1_000_000 };
+	store.progress("run-1", known);
+	store.progress("run-1", { ...usage, activity: "waiting for model" });
+	assert.equal(detailOf(store).contextTokens, 750_000, "omission in a partial update is not invalidation");
+	store.progress("run-1", { ...known, contextUnknown: true });
+	for (const view of [detailOf(store), store.summaries()[0]!]) {
+		assert.equal(view.contextUnknown, true);
+		assert.equal("contextTokens" in view, false, "unknown is not the obsolete number or a measured zero");
+		assert.equal("contextWindow" in view, false);
+		assert.deepEqual([view.tokensIn, view.tokensOut, view.costUsd], [900_000, 500, 2]);
+	}
+	assert.deepEqual([detailOf(store).cacheRead, detailOf(store).cacheWrite], [100_000, 200]);
+	store.progress("run-1", { ...usage, contextTokens: 120_000 });
+	store.progress("run-1", { ...usage, contextWindow: 500_000 });
+	assert.equal(detailOf(store).contextUnknown, true, "unrelated partial halves cannot resurrect a stale pair");
+	store.progress("run-1", { ...usage, contextTokens: 120_000, contextWindow: 1_000_000 });
+	for (const view of [detailOf(store), store.summaries()[0]!]) {
+		assert.equal(view.contextUnknown, undefined);
+		assert.deepEqual([view.contextTokens, view.contextWindow], [120_000, 1_000_000]);
+	}
+	store.progress("run-1", { ...usage, contextTokens: 0, contextWindow: 1_000_000 });
+	assert.equal(detailOf(store).contextTokens, 0, "an explicit measured zero is still known");
+	assert.equal(detailOf(store).contextUnknown, undefined);
+});
+
+test("full backend snapshots invalidate missing or unusable context, including on a final snapshot", () => {
+	const usage = { toolCalls: 2, tokensIn: 500, tokensOut: 10 };
+	for (const fields of [{}, { contextWindow: 1_000_000 }, { contextTokens: 400 }, { contextTokens: NaN, contextWindow: 1_000_000 }, { contextTokens: -1, contextWindow: 1_000_000 }, { contextTokens: 400, contextWindow: 0 }, { contextTokens: 400, contextWindow: Infinity }]) {
+		const { store } = started();
+		const known = { ...usage, contextTokens: 750_000, contextWindow: 1_000_000 };
+		store.progress("run-1", dashboardProgress(known));
+		const snapshot = { ...usage, ...fields };
+		const view = dashboardProgress(snapshot);
+		assert.equal(view.contextUnknown, true, JSON.stringify(fields));
+		assert.equal(Object.hasOwn(snapshot, "contextUnknown"), false, "the backend's object is untouched");
+		store.finish("run-1", { status: "done", snapshot: view });
+		assert.equal(detailOf(store).contextUnknown, true);
+		assert.equal(detailOf(store).contextTokens, undefined);
+		assert.equal(store.summaries()[0]!.contextWindow, undefined);
+		assert.equal(detailOf(store).status, "done", "display state cannot affect the run's outcome");
+	}
+	assert.equal(dashboardProgress({ ...usage, contextTokens: 0, contextWindow: 1_000_000 }).contextUnknown, undefined);
 });
 
 test("a run keeps the backend and effort it was admitted with, and a pi run takes the effort its child confirmed", () => {

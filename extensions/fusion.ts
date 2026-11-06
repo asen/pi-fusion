@@ -52,7 +52,7 @@ import {
 import { budgetConfig, budgetProblems, type CallUsage, Ledger } from "./budget.ts";
 import { bodyLines, Card, CARD_FILES, CARD_QUESTION_CHARS, type CardDetails, cardDetails, type CardMode, type CardTheme, headerLine, plainText, resultText, unpricedText, type WidgetRun, widgetLines } from "./cards.ts";
 import { type ChangedFile, changedFiles, type Snapshot, snapshot } from "./changes.ts";
-import { capBytes, type Dashboard, dashboardMaxRuns, dashboardProblems, parseRunLimit, RunStore, startDashboard, TEXT_CAP_BYTES } from "./dashboard.ts";
+import { capBytes, type Dashboard, dashboardMaxRuns, dashboardProblems, dashboardProgress, parseRunLimit, RunStore, startDashboard, TEXT_CAP_BYTES } from "./dashboard.ts";
 import { ArchiveIndex } from "./dashboard-archive.ts";
 import { contextShare, continueNote, handoffBlocked, handoffNote, handoffPrompt, handoffShare, planContextPct, planProblems, sharePercent, type HandoffReason } from "./handoff.ts";
 import { asEnded, History, type HistoryRecord, historyDir, historyEnabled, sameChild } from "./history.ts";
@@ -2795,7 +2795,7 @@ export default function fusion(pi: ExtensionAPI, options: FusionOptions = {}) {
 						onProgress: (progress) => {
 							run.latest = progress;
 							meter(run, progress, ctx);
-							record(() => store.progress(id, progress));
+							record(() => store.progress(id, dashboardProgress(progress)));
 							saveSpend();
 							render();
 						},
@@ -2863,7 +2863,7 @@ export default function fusion(pi: ExtensionAPI, options: FusionOptions = {}) {
 						status: run.state as Exclude<RunState, "running" | "waiting">,
 						text: child.text,
 						...(failure === undefined ? {} : { failure }),
-						snapshot: child,
+						snapshot: dashboardProgress(child),
 						...(verified === undefined ? {} : { ref: verified }),
 						// A backend that mirrors this notice into the activity of its own outcome — which the Pi one does,
 						// because a cancelled run is shown its activity and nothing else — would otherwise leave the monitor

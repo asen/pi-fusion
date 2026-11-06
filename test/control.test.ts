@@ -7,7 +7,7 @@ import * as path from "node:path";
 import test, { afterEach } from "node:test";
 import { fileURLToPath } from "node:url";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { type ArchiveProvider, startDashboard } from "../extensions/dashboard.ts";
+import { type ArchiveProvider, type RunStore, startDashboard } from "../extensions/dashboard.ts";
 import { ArchiveIndex } from "../extensions/dashboard-archive.ts";
 import fusion, { builtinConfiguration, compactionText, type FusionOptions, parseFusion, runRecords } from "../extensions/fusion.ts";
 import { settingsTable } from "../extensions/profiles.ts";
@@ -2145,6 +2145,32 @@ function archiveHost(session: { id?: string; file?: string }, backends: FusionOp
 }
 
 const durableArchive = (id: string, backends: FusionOptions["backends"] = {}) => archiveHost({ id, file: path.join(os.tmpdir(), `${id}.jsonl`) }, backends);
+
+test("dashboard snapshots clear obsolete context when a backend returns unknown, with or without final progress", async () => {
+	for (const finalProgress of [true, false]) {
+		const backend = fakeBackend({ name: "claude", scripts: [{ text: "done", pending: true, finalProgress, running: { contextTokens: 750_000, contextWindow: 1_000_000 } }] });
+		let store: RunStore | undefined;
+		const host = makeHost(repoRoot, "print", {}, { claude: backend.backend }, {
+			dashboard: async (runs) => {
+				store = runs;
+				return { url: "http://127.0.0.1:1/test/", port: 1, close: async () => {} };
+			},
+		});
+		await host.command("dashboard");
+		await host.call("fusion", { role: "ask", task: "a question", background: true });
+		const child = await backend.started();
+		const id = store!.summaries()[0]!.id;
+		assert.equal(store!.detail(id)!.contextTokens, 750_000);
+		child.release();
+		await host.control({ action: "wait", run: "run-1" });
+		const detail = store!.detail(id)!;
+		assert.equal(detail.contextUnknown, true, `finalProgress ${finalProgress}: missing context is an explicit invalidation`);
+		assert.equal(detail.contextTokens, undefined);
+		assert.equal(detail.contextWindow, undefined);
+		assert.deepEqual([detail.status, detail.text, detail.tokensIn, detail.tokensOut], ["done", "done", 10, 5]);
+		assert.equal(runRecords(host.branch).runs.get("run-1")?.checkpoint, "m-1", "the monitor changes no continuation identity");
+	}
+});
 
 /** What the /fusion status command says, which is what a user reads of every run, its handle and the session's spend. */
 const statusOf = async (host: ReturnType<typeof makeHost>): Promise<string> => {

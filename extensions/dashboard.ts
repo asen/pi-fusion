@@ -100,12 +100,24 @@ export interface RunProgress {
 	modelId?: string;
 	contextTokens?: number;
 	contextWindow?: number;
+	/** Explicitly invalidates the previous context pair; omission on a partial update leaves it alone. */
+	contextUnknown?: true;
 	thinking?: string[];
 	workflowTokens?: number;
 	sessionId?: string;
 	deniedTools?: string[];
 	/** What a child confirmed it runs with, which is where a run that named no effort learns the child's own, if it reports one. */
 	selection?: { model: string; effort?: string };
+}
+
+/** A usable pair comes from one observation, never an old window combined with a new unknown size. */
+function hasContext(snapshot: Pick<RunProgress, "contextTokens" | "contextWindow">): boolean {
+	return typeof snapshot.contextTokens === "number" && Number.isFinite(snapshot.contextTokens) && snapshot.contextTokens >= 0 && typeof snapshot.contextWindow === "number" && Number.isFinite(snapshot.contextWindow) && snapshot.contextWindow > 0;
+}
+
+/** Backend snapshots describe their entire current context, unlike the store's partial monitoring updates. */
+export function dashboardProgress(snapshot: RunProgress): RunProgress {
+	return { ...snapshot, contextUnknown: hasContext(snapshot) ? undefined : true };
 }
 
 export interface RunSummary {
@@ -155,6 +167,8 @@ export interface RunSummary {
 	/** The prompt size of the main loop's latest model call, and the window it has to fit in. */
 	contextTokens?: number;
 	contextWindow?: number;
+	/** The backend explicitly has no usable current measurement; this is not a measured zero. */
+	contextUnknown?: true;
 	/** Which of `REPORT_FLAGS` the report has as a heading. */
 	reportFlags?: string[];
 	/** The revision of the latest interim report of a run still going, or one that ended without succeeding. */
@@ -396,6 +410,7 @@ interface StoredRun {
 	modelId?: string;
 	contextTokens?: number;
 	contextWindow?: number;
+	contextUnknown?: true;
 	thinking: string[];
 	reportFlags?: string[];
 	files?: ChangedFile[];
@@ -492,6 +507,7 @@ function summaryOf(run: StoredRun): RunSummary {
 	if (run.costUsd !== undefined) summary.costUsd = run.costUsd;
 	if (run.contextTokens !== undefined) summary.contextTokens = run.contextTokens;
 	if (run.contextWindow !== undefined) summary.contextWindow = run.contextWindow;
+	if (run.contextUnknown) summary.contextUnknown = true;
 	if (run.reportFlags !== undefined) summary.reportFlags = [...run.reportFlags];
 	if (run.interim !== undefined && run.status !== "done") summary.interimRevision = run.interim.revision;
 	if (run.filesTotal !== undefined) summary.filesChanged = run.filesTotal;
@@ -1069,10 +1085,21 @@ export class RunStore {
 		if (numTurns !== undefined) run.numTurns = numTurns;
 		const apiMs = num(snapshot.apiMs);
 		if (apiMs !== undefined) run.apiMs = apiMs;
-		const contextTokens = num(snapshot.contextTokens);
-		if (contextTokens !== undefined) run.contextTokens = contextTokens;
-		const contextWindow = num(snapshot.contextWindow);
-		if (contextWindow !== undefined) run.contextWindow = contextWindow;
+		if (snapshot.contextUnknown === true) {
+			delete run.contextTokens;
+			delete run.contextWindow;
+			run.contextUnknown = true;
+		} else if (hasContext(snapshot)) {
+			run.contextTokens = snapshot.contextTokens;
+			run.contextWindow = snapshot.contextWindow;
+			delete run.contextUnknown;
+		} else if (!run.contextUnknown) {
+			// Existing partial updates may change one half. Once invalidated, only a fresh complete pair restores it.
+			const contextTokens = num(snapshot.contextTokens);
+			if (contextTokens !== undefined && contextTokens >= 0) run.contextTokens = contextTokens;
+			const contextWindow = num(snapshot.contextWindow);
+			if (contextWindow !== undefined && contextWindow > 0) run.contextWindow = contextWindow;
+		}
 		if (snapshot.modelId !== undefined) run.modelId = cap(String(snapshot.modelId));
 		if (typeof snapshot.selection?.effort === "string" && snapshot.selection.effort) run.effort = cap(snapshot.selection.effort);
 		if (Array.isArray(snapshot.models)) run.models = modelsOf(snapshot.models);
