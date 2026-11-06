@@ -229,6 +229,11 @@ test("the bundled architect preset is complete and valid: its policy, three unav
 	assert.deepEqual([policy.source, policy.path, policy.diagnostic], ["bundled", path.join(ARCHITECT_DIR, HOST_POLICY_FILE), undefined]);
 	assert.match(policy.text, /^# Architect policy\n/);
 	assert.match(policy.text, /This preset's role contracts make `plan`, `ultracode` and `security` unavailable/);
+	assert.match(policy.text, /Handle small, low-risk, self-contained, user-authorized tasks directly/);
+	assert.match(policy.text, /Judge by risk, ambiguity and context needs, not line count\./);
+	assert.match(policy.text, /Do not split larger work to fit this exception\./);
+	assert.match(policy.text, /Direct tasks need no implementer critique cycle\./);
+	assert.doesNotMatch(policy.text, /Implement directly only when the user explicitly asks you to\./);
 	for (const file of [HOST_POLICY_FILE, ...ROLE_CONTRACT_FILES.map((name) => path.join("contracts", name))]) {
 		assert.doesNotMatch(fs.readFileSync(path.join(ARCHITECT_DIR, file), "utf8"), /\bthis project's (role|review|ask|contract)|in this project\b/i, `${file} speaks of this preset, not a project`);
 	}
