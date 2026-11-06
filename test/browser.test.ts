@@ -1911,3 +1911,128 @@ test("an interim report is offered on a going run's Report tab without taking th
 		note: "Not a final report: revision 1 of the interim reports the run gave before it ended without succeeding.",
 	}, "the same text is shown once, as partial, after the failure");
 });
+
+/** Tool output long enough to scroll inside its own box, which stops growing at a few hundred pixels. */
+const outputLines = (what: string, count: number): string => Array.from({ length: count }, (_, i) => `${what} line ${i + 1}`).join("\n");
+const OPEN_CALL = (brief: string) =>
+	`(() => { const row = Array.from(document.querySelectorAll('.log .log-call')).find((node) => node.querySelector('.log-text').textContent.endsWith(${JSON.stringify(brief)})); if (!row) return 'missing'; row.querySelector('.log-text').click(); return 'clicked'; })()`;
+/** Each open call's brief with its input and result offsets, in log order. */
+const CALL_SCROLLS =
+	"Array.from(document.querySelectorAll('.log .log-open')).map((row) => [row.querySelector('.log-text').textContent, ...Array.from(row.querySelectorAll('.call-body')).map((body) => [body.scrollTop, body.scrollLeft])])";
+const CALLS_OVERFLOW = "Array.from(document.querySelectorAll('.log .log-open .call-body')).map((body) => body.scrollHeight > body.clientHeight)";
+/** A dashboard of the case's own, so rows it adds and prunes leave the shared store alone; its clock moves like the shared one. */
+async function ownServer(setup: (store: RunStore) => void) {
+	let clock = Date.now();
+	const store = new RunStore(() => clock++);
+	setup(store);
+	const dashboard = await startDashboard(store, { cwd: CWD });
+	return { store, url: dashboard.url, close: () => dashboard.close() };
+}
+const SCROLL_CALL = (brief: string, body: number, top: number) =>
+	`(() => { const row = Array.from(document.querySelectorAll('.log .log-open')).find((node) => node.querySelector('.log-text').textContent.endsWith(${JSON.stringify(brief)})); const node = row.querySelectorAll('.call-body')[${body}]; node.scrollTop = ${top}; return node.scrollTop; })()`;
+
+test("open tool inputs and results keep their own scroll through new rows, progress and a hidden Log tab", { skip }, async () => {
+	const { page } = await fixture();
+	const wide = Object.fromEntries(Array.from({ length: 60 }, (_, i) => [`key${i}`, `value ${i}`]));
+	const served = await ownServer((store) => {
+		store.start({ id: "calls", role: "calls-role", model: "opus" });
+		store.event("calls", { type: "tool_call", name: "Bash", brief: "long input", id: "call-a", input: wide });
+		store.event("calls", { type: "tool_result", toolUseId: "call-a", text: outputLines("first", 250), isError: false });
+		store.event("calls", { type: "tool_call", name: "Bash", brief: "long result", id: "call-b", input: { command: "short" } });
+		store.event("calls", { type: "tool_result", toolUseId: "call-b", text: outputLines("second", 250), isError: false });
+		for (let i = 0; i < 30; i++) store.event("calls", { type: "tool_call", name: "Read", brief: `filler ${i}` });
+	});
+	try {
+		const { store } = served;
+		await page.open(served.url);
+		await page.until<string>("the run is shown", DETAIL_TITLE, (title) => title === "calls-role");
+		await page.until<number>("the log is rendered", LOG_ROWS, (rows) => rows === 32);
+		assert.equal(await page.evaluate<string>(OPEN_CALL("long input")), "clicked");
+		assert.equal(await page.evaluate<string>(OPEN_CALL("long result")), "clicked");
+		const overflow = await page.until<boolean[]>("both calls load", CALLS_OVERFLOW, (bodies) => bodies.length === 4);
+		assert.deepEqual(overflow, [true, true, false, true], "both of the first call's boxes and the second call's result must overflow for this test to prove anything");
+		assert.equal(await page.evaluate<number>(SCROLL_CALL("long input", 0, 200)), 200);
+		assert.equal(await page.evaluate<number>(SCROLL_CALL("long input", 1, 500)), 500);
+		assert.equal(await page.evaluate<number>(SCROLL_CALL("long result", 1, 300)), 300);
+		assert.equal(await page.evaluate<number>(SCROLL_THE_LOG), 100, "the log must be scrolled up first");
+		const expected = [
+			["Bash long input", [200, 0], [500, 0]],
+			["Bash long result", [0, 0], [300, 0]],
+		];
+		assert.deepEqual(await page.evaluate(CALL_SCROLLS), expected);
+
+		store.event("calls", { type: "tool_call", name: "Read", brief: "unrelated" });
+		await page.refresh();
+		await page.until<number>("the new row arrives", LOG_ROWS, (rows) => rows === 33);
+		assert.deepEqual(await page.evaluate(CALL_SCROLLS), expected, "a new row must not move an open call's input or result");
+		assert.equal(await page.evaluate<number>(LOG_SCROLL), 100, "a new row must not move a log scrolled up");
+		await page.until<string>("the new row is counted", JUMP_TEXT, (text) => text === "1 new ↓");
+
+		for (const calls of [77, 78]) {
+			store.progress("calls", { toolCalls: calls, tokensIn: 5, tokensOut: 1 });
+			await page.refresh();
+			await page.until<string>(`progress ${calls} arrives`, TOOL_CALLS_FACT, (value) => value === String(calls));
+			assert.deepEqual(await page.evaluate(CALL_SCROLLS), expected, `progress ${calls} must not move an open call's input or result`);
+		}
+
+		assert.equal(await page.evaluate<string>(CLICK_TAB("Overview")), "clicked");
+		await page.until<string>("the Overview tab is shown", VISIBLE_PANEL, (tab) => tab === "overview");
+		store.progress("calls", { toolCalls: 79, tokensIn: 5, tokensOut: 1 });
+		store.event("calls", { type: "tool_call", name: "Read", brief: "while hidden" });
+		await page.refresh();
+		await page.until<string>("the hidden row is counted on the tab", TAB_BADGE("Log"), (badge) => badge === "+1*");
+		assert.equal(await page.evaluate<string>(CLICK_TAB("Log")), "clicked");
+		await page.until<string>("the Log tab is shown", VISIBLE_PANEL, (tab) => tab === "log");
+		assert.deepEqual(await page.evaluate(CALL_SCROLLS), expected, "a Log tab shown again must give each open call its input and result offsets back");
+		assert.equal(await page.evaluate<number>(LOG_SCROLL), 100, "a Log tab shown again must keep a log scrolled up");
+		assert.equal(await page.evaluate<string>(JUMP_TEXT), "2 new ↓", "the rows that arrived below stay counted");
+	} finally {
+		await served.close();
+	}
+});
+
+test("a pruned open call takes its scroll with it, and a pinned log stays at its bottom", { skip }, async () => {
+	const { page } = await fixture();
+	const served = await ownServer((store) => {
+		store.start({ id: "prune", role: "prune-role", model: "opus" });
+		store.event("prune", { type: "tool_call", name: "Bash", brief: "evicted", id: "call-old", input: { command: "old" } });
+		store.event("prune", { type: "tool_result", toolUseId: "call-old", text: outputLines("old", 250), isError: false });
+		store.event("prune", { type: "tool_call", name: "Read", brief: "between" });
+		store.event("prune", { type: "tool_call", name: "Bash", brief: "kept", id: "call-kept", input: { command: "kept" } });
+		store.event("prune", { type: "tool_result", toolUseId: "call-kept", text: outputLines("kept", 250), isError: false });
+		for (let i = 0; i < 29; i++) store.event("prune", { type: "tool_call", name: "Read", brief: `filler ${i}` });
+	});
+	try {
+		const { store } = served;
+		await page.open(served.url);
+		await page.until<string>("the run is shown", DETAIL_TITLE, (title) => title === "prune-role");
+		await page.until<number>("the log is rendered", LOG_ROWS, (rows) => rows === 32);
+		assert.equal(await page.evaluate<string>(OPEN_CALL("evicted")), "clicked");
+		assert.equal(await page.evaluate<string>(OPEN_CALL("kept")), "clicked");
+		await page.until<boolean[]>("both calls load", CALLS_OVERFLOW, (bodies) => bodies.length === 4 && bodies[1] === true && bodies[3] === true);
+		assert.equal(await page.evaluate<number>(SCROLL_CALL("evicted", 1, 400)), 400);
+		assert.equal(await page.evaluate<number>(SCROLL_CALL("kept", 1, 250)), 250);
+		await page.evaluate<number>("(() => { const log = document.querySelector('.log'); log.scrollTop = log.scrollHeight; return log.scrollTop; })()");
+		assert.ok((await page.evaluate<number>(LOG_GAP)) < 2, "the log must be at its bottom first");
+		await page.refresh();
+
+		// Drop the evicted call's row alone, so the kept call becomes the first open one, the place the evicted one had.
+		for (let i = 0; i < 100 - 32 + 1; i++) store.event("prune", { type: "tool_call", name: "Read", brief: `more ${i}` });
+		await page.refresh();
+		await page.until<string>("the evicted call is pruned", "document.querySelector('.log .log-row .log-text').textContent", (text) => text === "Read between");
+		assert.equal(await page.evaluate<number>(LOG_ROWS), 100);
+		assert.deepEqual(await page.evaluate(CALL_SCROLLS), [["Bash kept", [0, 0], [250, 0]]], "the kept call keeps its own offset, not the pruned call's");
+		assert.ok((await page.evaluate<number>(LOG_GAP)) < 2, "a log at its bottom stays there as rows arrive and leave");
+		assert.equal(await page.evaluate<string>(JUMP_TEXT), "", "a log at its bottom has nothing unseen");
+
+		store.event("prune", { type: "tool_call", name: "Bash", brief: "fresh", id: "call-new", input: { command: "new" } });
+		store.event("prune", { type: "tool_result", toolUseId: "call-new", text: outputLines("new", 250), isError: false });
+		await page.refresh();
+		assert.equal(await page.until<string>("the fresh call arrives", OPEN_CALL("fresh"), (result) => result === "clicked"), "clicked");
+		await page.until<boolean[]>("the fresh call loads", CALLS_OVERFLOW, (bodies) => bodies.length === 4);
+		await page.refresh();
+		assert.deepEqual(await page.evaluate(CALL_SCROLLS), [["Bash kept", [0, 0], [250, 0]], ["Bash fresh", [0, 0], [0, 0]]], "a newly opened call starts at the top");
+	} finally {
+		await served.close();
+	}
+});

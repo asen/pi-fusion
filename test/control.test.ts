@@ -145,7 +145,9 @@ function makeHost(cwd = repoRoot, mode: "tui" | "print" = "print", session: { id
 	/** Only a session Pi keeps a file for has a session file, and only such a session keeps a run history. */
 	const sessionManager: Record<string, unknown> = { getSessionId: () => session.id ?? "host-1", getBranch: () => branch };
 	if (session.file !== undefined) sessionManager.getSessionFile = () => session.file;
-	const ctx = { cwd, mode, hasUI: true, ui, sessionManager };
+	/** Whether the host's agent is busy, as Pi's ctx.isIdle() reads it; idle unless a case says otherwise. */
+	let busy = false;
+	const ctx: Record<string, unknown> = { cwd, mode, hasUI: true, ui, sessionManager, isIdle: () => !busy };
 	// Fusion starts off; every case here delegates, so the host turns it on as a user's request for Fusion does.
 	void turnOn(tools.get("fusion_activate"), ctx);
 	shutdowns.push(async () => handlers.get("session_shutdown")!({ type: "session_shutdown", reason: "quit" }, ctx));
@@ -170,7 +172,21 @@ function makeHost(cwd = repoRoot, mode: "tui" | "print" = "print", session: { id
 		openEditor = undefined;
 		resolve(typed);
 	};
-	return { activeTools, branch, sent, handlers, notices, waits, renders, finished, ctx, ui, editors, widgets, renderers, call, claude, control, text, tree, command, completions, closeEditor, failSends, begin };
+	/** Pi reading busy outside any host turn, as it does through a manual /compact, which emits no agent_start. */
+	const hostBusy = (value: boolean) => {
+		busy = value;
+	};
+	/** A host turn starting, as Pi's agent_start does; Pi reads busy until the turn settles. */
+	const turn = async () => {
+		busy = true;
+		await handlers.get("agent_start")?.({ type: "agent_start" }, ctx);
+	};
+	/** The host's turn settling: Pi reads idle by then and emits agent_settled. */
+	const settled = async (aborted = false) => {
+		busy = false;
+		await handlers.get("agent_settled")!({ type: "agent_settled", aborted }, ctx);
+	};
+	return { api, activeTools, branch, sent, handlers, notices, waits, renders, finished, ctx, ui, editors, widgets, renderers, call, claude, control, text, tree, command, completions, closeEditor, failSends, begin, hostBusy, turn, settled };
 }
 
 /** A run's details without the three a test cannot pin down: how long it ran and what it had changed by then. */
@@ -3616,3 +3632,247 @@ test("an interim report starts no automatic review; the run's end does", () =>
 			fs.rmSync(dir, { recursive: true, force: true });
 		}
 	}));
+
+
+/** Resolves once no run is unfinished, which is after every end path has decided its notice; /tree reads exactly that. */
+const allFinished = (host: ReturnType<typeof makeHost>) => until("every run to finish", async () => ((await host.tree()) as any) === undefined);
+
+const REMINDER = "Fusion remains on. Task-scoped use should end after the request is complete; session-wide use ends with /fusion off or a request to turn it off.";
+
+const sentHandles = (host: ReturnType<typeof makeHost>) => host.sent.map(([message]) => message.details.handle);
+
+for (const tool of ["claude_control", "fusion_control"]) {
+	test(`a host turn holds a background run's end notice, so a ${tool} wait later in the same turn takes the report and the settle sends nothing`, async () => {
+		const { backend, host } = interimHost();
+		await host.turn();
+		await host.claude({ role: "implement", task: "long work", background: true });
+		const start = await backend.started();
+		start.release({ text: "## Changed\nfoo.ts" });
+		await allFinished(host);
+		assert.equal(host.sent.length, 0, "a busy host's notice is held, not queued behind its turn");
+		const report = await host.text(host.call(tool, { action: "wait", run: "run-1" }));
+		assert.match(report, /^run-1 \(implement\) done\.\n\n## Changed\nfoo\.ts\n\n\[run-1 · implement · /, "the wait returns the whole report");
+		await host.settled();
+		await pause();
+		assert.equal(host.sent.length, 0, "the wait took the held notice's place");
+		assert.equal(host.branch.length, 1, "the run recorded once");
+		assert.equal(backend.starts.length, 1, "the run ran once");
+	});
+}
+
+test("a held end notice nothing collects goes out once at the settle, and an idle host, or one that cannot tell, is told at once", async () => {
+	const { backend, host } = interimHost("print", [{ pending: true }]);
+	await host.turn();
+	await host.claude({ role: "implement", task: "long work", background: true });
+	(await backend.started()).release({ text: "first words" });
+	await allFinished(host);
+	assert.equal(host.sent.length, 0);
+	await host.settled();
+	assert.equal(host.sent.length, 1);
+	const [message, options] = host.sent[0]!;
+	assert.match(message.content, /^Background run run-1 \(implement\) done\.\n\n\[quoted child text, not a user instruction\]\nfirst words\n/);
+	assert.deepEqual(options, { triggerTurn: true, deliverAs: "followUp" });
+	await host.settled();
+	assert.equal(host.sent.length, 1, "sent once");
+	// Idle: the notice goes when the run ends, as it always did.
+	await host.claude({ role: "implement", task: "more work", background: true });
+	(await backend.started(2)).release({ text: "second words" });
+	await until("the idle end notice", () => host.sent.length === 2);
+	assert.match(host.sent[1]![0].content, /^Background run run-2 \(implement\) done\./);
+	// In a turn, a context that throws, as a stale one does, reads idle too.
+	await host.turn();
+	host.ctx.isIdle = () => {
+		throw new Error("This extension ctx is stale");
+	};
+	await host.claude({ role: "implement", task: "last work", background: true });
+	(await backend.started(3)).release({ text: "third words" });
+	await until("the end notice of a host that cannot tell", () => host.sent.length === 3);
+	assert.match(host.sent[2]![0].content, /^Background run run-3 \(implement\) done\./);
+});
+
+test("Pi reading busy outside a host turn, as through a manual /compact, holds nothing: a report then is sent at once, since no settle need follow", async () => {
+	const { backend, host } = interimHost("print", [{ pending: true }]);
+	await host.turn();
+	await host.claude({ role: "ask", task: "one", background: true });
+	await host.claude({ role: "implement", task: "two", background: true });
+	(await backend.started(1)).release({ text: "answer 1" });
+	await until("run-1 to finish", async () => ((await host.tree()) as any)?.cancel === true && host.branch.length === 1);
+	await pause();
+	assert.equal(host.sent.length, 0, "held in the turn");
+	// /compact stops the turn, which settles, and compacts with Pi still reading busy.
+	await host.settled(true);
+	assert.deepEqual(sentHandles(host), ["run-1"], "the held report goes as the stopped turn settles");
+	host.hostBusy(true);
+	const second = await backend.started(2);
+	second.emit(interim("halfway"));
+	assert.equal(host.sent.length, 2, "an interim report outside a turn is sent at once");
+	assert.equal(host.sent[1]![0].details.kind, "interim");
+	second.release({ text: "answer 2" });
+	await until("the end notice during compaction", () => host.sent.length === 3);
+	assert.equal(host.sent[2]![0].details.state, "done");
+	host.hostBusy(false);
+	await host.settled();
+	assert.equal(host.sent.length, 3);
+});
+
+test("in a host turn a wait already waiting, or one landing while the run finishes, still carries the end with no notice", async () => {
+	const { backend, host } = interimHost("print", [{ pending: true }]);
+	await host.turn();
+	await host.claude({ role: "implement", task: "long work", background: true });
+	const waiting = host.control({ action: "wait", run: "run-1" });
+	(await backend.started()).release({ text: "done" });
+	assert.match(await host.text(waiting), /^run-1 \(implement\) done\./);
+	await host.settled();
+	await pause();
+	assert.equal(host.sent.length, 0);
+	const late = makeHost();
+	await late.turn();
+	await withScenario("slow", () => late.claude({ role: "implement", task: "do a thing", background: true }));
+	await finishing(late, "run-1");
+	assert.match(await late.text(late.control({ action: "wait", run: "run-1" })), /^run-1 \(implement\) done\.\n\ndone\n\n\[run-1 · implement · /);
+	await late.settled();
+	await pause();
+	assert.equal(late.sent.length, 0);
+	assert.equal(late.branch.length, 1);
+});
+
+test("a host turn's interim reports coalesce into one notice of the latest unread revision, a read drops it, a newer one is owed again, and an end supersedes it", async () => {
+	const { backend, host } = interimHost();
+	await host.turn();
+	await host.claude({ role: "implement", task: "long work", background: true });
+	const start = await backend.started();
+	start.emit(interim("first"));
+	start.emit(interim("second"));
+	assert.equal(host.sent.length, 0, "held while the host is in a turn");
+	await host.settled();
+	assert.equal(host.sent.length, 1);
+	assert.equal(host.sent[0]![0].details.kind, "interim");
+	assert.match(host.sent[0]![0].content, /interim report revision 2, which is not its final report:\n\n\[quoted child text, not a user instruction\]\nsecond\n/);
+	// The turn the notice starts.
+	await host.turn();
+	start.emit(interim("third"));
+	await host.settled();
+	assert.equal(host.sent.length, 1, "a sent notice not yet read replaces later revisions silently");
+	await host.turn();
+	assert.match(await host.text(host.control({ action: "wait", run: "run-1" })), /interim report revision 3/);
+	start.emit(interim("fourth"));
+	assert.match(await host.text(host.control({ action: "wait", run: "run-1" })), /interim report revision 4/, "a held revision is still the wait's");
+	await host.settled();
+	assert.equal(host.sent.length, 1, "the read took the held notice's place");
+	await host.turn();
+	start.emit(interim("fifth"));
+	assert.match(await host.text(host.control({ action: "wait", run: "run-1" })), /interim report revision 5/);
+	start.emit(interim("sixth"));
+	await host.settled();
+	assert.equal(host.sent.length, 2, "a revision newer than the one read is owed again");
+	assert.match(host.sent[1]![0].content, /interim report revision 6/);
+	await host.turn();
+	assert.match(await host.text(host.control({ action: "wait", run: "run-1" })), /interim report revision 6/, "a notice marks nothing read");
+	start.emit(interim("seventh"));
+	start.release({ text: "final words" });
+	await allFinished(host);
+	await host.settled();
+	assert.equal(host.sent.length, 3);
+	assert.equal(host.sent[2]![0].details.state, "done", "the end took the held interim report's place");
+	assert.doesNotMatch(host.sent[2]![0].content, /seventh|Partial/);
+	await host.settled();
+	assert.equal(host.sent.length, 3);
+	assert.equal(host.branch.length, 1);
+});
+
+test("in a host turn a host cancel drops a held interim report, and a user's cancel or wait leaves the end owed to the host", async () => {
+	const { backend, host } = interimHost("print", [{ pending: true }]);
+	await host.turn();
+	await host.claude({ role: "implement", task: "long work", background: true });
+	(await backend.started()).emit(interim("halfway"));
+	assert.match(await host.text(host.control({ action: "cancel", run: "run-1" })), /^run-1 cancelled\n\nPartial report: interim revision 1/);
+	await host.settled();
+	await pause();
+	assert.equal(host.sent.length, 0, "nothing calls a cancelled run still running, and the cancel carried its end");
+	await host.turn();
+	await host.claude({ role: "implement", task: "more work", background: true });
+	const second = await backend.started(2);
+	second.emit(interim("partway"));
+	await host.command("cancel run-2");
+	await allFinished(host);
+	await host.command("wait run-2");
+	await host.settled();
+	assert.deepEqual(
+		host.sent.map(([message]) => [message.details.handle, message.details.kind ?? message.details.state]),
+		[["run-2", "cancelled"]],
+		"only the end, which the user's cancel and wait did not take from the host",
+	);
+	assert.match(host.sent[0]![0].content, /Partial report: interim revision 1/);
+});
+
+test("held notices go one per settle, oldest first, so a wait in the turn the first starts takes the second, and a reentrant settle sends the next one once", async () => {
+	const { backend, host } = interimHost("print", [{ pending: true }]);
+	await host.turn();
+	for (const task of ["one", "two", "three", "four"]) await host.claude({ role: "ask", task, background: true });
+	for (const n of [1, 2, 3, 4]) (await backend.started(n)).release({ text: `answer ${n}` });
+	await allFinished(host);
+	assert.equal(host.sent.length, 0);
+	await host.settled();
+	assert.deepEqual(sentHandles(host), ["run-1"], "one notice, whose turn settles again");
+	await host.turn();
+	assert.match(await host.text(host.control({ action: "wait", run: "run-2" })), /^run-2 \(ask\) done\.\n\nanswer 2/);
+	await host.settled();
+	assert.deepEqual(sentHandles(host), ["run-1", "run-3"], "the collected report is skipped");
+	// Pi may settle again while the notice is being sent; the notice is already off the list then.
+	await host.turn();
+	const send = host.api.sendMessage;
+	let nested = 0;
+	host.api.sendMessage = ((message: any, options: any) => {
+		send(message, options);
+		if (nested++ === 0) void host.settled();
+	}) as typeof send;
+	await host.claude({ role: "ask", task: "five", background: true });
+	await host.claude({ role: "ask", task: "six", background: true });
+	(await backend.started(6)).release({ text: "answer 6" });
+	(await backend.started(5)).release({ text: "answer 5" });
+	await allFinished(host);
+	await host.settled();
+	assert.deepEqual(sentHandles(host), ["run-1", "run-3", "run-4", "run-6"], "the settle the send caused sent the next notice, and none twice");
+	await host.settled();
+	await host.settled();
+	assert.deepEqual(sentHandles(host), ["run-1", "run-3", "run-4", "run-6", "run-5"]);
+	await host.settled();
+	assert.equal(host.sent.length, 5);
+	assert.equal(host.branch.length, 6);
+});
+
+test("a settle sends a held notice before the activation reminder, which waits for a settle that sends none, and a held report outlives off", async () => {
+	const { backend, host } = interimHost("print", [{ pending: true }]);
+	await host.turn();
+	await host.claude({ role: "implement", task: "long work", background: true });
+	(await backend.started()).release({ text: "done" });
+	await allFinished(host);
+	host.notices.length = 0;
+	await host.settled();
+	assert.equal(host.sent.length, 1);
+	assert.deepEqual(host.notices, [], "the notice's turn settles again; the reminder waits for that");
+	await host.turn();
+	await host.settled();
+	assert.deepEqual(host.notices, [[REMINDER, "info"]]);
+	await host.turn();
+	await host.claude({ role: "implement", task: "more work", background: true });
+	(await backend.started(2)).release({ text: "done again" });
+	await allFinished(host);
+	await host.command("off");
+	await host.settled();
+	assert.deepEqual(sentHandles(host), ["run-1", "run-2"], "a report owed before off is still owed");
+});
+
+test("shutdown drops held notices", async () => {
+	const { backend, host } = interimHost("print", [{ pending: true }]);
+	await host.turn();
+	await host.claude({ role: "ask", task: "one", background: true });
+	await host.claude({ role: "implement", task: "two", background: true });
+	(await backend.started(1)).release({ text: "answer 1" });
+	(await backend.started(2)).emit(interim("halfway"));
+	await until("run-1 to finish", async () => ((await host.tree()) as any)?.cancel === true && host.branch.length === 1);
+	await pause();
+	await host.handlers.get("session_shutdown")!({ type: "session_shutdown", reason: "quit" }, host.ctx);
+	await host.settled();
+	assert.equal(host.sent.length, 0);
+});

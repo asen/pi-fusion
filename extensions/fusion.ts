@@ -2443,6 +2443,53 @@ export default function fusion(pi: ExtensionAPI, options: FusionOptions = {}) {
 		);
 	};
 
+	/**
+	 * Report notices held while the host was busy, oldest first, by run invocation. A notice Pi has queued cannot be taken
+	 * back, so one a host wait would collect in the same busy turn is not sent then: it is held here and goes out when the
+	 * host settles, only if nothing has read it by then. An end replaces the run's held interim report in its place.
+	 */
+	const owed = new Map<LiveRun, "interim" | "end">();
+
+	/**
+	 * True from the host's agent_start to its agent_settled, which Pi always emits after one: only a notice held then has
+	 * a settle sure to send it. Pi also reads busy outside a turn, through a manual /compact, where no wait could take the
+	 * report and no settle need follow, so a notice then goes at once, as all did before notices were held.
+	 */
+	let inTurn = false;
+
+	/** Whether the host is in a turn. A context that cannot tell, a stale one or a test host's, reads idle and notifies at once. */
+	const hostBusy = (ctx: any): boolean => {
+		try {
+			return inTurn && typeof ctx?.isIdle === "function" && !ctx.isIdle();
+		} catch {
+			return false;
+		}
+	};
+
+	/**
+	 * Sends the oldest held notice something has not made moot since, and only that one: the turn it starts settles
+	 * again, so the rest go one per settle and stay for a host wait to collect meanwhile. Pi runs the turns that notices
+	 * sent from one settle start one after another, which is why they are not all sent at once. Each is taken off before
+	 * it is sent, so a settle the send itself causes finds it gone. Says whether a notice went.
+	 */
+	const sendOwed = (): boolean => {
+		for (const [run, kind] of owed) {
+			owed.delete(run);
+			if (shuttingDown || !run.background) continue;
+			if (kind === "end") {
+				if (run.delivered) continue;
+				notify(run, finalText(run, true));
+				return true;
+			}
+			// An interim report is owed only while the run goes on and the host has read no newer one: an end or a stop since supersedes it.
+			if (!isActive(run) || run.controller.signal.aborted || run.interim === undefined || run.interim.revision <= run.interimRead || run.interimNoticed) continue;
+			run.interimNoticed = true;
+			notify(run, interimText(run, controlWith(run.tool), true), { kind: "interim" });
+			return true;
+		}
+		return false;
+	};
+
 	/** Calls the run's waiters and watchers and reports whether a waiter heard, so a notice goes out only when none did. */
 	const settle = (run: LiveRun): boolean => {
 		const waiters = [...run.waiters];
@@ -2497,6 +2544,7 @@ export default function fusion(pi: ExtensionAPI, options: FusionOptions = {}) {
 		if (run.interim === undefined || run.interim.revision <= run.interimRead || run.controller.signal.aborted) return undefined;
 		run.interimRead = run.interim.revision;
 		run.interimNoticed = false;
+		owed.delete(run);
 		return "interim";
 	};
 
@@ -2753,6 +2801,11 @@ export default function fusion(pi: ExtensionAPI, options: FusionOptions = {}) {
 			render();
 			// A run being stopped keeps the report as partial text, and says nothing that would call it still running.
 			if (run.controller.signal.aborted || wakeHost(run) || run.interimNoticed || !run.background || shuttingDown) return;
+			if (hostBusy(ctx)) {
+				owed.set(run, "interim");
+				return;
+			}
+			owed.delete(run);
 			run.interimNoticed = true;
 			notify(run, interimText(run, controlWith(run.tool), true), { kind: "interim" });
 		};
@@ -2884,7 +2937,13 @@ export default function fusion(pi: ExtensionAPI, options: FusionOptions = {}) {
 				// Before the run settles, so the report the host reads already names the review that reads the same tree.
 				record(() => startAutoReview(run, ctx));
 				const heard = settle(run);
-				if (run.background && !heard && !run.delivered && !shuttingDown) notify(run, finalText(run, true));
+				// A busy host may yet collect the report with a wait in this same turn, so its notice waits for the settle.
+				if (!run.background || heard || run.delivered || shuttingDown) owed.delete(run);
+				else if (hostBusy(ctx)) owed.set(run, "end");
+				else {
+					owed.delete(run);
+					notify(run, finalText(run, true));
+				}
 				run.finished = true;
 			}
 		})();
@@ -3966,14 +4025,22 @@ export default function fusion(pi: ExtensionAPI, options: FusionOptions = {}) {
 		noteSettings(ctx);
 	});
 
+	pi.on("agent_start", () => {
+		inTurn = true;
+	});
+
+	// A held report is owed whatever the mode or reminder, and the turn its notice starts settles again, so the reminder
+	// waits for a settle that sends none.
 	pi.on("agent_settled", (_event, ctx) => {
-		if (!activationReminder || !enabled || shuttingDown) return;
+		inTurn = false;
+		if (sendOwed() || !activationReminder || !enabled || shuttingDown) return;
 		activationReminder = false;
 		record(() => ctx.ui.notify("Fusion remains on. Task-scoped use should end after the request is complete; session-wide use ends with /fusion off or a request to turn it off.", "info"));
 	});
 
 	pi.on("session_shutdown", async () => {
 		shuttingDown = true;
+		owed.clear();
 		record(() => ui?.setWidget?.("fusion", undefined));
 		for (const dismiss of [...waits]) dismiss();
 		waits.clear();
@@ -4320,8 +4387,10 @@ export default function fusion(pi: ExtensionAPI, options: FusionOptions = {}) {
 				const answerLine = answered ? `\n\nanswered by the user: ${answered.text}` : "";
 				if (claim === "question") return { reply: reply(`${askedText(run, tool)}${answerLine}`, { ...runDetails(run), handle, state: run.state }) };
 				if (claim === "interim") return { reply: reply(`${interimText(run, tool, false)}${answerLine}`, { ...runDetails(run), handle, state: run.state, kind: "interim" }) };
-				// Taken before the run is awaited: a wait that lands while the run is still finishing carries the report too.
+				// Taken before the run is awaited: a wait that lands while the run is still finishing carries the report too,
+				// and one that lands while its notice is held takes that notice's place.
 				run.delivered = true;
+				owed.delete(run);
 				return { answerLine };
 			});
 			if (!claimed) throw new Error(`stopped waiting; ${handle} goes on in the background`);

@@ -193,7 +193,7 @@ The backend mappings are read from source (Claude Code 2.1.281's bundled code, P
 
 `background: true` returns a handle immediately. At most one file-changing run (`plan`, `implement`, `ultracode`, or enabled `security`) can be active across backends; waiting counts too. `ask` runs can run alongside it. Continuing an active handle refuses and points to a control `message` action instead.
 
-A completed background run normally sends a `pi-fusion-run` follow-up that starts a host turn when idle or queues behind its current turn. A report collected by a host control `wait`, or a run cancelled by a host control, sends no duplicate end message. User `/fusion cancel` and `/fusion wait` do not suppress the host's end notice. A foreground child asking a question returns early and waits in the background; see [Questions](questions.md). So does one that gives an [interim report](#interim-reports).
+A completed background run sends a `pi-fusion-run` notice that starts a host turn when the host is idle; during a host turn the notice is [held](#held-notices) until the turn settles. A report a host control `wait` collects before its notice is sent, or a run cancelled by a host control, sends no end message; a notice already sent cannot be withdrawn, so a later `wait` returns the report again. User `/fusion cancel` and `/fusion wait` do not suppress the host's end notice. A foreground child asking a question returns early and waits in the background; see [Questions](questions.md). So does one that gives an [interim report](#interim-reports).
 
 Both `fusion_control` and `claude_control` take `action`, optional `run`, and `message`, and manage every run:
 
@@ -212,6 +212,24 @@ A running child's input can refuse a message while it stays open, as a full Code
 
 Ordinary editor text targets the host. `/fusion steer run-N <text>` targets the child and logs the instruction in the host conversation. A waiting child instead needs `/fusion answer`; the host may forward an ordinary instruction through a control tool at its discretion.
 
+### Held notices
+
+Pi cannot withdraw a message it has queued. Final and [interim](#interim-reports) report notices are therefore not queued behind the host's current turn, where a `wait` later in the same turn would collect the same report again. A turn here runs from the host's `agent_start` to its `agent_settled`, which Pi always emits after one, while `ctx.isIdle()` reads busy:
+
+```text
+report ready, host in a turn      --> held, by run invocation, oldest first
+  host wait takes it              --> held notice dropped; the wait returns the full report
+host agent_settled                --> send the oldest held notice still owed; its turn settles and sends the next
+report ready, host not in a turn  --> notice now (starts a host turn); this includes Pi reading busy
+                                      through a manual /compact, which no settle need follow
+```
+
+- **Rechecked when sent.** An end goes unless a host `wait` or host cancel took it. An interim notice goes only while the run is still going, not being stopped, with a revision newer than the last read and no unread notice out; it carries the latest revision. An end replaces the run's held interim notice.
+- **One per settle.** Pi runs turns that one settle's notices start one after another, so the rest stay held, and a `wait` during the first notice's turn still takes them. Several held reports therefore arrive over successive host turns, not together.
+- **Not consumed by:** `status`, `message` to an ended run, the user's `/fusion wait` or `/fusion cancel`, mode changes or the activation reminder, which waits for a settle that sends no notice. Shutdown drops held notices.
+- **Timing:** a held report's card appears at the settle, not when the run ended, possibly after a later question notice; questions and answers keep their immediate notices. Threshold and overflow compaction run inside a host turn, whose settle sends. A context that cannot tell whether the host is idle sends at once, as does an instance loaded during a turn until that turn settles.
+- **Limits:** this prevents duplicates only before a notice is queued. Once sent, a notice marks nothing read, so a later `wait` can still return the same final or interim report. A report ready between a turn's start and its `agent_start` (Pi preparing the turn) is sent at once, as before. If the turn a sent notice starts never begins, the rest stay held until the next host turn settles.
+
 ### Interim reports
 
 A Claude child can report while background tasks it waits for still run: a top-level, non-error result with text, while its input is open and its [blocking membership](#when-a-claude-child-finishes) is not empty. An ultracode workflow launch is the common case. That text is an **interim report**: provisional, never the final report, and never read as completion. The run stays `running`, keeps the writer slot, and finishes only as below. Pi and Codex runs give none.
@@ -220,13 +238,13 @@ A Claude child can report while background tasks it waits for still run: a top-l
 child result while tasks run --> interim revision N (latest replaces earlier)
    foreground call waiting --> returns it, marked not final; run moves to background
    host control wait       --> returns it at once if unread; otherwise waits for newer/question/end
-   neither                 --> one notice per unread interval (background runs)
+   neither                 --> one notice per unread interval (background runs), held during a host turn
 ```
 
 - **Revisions** count up per run in the host. Only the latest is kept; the host bounds it to 32 KiB, marked when cut.
 - **Read** means a host control `wait` (either pair) or a foreground return carried it. Choosing the revision, marking it read and writing the reply are one step, so the reply carries exactly the revision it marked, and two waits never take the same one. That read rearms the notice. A notice carries the report but marks nothing read, so a `wait` after a notice can return the same text again. After a read, the next `wait` blocks for something new.
 - **Priority:** a question or the run's end wins over an unread interim report; a stale one never answers a wait for either. A run being cancelled or aborted offers none: its waits go on to the end, and no notice calls it still running; a report it gives meanwhile is kept as partial text.
-- **Coalescing:** one automatic `interim report` notice per unread interval; later revisions replace it silently until a read. The end notice follows the usual rules, so a final report is delivered once.
+- **Coalescing:** one automatic `interim report` notice per unread interval; later revisions replace it silently until a read. A [held](#held-notices) one carries the latest unread revision when sent, and a read drops it. The end notice follows the usual rules, so a final report is delivered once.
 - **Not read:** `status`, `/fusion status` and the dashboard show the report without marking it read or suppressing the host's notices. The user's `/fusion wait` does neither either: in the TUI it previews the first line of the latest one while it waits for a question or the end; in print mode it shows nothing before the end.
 - **What it waits for** is task-only: the bounded labels (at most 20, each up to 200 characters) of the blocking tasks, out of a total. A task leaving that list did not necessarily finish.
 - **Child text** in notices, including task labels and partial text, sits between the [quotation markers](#labelled-child-text); tool results stay unquoted.

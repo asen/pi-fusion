@@ -892,8 +892,13 @@ const showUnseen = (log) => {
 	log.jump.classList.toggle("hidden", log.unseen === 0);
 };
 
+/**
+ * `bodies` holds each shown tool input/result's own offsets by node, because a render moves the log out of the page
+ * and Chrome then drops nested scroll. A node with no box (a hidden tab, a closed or filtered row) reads 0, so it keeps
+ * what it last had; a pruned row or reloaded call takes its offsets with it.
+ */
 const newLog = (runId) => {
-	const log = { runId, node: el("ol", "log"), jump: el("button", "log-jump hidden"), rows: new Map(), lastSeq: -1, top: 0, pinned: true, unseen: 0 };
+	const log = { runId, node: el("ol", "log"), jump: el("button", "log-jump hidden"), rows: new Map(), bodies: new WeakMap(), lastSeq: -1, top: 0, pinned: true, unseen: 0 };
 	log.jump.type = "button";
 	log.jump.addEventListener("click", () => {
 		log.node.scrollTop = log.node.scrollHeight;
@@ -916,6 +921,7 @@ const syncLog = (runId, entries) => {
 	if (log.node.isConnected && log.node.clientHeight > 0) {
 		log.pinned = atBottom(log.node);
 		log.top = log.node.scrollTop;
+		for (const body of log.node.querySelectorAll(".call-body")) if (body.clientHeight > 0) log.bodies.set(body, [body.scrollTop, body.scrollLeft]);
 	}
 	const first = entries.length > 0 ? num(entries[0].seq) : Infinity;
 	let dropped = 0;
@@ -1050,6 +1056,11 @@ const restoreLog = () => {
 	const log = state.log;
 	if (!log || !log.node.isConnected) return;
 	log.node.scrollTop = log.pinned ? log.node.scrollHeight : log.top;
+	for (const body of log.node.querySelectorAll(".call-body")) {
+		const kept = log.bodies.get(body);
+		if (!kept || body.clientHeight === 0) continue;
+		[body.scrollTop, body.scrollLeft] = kept;
+	}
 };
 
 const appendModels = (parent, models) => {
