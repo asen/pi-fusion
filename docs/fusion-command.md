@@ -68,7 +68,7 @@ Launching a background run, answering a side question, or waiting for clarificat
 
 You can also turn it off with `/fusion off` or a plain request such as “turn Fusion off and work directly,” carried out through `fusion_deactivate`. Repeating a switch changes nothing and reports the current state.
 
-After tool/natural-language activation, the host's next `agent_settled` shows one reminder if Fusion is still on:
+After tool/natural-language activation, the host's next `agent_settled` that sends no [held background report](runs.md#held-notices) shows one reminder if Fusion is still on:
 
 ```text
 Fusion remains on. Task-scoped use should end after the request is complete; session-wide use ends with /fusion off or a request to turn it off.
@@ -76,7 +76,7 @@ Fusion remains on. Task-scoped use should end after the request is complete; ses
 
 The flag is cleared before notification. Background children may still be active; this is a host notification, not their completion or automatic deactivation. `/fusion on` suppresses the reminder, including when already on; successful off clears it.
 
-Off refuses **unfinished** runs: running, waiting, or ended but still recording/delivering, reviews included. It names them, marking final ones as finishing. Wait or cancel, then retry. The refusal cancels nothing and hides no control tools; a refused deactivation tells the host to wait for your next instruction rather than do the child's work itself.
+Off refuses **unfinished** runs: running, waiting, or ended but still recording/delivering, reviews included. It names them, marking final ones as finishing. Wait or cancel, then retry. A finished run's [held notice](runs.md#held-notices) does not count and is still sent after off. The refusal cancels nothing and hides no control tools; a refused deactivation tells the host to wait for your next instruction rather than do the child's work itself.
 
 The mode exists only in this instance's memory. Status/dashboard/settings/history commands work while off and do not activate it. Profiles, the history preference and mode are independent; neither mode tool enables a role. In particular, turning Fusion on does not enable security in `builtin`. Existing records remain and can be continued after activation when their role/record permits it.
 

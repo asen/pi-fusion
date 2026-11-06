@@ -25,7 +25,7 @@ Tests past 60 seconds are cancelled and named. Browser tests use `PI_FUSION_CHRO
 
 ## Entry point and boundaries
 
-`extensions/fusion.ts` exports `fusion(pi, options?)`: delegation/control pairs `fusion`/`fusion_control` and compatibility `claude`/`claude_control`, two mode tools, `/fusion`, the run-message renderer, and `session_start`, `agent_settled`, `session_shutdown`, `session_before_tree` handlers.
+`extensions/fusion.ts` exports `fusion(pi, options?)`: delegation/control pairs `fusion`/`fusion_control` and compatibility `claude`/`claude_control`, two mode tools, `/fusion`, the run-message renderer, and `session_start`, `agent_start`, `agent_settled`, `session_shutdown`, `session_before_tree` handlers.
 
 Load order: internal child marker, required contracts for every backend/ask mode, Pi bootstrap existence, then backend registration. A Pi child with `PI_FUSION_CHILD=pi` registers nothing before any contract check; this is not a user setting.
 

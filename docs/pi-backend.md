@@ -65,7 +65,7 @@ resolve role/model and session intent
   -> host accepts outcome and records it
 ```
 
-The bootstrap's `serving` diagnostic is not readiness. A prompt acknowledgement is not task completion. The child's `agent_settled` is used because `agent_end` can precede automatic retry, compaction, or queued work. Separately, the **host's** `agent_settled` handler shows the [activation reminder](fusion-command.md#turning-fusion-on-and-off); it does not stop children or switch Fusion off.
+The bootstrap's `serving` diagnostic is not readiness. A prompt acknowledgement is not task completion. The child's `agent_settled` is used because `agent_end` can precede automatic retry, compaction, or queued work. Separately, the **host's** `agent_settled` handler sends a [held background report](runs.md#held-notices) or shows the [activation reminder](fusion-command.md#turning-fusion-on-and-off); it does not stop children or switch Fusion off.
 
 The bootstrap uses in-memory settings, explicit tool lists, automatic compaction, and Pi retry with three retries and a two-second base delay. Steering and follow-up modes are `one-at-a-time`. It reads no user or project settings file. The base system prompt is Pi's own, with exactly the role contract appended. Project/ancestor instruction files remain available; context from the Fusion child agent directory is excluded. When a workspace lies inside that agent directory, the same file can be both global context and a project ancestor: it is suppressed because public loader metadata cannot distinguish the two.
 

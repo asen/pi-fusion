@@ -164,7 +164,7 @@ test("registers the sequential fusion and claude tool pairs and the two mode too
 		["fusion", "claude", "fusion_control", "claude_control", "fusion_activate", "fusion_deactivate"],
 	);
 	for (const name of ["fusion", "claude", "fusion_control", "claude_control", "fusion_activate", "fusion_deactivate"]) assert.equal(byName(name).executionMode, "sequential", name);
-	assert.deepEqual([...handlers.keys()], ["session_start", "agent_settled", "session_shutdown", "session_before_tree"]);
+	assert.deepEqual([...handlers.keys()], ["session_start", "agent_start", "agent_settled", "session_shutdown", "session_before_tree"]);
 	const command = commands.get("fusion");
 	assert.ok(command, "the fusion command is not registered");
 	assert.ok(command.description, "the command needs a description for the command list");
