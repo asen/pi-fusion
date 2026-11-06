@@ -58,6 +58,8 @@ Click a tool row to expand its input/result. Awaiting results are grey, error re
 
 The log initially follows newest rows. Scrolling up preserves the visible rows and shows a button counting new arrivals; click it to return to the bottom.
 
+Each expanded input/result box keeps its own scroll through new rows, refreshes and Log tab switches. Content that loads fresh starts at the top: reopening a call, or a result arriving for an open call, which reloads its input too. A box filtered out of view while the page refreshes also starts again at the top.
+
 - `/` opens Log and focuses search.
 - Search is case-insensitive; chips select event kinds or errored tool calls.
 - `Escape` or Clear resets text/kind/error filters together. Filters apply across runs and persist through refreshes.
