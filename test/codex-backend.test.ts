@@ -46,6 +46,7 @@ import {
 } from "../extensions/backends/codex-transport.ts";
 import { type ChildControl, type ChildEvent, type CodexUsageBaseline, failed, hostBackend, type ResolvedSelection, type SessionIntent } from "../extensions/backends/types.ts";
 import { type OwnedCleanup, productionFacilities } from "../extensions/process-tree.ts";
+import { RunStore } from "../extensions/dashboard.ts";
 
 /*
  * The fresh-run Codex backend composed over its real launch shape, transport and outcome mapping, driven against
@@ -435,6 +436,23 @@ test("a subagent's thread and a foreign turn of the same thread cannot win: thei
 			{ type: "tool_result", toolUseId: "cmd-1", text: "file-a\nfile-b", isError: false },
 		]);
 		assert.ok(!JSON.stringify(outcome.events).includes("subagent"), "nothing of the subagent's reached the monitor");
+	});
+});
+
+test("web search metadata and nullable results survive the fake app-server transport into dashboard calls", async () => {
+	await withBackend("search-items", async (fixture) => {
+		const store = new RunStore();
+		store.start({ id: "search", backend: "codex", role: "ask", model: "fake" });
+		const outcome = await fixture.call({ role: "ask", effort: "high" }, { onEvent: (event) => store.event("search", event) });
+		ended(outcome, "stop");
+		const hosted = store.callDetail("search", "search-hosted")!;
+		assert.deepEqual(JSON.parse(hosted.input), { query: "hosted query", action: { type: "search", query: "hosted query", queries: ["hosted query", "another query"] } });
+		assert.equal(hosted.result, "Codex did not expose result content for this web search.");
+		const standalone = store.callDetail("search", "search-standalone")!;
+		assert.deepEqual(JSON.parse(standalone.result!), [{ title: "Fake source", url: "https://example.com", snippet: "Fake result content", ref_id: "ref-1" }]);
+		assert.deepEqual(store.detail("search")!.log.filter((entry) => entry.kind === "tool").map((entry) => entry.toolUseId), ["search-hosted", "search-standalone"]);
+		assert.deepEqual([outcome.run.text, outcome.run.toolCalls, outcome.run.tokensIn, outcome.run.tokensOut], ["search report", 2, 300, 30]);
+		assert.equal(outcome.run.session?.checkpoint, "turn-1", "search output cannot replace final-message or checkpoint evidence");
 	});
 });
 
@@ -944,6 +962,92 @@ test("the live display shows the call's share of each update, the same counts fo
 	assert.equal(progress, before, "a total below the baseline is neither shown nor said");
 	assert.deepEqual(show().slice(0, 4), [400, 20, 300, 0]);
 	feed.end();
+});
+
+/** Protocol-shaped web-search notifications through the real feed and dashboard store, with no process or native lookup. */
+function searchDisplay(admit = true) {
+	const run = newCodexRun(codexRole({ role: "ask" }, undefined, {}));
+	const store = new RunStore();
+	store.start({ id: "display", backend: "codex", role: "ask", model: "fake" });
+	const events: ChildEvent[] = [];
+	const feed = codexFeed(run, { progress: () => store.progress("display", run), event: (event) => { events.push(event); store.event("display", event); } });
+	feed.thread("thr-1");
+	if (admit) feed.turn("turn-1");
+	const notify = (method: string, fields: Record<string, unknown>, threadId = "thr-1", turnId = "turn-1") => feed.onNotification({ method, params: { threadId, turnId, item: { type: "webSearch", id: "search-1", ...fields } } });
+	const call = () => store.callDetail("display", "search-1")!;
+	return { run, store, feed, events, notify, call };
+}
+
+const SEARCH_UNAVAILABLE = "Codex did not expose result content for this web search.";
+
+test("Codex web search exposes query/action input and opaque results rather than command output", () => {
+	const { run, store, events, notify, call } = searchDisplay();
+	const query = "a search query that is longer than the activity preview ".repeat(3);
+	const action = { type: "search", query, queries: [query, "another query"] };
+	const results = [{ title: "A source", url: "https://example.com", snippet: "Reported snippet", ref_id: "ref-1", future: { field: [1, true] } }];
+	notify("item/started", { query, action, results: null });
+	assert.deepEqual(JSON.parse(call().input), { query, action });
+	notify("item/completed", { query, action, results, aggregatedOutput: "not a search result" });
+	assert.deepEqual(JSON.parse(call().result!), results, "preserve opaque result fields within the preview bound");
+	assert.equal(call().isError, false);
+	assert.equal(store.detail("display")!.log.length, 1);
+	assert.deepEqual(events.map((event) => event.type), ["tool_call", "tool_result"]);
+	assert.deepEqual([run.toolCalls, run.text, run.tokensIn, run.tokensOut, run.session], [1, "", 0, 0, undefined], "display data grants no outcome, usage or checkpoint authority");
+});
+
+for (const action of [
+	{ type: "search", query: null, queries: ["first full query", "second full query"] },
+	{ type: "openPage", url: "https://example.com/full/page" },
+	{ type: "findInPage", url: "https://example.com/full/page", pattern: "the actual pattern" },
+	{ type: "other" },
+]) {
+	test(`Codex web search backfills ${action.type} metadata supplied only at completion without a second call`, () => {
+		const { run, store, events, notify, call } = searchDisplay();
+		notify("item/started", { query: "", action: null, results: null });
+		const query = "complete query or action summary, not necessarily original raw tool arguments";
+		notify("item/completed", { query, action, results: null });
+		assert.deepEqual(JSON.parse(call().input), { query, action });
+		assert.equal(call().result, SEARCH_UNAVAILABLE, "missing hosted output is not an empty successful result");
+		assert.equal(call().isError, false, "unavailable display data does not fail a tool");
+		assert.equal(run.toolCalls, 1);
+		assert.equal(store.detail("display")!.log.length, 1);
+		assert.deepEqual(events.map((event) => event.type), ["tool_call", "tool_result"]);
+	});
+}
+
+test("Codex web search distinguishes unavailable from empty results and keeps earlier input when completion omits it", () => {
+	for (const results of [undefined, null, "not an array", {}, []]) {
+		const { notify, call } = searchDisplay();
+		const input = { query: "already exposed", action: { type: "search", query: "already exposed", queries: null } };
+		notify("item/started", input);
+		for (const completion of [{ results }, { query: "", action: null, results }, { query: "", action: { type: "other" }, results }]) {
+			notify("item/completed", completion);
+			assert.deepEqual(JSON.parse(call().input), input, "omitted or placeholder metadata keeps the earlier known input");
+			assert.equal(call().result, Array.isArray(results) ? "[]" : SEARCH_UNAVAILABLE);
+		}
+	}
+});
+
+test("Codex web search previews are bounded before early buffering and stay inside the admitted thread and turn", () => {
+	const { feed, events, notify, call } = searchDisplay(false);
+	const item = { query: "😀".repeat(6_000), action: { type: "search", queries: ["early query"] }, results: [{ snippet: "é".repeat(6_000) }] };
+	notify("item/started", item, "foreign-thread");
+	notify("item/started", { query: "foreign turn" }, "thr-1", "foreign-turn");
+	notify("item/started", item);
+	notify("item/completed", item);
+	item.query = "mutated after digest";
+	item.results[0]!.snippet = "mutated after digest";
+	assert.equal(events.length, 0);
+	feed.turn("turn-1");
+	assert.equal(events.length, 2);
+	for (const value of [call().input, call().result!]) {
+		assert.ok([...value].length <= 4_097, "at most the existing 4096-code-point preview and its ellipsis");
+		assert.ok(value.endsWith("…"));
+		assert.ok(!value.includes("mutated") && !value.includes("foreign"));
+	}
+	feed.end();
+	notify("item/completed", { results: [] });
+	assert.equal(events.length, 2, "closed feeds never publish more display data");
 });
 
 test("the final usage clears a context the display showed when the final one has no window, and publishes no cost", () => {

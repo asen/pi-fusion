@@ -340,6 +340,17 @@ function startTurn(id, params) {
 			tokenUsage(threadId, turnId, usage(80, 0, 8, 0), usage(80, 0, 8, 0));
 			completed(threadId, turnId);
 			return;
+		case "search-items":
+			// A hosted search starts without arguments, before admission, and reveals them only at completion.
+			notify("item/started", { threadId, turnId, startedAtMs: 1, item: { type: "webSearch", id: "search-hosted", query: "", action: null, results: null } });
+			answer();
+			notify("item/completed", { threadId, turnId, completedAtMs: 2, item: { type: "webSearch", id: "search-hosted", query: "hosted query", action: { type: "search", query: "hosted query", queries: ["hosted query", "another query"] }, results: null } });
+			notify("item/started", { threadId, turnId, startedAtMs: 3, item: { type: "webSearch", id: "search-standalone", query: "standalone query", action: { type: "search", query: "standalone query", queries: null }, results: null } });
+			notify("item/completed", { threadId, turnId, completedAtMs: 4, item: { type: "webSearch", id: "search-standalone", query: "standalone query", action: { type: "search", query: "standalone query", queries: null }, results: [{ title: "Fake source", url: "https://example.com", snippet: "Fake result content", ref_id: "ref-1" }] } });
+			notify("item/completed", { threadId, turnId, completedAtMs: 5, item: { type: "agentMessage", id: "msg-1", text: "search report" } });
+			tokenUsage(threadId, turnId, usage(300, 100, 30, 0), usage(200, 100, 20, 0));
+			completed(threadId, turnId);
+			return;
 		case "foreign-final":
 			answer();
 			notify("item/started", { threadId, turnId, startedAtMs: 1, item: { type: "commandExecution", id: "cmd-1", command: "ls -la\nsecond line", status: "inProgress" } });

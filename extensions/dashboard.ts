@@ -864,6 +864,11 @@ export class RunStore {
 			if (isError) run.toolErrors++;
 			const call = run.calls.get(toolUseId);
 			if (call) {
+				if (event.input !== undefined) {
+					const input = capBytes(inputText(event.input), CALL_CAP_BYTES);
+					call.input = input.text;
+					call.inputTruncated = input.truncated;
+				}
 				const result = capBytes(String(event.text ?? ""), CALL_CAP_BYTES);
 				call.result = result.text;
 				call.resultTruncated = result.truncated;
