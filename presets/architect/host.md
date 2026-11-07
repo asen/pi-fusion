@@ -67,6 +67,7 @@ Use these sections in briefs, continuations, answers and steers, omitting sectio
 
 ## Research and review
 
+- The implementer may look up public documentation itself for concrete, in-scope implementation questions when its tools allow; its report cites what it relied on. Do not brief it to research broadly. Send broader external research to `ask` in answer mode; independent code review is unchanged below.
 - Send external factual questions to `ask` in answer mode, with relevant versions and dates. Require sources and an explicit account of anything not checked. If the configured child lacks web access, report the limitation; do not silently change its backend or ask it to inspect the repository instead.
 - Use `ask` review mode selectively when risk, complexity, subsystem interactions or context cost justify an independent code review, not merely because files changed. Small, clear, low-risk changes get proportionate host checks. Honor explicit user requests for or against review; do not impose a line-count threshold or ask permission for every review when the user has left that choice to you.
 - Prefer one fresh reviewer at a coherent completion boundary, after the file-changing child has finished, not after every implementation step or minor correction. Additional review is for substantive follow-up changes or unresolved findings, not a routine full-review loop. The reviewer must not be the agent that wrote the change.

@@ -34,7 +34,7 @@ test("availability and defaults metadata: strict keys and types, a body only a d
 	assert.deepEqual(parseRoleContract(`---\ndisabled: false\n${HEADER.slice(4)}Body.\n`, "plan.md").disabled, undefined, "false is the same as absent");
 	assert.deepEqual(parseRoleContract(`---\ndefaults:\n  backend: codex\n  model: gpt-x\n${HEADER.slice(4)}Body.\n`, "plan.md").defaults, { backend: "codex", model: "gpt-x" });
 	for (const [text, why] of [
-		[`---\nDisabled: true\n${HEADER.slice(4)}Body.`, /unknown frontmatter field; use only host, disabled and defaults$/],
+		[`---\nDisabled: true\n${HEADER.slice(4)}Body.`, /unknown frontmatter field; use only host, disabled, defaults and, on implement\.md, claudeWebTools$/],
 		[`---\ndisabled: 1\n${HEADER.slice(4)}Body.`, /disabled must be true or false/],
 		[`---\ndefaults: codex\n${HEADER.slice(4)}Body.`, /defaults must be an object/],
 		[`---\ndefaults:\n  effort: high\n${HEADER.slice(4)}Body.`, /defaults\.backend is required/],
@@ -42,17 +42,41 @@ test("availability and defaults metadata: strict keys and types, a body only a d
 		[`---\ndefaults:\n  backend: claude\n  model: 7\n${HEADER.slice(4)}Body.`, /defaults\.model must be nonblank text/],
 		[`---\ndisabled: true\n---\n`, /host must be an object/],
 	] as const) assert.throws(() => parseRoleContract(text, "/c/plan.md"), why);
-	assert.throws(() => parseRoleContract(`---\ndisabled: true\n${HEADER.slice(4)}Body.`, "ask-review.md", "ask-answer.md"), /disabled and defaults belong to ask-answer\.md/);
-	assert.equal(parseRoleContract("Review.\n", "ask-review.md", "ask-answer.md").body, "Review.\n");
+	assert.throws(() => parseRoleContract(`---\ndisabled: true\n${HEADER.slice(4)}Body.`, "/c/ask-review.md", "ask-review.md"), /disabled and defaults belong to ask-answer\.md/);
+	assert.equal(parseRoleContract("Review.\n", "/c/ask-review.md", "ask-review.md").body, "Review.\n");
 });
 
 test("host metadata takes only its four fields, so a misplaced disabled or defaults cannot leave a role available", () => {
-	for (const misplaced of ["  disabled: true\n", "  defaults:\n    backend: codex\n", "  PRIVATE_HOST_KEY: PRIVATE_HOST_VALUE\n"]) {
+	for (const misplaced of ["  disabled: true\n", "  defaults:\n    backend: codex\n", "  claudeWebTools: true\n", "  PRIVATE_HOST_KEY: PRIVATE_HOST_VALUE\n"]) {
 		assert.throws(() => parseRoleContract(HEADER.replace("host:\n", `host:\n${misplaced}`) + "Body.", "/c/plan.md"), (error: Error) => {
-			assert.match(error.message, /host has an unknown field; use only description, guidance, task_brief and snippet, and put disabled and defaults at the top level$/);
+			assert.match(error.message, /host has an unknown field; use only description, guidance, task_brief and snippet, and put disabled, defaults and claudeWebTools at the top level$/);
 			assert.doesNotMatch(error.message, /PRIVATE_HOST|codex/);
 			return true;
 		});
+	}
+});
+
+test("claudeWebTools: a boolean only implement.md may name, recorded only when true, never echoed when rejected", () => {
+	const web = (value: string) => `---\nclaudeWebTools: ${value}\n${HEADER.slice(4)}Body.\n`;
+	assert.equal(parseRoleContract(web("true"), "/c/implement.md", "implement.md").claudeWebTools, true);
+	assert.deepEqual(parseRoleContract(web("false"), "/c/implement.md", "implement.md"), parseRoleContract(`${HEADER}Body.\n`, "/c/implement.md", "implement.md"), "false is the same as absent");
+	assert.equal(parseRoleContract(`${HEADER}Body.\n`, "/c/implement.md", "implement.md").claudeWebTools, undefined);
+	for (const value of ['"PRIVATE_VALUE"', "1", "null", "[true]", "{ PRIVATE_KEY: true }"]) {
+		assert.throws(() => parseRoleContract(web(value), "/c/implement.md", "implement.md"), (error: Error) => {
+			assert.match(error.message, /invalid role contract \/c\/implement\.md: claudeWebTools must be true or false$/);
+			assert.doesNotMatch(error.message, /PRIVATE/);
+			return true;
+		});
+	}
+	// Identity is the name the caller knows, never the path: a file called implement.md by its source alone is refused.
+	for (const [source, name] of [["/c/plan.md", "plan.md"], ["/c/ultracode.md", "ultracode.md"], ["/c/ask-answer.md", "ask-answer.md"], ["/c/ask-review.md", "ask-review.md"], ["/c/security.md", "security.md"], ["/c/implement.md", undefined]] as const) {
+		for (const value of ["true", "false", '"PRIVATE_VALUE"']) {
+			assert.throws(() => parseRoleContract(web(value), source, name), (error: Error) => {
+				assert.match(error.message, /claudeWebTools belongs to implement\.md only$/, `${name} ${value}`);
+				assert.doesNotMatch(error.message, /PRIVATE/);
+				return true;
+			});
+		}
 	}
 });
 
@@ -81,6 +105,12 @@ test("a lazy canonical read refuses a disabled, blank or invalid canonical contr
 	assert.equal(canonicalContractBody(read, "ask-review.md"), "Review.\n");
 	files["ask-review.md"] = " \n";
 	assert.throws(() => canonicalContractBody(read, "ask-review.md"), /ask-review\.md has blank child instructions/);
+	files["implement.md"] = `---\nclaudeWebTools: true\n${HEADER.slice(4)}Implement.\n`;
+	assert.equal(canonicalContractBody(read, "implement.md"), "Implement.\n", "the lazy guard knows the file it reads and accepts its switch");
+	files["plan.md"] = `---\nclaudeWebTools: false\n${HEADER.slice(4)}Plan.\n`;
+	assert.throws(() => canonicalContractBody(read, "plan.md"), /claudeWebTools belongs to implement\.md only/);
+	files["ask-review.md"] = `---\nclaudeWebTools: true\n${HEADER.slice(4)}Review.\n`;
+	assert.throws(() => canonicalContractBody(read, "ask-review.md"), /claudeWebTools belongs to implement\.md only/);
 	assert.equal(suppliedContractBody(disabled), disabled);
 	assert.throws(() => suppliedContractBody(" \n"), /blank/);
 });

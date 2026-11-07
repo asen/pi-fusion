@@ -47,6 +47,8 @@ export interface GuidanceInput {
 	quote: QuoteMarkers;
 	/** The host policy's Markdown as this instance selected it, or undefined until the instance has loaded it. */
 	policy: string | undefined;
+	/** True when the startup `implement.md` gives a Claude implement child WebSearch and WebFetch. */
+	claudeWebTools?: boolean;
 }
 
 /** The part of a delegation tool's definition that is guidance rather than schema or executor. */
@@ -279,6 +281,12 @@ const snippet = (view: View, child: string, none: string): string =>
 /** Tool availability is a backend fact, separate from ask's contract prose. */
 const CLAUDE_ASK_TOOLS = "On claude, role ask runs with Read, Bash, Grep, Glob, WebSearch and WebFetch, and has no Edit or Write tool.";
 
+/** The Claude implementer's tools when this instance's implement contract adds web tools: a fact, never a mandate to research. */
+const CLAUDE_IMPLEMENT_WEB_TOOLS = "On claude, role implement also runs with WebSearch and WebFetch, as this instance's implement contract enables; on pi and codex its tools are unchanged.";
+
+/** The web-tools sentence, said only while role implement is available and enabled and its contract adds them. */
+const implementWebTools = (view: View): string[] => (view.input.claudeWebTools === true && view.on("implement") ? [CLAUDE_IMPLEMENT_WEB_TOOLS] : []);
+
 /** The pi part of the fusion description: what it runs, which roles are pinned to one harness, its tools and its models. */
 const piText = (view: View): string[] => {
 	const { on } = view;
@@ -324,6 +332,7 @@ const backendText = (view: View): string[] => {
 	return [
 		"backend picks the harness a child runs in: leave backend unset unless the user names one, and a fresh run goes to the backend the configuration above names for its role, on that role's configured model and effort. A call that names the other backend runs there on this instance's legacy defaults for that backend, never on the settings configured for the role's other backend or on a role contract's defaults.",
 		...(view.on("ask") ? [CLAUDE_ASK_TOOLS] : []),
+		...implementWebTools(view),
 		...piText(view),
 		...codexText(view),
 		...(idle.length ? [`${capital(series(idle.map((backend) => `backend ${backend}`)))} ${idle.length === 1 ? "runs" : "run"} no role this session enables.`] : []),
@@ -365,6 +374,7 @@ export function claudeGuidance(input: GuidanceInput): ToolGuidance {
 		claude.enabled.length ? claude.enabled.map((role) => roleText(role, claude)).join(" ") : "No role this tool runs is enabled in this session's configuration, so every call is refused, whether it starts a run or continues one.",
 		...(claude.enabled.length ? [claudeConfigurationText(input)] : []),
 		...(claude.on("ask") ? [CLAUDE_ASK_TOOLS] : []),
+		...implementWebTools(claude),
 		"Every run gets a handle such as run-3, shown in the stats line. continue with a handle sends the task as a follow-up to that run: the child keeps its context from the run's last successful call, across a resume of this session, /tree and forks, and keeps the model and effort that run was started with unless the call names others. Calls run one at a time: Pi serializes any turn that contains one.",
 		`Returns the child's report, or with background true the handle at once and the report later as a message; manage a background run with ${names.claudeControl}. If the child asks a question, the call returns the question at once and the run waits in the background until you answer it with ${names.claudeControl} message. A child that reports while background work it waits for still runs, as a workflow launch does, makes the call return that report at once as an interim report, marked as not final; the run goes on in the background, keeping its slot, and ${names.claudeControl} wait returns a newer interim report, a question or the final report. Only one run that can change files is active at a time, waiting included${ask}.`,
 	];

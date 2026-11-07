@@ -29,6 +29,8 @@ export interface RoleContractSnapshot {
 	unavailable: Partial<Record<KnownRoleName, string>>;
 	/** The defaults each available role's contract declares. */
 	defaults: Partial<Record<KnownRoleName, LoadedDefault>>;
+	/** The selected `implement.md` that gives a Claude implement child WebSearch and WebFetch, when it is available and says so. */
+	claudeWebTools?: string;
 }
 
 export interface RoleContractLoader {
@@ -41,9 +43,8 @@ const ROLE_OF: Record<RoleContractName, KnownRoleName> = { "plan.md": "plan", "i
 
 /** The five advertised roles need host metadata and may declare availability and defaults; review may remain a headerless child contract. */
 const parser = (name: RoleContractName) => (text: string, source: string): ParsedRoleContract => {
-	const owner = contractOwner(name);
-	const parsed = parseRoleContract(text, source, owner);
-	if (owner !== undefined) return parsed;
+	const parsed = parseRoleContract(text, source, name);
+	if (contractOwner(name) !== undefined) return parsed;
 	if (!parsed.host) throw new Error(`pi-fusion: role contract ${source} has no host frontmatter`);
 	if (!parsed.defaults) return parsed;
 	try {
@@ -91,6 +92,7 @@ const snapshot = (files: RoleContractSnapshot["files"]): RoleContractSnapshot =>
 	const guidance = {} as RoleGuidanceMap;
 	const unavailable: RoleContractSnapshot["unavailable"] = {};
 	const defaults: RoleContractSnapshot["defaults"] = {};
+	let web: string | undefined;
 	for (const [role, name] of Object.entries(ROLE_CONTRACTS) as [KnownRoleName, RoleContractName][]) {
 		const file = files[name];
 		const mode = role === "ask" ? files["ask-review.md"] : undefined;
@@ -98,9 +100,12 @@ const snapshot = (files: RoleContractSnapshot["files"]): RoleContractSnapshot =>
 		if (file.unusable) unavailable[role] = file.diagnostic!;
 		else if (mode?.unusable) unavailable[role] = mode.diagnostic!;
 		else if (file.disabled) unavailable[role] = `the ${sourceText(file)} ${file.path} declares disabled: true`;
-		else if (file.defaults) defaults[role] = { ...file.defaults, path: file.path };
+		else {
+			if (file.defaults) defaults[role] = { ...file.defaults, path: file.path };
+			if (file.claudeWebTools) web = file.path;
+		}
 	}
-	return { files, guidance, unavailable, defaults };
+	return { files, guidance, unavailable, defaults, ...(web === undefined ? {} : { claudeWebTools: web }) };
 };
 
 /** Fixed filenames only: no caller can turn contract lookup into arbitrary path access, or read an unavailable role's body. */

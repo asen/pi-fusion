@@ -105,7 +105,7 @@ cp <selected implement.md path from /fusion config> .pi/pi-fusion/contracts/impl
 $EDITOR .pi/pi-fusion/contracts/implement.md
 ```
 
-The same applies to `.pi/pi-fusion/host.md`. **Profiles and settings remain user-global**: there is no project `profiles.json` or `settings.json` support under `.pi/pi-fusion/`. Role enablement/backend/model settings still come from the current profile or `/fusion config`; a project contract can only make a role unavailable or change its built-in defaults, as [below](#role-availability-and-defaults).
+The same applies to `.pi/pi-fusion/host.md`. **Profiles and settings remain user-global**: there is no project `profiles.json` or `settings.json` support under `.pi/pi-fusion/`. Role enablement/backend/model settings still come from the current profile or `/fusion config`; a project contract's frontmatter can only make a role unavailable, change its built-in defaults, as [below](#role-availability-and-defaults), or, in `implement.md`, add Claude's native web tools to role implement ([Claude implementer web tools](#claude-implementer-web-tools)).
 
 ## The host policy file
 
@@ -162,13 +162,13 @@ Then `/reload`, restart Pi, or start a new session, and check `/fusion config`. 
 | `ask-review.md` | Not used; frontmatter is optional | Ask review mode |
 | `security.md` | Security | Security (Pi only) |
 
-Each named override replaces its lower-priority counterpart **whole**, not just its body or frontmatter. The five files supplying host metadata must retain the complete `host` header shown above and a nonblank child body, unless they [declare their role disabled](#role-availability-and-defaults). `ask-review.md` needs only nonblank child instructions; if it has frontmatter, that header must also be valid and may not declare `disabled` or `defaults`, which belong to `ask-answer.md`. Unknown filenames are ignored. The host policy override remains `pi-fusion/host.md`, not `pi-fusion/contracts/host.md`.
+Each named override replaces its lower-priority counterpart **whole**, not just its body or frontmatter. The five files supplying host metadata must retain the complete `host` header shown above and a nonblank child body, unless they [declare their role disabled](#role-availability-and-defaults). `ask-review.md` needs only nonblank child instructions; if it has frontmatter, that header must also be valid and may not declare `disabled` or `defaults`, which belong to `ask-answer.md`, or `claudeWebTools`, which belongs to `implement.md`. Unknown filenames are ignored. The host policy override remains `pi-fusion/host.md`, not `pi-fusion/contracts/host.md`.
 
 Loading uses the same file machinery as the host policy: regular files, strict UTF-8, nonblank, at most **64 KiB per file**, no templates or includes. Every shipped contract is validated before any role override is consulted, including disabled roles. A broken shipped contract fails startup; an override never hides a broken install. A missing override quietly falls through to the next scope. Loading creates and writes nothing.
 
 ### Role availability and defaults
 
-Besides `host`, a role contract's frontmatter may carry two optional top-level fields. Any other top-level field, or any `host` field besides the four shown above, makes the file invalid, so a misspelt or misplaced key (such as `disabled` under `host`) cannot leave a role available by accident. Diagnostics name the field category and file, never the unknown key or rejected value.
+Besides `host`, a role contract's frontmatter may carry two optional top-level fields, `disabled` and `defaults`, and `implement.md` alone a third, [`claudeWebTools`](#claude-implementer-web-tools). Any other top-level field, or any `host` field besides the four shown above, makes the file invalid, so a misspelt or misplaced key (such as `disabled` under `host`) cannot leave a role available by accident. Diagnostics name the field category and file, never the unknown key or rejected value.
 
 A role that starts on Codex with a chosen model (`defaults` with `backend`, which is required whenever `defaults` is present):
 
@@ -208,15 +208,24 @@ host:
 
 Defaults apply only where the built-in configuration does: a session with no saved default profile, and `/fusion profile use builtin`, which restores the startup selection without rereading. A saved profile is a complete snapshot and wins over them. An explicit call naming another backend, and the editor's backend switch, use that backend's legacy defaults, not the contract's. Continuations keep their recorded selection; older Claude records missing a model or effort still fall back to the legacy defaults, never a contract's. A Pi role a contract leaves without a model is refused, naming that contract.
 
+### Claude implementer web tools
+
+`claudeWebTools: true` in the selected `implement.md` gives a Claude `implement` child Claude Code's native WebSearch and WebFetch besides its usual tools ([child tools](runs.md#child-tools-and-settings)). Absent or `false` keeps the usual list; shipped `implement.md` leaves it out, and the bundled [architect preset](presets.md#the-architect-preset) sets it.
+
+- It must be `true` or `false`, and only `implement.md` may name it: any other contract naming it, even as `false`, is invalid, as is the field under `host`.
+- It applies to every run of role implement on Claude, through `fusion` or `claude`, fresh or continued, read from the startup snapshot like the rest of the contract. No profile, `/fusion config` edit, call parameter or run record sets it. Pi and Codex implement tools and every other role's tools are unchanged; a Codex child's web access is whatever its own configuration gives.
+- It adds tools, not isolation: the implementer already has Bash, and Fusion verifies no search actually works. The child's instructions decide how it uses them.
+- Delegation tool guidance mentions the tools only while implement is available and enabled; `/fusion config` names the file that enables them.
+
 Saved profiles keep their `enabled` setting for an unavailable role: the role table shows `unavailable` in its place, the editor offers no way to turn it on, and saving the configuration writes the setting unchanged. `/fusion config` lists each unavailable role with its reason, and each role's declared defaults with their path.
 
 ### Unusable role overrides
 
-A role-contract override that is present but unreadable or invalid (including invalid `disabled` or `defaults`, or a link whose target is missing, at the file or at a directory above it), or a scope whose directory cannot be located, makes its role **unavailable** with one startup warning and a `/fusion config` diagnostic naming the scope, path and reason. Fusion does not fall back to a lower scope for it, because that file may have restricted the role. An unusable `ask-review.md` makes role `ask` unavailable, so a broken review contract never falls back to the shipped reviewer. If the user agent directory cannot be resolved, every role whose project file is missing becomes unavailable. Fix or remove the file, then restart Pi, `/reload` or start a new session. Other valid overrides still apply, and an invalid `host.md` keeps its own fallback.
+A role-contract override that is present but unreadable or invalid (including invalid `disabled`, `defaults` or `claudeWebTools`, or a link whose target is missing, at the file or at a directory above it), or a scope whose directory cannot be located, makes its role **unavailable** with one startup warning and a `/fusion config` diagnostic naming the scope, path and reason. Fusion does not fall back to a lower scope for it, because that file may have restricted the role. An unusable `ask-review.md` makes role `ask` unavailable, so a broken review contract never falls back to the shipped reviewer. If the user agent directory cannot be resolved, every role whose project file is missing becomes unavailable. Fix or remove the file, then restart Pi, `/reload` or start a new session. Other valid overrides still apply, and an invalid `host.md` keeps its own fallback.
 
 The host loads one snapshot at `session_start`, or the first call/command needing configuration. Delegation and configuration wait for it. Both host metadata and child bodies come from that snapshot, including continuations, plan handoffs and reviews, on Claude, Pi and Codex. No run rereads contract files, and profile/settings changes do not reload them. Before startup finishes, role descriptions say their contracts are not loaded yet. A failed load is not retried in that instance and refuses the same gated operations as a failed host-policy load; mode and control tools remain usable.
 
-`/fusion config` and its editor list each selected source and path (`, disabled` or `, unusable` where applicable), diagnostics, unavailable roles with their reasons and declared defaults, never contract contents. These are startup observations, not new reads. To customize one file, copy the shipped path shown there:
+`/fusion config` and its editor list each selected source and path (`, disabled` or `, unusable` where applicable), diagnostics, unavailable roles with their reasons, declared defaults and the file enabling Claude implementer web tools, never contract contents. These are startup observations, not new reads. To customize one file, copy the shipped path shown there:
 
 ```bash
 mkdir -p ~/.pi/agent/pi-fusion/contracts
@@ -224,7 +233,7 @@ cp <shipped implement.md path from /fusion config> ~/.pi/agent/pi-fusion/contrac
 $EDITOR ~/.pi/agent/pi-fusion/contracts/implement.md
 ```
 
-Then `/reload`, restart Pi, or start a new session. Remove the override and reload to return to the next valid lower-priority version. An existing instance keeps its snapshot even if a file is edited or deleted. Contract text is guidance, not a way to alter runtime tool lists, enabled roles, backend support or admission restrictions.
+Then `/reload`, restart Pi, or start a new session. Remove the override and reload to return to the next valid lower-priority version. An existing instance keeps its snapshot even if a file is edited or deleted. A contract's child-instruction body is guidance, not a way to alter runtime tool lists, enabled roles, backend support or admission restrictions; only the validated frontmatter fields [above](#role-availability-and-defaults) change runtime behavior, and none of them enables a role, adds backend support or relaxes admission.
 
 ## The pi backend's variables
 

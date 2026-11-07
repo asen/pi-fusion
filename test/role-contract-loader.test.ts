@@ -128,6 +128,28 @@ test("disabled and defaults metadata: availability, checked defaults, and the mi
 	assert.deepEqual((await memoryRoleContractLoader().load()).unavailable, {}, "this build's shipped contracts are all available");
 });
 
+test("claudeWebTools reaches the snapshot from an available implement.md only, and a misplaced or invalid one closes its role without falling back", async () => {
+	const web = (label: string, value = "true") => contract(label).replace("---\nhost:", `---\nclaudeWebTools: ${value}\nhost:`);
+	assert.equal((await memoryRoleContractLoader().load()).claudeWebTools, undefined, "shipped implement.md leaves it out");
+	const on = await memoryRoleContractLoader({ overrides: { "implement.md": web("implement") } }).load();
+	assert.equal(on.claudeWebTools, "(override implement.md, in memory)");
+	assert.equal(on.files["implement.md"].claudeWebTools, true);
+	assert.equal(roleContractBody(on, "implement.md"), "Child implement.\n", "the switch is frontmatter, never child instructions");
+	assert.equal((await memoryRoleContractLoader({ overrides: { "implement.md": web("implement", "false") } }).load()).claudeWebTools, undefined);
+	const disabled = await memoryRoleContractLoader({ overrides: { "implement.md": web("implement").replace("claudeWebTools: true", "claudeWebTools: true\ndisabled: true") } }).load();
+	assert.equal(disabled.claudeWebTools, undefined, "an unavailable implementer gets no tools from its contract");
+	const bad = await memoryRoleContractLoader({
+		overrides: { "implement.md": web("implement", "PRIVATE_VALUE"), "plan.md": web("plan", "false"), "ask-review.md": web("review") },
+	}).load();
+	assert.deepEqual(Object.keys(bad.unavailable).sort(), ["ask", "implement", "plan"]);
+	assert.match(bad.unavailable.implement!, /claudeWebTools must be true or false/);
+	assert.match(bad.unavailable.plan!, /claudeWebTools belongs to implement\.md only/);
+	assert.match(bad.unavailable.ask!, /ask-review\.md .*claudeWebTools belongs to implement\.md only/);
+	assert.doesNotMatch(JSON.stringify(bad), /PRIVATE/);
+	assert.equal(bad.claudeWebTools, undefined);
+	await assert.rejects(memoryRoleContractLoader({ shipped: { "security.md": web("security") } }).load(), /claudeWebTools belongs to implement\.md only/, "a shipped file naming it elsewhere is a broken install");
+});
+
 test("defaults are checked for the role and backend that declare them, and an invalid one makes the role unavailable", async () => {
 	const withDefaults = (role: string, defaults: string): string => contract(role).replace("---\nhost:", `---\ndefaults:\n${defaults}\nhost:`);
 	for (const [name, defaults, why] of [

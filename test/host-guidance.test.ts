@@ -85,6 +85,27 @@ test("both tools carry architect research/review facts and the selective host po
 	}
 });
 
+test("the Claude implementer's web tools are stated as a fact only when the contract adds them and implement is available and enabled", () => {
+	const WEB = /role implement also runs with WebSearch and WebFetch/;
+	for (const tool of TOOLS) {
+		for (const enabled of SUBSETS) {
+			for (const claudeWebTools of [undefined, false, true]) {
+				const configuration: GuidanceInput = { ...input(enabling(enabled)), ...(claudeWebTools === undefined ? {} : { claudeWebTools }) };
+				const all = texts(tool.guidance(configuration), tool.help(configuration)).join("\n");
+				const expected = claudeWebTools === true && enabled.includes("implement");
+				assert.equal(WEB.test(all), expected, `${tool.name} ${enabled.join(",")} ${claudeWebTools}`);
+			}
+		}
+		const unavailable: GuidanceInput = { ...input(enabling(["implement", "ask"])), unavailable: { implement: "disabled" }, claudeWebTools: true };
+		assert.doesNotMatch(texts(tool.guidance(unavailable), tool.help(unavailable)).join("\n"), WEB, `${tool.name}: an unavailable implementer is not described`);
+		// A fact, never a research mandate: ask keeps its own sentence and nothing tells the host to research.
+		const on: GuidanceInput = { ...input(enabling(["implement", "ask"])), claudeWebTools: true };
+		const text = texts(tool.guidance(on), tool.help(on)).join("\n");
+		assert.match(text, /role ask runs with Read, Bash, Grep, Glob, WebSearch and WebFetch/);
+		assert.doesNotMatch(text, /\b(should|must) (research|search the web)/i);
+	}
+});
+
 test("disabled roles contribute no metadata and have one refusal notice per tool, across every enabled-role combination", () => {
 	for (const enabled of SUBSETS) {
 		const configuration = input(enabling(enabled));

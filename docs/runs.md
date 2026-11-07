@@ -29,7 +29,7 @@ Every child runs in the host's working directory. The host supplies the child bo
 
 | Role | Claude Code tools | Pi tools |
 | --- | --- | --- |
-| `plan`, `implement` | Read, Bash, Edit, Write, Grep, Glob | read, bash, edit, write, grep, find, ls |
+| `plan`, `implement` | Read, Bash, Edit, Write, Grep, Glob; `implement` adds WebSearch and WebFetch when its contract sets [`claudeWebTools`](configuration.md#claude-implementer-web-tools) | read, bash, edit, write, grep, find, ls |
 | `ask` | Read, Bash, Grep, Glob, WebSearch, WebFetch | read, bash, grep, find, ls |
 | `ultracode` | Claude's own tools, Workflow, Agent, and the user's MCP servers | Unsupported |
 | Enabled `security` | Unsupported | Same as Pi implement |

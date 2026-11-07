@@ -224,6 +224,10 @@ test("the bundled architect preset is complete and valid: its policy, three unav
 	assert.match(review, /^# Independent code review/);
 	assert.match(review, /you did not write it and do not implement fixes/);
 	assert.match(roleContractBody(loaded, "implement.md"), /^You are the implementer\./);
+	assert.equal(loaded.claudeWebTools, path.join(ARCHITECT_DIR, "contracts", "implement.md"), "the bundled implementer enables Claude web tools");
+	assert.equal(loaded.files["implement.md"].claudeWebTools, true);
+	for (const name of ROLE_CONTRACT_FILES) if (name !== "implement.md") assert.equal(loaded.files[name].claudeWebTools, undefined, name);
+	assert.equal((await memoryRoleContractLoader().load({ cwd: "/p", projectTrusted: false, preset: "builtin" })).claudeWebTools, undefined, "builtin leaves them off");
 	assert.match(roleContractBody(loaded, "ask-answer.md"), /external web researcher/);
 	const policy = await memoryHostPolicyLoader().load({ cwd: "/p", projectTrusted: false, preset: "architect" });
 	assert.deepEqual([policy.source, policy.path, policy.diagnostic], ["bundled", path.join(ARCHITECT_DIR, HOST_POLICY_FILE), undefined]);
@@ -276,6 +280,18 @@ test("architect separates research from read-only review and keeps selective rev
 	assert.match(policy, /Escalate review findings that require a user decision or remain disputed after one substantive Architect response/);
 	assert.match(policy, /Do not force agreement or reset existing discussion limits/);
 	assert.doesNotMatch(policy, /`ask` only for external web research|Do not use `ask` review mode|review contract declines/);
+	// The implementer's own lookups are bounded in its contract; the policy allows them and keeps broad research with ask.
+	const implement = roleContractBody(loaded, "implement.md");
+	assert.match(implement, /## Public lookups\n/);
+	assert.match(implement, /concrete, in-scope implementation questions/);
+	assert.match(implement, /Prefer primary, version-matched sources/);
+	assert.match(implement, /Never put private code, secrets, credentials/);
+	assert.match(implement, /never execute or install downloaded code/);
+	assert.match(implement, /Broad external research, conflicting sources that change the design, or a finding that challenges the agreed architecture go to the Architect/);
+	assert.match(implement, /Never invent sources, results or versions/);
+	assert.doesNotMatch(implement, /WebSearch|WebFetch|claudeWebTools/, "the lookup rules name no harness tool and no frontmatter reaches the child");
+	assert.match(policy, /The implementer may look up public documentation itself for concrete, in-scope implementation questions/);
+	assert.match(policy, /Send broader external research to `ask` in answer mode/);
 });
 
 test("an unusable bundled preset fails its selection, after builtin is validated, and never borrows a missing file from builtin", async (t) => {

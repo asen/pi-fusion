@@ -29,19 +29,27 @@ export interface ParsedRoleContract {
 	/** Present only when the header says `disabled: true`: the role is unavailable for this instance's life. */
 	disabled?: true;
 	defaults?: ContractDefaults;
+	/** Present only when `implement.md` says `claudeWebTools: true`: a Claude implement child also gets WebSearch and WebFetch. */
+	claudeWebTools?: true;
 }
 
-const HEADER_FIELDS = new Set(["host", "disabled", "defaults"]);
+/** The one contract file that may carry `claudeWebTools`: the Claude tool lists of every other role are fixed. */
+const WEB_TOOLS_CONTRACT = "implement.md";
+
+const HEADER_FIELDS = new Set(["host", "disabled", "defaults", "claudeWebTools"]);
 const HOST_FIELDS = new Set(["description", "guidance", "task_brief", "snippet"]);
 const DEFAULT_FIELDS = new Set(["backend", "model", "effort"]);
 
 /**
- * Split host-only YAML from child instructions, leaving contracts without a header unchanged. Only `host`, `disabled`
- * and `defaults` may appear at the top, so a misspelt availability key is refused rather than read as an available role;
- * a disabled contract may have no child body, every other one must have a nonblank one.
+ * Split host-only YAML from child instructions, leaving contracts without a header unchanged. Only `host`, `disabled`,
+ * `defaults` and, on `implement.md`, `claudeWebTools` may appear at the top, so a misspelt availability key is refused
+ * rather than read as an available role; a disabled contract may have no child body, every other one must have a
+ * nonblank one. `name` is the contract file this text is, never guessed from `source`, which only labels diagnostics:
+ * it decides the mode contract's owner and whether the web-tools switch is allowed, so text of unknown identity has none.
  */
-export function parseRoleContract(text: string, source: string, owner?: string): ParsedRoleContract {
+export function parseRoleContract(text: string, source: string, name?: string): ParsedRoleContract {
 	if (!/^---\r?\n/.test(text)) return { body: text };
+	const owner = name === undefined ? undefined : contractOwner(name);
 	const fail = (why: string): never => { throw new Error(`pi-fusion: invalid role contract ${source}: ${why}`); };
 	const header = /^---\r?\n([\s\S]*?)\r?\n---(?:\r?\n|$)/.exec(text);
 	if (!header) return fail("unterminated frontmatter");
@@ -54,13 +62,13 @@ export function parseRoleContract(text: string, source: string, owner?: string):
 	}
 	if (!metadata || typeof metadata !== "object" || Array.isArray(metadata)) return fail("host must be an object");
 	// Diagnostics name the category, never the key or value as written: they reach warnings and /fusion config.
-	for (const key of Object.keys(metadata)) if (!HEADER_FIELDS.has(key)) fail("unknown frontmatter field; use only host, disabled and defaults");
+	for (const key of Object.keys(metadata)) if (!HEADER_FIELDS.has(key)) fail("unknown frontmatter field; use only host, disabled, defaults and, on implement.md, claudeWebTools");
 	const top = metadata as Record<string, unknown>;
 	const host = top.host;
 	if (!host || typeof host !== "object" || Array.isArray(host)) return fail("host must be an object");
 	const fields = host as Record<string, unknown>;
-	// A `disabled` or `defaults` placed under host would otherwise be ignored and leave the role available.
-	for (const key of Object.keys(fields)) if (!HOST_FIELDS.has(key)) fail("host has an unknown field; use only description, guidance, task_brief and snippet, and put disabled and defaults at the top level");
+	// A `disabled`, `defaults` or `claudeWebTools` placed under host would otherwise be ignored as if it said nothing.
+	for (const key of Object.keys(fields)) if (!HOST_FIELDS.has(key)) fail("host has an unknown field; use only description, guidance, task_brief and snippet, and put disabled, defaults and claudeWebTools at the top level");
 	for (const field of ["description", "task_brief", "snippet"] as const) {
 		if (typeof fields[field] !== "string" || !fields[field].trim()) return fail(`host.${field} must be nonblank text`);
 	}
@@ -70,9 +78,13 @@ export function parseRoleContract(text: string, source: string, owner?: string):
 	if (top.disabled !== undefined && typeof top.disabled !== "boolean") return fail("disabled must be true or false");
 	const disabled = top.disabled === true;
 	const defaults = top.defaults === undefined ? undefined : contractDefaults(top.defaults, fail);
+	// Even `false` is refused elsewhere: a file that names the switch where it does nothing reads as if it did.
+	if (top.claudeWebTools !== undefined && name !== WEB_TOOLS_CONTRACT) return fail(`claudeWebTools belongs to ${WEB_TOOLS_CONTRACT} only`);
+	if (top.claudeWebTools !== undefined && typeof top.claudeWebTools !== "boolean") return fail("claudeWebTools must be true or false");
+	const web = top.claudeWebTools === true;
 	const body = text.slice(header[0].length).replace(/^\r?\n/, "");
 	if (!disabled && !body.trim()) return fail("child instructions are blank");
-	return { body, host: fields as unknown as RoleGuidance, ...(disabled ? { disabled: true as const } : {}), ...(defaults ? { defaults } : {}) };
+	return { body, host: fields as unknown as RoleGuidance, ...(disabled ? { disabled: true as const } : {}), ...(defaults ? { defaults } : {}), ...(web ? { claudeWebTools: true as const } : {}) };
 }
 
 /** The shape of `defaults`: a backend whenever a model or effort is named, and nothing a reader would have to guess at. */
@@ -95,8 +107,8 @@ export const CONTRACT_OWNERS: Readonly<Record<string, string>> = { "ask-review.m
 export const contractOwner = (name: string): string | undefined => (Object.hasOwn(CONTRACT_OWNERS, name) ? CONTRACT_OWNERS[name] : undefined);
 
 /** A contract read lazily runs only when it is valid, not disabled and has child instructions. */
-function runnableBody(read: (name: string) => string, name: string, owner?: string): string {
-	const parsed = parseRoleContract(read(name), name, owner);
+function runnableBody(read: (name: string) => string, name: string): string {
+	const parsed = parseRoleContract(read(name), name, name);
 	if (parsed.disabled) throw new Error(`pi-fusion: role contract ${name} declares its role disabled`);
 	if (!parsed.body.trim()) throw new Error(`pi-fusion: role contract ${name} has blank child instructions`);
 	return parsed.body;
@@ -117,7 +129,7 @@ export function canonicalContractBody(read: (name: string) => string, name: stri
 			throw new Error(`pi-fusion: ${name} is not run because its role's contract cannot run: ${error instanceof Error ? error.message : String(error)}`);
 		}
 	}
-	return runnableBody(read, name, owner);
+	return runnableBody(read, name);
 }
 
 /** A body the host already resolved at startup: checked for text only, never parsed again as frontmatter. */

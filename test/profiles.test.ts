@@ -2654,6 +2654,66 @@ test("preset use records the session's choice for its next startup only, with Fu
 	await reloaded.shutdown();
 });
 
+test("the architect implementer's claudeWebTools reaches Claude implement runs alone, on both tools, across continuations and profile switches", async () => {
+	const BASE = ["Read", "Bash", "Edit", "Write", "Grep", "Glob"];
+	const WEB = [...BASE, "WebSearch", "WebFetch"];
+	const toolsOf = (start: { role: unknown } | undefined) => (start?.role as { tools?: string[] } | undefined)?.tools;
+	const claude = fakeBackend({ name: "claude", scripts: [{ sessionId: "web-claude" }] });
+	const pi = fakeBackend({ name: "pi" });
+	const codex = fakeBackend({ name: "codex", scripts: [{ session: { backend: "codex", sessionId: "web-thread", checkpoint: "turn-1", baseline: { inputTokens: 10, cachedInputTokens: 0, outputTokens: 5, reasoningOutputTokens: 0, totalTokens: 15 } }, selection: { model: "codex-model", provider: "openai" } }] });
+	const elsewhere = settings({ implement: { enabled: true, backend: "pi", model: "openai/gpt-5" }, ask: { enabled: true, backend: "claude", model: "haiku", effort: "medium" } });
+	const host = sdkHost({ backends: { claude: claude.backend, pi: pi.backend, codex: codex.backend }, profiles: memoryProfileStore(document({ elsewhere })), ui: false });
+	host.branch.push(presetEntry("architect"));
+	await host.start();
+	await host.on();
+	for (const name of ["fusion", "claude"]) assert.match(toolText(host.tools.get(name)!).join("\n"), /role implement also runs with WebSearch and WebFetch/, name);
+	await host.command("config");
+	assert.match(host.last()!, /^role implement: on claude also runs with WebSearch and WebFetch, as .*presets\/architect\/contracts\/implement\.md enables; other backends and roles are unchanged$/m);
+
+	const fresh = await host.fusion({ role: "implement", task: "first" });
+	assert.equal(fresh.error, undefined);
+	assert.deepEqual(toolsOf(claude.starts[0]), WEB, "fusion routed to claude");
+	const continued = await host.fusion({ continue: fresh.details!.handle, task: "again" });
+	assert.equal(continued.error, undefined);
+	assert.deepEqual(toolsOf(claude.starts[1]), WEB, "a continuation keeps the startup switch");
+	assert.equal(claude.starts[1]?.intent?.kind, "resume");
+	assert.equal((await host.claude({ role: "implement", task: "forced" })).error, undefined);
+	assert.deepEqual(toolsOf(claude.starts[2]), WEB, "the claude tool");
+	assert.notEqual(toolsOf(claude.starts[0]), toolsOf(claude.starts[2]), "each run gets its own list");
+	assert.equal((await host.fusion({ role: "ask", task: "answer", backend: "claude" })).error, undefined);
+	assert.deepEqual(toolsOf(claude.starts[3]), ["Read", "Bash", "Grep", "Glob", "WebSearch", "WebFetch"], "ask keeps its own list");
+
+	// A profile that moves implement to pi changes where it runs, never what the contract adds on claude.
+	await host.command("profile use elsewhere");
+	const onPi = await host.fusion({ role: "implement", task: "on pi" });
+	assert.equal(onPi.error, undefined);
+	assert.ok(!toolsOf(pi.starts[0])!.some((tool) => /web/i.test(tool)), "pi implement tools are unchanged");
+	assert.equal((await host.fusion({ role: "implement", task: "on codex", backend: "codex" })).error, undefined);
+	assert.equal(toolsOf(codex.starts[0]), undefined, "a codex role carries no tool list");
+	const forced = await host.claude({ role: "implement", task: "forced again" });
+	assert.equal(forced.error, undefined);
+	assert.deepEqual(toolsOf(claude.starts.at(-1)), WEB, "a call forced onto claude still gets them");
+	assert.equal((await host.call("fusion_control", { action: "wait", run: forced.details!.handle })).error, undefined);
+	await host.shutdown();
+
+	// The shared shapes were never widened: a pure binding, and another instance on builtin, see the plain list.
+	assert.deepEqual(roleFor({ role: "implement", task: "x" }).tools, BASE);
+	const plain = fakeBackend({ name: "claude" });
+	const builtin = sdkHost({ backends: { claude: plain.backend }, ui: false });
+	await builtin.start();
+	await builtin.on();
+	for (const name of ["fusion", "claude"]) assert.doesNotMatch(toolText(builtin.tools.get(name)!).join("\n"), /role implement also runs with WebSearch/, name);
+	await builtin.command("config");
+	assert.doesNotMatch(builtin.last()!, /WebSearch/);
+	assert.equal((await builtin.fusion({ role: "implement", task: "plain" })).error, undefined);
+	const plan = await builtin.claude({ role: "plan", task: "plan", fresh: true });
+	assert.equal(plan.error, undefined);
+	assert.deepEqual(toolsOf(plain.starts[0]), BASE, "default off");
+	assert.deepEqual(toolsOf(plain.starts[1]), BASE, "plan is unchanged");
+	assert.equal((await builtin.call("fusion_control", { action: "wait", run: plan.details!.handle })).error, undefined);
+	await builtin.shutdown();
+});
+
 test("an unusable session entry or default file refuses startup; reset recovers an entry, only an explicit choice gets past a default file", async () => {
 	// An unusable latest entry over a valid default: the startup refuses, the preset commands still answer, and reset recovers.
 	const valid = memoryPresetDefaults({ user: "builtin" });

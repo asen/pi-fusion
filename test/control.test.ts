@@ -1660,6 +1660,43 @@ function argvValue(argv: string[], flag: string): string | undefined {
 
 const reviewLink = "run-2 reviews this run in the background; its report arrives as a message.";
 
+/** The argv the fake Claude CLI was started with for one call. */
+async function argvOf<T>(body: () => Promise<T>): Promise<string[]> {
+	const out = path.join(os.tmpdir(), `pi-fusion-web-argv-${process.pid}.json`);
+	fs.rmSync(out, { force: true });
+	process.env.FAKE_CLAUDE_ARGV_OUT = out;
+	try {
+		await body();
+	} finally {
+		delete process.env.FAKE_CLAUDE_ARGV_OUT;
+	}
+	const recorded = JSON.parse(fs.readFileSync(out, "utf8")) as { argv: string[] };
+	fs.rmSync(out, { force: true });
+	return recorded.argv;
+}
+
+test("an implement contract with claudeWebTools: true starts the Claude CLI with WebSearch and WebFetch on both tools, fresh and continued", async () => {
+	const shipped = fs.readFileSync(path.join(repoRoot, "contracts", "implement.md"), "utf8");
+	const web = memoryRoleContractLoader({ overrides: { "implement.md": shipped.replace(/^---\n/, "---\nclaudeWebTools: true\n") } });
+	const host = makeHost(repoRoot, "print", {}, {}, { roleContracts: web });
+	const BASE = "Read,Bash,Edit,Write,Grep,Glob";
+	const fresh = await argvOf(() => host.claude({ role: "implement", task: "look it up" }));
+	assert.equal(argvValue(fresh, "--tools"), `${BASE},WebSearch,WebFetch`);
+	assert.ok(fresh.includes("--strict-mcp-config"), "the user's MCP servers stay out");
+	const continued = await argvOf(() => host.claude({ continue: "run-1", task: "and again" }));
+	assert.equal(argvValue(continued, "--tools"), `${BASE},WebSearch,WebFetch`);
+	assert.ok(argvValue(continued, "--resume"), "the continuation resumes its session");
+	const routed = await argvOf(() => host.call("fusion", { role: "implement", task: "through fusion" }));
+	assert.equal(argvValue(routed, "--tools"), `${BASE},WebSearch,WebFetch`);
+	assert.equal(argvValue(await argvOf(() => host.claude({ role: "plan", task: "a plan" })), "--tools"), BASE, "plan is unchanged");
+	assert.equal(argvValue(await argvOf(() => host.claude({ role: "ask", task: "a question" })), "--tools"), "Read,Bash,Grep,Glob,WebSearch,WebFetch", "ask is unchanged");
+
+	// Default off: the shipped contract, in another instance of the same process after the one above.
+	const plain = makeHost();
+	assert.equal(argvValue(await argvOf(() => plain.claude({ role: "implement", task: "no lookups" })), "--tools"), BASE);
+	assert.equal(argvValue(await argvOf(() => plain.call("fusion", { role: "implement", task: "no lookups" })), "--tools"), BASE);
+});
+
 test("/fusion review starts an ask review child on the run's tree, tells the host once, and reports when it ends", () =>
 	withRepo(async (host) => {
 		await withScenario("edit", () => host.claude({ role: "implement", task: "add the retry" }));

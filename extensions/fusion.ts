@@ -985,6 +985,22 @@ export function fusionRole(route: FusionRoute): HostRole {
 	}
 }
 
+/** What a selected `implement.md` with `claudeWebTools: true` adds to the Claude implementer, after its own tools. */
+const CLAUDE_WEB_TOOLS = ["WebSearch", "WebFetch"] as const;
+
+/**
+ * The bound role with the startup contract's web tools: a Claude implement role gets a new role over a new list, so the
+ * shared shapes stay as every other call and instance reads them. Any other backend or role, or a switch that is off,
+ * returns the role as bound. The backend is the route's, not the role's shape: a Pi implement role has a list too.
+ */
+function withClaudeWebTools(route: FusionRoute, role: HostRole, enabled: boolean): HostRole {
+	if (!enabled || route.backend !== "claude" || role.name !== "implement") return role;
+	const claude = role as Role;
+	if (claude.tools === undefined) return role;
+	const widened: Role = { ...claude, tools: [...claude.tools, ...CLAUDE_WEB_TOOLS] };
+	return widened;
+}
+
 /** The run a fusion call starts or continues, with the role its backend bound for it. */
 export function fusionCall(params: FusionParams, records: RunRecords, planPct: number = planContextPct(), config?: Configuration): FusionCall {
 	const route = fusionRoute(params, records, planPct, config);
@@ -3276,6 +3292,7 @@ export default function fusion(pi: ExtensionAPI, options: FusionOptions = {}) {
 				const fields = [`backend ${declared.backend}`, ...(declared.model === undefined ? [] : [`model ${declared.model}`]), ...(declared.effort === undefined ? [] : [`effort ${declared.effort}`])];
 				return [`role ${role}: built-in defaults from ${declared.path}: ${fields.join(", ")}; other fields keep this instance's legacy ${declared.backend} defaults`];
 			}),
+			...(loaded.claudeWebTools === undefined ? [] : [`role implement: on claude also runs with WebSearch and WebFetch, as ${loaded.claudeWebTools} enables; other backends and roles are unchanged`]),
 		];
 	};
 
@@ -4109,7 +4126,8 @@ export default function fusion(pi: ExtensionAPI, options: FusionOptions = {}) {
 		 */
 		const backend = backends[route.backend];
 		if (!backend) throw new Error(unavailable(route.backend, route.record ? `${handle} ran on it` : `${handle} would run role ${route.role} on it`, route.record !== undefined));
-		const role = fusionRole(route);
+		// The startup contract alone says whether the Claude implementer gets web tools: no call, profile or record does.
+		const role = withClaudeWebTools(route, fusionRole(route), contracts?.claudeWebTools !== undefined);
 		refuseActive(handle);
 		const busy = canChangeFiles(role.name) ? active().find((run) => canChangeFiles(run.role.name)) : undefined;
 		if (busy) {
@@ -4204,6 +4222,7 @@ export default function fusion(pi: ExtensionAPI, options: FusionOptions = {}) {
 		claudeRoles: ROLE_NAMES,
 		quote: { open: CHILD_QUOTE_OPEN, close: CHILD_QUOTE_CLOSE },
 		policy: policy?.text,
+		claudeWebTools: contracts?.claudeWebTools !== undefined,
 	});
 
 	/**
