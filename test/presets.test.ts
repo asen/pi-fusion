@@ -249,6 +249,11 @@ test("architect separates research from read-only review and keeps selective rev
 	assert.match(review, /Inspect the named working-tree change, commit range or files/);
 	assert.match(review, /Do not modify repository files, implement fixes, change Git state/);
 	assert.match(review, /Run only documented, model-free verification that leaves the working tree unchanged/);
+	assert.match(review, /Do not routinely repeat the implementer's verification/);
+	assert.match(review, /Inspect reported results and test coverage/);
+	assert.match(review, /Run targeted checks only to investigate a concrete concern or resolve missing, stale or inconsistent evidence/);
+	assert.match(review, /Repeat the full suite only when specifically justified or requested/);
+	assert.match(review, /Separate commands you actually ran and their results from checks the implementer merely reported/);
 	assert.match(review, /Return findings to the Architect, not directly to the implementer/);
 	assert.match(review, /Use `ask_orchestrator` for missing details or blockers/);
 	assert.match(review, /After one substantive Architect response/);
