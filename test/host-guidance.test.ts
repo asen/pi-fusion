@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { memoryRoleContractLoader } from "../extensions/role-contract-loader.ts";
+import { memoryHostPolicyLoader } from "../extensions/host-policy.ts";
 import { claudeGuidance, claudeParameterHelp, fusionGuidance, fusionParameterHelp, type GuidanceInput, type ParameterHelp, policyGuideline, type ToolGuidance } from "../extensions/host-guidance.ts";
 import { builtinSettings, captureBaseline, copySettings, type RoleSettings } from "../extensions/profiles.ts";
 import { KNOWN_ROLE_NAMES, type KnownRoleName } from "../extensions/roles.ts";
@@ -64,6 +65,23 @@ test("contract metadata supplies both tools' descriptions, snippets, guidance an
 		assert.ok(guidance.promptGuidelines.some((line) => line.includes("Custom host instruction.")));
 		assert.ok(tool.help(configuration).task.includes("For implement: Custom task brief."));
 		for (const text of texts(guidance, tool.help(configuration))) assert.ok(!text.includes(roleGuidance.implement.description), "old role prose must not remain beside the metadata");
+	}
+});
+
+test("both tools carry architect research/review facts and the selective host policy without the old review refusal", async () => {
+	const context = { cwd: "/p", projectTrusted: false, preset: "architect" as const };
+	const contracts = await memoryRoleContractLoader().load(context);
+	const policy = await memoryHostPolicyLoader().load(context);
+	const configuration: GuidanceInput = { ...input(enabling(["implement", "ask"])), roleGuidance: contracts.guidance, unavailable: contracts.unavailable, policy: policy.text };
+	for (const tool of TOOLS) {
+		const guidance = tool.guidance(configuration);
+		const help = tool.help(configuration);
+		assert.ok(guidance.description.includes(contracts.guidance.ask.description), tool.name);
+		assert.ok(guidance.promptSnippet.includes(contracts.guidance.ask.snippet), tool.name);
+		assert.ok(help.task.includes(contracts.guidance.ask.task_brief), tool.name);
+		for (const fact of contracts.guidance.ask.guidance) assert.ok(guidance.promptGuidelines.some((line) => line.includes(fact)), tool.name);
+		assert.ok(guidance.promptGuidelines.includes(policyGuideline(policy.text)), "selective scheduling remains in the host policy");
+		assert.doesNotMatch(texts(guidance, help).join("\n"), /Review mode declines|Do not use `ask` review mode|review contract declines/);
 	}
 });
 

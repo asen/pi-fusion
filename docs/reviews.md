@@ -10,7 +10,7 @@
 | Self-review | A child reviews its own work, such as ultracode's agents under its briefing | No |
 | Independent review | A fresh `ask` review run that did not write the change and inherits nothing from it | Yes |
 
-This page owns the independent kind. Whether and when the host asks for one, and what it reports, is the [host policy](routing.md#the-host-policy)'s: the shipped policy asks for one after each implementation step when a reviewer can start, and otherwise for a host review labelled as such. Fusion enforces only the eligibility rules below, never the policy.
+This page owns the independent kind. Whether and when the host asks for one, and what it reports, is the [host policy](routing.md#the-host-policy)'s: the shipped policy asks for one after each implementation step when a reviewer can start, and otherwise for a host review labelled as such. The bundled [Architect preset](presets.md#the-architect-preset) instead selects reviews by risk, complexity and context cost, with small changes checked by the host and automatic review left off. Its reviewer returns concise findings to the Architect, which triages them, relays accepted fixes to the implementer and escalates unresolved user decisions. Fusion enforces only the eligibility rules below, never the policy.
 
 ## What can be reviewed
 

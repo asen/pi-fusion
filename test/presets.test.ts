@@ -204,7 +204,7 @@ test("memory loaders honour every preset: overrides are the user scope, project 
 	assert.equal((await policy.load({ cwd: "/p", projectTrusted: true, preset: "architect" })).source, "bundled");
 });
 
-test("the bundled architect preset is complete and valid: its policy, three unavailable roles, two defaults and a declining review", async () => {
+test("the bundled architect preset is complete and valid: its policy, three unavailable roles, two defaults and independent review", async () => {
 	const loaded = await memoryRoleContractLoader().load({ cwd: "/p", projectTrusted: false, preset: "architect" });
 	for (const name of ROLE_CONTRACT_FILES) {
 		assert.equal(loaded.files[name].source, "bundled", name);
@@ -221,8 +221,8 @@ test("the bundled architect preset is complete and valid: its policy, three unav
 		ask: { backend: "codex", model: "gpt-6.1-sol", effort: "high", path: path.join(ARCHITECT_DIR, "contracts", "ask-answer.md") },
 	});
 	const review = roleContractBody(loaded, "ask-review.md");
-	assert.match(review, /^# Review mode is outside this research role/);
-	assert.match(review, /No code review was performed/);
+	assert.match(review, /^# Independent code review/);
+	assert.match(review, /you did not write it and do not implement fixes/);
 	assert.match(roleContractBody(loaded, "implement.md"), /^You are the implementer\./);
 	assert.match(roleContractBody(loaded, "ask-answer.md"), /external web researcher/);
 	const policy = await memoryHostPolicyLoader().load({ cwd: "/p", projectTrusted: false, preset: "architect" });
@@ -237,6 +237,40 @@ test("the bundled architect preset is complete and valid: its policy, three unav
 	for (const file of [HOST_POLICY_FILE, ...ROLE_CONTRACT_FILES.map((name) => path.join("contracts", name))]) {
 		assert.doesNotMatch(fs.readFileSync(path.join(ARCHITECT_DIR, file), "utf8"), /\bthis project's (role|review|ask|contract)|in this project\b/i, `${file} speaks of this preset, not a project`);
 	}
+});
+
+test("architect separates research from read-only review and keeps selective review, triage and escalation in the host policy", async () => {
+	const context = { cwd: "/p", projectTrusted: false, preset: "architect" as const };
+	const loaded = await memoryRoleContractLoader().load(context);
+	const answer = roleContractBody(loaded, "ask-answer.md");
+	const review = roleContractBody(loaded, "ask-review.md");
+	assert.match(answer, /Do not inspect local project files, Git history or diffs, run project code\/tests\/builds, or perform code review/);
+	assert.match(answer, /If web access or a needed source is unavailable, say so explicitly/);
+	assert.match(review, /Inspect the named working-tree change, commit range or files/);
+	assert.match(review, /Do not modify repository files, implement fixes, change Git state/);
+	assert.match(review, /Run only documented, model-free verification that leaves the working tree unchanged/);
+	assert.match(review, /Return findings to the Architect, not directly to the implementer/);
+	assert.match(review, /Use `ask_orchestrator` for missing details or blockers/);
+	assert.match(review, /After one substantive Architect response/);
+	assert.match(review, /Existing discussion limits do not reset for a review finding/);
+	assert.match(review, /Do not paste the patch or full command output/);
+	for (const heading of ["Verdict", "Findings", "Verification", "Notes and limits", "Escalation"]) assert.ok(review.includes(`## ${heading}\n`), heading);
+	const metadata = loaded.guidance.ask;
+	assert.match(metadata.description, /answer mode.*review mode/);
+	assert.match(metadata.guidance.join("\n"), /Answer mode is web-research only/);
+	assert.match(metadata.guidance.join("\n"), /Review mode is read-only code review/);
+	assert.match(metadata.task_brief, /answer mode.*review mode/);
+	assert.doesNotMatch(JSON.stringify(metadata), /declines|no repository investigation or code review/);
+	const policy = (await memoryHostPolicyLoader().load(context)).text;
+	assert.match(policy, /risk, complexity, subsystem interactions or context cost/);
+	assert.match(policy, /Small, clear, low-risk changes get proportionate host checks/);
+	assert.match(policy, /Prefer one fresh reviewer at a coherent completion boundary/);
+	assert.match(policy, /Automatic review must remain unset or disabled/);
+	assert.match(policy, /spot-check relevant critical paths rather than routinely repeating the entire large-diff inspection/);
+	assert.match(policy, /Triage them and relay accepted findings/);
+	assert.match(policy, /Escalate review findings that require a user decision or remain disputed after one substantive Architect response/);
+	assert.match(policy, /Do not force agreement or reset existing discussion limits/);
+	assert.doesNotMatch(policy, /`ask` only for external web research|Do not use `ask` review mode|review contract declines/);
 });
 
 test("an unusable bundled preset fails its selection, after builtin is validated, and never borrows a missing file from builtin", async (t) => {
