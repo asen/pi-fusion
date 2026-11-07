@@ -405,7 +405,7 @@ export function finishCodexRun(run: CodexRun, ending: CodexEnding, ms: number, s
 
 /** How much of a child's latest line of work its activity shows, the window the other backends use. */
 export const CODEX_ACTIVITY_CHARS = 60;
-/** How much of a tool's output one event carries, and how long one rendered argument may be. */
+/** How much tool output or web-search metadata one event carries, and how long one rendered command argument may be. */
 export const CODEX_EVENT_TEXT_MAX_CHARS = 4_096;
 export const CODEX_EVENT_FIELD_MAX_CHARS = 1_024;
 /** How long a tool name or an id a monitor files events under may be. */
@@ -443,8 +443,35 @@ const key = (value: unknown): string | undefined => {
 	return named ? capped(named, CODEX_EVENT_KEY_MAX_CHARS) : undefined;
 };
 
+/** Opaque search data is a bounded text preview before an early notification can retain it, never dashboard HTML. */
+function jsonPreview(value: unknown): string | undefined {
+	try {
+		const json = JSON.stringify(value, null, 2);
+		return json === undefined ? undefined : capped(json, CODEX_EVENT_TEXT_MAX_CHARS);
+	} catch {
+		return undefined;
+	}
+}
+
+/** Codex reports query/action metadata, sometimes only at completion, not the original raw tool-arguments JSON. */
+function webSearchInput(item: Fields): string | undefined {
+	const query = text(item.query);
+	const action = record(item.action);
+	// Empty completion placeholders must not erase input that the start already exposed.
+	if (!query?.trim() && (action === undefined || action.type === "other")) return undefined;
+	const input: Fields = {};
+	if (query !== undefined) input.query = query;
+	if (action !== undefined || item.action === null) input.action = action ?? null;
+	return jsonPreview(input);
+}
+
+/** Hosted search can expose no result content; an empty array from standalone search is different from absence. */
+function webSearchOutput(item: Fields): string {
+	return (Array.isArray(item.results) ? jsonPreview(item.results) : undefined) ?? "Codex did not expose result content for this web search.";
+}
+
 /** A tool item as a monitor shows one: a name, a one-line brief and a bounded input. Other items are not tools. */
-function toolOf(item: Fields): { name: string; brief: string; input?: Record<string, string> } | undefined {
+function toolOf(item: Fields): { name: string; brief: string; input?: Record<string, string> | string } | undefined {
 	switch (item.type) {
 		case "commandExecution": {
 			const command = text(item.command);
@@ -457,8 +484,10 @@ function toolOf(item: Fields): { name: string; brief: string; input?: Record<str
 		}
 		case "mcpToolCall":
 			return { name: capped(`${text(item.server) ?? "?"}/${text(item.tool) ?? "?"}`, CODEX_EVENT_KEY_MAX_CHARS), brief: "" };
-		case "webSearch":
-			return { name: "web search", brief: firstLine(text(item.query)) };
+		case "webSearch": {
+			const input = webSearchInput(item);
+			return { name: "web search", brief: firstLine(text(item.query)), ...(input === undefined ? {} : { input }) };
+		}
 		case "collabAgentToolCall":
 			return { name: "agent", brief: firstLine(text(item.tool)) };
 		default:
@@ -549,14 +578,17 @@ export function codexFeed(run: CodexRun, emit: CodexFeedEmit, baseline?: CodexUs
 						progress();
 					};
 				}
-				if (!toolOf(item)) return undefined;
+				const tool = toolOf(item);
+				if (!tool) return undefined;
 				const id = key(item.id);
 				const status = text(item.status);
 				const exitCode = typeof item.exitCode === "number" ? item.exitCode : undefined;
-				const output = capped(text(item.aggregatedOutput) ?? "", CODEX_EVENT_TEXT_MAX_CHARS);
+				const search = item.type === "webSearch";
+				const output = search ? webSearchOutput(item) : capped(text(item.aggregatedOutput) ?? "", CODEX_EVENT_TEXT_MAX_CHARS);
+				const input = search ? tool.input : undefined;
 				const isError = status === "failed" || status === "declined" || (exitCode !== undefined && exitCode !== 0);
 				return () => {
-					if (id !== undefined) event({ type: "tool_result", toolUseId: id, text: output, isError });
+					if (id !== undefined) event({ type: "tool_result", toolUseId: id, text: output, isError, ...(input === undefined ? {} : { input }) });
 					run.activity = "waiting for model";
 					progress();
 				};

@@ -463,6 +463,27 @@ test("a tool call keeps its input and result and marks its log entry", () => {
 	assert.equal(store.callDetail("nope", "tu-1"), undefined);
 });
 
+test("a tool completion can replace its input without adding a call, losing omitted input, or changing another call", () => {
+	const { store } = started();
+	store.event("run-1", { type: "tool_call", name: "web search", brief: "", id: "search", input: { query: "" } });
+	store.event("run-1", { type: "tool_call", name: "Read", brief: "other", id: "other", input: { path: "untouched" } });
+	const initial = detailOf(store).log.map(({ seq, text }) => ({ seq, text }));
+	store.event("run-1", { type: "tool_result", toolUseId: "search", input: { query: "complete query", action: { type: "search", queries: ["one", "two"] } }, text: "a result", isError: false });
+	assert.deepEqual(JSON.parse(store.callDetail("run-1", "search")!.input), { query: "complete query", action: { type: "search", queries: ["one", "two"] } });
+	assert.deepEqual(detailOf(store).log.map(({ seq, text }) => ({ seq, text })), initial, "completion metadata does not invent another call");
+	assert.deepEqual(JSON.parse(store.callDetail("run-1", "other")!.input), { path: "untouched" });
+	store.event("run-1", { type: "tool_result", toolUseId: "search", input: "é".repeat(CALL_CAP_BYTES), text: "updated result", isError: false });
+	const big = store.callDetail("run-1", "search")!;
+	assert.equal(big.inputTruncated, true);
+	assert.ok(Buffer.byteLength(big.input, "utf8") <= CALL_CAP_BYTES && !big.input.includes("\uFFFD"));
+	store.event("run-1", { type: "tool_result", toolUseId: "search", text: "no new input", isError: false });
+	assert.equal(store.callDetail("run-1", "search")!.input, big.input, "an ordinary result keeps the input it already had");
+	assert.equal(store.callDetail("run-1", "search")!.inputTruncated, true);
+	store.event("run-1", { type: "tool_result", toolUseId: "search", input: "small", text: "last", isError: false });
+	assert.equal(store.callDetail("run-1", "search")!.input, "small");
+	assert.equal(store.callDetail("run-1", "search")!.inputTruncated, false, "replacement input has its own truncation flag");
+});
+
 test("a call is forgotten with its log entry, and an Agent call's prompt goes to its task", () => {
 	const { store } = started();
 	store.event("run-1", { type: "tool_call", name: "Agent", brief: "probe", id: "tu-a", input: { description: "probe", prompt: "look at the store" } });

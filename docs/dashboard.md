@@ -54,7 +54,7 @@ Browsing is read-only. It writes no history file, re-seeds no usage, reserves no
 
 ## Log and keyboard navigation
 
-Click a tool row to expand its input/result. Awaiting results are grey, error results red, and tool-error count appears in facts. Agent calls can expose their prompts. Task bars run from start to end on the run's clock, grow while active, and show overlap/state.
+Click a tool row to expand its input/result. Awaiting results are grey, error results red, and tool-error count appears in facts. Agent calls can expose their prompts. Codex [web-search rows](codex-backend.md#web-search-display) show reported query/action metadata and available structured results, updating input when completion supplies it; unavailable output is labelled rather than shown as an empty result. Task bars run from start to end on the run's clock, grow while active, and show overlap/state.
 
 The log initially follows newest rows. Scrolling up preserves the visible rows and shows a button counting new arrivals; click it to return to the bottom.
 

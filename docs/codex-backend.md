@@ -106,6 +106,16 @@ Approval requests are declined and listed as denied tools. Unsupported server re
 
 The live display filters unfiltered transport notifications to the verified primary thread and admitted turn. Foreign/subagent final text, usage and tool calls do not enter its report or monitor.
 
+### Web-search display
+
+A `webSearch` log row expands to Codex's reported `query` and `action` metadata, including multiple queries, page URLs or find patterns when supplied. These are normalized app-server fields, not a reconstruction of the original raw tool arguments. Completion can replace placeholder input with the later metadata without adding another call; an already-open row refreshes with it.
+
+The result shows a bounded JSON preview of the opaque `results` array, retaining supplied fields such as titles, URLs, reference ids and snippets. An empty array is shown as `[]`. Absent, null or unusable result content instead reads **Codex did not expose result content for this web search.** Missing display data does not fail the tool or the run. The adapter never substitutes command `aggregatedOutput` for search results.
+
+Input metadata and results are each capped at 4096 code points before any early-event buffering, with an ellipsis when cut; the dashboard's own byte cap still applies. Foreign threads/turns remain excluded. This changes monitoring only, not final reports, usage, checkpoints or success checks. Nothing probes capabilities, refetches a page, replays a search or uses internal raw-response events.
+
+Protocol limits are source-derived from Codex `rust-v0.160.0`, not provider-qualified: the [item schema](https://github.com/openai/codex/blob/rust-v0.160.0/codex-rs/app-server-protocol/schema/typescript/WebSearchItem.ts) allows nullable opaque results, while the [hosted-search mapping](https://github.com/openai/codex/blob/rust-v0.160.0/codex-rs/core/src/event_mapping.rs) supplies none. Standalone built-in search can supply structured results; complete fetched page text or exact model-visible output is not guaranteed. Fake protocol/store/browser tests cover the display, not a native search.
+
 ## Continuation and fork
 
 Sources: [`codexSession`](../extensions/backends/codex-outcome.ts), [`drive`](../extensions/backends/codex.ts), and [host recovery policy](runs.md#recovery-policy).

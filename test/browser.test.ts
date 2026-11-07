@@ -1907,6 +1907,31 @@ async function ownServer(setup: (store: RunStore) => void) {
 const SCROLL_CALL = (brief: string, body: number, top: number) =>
 	`(() => { const row = Array.from(document.querySelectorAll('.log .log-open')).find((node) => node.querySelector('.log-text').textContent.endsWith(${JSON.stringify(brief)})); const node = row.querySelectorAll('.call-body')[${body}]; node.scrollTop = ${top}; return node.scrollTop; })()`;
 
+test("an expanded search call refreshes its input and result when completion supplies the metadata", { skip }, async () => {
+	const { page } = await fixture();
+	const served = await ownServer((store) => {
+		store.start({ id: "search", backend: "codex", role: "search-role", model: "fake" });
+		store.event("search", { type: "tool_call", name: "web search", brief: "starting search", id: "search-call", input: { query: "", action: null } });
+	});
+	try {
+		await page.open(served.url);
+		await page.until<string>("the search run is shown", DETAIL_TITLE, (title) => title === "search-role");
+		assert.equal(await page.evaluate<string>(OPEN_CALL("starting search")), "clicked");
+		const bodies = "Array.from(document.querySelectorAll('.log-open .call-body')).map((node) => node.textContent)";
+		await page.until<string[]>("the initial input loads", bodies, (values) => values.length === 1 && values[0]!.includes('"query": ""'));
+		const input = { query: "full query supplied at completion", action: { type: "findInPage", url: "https://example.com", pattern: "reported pattern" } };
+		const result = JSON.stringify([{ title: "Source", snippet: "<script>not executable</script>" }], null, 2);
+		served.store.event("search", { type: "tool_result", toolUseId: "search-call", input, text: result, isError: false });
+		await page.refresh();
+		await page.until<string[]>("the open call refreshes its input and output", bodies, (values) => values.length === 2 && values[0]!.includes(input.query));
+		assert.deepEqual(await page.evaluate<string[]>(bodies), [JSON.stringify(input, null, 2), result]);
+		assert.equal(await page.evaluate<number>(LOG_ROWS), 1, "backfilled input does not duplicate the call");
+		assert.equal(await page.evaluate<number>("document.querySelectorAll('.call-body script').length"), 0, "opaque search results remain text, never HTML");
+	} finally {
+		await served.close();
+	}
+});
+
 test("open tool inputs and results keep their own scroll through new rows, progress and a hidden Log tab", { skip }, async () => {
 	const { page } = await fixture();
 	const wide = Object.fromEntries(Array.from({ length: 60 }, (_, i) => [`key${i}`, `value ${i}`]));

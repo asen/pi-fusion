@@ -326,7 +326,8 @@ export type ChildEvent =
 	| { type: "init"; sessionId: string }
 	| { type: "tool_call"; name: string; brief: string; id?: string; input?: unknown }
 	| { type: "agent_tool_call"; parentToolUseId: string; name: string; id?: string; input?: unknown }
-	| { type: "tool_result"; toolUseId: string; text: string; isError: boolean }
+	/** Some harnesses expose the final tool input only on completion; omission keeps the input already shown. */
+	| { type: "tool_result"; toolUseId: string; text: string; isError: boolean; input?: unknown }
 	| { type: "task_started"; taskId: string; toolUseId?: string; taskType?: string; name: string; subagentType?: string }
 	| { type: "task_progress"; taskId: string; description?: string; summary?: string; lastTool?: string; tokens?: number; toolUses?: number; phase?: string; agents?: Array<{ label: string; state: string }> }
 	| { type: "task_ended"; taskId: string; status: "completed" | "failed" | "stopped"; summary?: string; tokens?: number }
